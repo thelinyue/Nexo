@@ -744,8 +744,15 @@ function SiteNetworkRow({
         <span>{network.site_name} · {network.publisher_device_name}</span>
       </div>
       <div className="network-prefix">
-        <span>共享网段</span>
+        <span>期望共享网段</span>
         <code>{network.desired_prefix}</code>
+        <small className="network-applied">
+          {network.applied_prefix
+            ? `已确认生效：${network.applied_prefix}`
+            : network.enabled
+              ? "已确认生效：等待设备 ACK"
+              : "已确认生效：未共享"}
+        </small>
         <small>下一跳：{network.gateway_address ?? "等待设备地址"}</small>
       </div>
       {network.apply_error && <p className="network-error">{network.apply_error}</p>}
@@ -768,7 +775,11 @@ function SiteNetworkRow({
 function siteLinkStatus(status: SiteLink["apply_status"]): { label: string; kind: string } {
   switch (status) {
     case "ready":
-      return { label: "已建立", kind: "ready" };
+      return { label: "已生效", kind: "ready" };
+    case "checking":
+      return { label: "等待设备确认", kind: "working" };
+    case "applying":
+      return { label: "正在应用", kind: "working" };
     case "retrying":
       return { label: "自动重试中", kind: "working" };
     case "failed":

@@ -361,24 +361,32 @@ async fn health() -> impl IntoResponse {
     })
 }
 
-async fn overview(State(state): State<AppState>) -> Result<Json<OverviewResponse>, StatusCode> {
+async fn overview(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<OverviewResponse>, ApiError> {
+    require_admin(&headers)?;
     let connection = state
         .db
         .lock()
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    let devices = count(&connection, "SELECT COUNT(*) FROM devices")?;
+        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "数据库锁不可用"))?;
+    let devices = count(&connection, "SELECT COUNT(*) FROM devices")
+        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法读取设备数量"))?;
     let running_tunnels = count(
         &connection,
         "SELECT COUNT(*) FROM tunnels WHERE enabled = 1 AND apply_status = 'ready'",
-    )?;
+    )
+    .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法读取隧道数量"))?;
     let mesh_devices = count(
         &connection,
         "SELECT COUNT(*) FROM devices WHERE capabilities_json LIKE '%mesh%'",
-    )?;
+    )
+    .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法读取组网设备数量"))?;
     let current_connections = count(
         &connection,
         "SELECT COUNT(*) FROM devices WHERE status = 'online'",
-    )?;
+    )
+    .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法读取在线设备数量"))?;
     Ok(Json(OverviewResponse {
         devices,
         running_tunnels,
@@ -2512,6 +2520,23 @@ mod tests {
         AppState {
             db: Arc::new(Mutex::new(connection)),
         }
+    }
+
+    #[tokio::test]
+    async fn overview_requires_admin_token() {
+        env::set_var("NEXO_ADMIN_TOKEN", "test-admin");
+        let state = test_state();
+        let error = overview(State(state.clone()), HeaderMap::new())
+            .await
+            .expect_err("概览不应在缺少管理员凭证时开放");
+        assert_eq!(error.status, StatusCode::UNAUTHORIZED);
+
+        let response = overview(State(state), admin_headers())
+            .await
+            .expect("管理员应能读取概览")
+            .0;
+        assert_eq!(response.devices, 0);
+        assert_eq!(response.current_connections, 0);
     }
 
     #[tokio::test]
