@@ -1,0 +1,21 @@
+[package]
+name = "nexo-agent"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+get_if_addrs.workspace = true
+ipnet.workspace = true
+nexo-core = { path = "../nexo-core" }
+nexo-protocol = { path = "../nexo-protocol" }
+rcgen.workspace = true
+reqwest.workspace = true
+rustls.workspace = true
+rustls-pemfile.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tokio-rustls.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

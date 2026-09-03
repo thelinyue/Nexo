@@ -1,0 +1,40 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/nexo-core",
+    "crates/nexo-protocol",
+    "crates/nexo-tunnel",
+    "crates/nexo-server",
+    "crates/nexo-agent",
+    "crates/nexo-headscale-adapter",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0-only"
+
+[workspace.dependencies]
+anyhow = "1"
+axum = "0.8"
+base64 = "0.22"
+bytes = "1"
+hex = "0.4"
+get_if_addrs = "0.5"
+ipnet = { version = "2", features = ["serde"] }
+rand = "0.8"
+rcgen = { version = "0.14", features = ["x509-parser"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-pemfile = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+thiserror = "2"
+time = "0.3"
+tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "time"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "logging", "tls12"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+uuid = { version = "1", features = ["v4"] }

@@ -1,0 +1,13 @@
+[package]
+name = "nexo-protocol"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+bytes.workspace = true
+nexo-core = { path = "../nexo-core" }
+serde.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
