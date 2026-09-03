@@ -211,6 +211,23 @@ function App() {
     void refreshOverview();
   }, [refreshOverview]);
 
+  /**
+   * 网关状态由 Agent ACK 最终收敛；只在存在待应用 revision 时轮询，避免常驻后台请求。
+   * 失败状态不会自动重置，用户仍能看到明确错误并决定是否重新启用。
+   */
+  const hasPendingGatewayChanges = [...siteNetworks, ...siteLinks].some((item) =>
+    item.apply_status === "checking" || item.apply_status === "applying" || item.apply_status === "retrying",
+  );
+  useEffect(() => {
+    if (!hasPendingGatewayChanges) {
+      return;
+    }
+    const timer = window.setInterval(() => {
+      void refreshOverview();
+    }, 4000);
+    return () => window.clearInterval(timer);
+  }, [hasPendingGatewayChanges, refreshOverview]);
+
   return (
     <div className="app-shell">
       <aside className="sidebar">
