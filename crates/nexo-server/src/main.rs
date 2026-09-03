@@ -118,6 +118,7 @@ struct SiteNetworkResponse {
     desired_prefix: String,
     applied_prefix: Option<String>,
     desired_revision: i64,
+    enabled: bool,
     apply_status: ApplyStatus,
     apply_error: Option<String>,
 }
@@ -141,6 +142,7 @@ struct SiteLinkResponse {
     right_site_id: String,
     left_network_id: String,
     right_network_id: String,
+    enabled: bool,
     apply_status: ApplyStatus,
     apply_error: Option<String>,
 }
@@ -259,8 +261,18 @@ async fn main() -> Result<()> {
         )
         .route("/api/v1/site-networks", post(create_site_network))
         .route("/api/v1/site-networks/{id}", get(get_site_network))
+        .route(
+            "/api/v1/site-networks/{id}/disable",
+            post(disable_site_network),
+        )
+        .route(
+            "/api/v1/site-networks/{id}/enable",
+            post(enable_site_network),
+        )
         .route("/api/v1/site-links", post(create_site_link))
         .route("/api/v1/site-links/{id}", get(get_site_link))
+        .route("/api/v1/site-links/{id}/disable", post(disable_site_link))
+        .route("/api/v1/site-links/{id}/enable", post(enable_site_link))
         .with_state(state);
 
     let address: SocketAddr = env::var("NEXO_HTTP_ADDR")
@@ -729,10 +741,10 @@ fn load_gateway_desired_state(
     let mut routes = Vec::new();
     {
         let mut statement = connection.prepare(
-            "SELECT n.id, g.desired_prefix, g.desired_revision
+            "SELECT n.id, g.desired_prefix, g.desired_revision, n.enabled
              FROM site_networks n
              JOIN gateway_network_states g ON g.site_network_id = n.id
-             WHERE n.publisher_device_id = ?1 AND n.enabled = 1",
+             WHERE n.publisher_device_id = ?1",
         )?;
         let rows = statement.query_map([device_id], |row| {
             Ok(GatewayDesiredRoute {
@@ -740,6 +752,7 @@ fn load_gateway_desired_state(
                 site_link_id: None,
                 prefix: row.get(1)?,
                 revision: row.get(2)?,
+                enabled: row.get::<_, i64>(3)? != 0,
             })
         })?;
         for row in rows {
@@ -748,7 +761,8 @@ fn load_gateway_desired_state(
     }
     {
         let mut statement = connection.prepare(
-            "SELECT remote_n.id, l.id, remote_g.desired_prefix, remote_g.desired_revision
+            "SELECT remote_n.id, l.id, remote_g.desired_prefix, remote_g.desired_revision,
+                    l.apply_revision, l.enabled, local_n.enabled, remote_n.enabled
              FROM site_links l
              JOIN site_link_networks local_link ON local_link.site_link_id = l.id
              JOIN site_networks local_n ON local_n.id = local_link.site_network_id
@@ -757,14 +771,19 @@ fn load_gateway_desired_state(
              JOIN site_networks remote_n ON remote_n.id = remote_link.site_network_id
              JOIN gateway_network_states remote_g ON remote_g.site_network_id = remote_n.id
              WHERE local_n.publisher_device_id = ?1
-               AND l.enabled = 1 AND remote_n.enabled = 1",
+            ",
         )?;
         let rows = statement.query_map([device_id], |row| {
+            let network_revision: i64 = row.get(3)?;
+            let link_revision: i64 = row.get(4)?;
             Ok(GatewayDesiredRoute {
                 network_id: row.get(0)?,
                 site_link_id: Some(row.get(1)?),
                 prefix: row.get(2)?,
-                revision: row.get(3)?,
+                revision: network_revision.max(link_revision),
+                enabled: row.get::<_, i64>(5)? != 0
+                    && row.get::<_, i64>(6)? != 0
+                    && row.get::<_, i64>(7)? != 0,
             })
         })?;
         for row in rows {
@@ -821,6 +840,18 @@ fn apply_gateway_ack(state: &AppState, device_id: &str, ack: &GatewayApplyAck) -
                         WHERE n.publisher_device_id = ?3)",
                 rusqlite::params![network_id, ack.revision, device_id],
             )?;
+            transaction.execute(
+                "UPDATE site_networks
+                 SET apply_status = 'ready', apply_revision = ?1,
+                     apply_error = NULL, updated_at = CURRENT_TIMESTAMP
+                 WHERE id = ?2 AND id IN
+                       (SELECT n.id FROM site_networks n
+                        WHERE n.publisher_device_id = ?3)
+                   AND EXISTS (SELECT 1 FROM gateway_network_states g
+                               WHERE g.site_network_id = site_networks.id
+                                 AND g.desired_revision <= ?1)",
+                rusqlite::params![ack.revision, network_id, device_id],
+            )?;
         }
     } else {
         for network_id in &ack.network_ids {
@@ -837,6 +868,24 @@ fn apply_gateway_ack(state: &AppState, device_id: &str, ack: &GatewayApplyAck) -
                     ack.error_message,
                     network_id,
                     ack.revision,
+                    device_id
+                ],
+            )?;
+            transaction.execute(
+                "UPDATE site_networks
+                 SET apply_status = ?1, apply_revision = ?2, apply_error = ?3,
+                     updated_at = CURRENT_TIMESTAMP
+                 WHERE id = ?4 AND id IN
+                       (SELECT n.id FROM site_networks n
+                        WHERE n.publisher_device_id = ?5)
+                   AND EXISTS (SELECT 1 FROM gateway_network_states g
+                               WHERE g.site_network_id = site_networks.id
+                                 AND g.desired_revision <= ?2)",
+                rusqlite::params![
+                    status,
+                    ack.revision,
+                    ack.error_message,
+                    network_id,
                     device_id
                 ],
             )?;
@@ -1450,6 +1499,7 @@ async fn create_site_network(
         applied_prefix: None,
         desired_revision: 1,
         apply_status: ApplyStatus::Checking,
+        enabled: true,
         apply_error: None,
     }))
 }
@@ -1465,14 +1515,123 @@ async fn get_site_network(
         .db
         .lock()
         .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "数据库锁不可用"))?;
+    Ok(Json(read_site_network_response(&connection, &id)?))
+}
+
+/// 关闭共享本地网络，使 Agent 收到撤销路由的最新 revision。
+async fn disable_site_network(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<Json<SiteNetworkResponse>, ApiError> {
+    set_site_network_enabled(state, headers, id, false).await
+}
+
+/// 重新启用共享本地网络，使 Agent 收到重新发布路由的最新 revision。
+async fn enable_site_network(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<Json<SiteNetworkResponse>, ApiError> {
+    set_site_network_enabled(state, headers, id, true).await
+}
+
+/// 事务性切换共享网络开关，并把关联站点互联退回检查状态。
+async fn set_site_network_enabled(
+    state: AppState,
+    headers: HeaderMap,
+    id: String,
+    enabled: bool,
+) -> Result<Json<SiteNetworkResponse>, ApiError> {
+    require_admin(&headers)?;
+    let mut connection = state
+        .db
+        .lock()
+        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "数据库锁不可用"))?;
+    let transaction = connection
+        .transaction()
+        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法开始共享网络事务"))?;
+    let (tenant_id, current_enabled): (String, i64) = transaction
+        .query_row(
+            "SELECT tenant_id, enabled FROM site_networks WHERE id = ?1",
+            [&id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .map_err(|_| ApiError::new(StatusCode::NOT_FOUND, "共享网络不存在"))?;
+    if (current_enabled != 0) != enabled {
+        transaction
+            .execute(
+                "UPDATE site_networks
+                 SET enabled = ?1, apply_status = 'checking', apply_error = NULL,
+                     updated_at = CURRENT_TIMESTAMP
+                 WHERE id = ?2",
+                rusqlite::params![if enabled { 1 } else { 0 }, id],
+            )
+            .map_err(|_| {
+                ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法更新共享网络状态")
+            })?;
+        transaction
+            .execute(
+                "UPDATE gateway_network_states
+                 SET desired_revision = desired_revision + 1,
+                     apply_status = 'checking', applied_prefix = NULL,
+                     apply_error = NULL, updated_at = CURRENT_TIMESTAMP
+                 WHERE site_network_id = ?1",
+                [&id],
+            )
+            .map_err(|_| {
+                ApiError::new(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "无法生成网关撤销 revision",
+                )
+            })?;
+        transaction
+            .execute(
+                "UPDATE site_links SET apply_status = 'checking', apply_error = NULL,
+                     updated_at = CURRENT_TIMESTAMP
+                 WHERE id IN (
+                     SELECT DISTINCT site_link_id FROM site_link_networks
+                     WHERE site_network_id = ?1
+                 )",
+                [&id],
+            )
+            .map_err(|_| {
+                ApiError::new(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "无法刷新关联站点互联状态",
+                )
+            })?;
+        write_audit_event(
+            &transaction,
+            &tenant_id,
+            if enabled {
+                "SUBNET_ENABLED"
+            } else {
+                "SUBNET_REMOVED"
+            },
+            "site_network",
+            &id,
+        )?;
+    }
+    transaction
+        .commit()
+        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法提交共享网络事务"))?;
+    Ok(Json(read_site_network_response(&connection, &id)?))
+}
+
+/// 从 Nexo 数据库读取共享网络的完整 Desired / Applied 状态。
+fn read_site_network_response(
+    connection: &Connection,
+    id: &str,
+) -> Result<SiteNetworkResponse, ApiError> {
     connection
         .query_row(
             "SELECT n.id, n.tenant_id, n.site_id, n.name, n.publisher_device_id,
                     n.interface_id, g.desired_prefix, g.applied_prefix,
-                    g.desired_revision, g.apply_status, g.apply_error
+                    g.desired_revision, n.enabled, g.apply_status, g.apply_error
              FROM site_networks n JOIN gateway_network_states g
              ON g.site_network_id = n.id WHERE n.id = ?1",
-            [&id],
+            [id],
             |row| {
                 Ok(SiteNetworkResponse {
                     id: row.get(0)?,
@@ -1484,12 +1643,12 @@ async fn get_site_network(
                     desired_prefix: row.get(6)?,
                     applied_prefix: row.get(7)?,
                     desired_revision: row.get(8)?,
-                    apply_status: parse_apply_status(&row.get::<_, String>(9)?),
-                    apply_error: row.get(10)?,
+                    enabled: row.get::<_, i64>(9)? != 0,
+                    apply_status: parse_apply_status(&row.get::<_, String>(10)?),
+                    apply_error: row.get(11)?,
                 })
             },
         )
-        .map(Json)
         .map_err(|_| ApiError::new(StatusCode::NOT_FOUND, "共享网络不存在"))
 }
 
@@ -1634,6 +1793,7 @@ async fn create_site_link(
         right_site_id,
         left_network_id,
         right_network_id,
+        enabled: true,
         apply_status: ApplyStatus::Checking,
         apply_error: None,
     }))
@@ -1650,16 +1810,103 @@ async fn get_site_link(
         .db
         .lock()
         .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "数据库锁不可用"))?;
+    Ok(Json(read_site_link_response(&connection, &id)?))
+}
+
+/// 关闭站点互联，使两侧 Agent 撤销对端网段路由。
+async fn disable_site_link(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<Json<SiteLinkResponse>, ApiError> {
+    set_site_link_enabled(state, headers, id, false).await
+}
+
+/// 重新启用站点互联，使两侧 Agent 重新收到对端网段路由。
+async fn enable_site_link(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<Json<SiteLinkResponse>, ApiError> {
+    set_site_link_enabled(state, headers, id, true).await
+}
+
+/// 事务性切换站点互联开关，并递增 link revision 作为路由撤销信号。
+async fn set_site_link_enabled(
+    state: AppState,
+    headers: HeaderMap,
+    id: String,
+    enabled: bool,
+) -> Result<Json<SiteLinkResponse>, ApiError> {
+    require_admin(&headers)?;
+    let mut connection = state
+        .db
+        .lock()
+        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "数据库锁不可用"))?;
+    let transaction = connection
+        .transaction()
+        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法开始站点互联事务"))?;
+    let (tenant_id, current_enabled): (String, i64) = transaction
+        .query_row(
+            "SELECT tenant_id, enabled FROM site_links WHERE id = ?1",
+            [&id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .map_err(|_| ApiError::new(StatusCode::NOT_FOUND, "站点互联不存在"))?;
+    if (current_enabled != 0) != enabled {
+        transaction
+            .execute(
+                "UPDATE site_links
+                 SET enabled = ?1,
+                     apply_revision = MAX(
+                         apply_revision,
+                         COALESCE((SELECT MAX(g.desired_revision)
+                                   FROM site_link_networks ln
+                                   JOIN gateway_network_states g
+                                     ON g.site_network_id = ln.site_network_id
+                                   WHERE ln.site_link_id = site_links.id), 0)
+                     ) + 1,
+                     apply_status = 'checking', apply_error = NULL,
+                     updated_at = CURRENT_TIMESTAMP
+                 WHERE id = ?2",
+                rusqlite::params![if enabled { 1 } else { 0 }, id],
+            )
+            .map_err(|_| {
+                ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法更新站点互联状态")
+            })?;
+        write_audit_event(
+            &transaction,
+            &tenant_id,
+            if enabled {
+                "SITE_LINK_ENABLED"
+            } else {
+                "SITE_LINK_REMOVED"
+            },
+            "site_link",
+            &id,
+        )?;
+    }
+    transaction
+        .commit()
+        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法提交站点互联事务"))?;
+    Ok(Json(read_site_link_response(&connection, &id)?))
+}
+
+/// 从 Nexo 数据库读取站点互联的完整状态。
+fn read_site_link_response(
+    connection: &Connection,
+    id: &str,
+) -> Result<SiteLinkResponse, ApiError> {
     connection
         .query_row(
             "SELECT l.id, l.tenant_id, l.left_site_id, l.right_site_id,
                     ln.site_network_id, rn.site_network_id,
-                    l.apply_status, l.apply_error
+                    l.enabled, l.apply_status, l.apply_error
              FROM site_links l
              JOIN site_link_networks ln ON ln.site_link_id = l.id AND ln.side = 'left'
              JOIN site_link_networks rn ON rn.site_link_id = l.id AND rn.side = 'right'
              WHERE l.id = ?1",
-            [&id],
+            [id],
             |row| {
                 Ok(SiteLinkResponse {
                     id: row.get(0)?,
@@ -1668,12 +1915,12 @@ async fn get_site_link(
                     right_site_id: row.get(3)?,
                     left_network_id: row.get(4)?,
                     right_network_id: row.get(5)?,
-                    apply_status: parse_apply_status(&row.get::<_, String>(6)?),
-                    apply_error: row.get(7)?,
+                    enabled: row.get::<_, i64>(6)? != 0,
+                    apply_status: parse_apply_status(&row.get::<_, String>(7)?),
+                    apply_error: row.get(8)?,
                 })
             },
         )
-        .map(Json)
         .map_err(|_| ApiError::new(StatusCode::NOT_FOUND, "站点互联不存在"))
 }
 
@@ -2144,6 +2391,17 @@ mod tests {
             .expect("应能读取已应用网关状态");
         assert_eq!(status, "ready");
         assert_eq!(applied.as_deref(), Some("192.168.10.0/24"));
+        let network_status: String = state
+            .db
+            .lock()
+            .expect("数据库锁应可用")
+            .query_row(
+                "SELECT apply_status FROM site_networks WHERE id = 'network-a'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("应能读取共享网络用户状态");
+        assert_eq!(network_status, "ready");
 
         apply_gateway_ack(
             &state,
@@ -2168,6 +2426,151 @@ mod tests {
             )
             .expect("应能读取旧 ACK 后的状态");
         assert_eq!(status, "ready");
+    }
+
+    #[tokio::test]
+    async fn disabling_site_network_increments_revision_and_publishes_revoke_route() {
+        env::set_var("NEXO_ADMIN_TOKEN", "test-admin");
+        let state = test_state();
+        {
+            let connection = state.db.lock().expect("数据库锁应可用");
+            connection
+                .execute_batch(
+                    "INSERT INTO sites (id, tenant_id, name) VALUES ('site-a', 'tenant-1', '家庭');
+                     INSERT INTO devices
+                        (id, tenant_id, site_id, name, status, capabilities_json)
+                        VALUES ('device-a', 'tenant-1', 'site-a', '家庭网关', 'online',
+                                '[\"subnet_gateway\"]');
+                     INSERT INTO site_networks
+                        (id, tenant_id, site_id, name, publisher_device_id, interface_id,
+                         address_family, current_prefix)
+                        VALUES ('network-a', 'tenant-1', 'site-a', '家庭 LAN', 'device-a',
+                                'eth0', 'ipv4', '192.168.10.0/24');
+                     INSERT INTO gateway_network_states
+                        (site_network_id, desired_prefix, desired_revision, apply_status)
+                        VALUES ('network-a', '192.168.10.0/24', 1, 'ready');",
+                )
+                .expect("应创建关闭网关测试数据");
+        }
+
+        let disabled = disable_site_network(
+            State(state.clone()),
+            admin_headers(),
+            Path("network-a".to_owned()),
+        )
+        .await
+        .expect("管理员应能关闭共享网络")
+        .0;
+        assert!(!disabled.enabled);
+        assert_eq!(disabled.desired_revision, 2);
+        assert_eq!(disabled.apply_status, ApplyStatus::Checking);
+
+        let desired = {
+            let connection = state.db.lock().expect("数据库锁应可用");
+            load_gateway_desired_state(&connection, "device-a")
+                .expect("应能加载撤销 Desired State")
+                .expect("关闭后的撤销路由仍需下发")
+        };
+        assert_eq!(desired.revision, 2);
+        assert_eq!(desired.routes.len(), 1);
+        assert!(!desired.routes[0].enabled);
+        assert_eq!(desired.routes[0].network_id, "network-a");
+
+        apply_gateway_ack(
+            &state,
+            "device-a",
+            &GatewayApplyAck {
+                revision: 2,
+                status: ApplyStatus::Disabled,
+                network_ids: vec!["network-a".to_owned()],
+                applied_network_ids: Vec::new(),
+                error_message: None,
+            },
+        )
+        .expect("Agent 应能确认网关路由已撤销");
+        let applied_status: String = state
+            .db
+            .lock()
+            .expect("数据库锁应可用")
+            .query_row(
+                "SELECT apply_status FROM site_networks WHERE id = 'network-a'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("应能读取撤销后的用户状态");
+        assert_eq!(applied_status, "disabled");
+
+        let repeated =
+            disable_site_network(State(state), admin_headers(), Path("network-a".to_owned()))
+                .await
+                .expect("重复关闭应保持幂等")
+                .0;
+        assert_eq!(repeated.desired_revision, 2);
+    }
+
+    #[tokio::test]
+    async fn disabling_site_link_uses_revision_newer_than_network_revision() {
+        env::set_var("NEXO_ADMIN_TOKEN", "test-admin");
+        let state = test_state();
+        {
+            let connection = state.db.lock().expect("数据库锁应可用");
+            connection
+                .execute_batch(
+                    "INSERT INTO sites (id, tenant_id, name) VALUES
+                        ('site-a', 'tenant-1', '家庭'),
+                        ('site-b', 'tenant-1', '办公室');
+                     INSERT INTO devices
+                        (id, tenant_id, site_id, name, status, capabilities_json)
+                        VALUES
+                        ('device-a', 'tenant-1', 'site-a', '家庭网关', 'online',
+                         '[\"site_gateway\"]'),
+                        ('device-b', 'tenant-1', 'site-b', '办公室网关', 'online',
+                         '[\"site_gateway\"]');
+                     INSERT INTO site_networks
+                        (id, tenant_id, site_id, name, publisher_device_id, interface_id,
+                         address_family, current_prefix)
+                        VALUES
+                        ('network-a', 'tenant-1', 'site-a', '家庭 LAN', 'device-a', 'eth0',
+                         'ipv4', '192.168.10.0/24'),
+                        ('network-b', 'tenant-1', 'site-b', '办公室 LAN', 'device-b', 'eth0',
+                         'ipv4', '192.168.20.0/24');
+                     INSERT INTO gateway_network_states
+                        (site_network_id, desired_prefix, desired_revision)
+                        VALUES
+                        ('network-a', '192.168.10.0/24', 1),
+                        ('network-b', '192.168.20.0/24', 1);
+                     INSERT INTO site_links (id, tenant_id, left_site_id, right_site_id)
+                        VALUES ('link-a-b', 'tenant-1', 'site-a', 'site-b');
+                     INSERT INTO site_link_networks (site_link_id, site_network_id, side)
+                        VALUES ('link-a-b', 'network-a', 'left'),
+                               ('link-a-b', 'network-b', 'right');",
+                )
+                .expect("应创建站点互联关闭测试数据");
+        }
+
+        let disabled = disable_site_link(
+            State(state.clone()),
+            admin_headers(),
+            Path("link-a-b".to_owned()),
+        )
+        .await
+        .expect("管理员应能关闭站点互联")
+        .0;
+        assert!(!disabled.enabled);
+        assert_eq!(disabled.apply_status, ApplyStatus::Checking);
+
+        let connection = state.db.lock().expect("数据库锁应可用");
+        let desired = load_gateway_desired_state(&connection, "device-a")
+            .expect("应能加载站点互联撤销 Desired State")
+            .expect("关闭后的互联撤销路由仍需下发");
+        assert_eq!(desired.revision, 2);
+        let remote_route = desired
+            .routes
+            .iter()
+            .find(|route| route.site_link_id.as_deref() == Some("link-a-b"))
+            .expect("应保留站点互联撤销路由");
+        assert!(!remote_route.enabled);
+        assert_eq!(remote_route.revision, 2);
     }
 
     #[tokio::test]

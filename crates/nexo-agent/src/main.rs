@@ -331,6 +331,7 @@ async fn control_session(
     .await?;
     let response = read_control_response(&mut reader).await?;
     let mut last_gateway_revision = None;
+    let mut last_gateway_status = None;
     match response {
         ServerControlMessage::HelloAccepted {
             gateway_state: Some(gateway_state),
@@ -338,6 +339,7 @@ async fn control_session(
         } => {
             let ack = apply_gateway_desired_state(&gateway_state);
             last_gateway_revision = Some(ack.revision);
+            last_gateway_status = Some(ack.status);
             write_agent_message(
                 reader.get_mut(),
                 &AgentControlMessage::GatewayApplyAck { ack: ack.clone() },
@@ -378,9 +380,14 @@ async fn control_session(
             ServerControlMessage::HeartbeatAck {
                 gateway_state: Some(gateway_state),
                 ..
-            } if last_gateway_revision != Some(gateway_state.revision) => {
+            } if last_gateway_revision != Some(gateway_state.revision)
+                || last_gateway_status.is_some_and(|status| {
+                    !matches!(status, ApplyStatus::Ready | ApplyStatus::Disabled)
+                }) =>
+            {
                 let ack = apply_gateway_desired_state(&gateway_state);
                 last_gateway_revision = Some(ack.revision);
+                last_gateway_status = Some(ack.status);
                 write_agent_message(
                     reader.get_mut(),
                     &AgentControlMessage::GatewayApplyAck { ack: ack.clone() },
@@ -417,34 +424,49 @@ async fn control_session(
 /// 处理服务端下发的网关 Desired State。
 ///
 /// 当前 Agent 只完成协议接收和状态回传，真正的 Tailscale 路由应用会在
-/// 后续适配器接入后填充；因此这里明确返回 `checking`，绝不宣称路由已生效。
+/// 后续适配器接入后填充；因此启用路由明确返回 `checking`，绝不宣称已生效。
+/// 已关闭的路由会返回 `disabled`，让服务端清空对应 Applied State。
 fn apply_gateway_desired_state(state: &GatewayDesiredState) -> GatewayApplyAck {
     let network_ids: Vec<String> = state
         .routes
         .iter()
         .map(|route| route.network_id.clone())
         .collect();
-    if let Some(invalid_route) = state.routes.iter().find(|route| {
-        route
-            .prefix
-            .parse::<IpNet>()
-            .map(|prefix| validate_published_network(prefix).is_err())
-            .unwrap_or(true)
-    }) {
-        let error_message = format!("服务端下发的网关网络无效：{}", invalid_route.prefix);
-        tracing::error!("{}", error_message);
+    let plan = match build_tailscale_route_plan(state) {
+        Ok(plan) => plan,
+        Err(error) => {
+            let error_message = format!("服务端下发的网关网络无效：{error}");
+            tracing::error!("{}", error_message);
+            return GatewayApplyAck {
+                revision: state.revision,
+                status: ApplyStatus::Failed,
+                network_ids,
+                applied_network_ids: Vec::new(),
+                error_message: Some(error_message),
+            };
+        }
+    };
+    if !state.routes.iter().any(|route| route.enabled) {
+        tracing::info!(
+            revision = state.revision,
+            route_count = state.routes.len(),
+            "已收到网关路由撤销配置"
+        );
         return GatewayApplyAck {
             revision: state.revision,
-            status: ApplyStatus::Failed,
+            status: ApplyStatus::Disabled,
             network_ids,
             applied_network_ids: Vec::new(),
-            error_message: Some(error_message),
+            error_message: None,
         };
     }
     tracing::info!(
         revision = state.revision,
         route_count = state.routes.len(),
-        "已收到网关配置，等待 Tailscale 路由适配器应用"
+        advertise_routes = ?plan.advertise_routes,
+        accept_routes = plan.accept_routes,
+        snat_subnet_routes = ?plan.snat_subnet_routes,
+        "已生成网关 Tailscale 应用计划，等待适配器执行"
     );
     GatewayApplyAck {
         revision: state.revision,
@@ -453,6 +475,47 @@ fn apply_gateway_desired_state(state: &GatewayDesiredState) -> GatewayApplyAck {
         applied_network_ids: Vec::new(),
         error_message: None,
     }
+}
+
+/// Agent 交给 Tailscale CLI/本地 API 适配器的最小应用计划。
+///
+/// 计划只包含 Nexo 已确认的本地发布网段和站点互联是否需要接收远端路由，
+/// 不会把 Exit Node 或默认路由混入其中。当前阶段只生成计划，不执行系统命令。
+#[derive(Debug, PartialEq, Eq)]
+struct TailscaleRoutePlan {
+    advertise_routes: Vec<String>,
+    accept_routes: bool,
+    /// 只有站点互联需要明确关闭 SNAT；单站点共享保持 Tailscale 默认行为。
+    snat_subnet_routes: Option<bool>,
+}
+
+/// 将 Nexo 语义路由转换为未来 Tailscale 适配器所需的参数。
+fn build_tailscale_route_plan(state: &GatewayDesiredState) -> Result<TailscaleRoutePlan> {
+    let mut advertise_routes = Vec::new();
+    let mut accept_routes = false;
+    for route in &state.routes {
+        let prefix = route
+            .prefix
+            .parse::<IpNet>()
+            .with_context(|| format!("前缀 {} 不是有效 CIDR", route.prefix))?;
+        validate_published_network(prefix)
+            .with_context(|| format!("前缀 {} 不允许发布", route.prefix))?;
+        if !route.enabled {
+            continue;
+        }
+        if route.site_link_id.is_some() {
+            accept_routes = true;
+        } else {
+            advertise_routes.push(route.prefix.clone());
+        }
+    }
+    advertise_routes.sort();
+    advertise_routes.dedup();
+    Ok(TailscaleRoutePlan {
+        advertise_routes,
+        accept_routes,
+        snat_subnet_routes: accept_routes.then_some(false),
+    })
 }
 
 fn build_tls_connector(config: &AgentRuntimeConfig, key_pair: &KeyPair) -> Result<TlsConnector> {
@@ -701,6 +764,7 @@ mod tests {
                 site_link_id: None,
                 prefix: "192.168.10.0/24".to_owned(),
                 revision: 3,
+                enabled: true,
             }],
         };
         let ack = apply_gateway_desired_state(&state);
@@ -720,6 +784,7 @@ mod tests {
                 site_link_id: None,
                 prefix: "0.0.0.0/0".to_owned(),
                 revision: 4,
+                enabled: true,
             }],
         };
         let ack = apply_gateway_desired_state(&state);
@@ -727,5 +792,58 @@ mod tests {
         assert_eq!(ack.network_ids, vec!["network-invalid"]);
         assert!(ack.applied_network_ids.is_empty());
         assert!(ack.error_message.is_some());
+    }
+
+    #[test]
+    fn gateway_apply_ack_marks_all_disabled_routes_as_disabled() {
+        let state = GatewayDesiredState {
+            revision: 5,
+            routes: vec![nexo_protocol::GatewayDesiredRoute {
+                network_id: "network-closed".to_owned(),
+                site_link_id: None,
+                prefix: "192.168.10.0/24".to_owned(),
+                revision: 5,
+                enabled: false,
+            }],
+        };
+        let ack = apply_gateway_desired_state(&state);
+        assert_eq!(ack.status, ApplyStatus::Disabled);
+        assert_eq!(ack.network_ids, vec!["network-closed"]);
+        assert!(ack.applied_network_ids.is_empty());
+        assert!(ack.error_message.is_none());
+    }
+
+    #[test]
+    fn tailscale_route_plan_keeps_site_routing_bidirectional_without_snat() {
+        let state = GatewayDesiredState {
+            revision: 6,
+            routes: vec![
+                nexo_protocol::GatewayDesiredRoute {
+                    network_id: "local".to_owned(),
+                    site_link_id: None,
+                    prefix: "192.168.10.0/24".to_owned(),
+                    revision: 6,
+                    enabled: true,
+                },
+                nexo_protocol::GatewayDesiredRoute {
+                    network_id: "remote".to_owned(),
+                    site_link_id: Some("link-a-b".to_owned()),
+                    prefix: "192.168.20.0/24".to_owned(),
+                    revision: 6,
+                    enabled: true,
+                },
+                nexo_protocol::GatewayDesiredRoute {
+                    network_id: "old".to_owned(),
+                    site_link_id: None,
+                    prefix: "192.168.30.0/24".to_owned(),
+                    revision: 5,
+                    enabled: false,
+                },
+            ],
+        };
+        let plan = build_tailscale_route_plan(&state).expect("应生成站点网关应用计划");
+        assert_eq!(plan.advertise_routes, vec!["192.168.10.0/24"]);
+        assert!(plan.accept_routes);
+        assert_eq!(plan.snat_subnet_routes, Some(false));
     }
 }

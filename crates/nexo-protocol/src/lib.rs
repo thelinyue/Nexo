@@ -43,6 +43,14 @@ pub struct GatewayDesiredRoute {
     pub site_link_id: Option<String>,
     pub prefix: String,
     pub revision: i64,
+    /// 路由是否仍应保留；false 用于把之前发布的网段撤销。
+    #[serde(default = "default_route_enabled")]
+    pub enabled: bool,
+}
+
+/// 兼容旧 Agent：旧协议没有 enabled 字段时按“继续保留路由”处理。
+fn default_route_enabled() -> bool {
+    true
 }
 
 /// 服务端根据设备所属站点汇总出的网关 Desired State。
@@ -190,6 +198,7 @@ mod tests {
                 site_link_id: Some("link-a-b".to_owned()),
                 prefix: "192.168.20.0/24".to_owned(),
                 revision: 7,
+                enabled: true,
             }],
         };
         let response = ServerControlMessage::HelloAccepted {
