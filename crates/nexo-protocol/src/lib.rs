@@ -4,11 +4,16 @@ use serde::{Deserialize, Serialize};
 
 use nexo_core::{ApplyStatus, DeviceCapability, EnrollmentStatus, GatewayCapabilityReport};
 
-/// Agent 向服务端报告的最小心跳消息。
+/// Agent 向服务端报告的心跳消息。
+///
+/// 网关能力报告可选，便于旧 Agent 继续连接；新 Agent 会在每次心跳
+/// 重新探测宿主机环境，避免服务端长期使用过期的能力快照。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Heartbeat {
     pub device_id: String,
     pub agent_version: String,
+    #[serde(default)]
+    pub gateway_report: Option<GatewayCapabilityReport>,
 }
 
 /// Agent 启动时报告的能力，服务端据此决定可下发的配置。
@@ -103,6 +108,8 @@ pub enum AgentControlMessage {
     Heartbeat {
         device_id: String,
         agent_version: String,
+        #[serde(default)]
+        gateway_report: Option<GatewayCapabilityReport>,
     },
     GatewayApplyAck {
         ack: GatewayApplyAck,
@@ -231,6 +238,21 @@ mod tests {
         assert!(matches!(
             decoded,
             AgentControlMessage::GatewayApplyAck { .. }
+        ));
+    }
+
+    #[test]
+    fn heartbeat_without_gateway_report_remains_compatible() {
+        let message: AgentControlMessage = serde_json::from_str(
+            r#"{"type":"heartbeat","device_id":"device-a","agent_version":"0.1.0"}"#,
+        )
+        .expect("旧 Agent 心跳格式应仍可解析");
+        assert!(matches!(
+            message,
+            AgentControlMessage::Heartbeat {
+                gateway_report: None,
+                ..
+            }
         ));
     }
 }

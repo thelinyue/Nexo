@@ -13,7 +13,7 @@ Nexo 是面向个人自托管环境的设备、隧道和异地组网管理服务
 - Agent 自动轮询审批结果并一次性领取证书链，状态随后变为 `consumed`；私钥始终留在 Agent。
 - 服务端同时监听独立的 mTLS 控制通道；Agent 领取证书后会使用设备证书持续发送心跳，服务端只接受证书指纹与设备 ID 匹配的连接。
 - Agent 在控制通道首次握手时只读探测 TUN、NET_ADMIN、IP 转发和本地直连网段，并上报结构化的 Subnet Gateway / Site Gateway 能力状态；探测不会修改宿主机网络配置，也不会自动发布网段。
-- 服务端会在 mTLS 握手响应及后续心跳确认中下发该设备对应的最新网关 Desired State，Agent 会回传带 revision 的应用 ACK；Agent 已将本地发布网段、远端接收路由和站点互联的 SNAT 策略整理成应用计划。默认只生成计划，设置 `NEXO_TAILSCALE_APPLY=true` 后才执行 Tailscale CLI；命令成功但 Headscale 尚未批准时 ACK 仍保持 `CHECKING`，不会把未生效的路由标记为 `READY`。
+- 服务端会在 mTLS 握手响应及后续心跳确认中下发该设备对应的最新网关 Desired State，Agent 会回传带 revision 的应用 ACK；Agent 已将本地发布网段、远端接收路由和站点互联的 SNAT 策略整理成应用计划。默认只生成计划，设置 `NEXO_TAILSCALE_APPLY=true` 后才执行 Tailscale CLI；命令成功但 Headscale 尚未批准时 ACK 仍保持 `CHECKING`，不会把未生效的路由标记为 `READY`。每次实际应用前 Agent 都会重新检查网关能力；命令失败会按指数退避和抖动重试，不会在每个心跳中重复执行。
 - 共享网络和站点互联都支持显式启用/关闭；关闭操作会递增 Desired State revision，并下发带 `enabled=false` 的撤销路由，避免 Agent 继续保留旧配置。
 - `nexo-headscale-adapter` 已定义 Nexo 路由申请边界；未配置 API 时返回可展示的 Pending 结果，业务代码不会读取 Headscale 内部数据库。
 - Tunnel/组网配置下发仍是后续切片；当前不会把待签发设备伪装为在线设备。

@@ -653,6 +653,7 @@ async fn serve_control_connection(
             AgentControlMessage::Heartbeat {
                 device_id: heartbeat_device_id,
                 agent_version: heartbeat_version,
+                gateway_report,
             } if heartbeat_device_id == device_id => {
                 {
                     let connection = state
@@ -675,6 +676,18 @@ async fn serve_control_connection(
                          WHERE id = ?1",
                         rusqlite::params![device_id, heartbeat_version],
                     )?;
+                    if let Some(report) = gateway_report {
+                        connection.execute(
+                            "INSERT INTO device_capability_reports
+                             (device_id, report_json, reported_at, updated_at)
+                             VALUES (?1, ?2, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                             ON CONFLICT(device_id) DO UPDATE SET
+                             report_json = excluded.report_json,
+                             reported_at = CURRENT_TIMESTAMP,
+                             updated_at = CURRENT_TIMESTAMP",
+                            rusqlite::params![device_id, serde_json::to_string(&report)?],
+                        )?;
+                    }
                 }
                 let gateway_state = {
                     let connection = state
@@ -2693,6 +2706,7 @@ mod tests {
         let heartbeat = AgentControlMessage::Heartbeat {
             device_id: device_id.clone(),
             agent_version: "0.1.0".to_owned(),
+            gateway_report: None,
         };
         reader
             .get_mut()

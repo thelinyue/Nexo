@@ -3,7 +3,14 @@
 //! Agent 不绑定固定服务端。首次入网时通过环境变量指定目标地址和一次性
 //! token，完成请求后继续作为常驻进程运行；后续控制通道会复用同一配置。
 
-use std::{env, fs, io::BufReader, path::PathBuf, process::Command, sync::Arc};
+use std::{
+    env, fs,
+    io::BufReader,
+    path::PathBuf,
+    process::Command,
+    sync::Arc,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+};
 
 use anyhow::{Context, Result};
 use get_if_addrs::{get_if_addrs, IfAddr};
@@ -344,28 +351,41 @@ async fn control_session(
         .await
         .context("Nexo mTLS 握手失败")?;
     let mut reader = AsyncBufReader::new(tls_stream);
+    let gateway_report = detect_gateway_capabilities();
     write_agent_message(
         reader.get_mut(),
         &AgentControlMessage::Hello {
             device_id: device_id.to_owned(),
             agent_version: env!("CARGO_PKG_VERSION").to_owned(),
             capabilities: config.capabilities.clone(),
-            gateway_report: Some(detect_gateway_capabilities()),
+            gateway_report: Some(gateway_report.clone()),
         },
     )
     .await?;
     let response = read_control_response(&mut reader).await?;
     let mut last_gateway_revision = None;
     let mut last_gateway_status = None;
+    let mut gateway_retry_attempt = 0;
+    let mut gateway_retry_at = None;
+    let mut last_gateway_report = Some(gateway_report.clone());
     match response {
         ServerControlMessage::HelloAccepted {
             gateway_state: Some(gateway_state),
             ..
         } => {
             let applier = TailscaleRouteApplier::from_config(config);
-            let ack = apply_gateway_desired_state(&gateway_state, &applier);
+            let ack = apply_gateway_desired_state_with_report(
+                &gateway_state,
+                &applier,
+                Some(&gateway_report),
+            );
             last_gateway_revision = Some(ack.revision);
             last_gateway_status = Some(ack.status);
+            update_gateway_retry_state(
+                ack.status,
+                &mut gateway_retry_attempt,
+                &mut gateway_retry_at,
+            );
             write_agent_message(
                 reader.get_mut(),
                 &AgentControlMessage::GatewayApplyAck { ack: ack.clone() },
@@ -394,11 +414,13 @@ async fn control_session(
     }
     loop {
         tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+        let heartbeat_gateway_report = detect_gateway_capabilities();
         write_agent_message(
             reader.get_mut(),
             &AgentControlMessage::Heartbeat {
                 device_id: device_id.to_owned(),
                 agent_version: env!("CARGO_PKG_VERSION").to_owned(),
+                gateway_report: Some(heartbeat_gateway_report.clone()),
             },
         )
         .await?;
@@ -406,15 +428,27 @@ async fn control_session(
             ServerControlMessage::HeartbeatAck {
                 gateway_state: Some(gateway_state),
                 ..
-            } if last_gateway_revision != Some(gateway_state.revision)
-                || last_gateway_status.is_some_and(|status| {
-                    matches!(status, ApplyStatus::Retrying | ApplyStatus::Failed)
-                }) =>
+            } if should_apply_gateway_state(
+                &gateway_state,
+                last_gateway_revision,
+                last_gateway_status,
+                gateway_retry_at,
+                last_gateway_report.as_ref() != Some(&heartbeat_gateway_report),
+            ) =>
             {
                 let applier = TailscaleRouteApplier::from_config(config);
-                let ack = apply_gateway_desired_state(&gateway_state, &applier);
+                let ack = apply_gateway_desired_state_with_report(
+                    &gateway_state,
+                    &applier,
+                    Some(&heartbeat_gateway_report),
+                );
                 last_gateway_revision = Some(ack.revision);
                 last_gateway_status = Some(ack.status);
+                update_gateway_retry_state(
+                    ack.status,
+                    &mut gateway_retry_attempt,
+                    &mut gateway_retry_at,
+                );
                 write_agent_message(
                     reader.get_mut(),
                     &AgentControlMessage::GatewayApplyAck { ack: ack.clone() },
@@ -445,7 +479,77 @@ async fn control_session(
                 anyhow::bail!("服务端在心跳期间返回了网关确认")
             }
         }
+        last_gateway_report = Some(heartbeat_gateway_report);
     }
+}
+
+/// 判断本次心跳是否需要重新应用网关状态。
+///
+/// 新 revision 必须立即应用；相同 revision 只有在退避时间到达后才重试，
+/// 避免 Tailscale 或宿主机暂时故障时每个心跳都重复执行系统命令。
+fn should_apply_gateway_state(
+    state: &GatewayDesiredState,
+    last_revision: Option<i64>,
+    last_status: Option<ApplyStatus>,
+    retry_at: Option<Instant>,
+    capabilities_changed: bool,
+) -> bool {
+    if last_revision != Some(state.revision) {
+        return true;
+    }
+    if capabilities_changed && last_status == Some(ApplyStatus::Failed) {
+        return true;
+    }
+    if !last_status.is_some_and(|status| matches!(status, ApplyStatus::Retrying)) {
+        return false;
+    }
+    retry_at.is_none_or(|deadline| Instant::now() >= deadline)
+}
+
+/// 根据应用结果更新失败重试计划。
+///
+/// 退避从 5 秒开始，最多 5 分钟；抖动最多占当前基础延迟的 25%，
+/// 让多个 Agent 在同一时刻失败时不会同时轰击服务端或本机 Tailscale。
+fn update_gateway_retry_state(
+    status: ApplyStatus,
+    attempt: &mut u32,
+    retry_at: &mut Option<Instant>,
+) {
+    if !matches!(status, ApplyStatus::Retrying) {
+        *attempt = 0;
+        *retry_at = None;
+        return;
+    }
+    *attempt = attempt.saturating_add(1);
+    let delay = gateway_retry_delay(*attempt, retry_jitter_seconds(*attempt));
+    *retry_at = Some(Instant::now() + delay);
+    tracing::warn!(
+        attempt = *attempt,
+        retry_after_seconds = delay.as_secs(),
+        "网关应用失败，将按退避计划重试"
+    );
+}
+
+/// 计算指数退避时长；attempt 从 1 开始，结果被限制在最大值以内。
+fn gateway_retry_delay(attempt: u32, jitter_seconds: u64) -> Duration {
+    const BASE_SECONDS: u64 = 5;
+    const MAX_SECONDS: u64 = 300;
+    let exponent = attempt.saturating_sub(1).min(6);
+    let base = BASE_SECONDS
+        .saturating_mul(1_u64 << exponent)
+        .min(MAX_SECONDS);
+    Duration::from_secs((base + jitter_seconds.min(base / 4)).min(MAX_SECONDS))
+}
+
+/// 生成低成本的进程内抖动，不引入新的随机数依赖。
+fn retry_jitter_seconds(attempt: u32) -> u64 {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.subsec_nanos() as u64)
+        .unwrap_or_default();
+    let base_seconds = gateway_retry_delay(attempt, 0).as_secs();
+    let jitter_window = (base_seconds / 4).max(1);
+    nanos.wrapping_add(u64::from(attempt)) % (jitter_window + 1)
 }
 
 /// 网关路由执行器的稳定边界。
@@ -528,13 +632,23 @@ impl GatewayRouteApplier for NoopGatewayRouteApplier {
     }
 }
 
+/// 处理服务端下发的网关 Desired State（测试和演练模式入口）。
+#[cfg(test)]
+fn apply_gateway_desired_state(
+    state: &GatewayDesiredState,
+    applier: &dyn GatewayRouteApplier,
+) -> GatewayApplyAck {
+    apply_gateway_desired_state_with_report(state, applier, None)
+}
+
 /// 处理服务端下发的网关 Desired State。
 ///
 /// 执行器成功后，启用路由仍返回 `checking`：Headscale 的批准状态尚未进入
 /// 本地 ACK 链路。全部关闭时返回 `disabled`，让服务端清空 Applied State。
-fn apply_gateway_desired_state(
+fn apply_gateway_desired_state_with_report(
     state: &GatewayDesiredState,
     applier: &dyn GatewayRouteApplier,
+    gateway_report: Option<&GatewayCapabilityReport>,
 ) -> GatewayApplyAck {
     let network_ids: Vec<String> = state
         .routes
@@ -555,12 +669,24 @@ fn apply_gateway_desired_state(
             };
         }
     };
+    if let Some(report) = gateway_report {
+        if let Some(error_message) = gateway_capability_error(state, report) {
+            tracing::error!("{}", error_message);
+            return GatewayApplyAck {
+                revision: state.revision,
+                status: ApplyStatus::Failed,
+                network_ids,
+                applied_network_ids: Vec::new(),
+                error_message: Some(error_message),
+            };
+        }
+    }
     if let Err(error) = applier.apply(&plan) {
         let error_message = format!("Tailscale 网关应用失败：{error:#}");
         tracing::error!("{}", error_message);
         return GatewayApplyAck {
             revision: state.revision,
-            status: ApplyStatus::Failed,
+            status: ApplyStatus::Retrying,
             network_ids,
             applied_network_ids: Vec::new(),
             error_message: Some(error_message),
@@ -594,6 +720,42 @@ fn apply_gateway_desired_state(
         network_ids,
         applied_network_ids: Vec::new(),
         error_message: None,
+    }
+}
+
+/// 在真实应用前再次核对能力，避免设备运行环境变化后仍执行高权限路由操作。
+fn gateway_capability_error(
+    state: &GatewayDesiredState,
+    report: &GatewayCapabilityReport,
+) -> Option<String> {
+    for route in state.routes.iter().filter(|route| route.enabled) {
+        let (capability, reason, label) = if route.site_link_id.is_some() {
+            (report.site_gateway, report.site_gateway_reason, "站点互联")
+        } else {
+            (
+                report.subnet_gateway,
+                report.subnet_gateway_reason,
+                "共享本地网络",
+            )
+        };
+        if capability != CapabilityState::Ready {
+            let reason = reason
+                .map(gateway_reason_message)
+                .unwrap_or("本机当前不满足网关运行条件");
+            return Some(format!("{label}无法应用：{reason}"));
+        }
+    }
+    None
+}
+
+/// 将内部能力探测原因翻译为可直接展示给用户的中文说明。
+fn gateway_reason_message(reason: GatewayCapabilityReason) -> &'static str {
+    match reason {
+        GatewayCapabilityReason::MissingNetAdmin => "缺少网络管理权限",
+        GatewayCapabilityReason::TunNotAvailable => "系统没有可用的 TUN 设备",
+        GatewayCapabilityReason::IpForwardingDisabled => "系统未开启 IP 转发",
+        GatewayCapabilityReason::NoLocalSubnet => "没有检测到可共享的本地网络",
+        GatewayCapabilityReason::UnsupportedPlatform => "当前平台不支持网关能力",
     }
 }
 
@@ -1011,7 +1173,7 @@ mod tests {
     }
 
     #[test]
-    fn tailscale_executor_failure_is_reported_as_failed_ack() {
+    fn tailscale_executor_failure_is_reported_as_retrying_ack() {
         let state = GatewayDesiredState {
             revision: 7,
             routes: vec![nexo_protocol::GatewayDesiredRoute {
@@ -1027,10 +1189,99 @@ mod tests {
             binary: "__nexo_missing_tailscale_binary__".to_owned(),
         };
         let ack = apply_gateway_desired_state(&state, &applier);
-        assert_eq!(ack.status, ApplyStatus::Failed);
+        assert_eq!(ack.status, ApplyStatus::Retrying);
         assert!(ack
             .error_message
             .as_deref()
             .is_some_and(|message| message.contains("Tailscale 网关应用失败")));
+    }
+
+    #[test]
+    fn gateway_retry_delay_is_exponential_and_capped() {
+        assert_eq!(gateway_retry_delay(1, 0), Duration::from_secs(5));
+        assert_eq!(gateway_retry_delay(2, 0), Duration::from_secs(10));
+        assert_eq!(gateway_retry_delay(3, 2), Duration::from_secs(22));
+        assert_eq!(gateway_retry_delay(99, 99), Duration::from_secs(300));
+    }
+
+    #[test]
+    fn gateway_retry_state_resets_after_non_retry_status() {
+        let mut attempt = 4;
+        let mut retry_at = Some(Instant::now());
+        update_gateway_retry_state(ApplyStatus::Checking, &mut attempt, &mut retry_at);
+        assert_eq!(attempt, 0);
+        assert!(retry_at.is_none());
+    }
+
+    #[test]
+    fn gateway_retry_waits_until_deadline_for_same_revision() {
+        let state = GatewayDesiredState {
+            revision: 8,
+            routes: Vec::new(),
+        };
+        assert!(!should_apply_gateway_state(
+            &state,
+            Some(8),
+            Some(ApplyStatus::Retrying),
+            Some(Instant::now() + Duration::from_secs(60)),
+            false,
+        ));
+        assert!(should_apply_gateway_state(
+            &state,
+            Some(8),
+            Some(ApplyStatus::Retrying),
+            Some(Instant::now() - Duration::from_secs(1)),
+            false,
+        ));
+        assert!(should_apply_gateway_state(
+            &state,
+            Some(7),
+            Some(ApplyStatus::Checking),
+            None,
+            false,
+        ));
+        assert!(should_apply_gateway_state(
+            &state,
+            Some(8),
+            Some(ApplyStatus::Failed),
+            None,
+            true,
+        ));
+    }
+
+    #[test]
+    fn gateway_apply_rechecks_capability_before_running_applier() {
+        let state = GatewayDesiredState {
+            revision: 9,
+            routes: vec![nexo_protocol::GatewayDesiredRoute {
+                network_id: "network-a".to_owned(),
+                site_link_id: None,
+                prefix: "192.168.10.0/24".to_owned(),
+                revision: 9,
+                enabled: true,
+            }],
+        };
+        let report = GatewayCapabilityReport {
+            platform: "linux".to_owned(),
+            tun_available: true,
+            net_admin_available: true,
+            ipv4_forwarding: false,
+            ipv6_forwarding: true,
+            local_networks: vec![],
+            subnet_gateway: CapabilityState::Unavailable,
+            subnet_gateway_reason: Some(GatewayCapabilityReason::IpForwardingDisabled),
+            site_gateway: CapabilityState::Unavailable,
+            site_gateway_reason: Some(GatewayCapabilityReason::IpForwardingDisabled),
+        };
+        let ack = apply_gateway_desired_state_with_report(
+            &state,
+            &NoopGatewayRouteApplier,
+            Some(&report),
+        );
+        assert_eq!(ack.status, ApplyStatus::Failed);
+        assert_eq!(
+            ack.error_message.as_deref(),
+            Some("共享本地网络无法应用：系统未开启 IP 转发")
+        );
     }
 }
