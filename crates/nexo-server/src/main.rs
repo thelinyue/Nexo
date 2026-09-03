@@ -86,6 +86,14 @@ struct DeviceResponse {
     last_seen_at: Option<String>,
 }
 
+/// 站点目录摘要；Web 只需要用户可读名称和租户归属，不暴露站点内部关系。
+#[derive(Debug, Serialize)]
+struct SiteResponse {
+    id: String,
+    tenant_id: String,
+    name: String,
+}
+
 /// 管理端创建一次性设备入网凭证的请求。
 #[derive(Debug, Deserialize)]
 struct CreateEnrollmentRequest {
@@ -128,8 +136,10 @@ struct SiteNetworkResponse {
     id: String,
     tenant_id: String,
     site_id: String,
+    site_name: String,
     name: String,
     publisher_device_id: String,
+    publisher_device_name: String,
     interface_id: String,
     /// Agent 在本地局域网上的地址；路由器应把远端网段指向该地址。
     gateway_address: Option<String>,
@@ -291,6 +301,7 @@ async fn main() -> Result<()> {
         .route("/health", get(health))
         .route("/api/v1/overview", get(overview))
         .route("/api/v1/devices", get(list_devices))
+        .route("/api/v1/sites", get(list_sites))
         .route("/api/v1/enrollments", post(create_enrollment))
         .route("/api/v1/enrollments/{id}", get(get_enrollment))
         .route("/api/v1/enrollments/{id}/approve", post(approve_enrollment))
@@ -299,7 +310,10 @@ async fn main() -> Result<()> {
             "/api/v1/agent/enroll/{id}/poll",
             post(poll_agent_enrollment),
         )
-        .route("/api/v1/site-networks", post(create_site_network))
+        .route(
+            "/api/v1/site-networks",
+            get(list_site_networks).post(create_site_network),
+        )
         .route("/api/v1/site-networks/{id}", get(get_site_network))
         .route(
             "/api/v1/site-networks/{id}/disable",
@@ -435,6 +449,39 @@ async fn list_devices(
                 "设备数据格式无效，请让 Agent 重新连接",
             )
         })
+    })
+    .collect::<Result<Vec<_>, _>>()
+    .map(Json)
+}
+
+/// 返回站点目录，供 Web 创建共享网络和站点互联时选择站点。
+async fn list_sites(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<SiteResponse>>, ApiError> {
+    require_admin(&headers)?;
+    let connection = state
+        .db
+        .lock()
+        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "数据库锁不可用"))?;
+    let mut statement = connection
+        .prepare(
+            "SELECT id, tenant_id, name
+             FROM sites
+             ORDER BY name ASC, id ASC",
+        )
+        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法读取站点列表"))?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok(SiteResponse {
+                id: row.get(0)?,
+                tenant_id: row.get(1)?,
+                name: row.get(2)?,
+            })
+        })
+        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法读取站点列表"))?;
+    rows.map(|row| {
+        row.map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "站点数据格式无效"))
     })
     .collect::<Result<Vec<_>, _>>()
     .map(Json)
@@ -1614,6 +1661,41 @@ async fn create_site_network(
     Ok(Json(read_site_network_response(&connection, &id)?))
 }
 
+/// 返回所有共享本地网络，供 Web 统一展示 Subnet Gateway 的应用状态。
+async fn list_site_networks(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<SiteNetworkResponse>>, ApiError> {
+    require_admin(&headers)?;
+    let connection = state
+        .db
+        .lock()
+        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "数据库锁不可用"))?;
+    let ids = {
+        let mut statement = connection
+            .prepare(
+                "SELECT n.id FROM site_networks n
+                 JOIN gateway_network_states g ON g.site_network_id = n.id
+                 ORDER BY n.updated_at DESC, n.id ASC",
+            )
+            .map_err(|_| {
+                ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法读取共享网络列表")
+            })?;
+        let rows = statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法读取共享网络列表"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| {
+                ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "共享网络数据格式无效")
+            })?;
+        rows
+    };
+    ids.iter()
+        .map(|id| read_site_network_response(&connection, id))
+        .collect::<Result<Vec<_>, _>>()
+        .map(Json)
+}
+
 /// 查询共享网络的 Desired / Applied 状态，供 Web 明确显示“正在检查”或失败原因。
 async fn get_site_network(
     State(state): State<AppState>,
@@ -1736,27 +1818,33 @@ fn read_site_network_response(
 ) -> Result<SiteNetworkResponse, ApiError> {
     connection
         .query_row(
-            "SELECT n.id, n.tenant_id, n.site_id, n.name, n.publisher_device_id,
-                    n.interface_id, g.desired_prefix, g.applied_prefix,
+            "SELECT n.id, n.tenant_id, n.site_id, s.name, n.name,
+                    n.publisher_device_id, d.name, n.interface_id,
+                    g.desired_prefix, g.applied_prefix,
                     g.desired_revision, n.enabled, g.apply_status, g.apply_error
              FROM site_networks n JOIN gateway_network_states g
-             ON g.site_network_id = n.id WHERE n.id = ?1",
+             ON g.site_network_id = n.id
+             JOIN sites s ON s.id = n.site_id
+             JOIN devices d ON d.id = n.publisher_device_id
+             WHERE n.id = ?1",
             [id],
             |row| {
                 Ok(SiteNetworkResponse {
                     id: row.get(0)?,
                     tenant_id: row.get(1)?,
                     site_id: row.get(2)?,
-                    name: row.get(3)?,
-                    publisher_device_id: row.get(4)?,
-                    interface_id: row.get(5)?,
+                    site_name: row.get(3)?,
+                    name: row.get(4)?,
+                    publisher_device_id: row.get(5)?,
+                    publisher_device_name: row.get(6)?,
+                    interface_id: row.get(7)?,
                     gateway_address: None,
-                    desired_prefix: row.get(6)?,
-                    applied_prefix: row.get(7)?,
-                    desired_revision: row.get(8)?,
-                    enabled: row.get::<_, i64>(9)? != 0,
-                    apply_status: parse_apply_status(&row.get::<_, String>(10)?),
-                    apply_error: row.get(11)?,
+                    desired_prefix: row.get(8)?,
+                    applied_prefix: row.get(9)?,
+                    desired_revision: row.get(10)?,
+                    enabled: row.get::<_, i64>(11)? != 0,
+                    apply_status: parse_apply_status(&row.get::<_, String>(12)?),
+                    apply_error: row.get(13)?,
                 })
             },
         )
@@ -3071,6 +3159,17 @@ mod tests {
                 )
                 .expect("应保存网关能力报告");
         }
+        let sites = list_sites(State(state.clone()), admin_headers())
+            .await
+            .expect("管理员应能读取站点目录")
+            .0;
+        assert_eq!(
+            sites
+                .iter()
+                .map(|site| site.name.as_str())
+                .collect::<Vec<_>>(),
+            ["办公室", "家庭"]
+        );
         let left = create_site_network(
             State(state.clone()),
             admin_headers(),
@@ -3101,6 +3200,22 @@ mod tests {
         .await
         .expect("应创建办公室共享网络")
         .0;
+        let networks = list_site_networks(State(state.clone()), admin_headers())
+            .await
+            .expect("管理员应能读取共享网络列表")
+            .0;
+        assert_eq!(networks.len(), 2);
+        assert_eq!(
+            networks
+                .iter()
+                .find(|network| network.id == left.id)
+                .map(|network| (
+                    network.site_name.as_str(),
+                    network.publisher_device_name.as_str(),
+                    network.gateway_address.as_deref(),
+                )),
+            Some(("家庭", "家庭网关", Some("192.168.10.2")))
+        );
         let link = create_site_link(
             State(state.clone()),
             admin_headers(),
