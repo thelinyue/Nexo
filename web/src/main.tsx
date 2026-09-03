@@ -457,6 +457,35 @@ function CreateSiteNetworkForm({
   const localNetworks = selectedDevice?.gateway_report?.local_networks ?? [];
   const selectedNetwork = localNetworks.find((network) => `${network.interface_id}|${network.prefix}` === networkKey);
 
+  /**
+   * 页面会定时重新读取 Agent 能力；如果站点、设备或网段在此期间变化，
+   * 及时清空失效选择，避免表单提交一个已经不存在的设备状态。
+   */
+  useEffect(() => {
+    if (!siteId && sites.length > 0) {
+      setSiteId(sites[0].id);
+      return;
+    }
+    if (siteId && !sites.some((site) => site.id === siteId)) {
+      setSiteId(sites[0]?.id ?? "");
+      setDeviceId("");
+      setNetworkKey("");
+    }
+  }, [siteId, sites]);
+
+  useEffect(() => {
+    if (deviceId && !eligibleDevices.some((device) => device.id === deviceId)) {
+      setDeviceId("");
+      setNetworkKey("");
+    }
+  }, [deviceId, eligibleDevices]);
+
+  useEffect(() => {
+    if (networkKey && !localNetworks.some((network) => `${network.interface_id}|${network.prefix}` === networkKey)) {
+      setNetworkKey("");
+    }
+  }, [localNetworks, networkKey]);
+
   return (
     <form
       className="inline-form"
@@ -579,6 +608,38 @@ function CreateSiteLinkForm({
   const rightNetworks = availableNetworks.filter((network) => network.site_id === rightSiteId);
   const leftSite = sites.find((site) => site.id === leftSiteId);
   const rightSite = sites.find((site) => site.id === rightSiteId);
+
+  /**
+   * 轮询期间共享网络可能被关闭或删除；站点选择失效时同步回到当前可用站点，
+   * 并清理对应网络，避免把旧站点 ID 继续带入提交请求。
+   */
+  useEffect(() => {
+    if (!leftSiteId && availableSites.length > 0) {
+      setLeftSiteId(availableSites[0].id);
+      setLeftNetworkId("");
+    }
+    if (!rightSiteId && availableSites.length > 0) {
+      setRightSiteId(availableSites[1]?.id ?? availableSites[0].id);
+      setRightNetworkId("");
+    }
+    if (leftSiteId && !availableSites.some((site) => site.id === leftSiteId)) {
+      setLeftSiteId(availableSites[0]?.id ?? "");
+      setLeftNetworkId("");
+    }
+    if (rightSiteId && !availableSites.some((site) => site.id === rightSiteId)) {
+      setRightSiteId(availableSites[1]?.id ?? availableSites[0]?.id ?? "");
+      setRightNetworkId("");
+    }
+  }, [availableSites, leftSiteId, rightSiteId]);
+
+  useEffect(() => {
+    if (leftNetworkId && !leftNetworks.some((network) => network.id === leftNetworkId)) {
+      setLeftNetworkId("");
+    }
+    if (rightNetworkId && !rightNetworks.some((network) => network.id === rightNetworkId)) {
+      setRightNetworkId("");
+    }
+  }, [leftNetworkId, leftNetworks, rightNetworkId, rightNetworks]);
 
   return (
     <form
