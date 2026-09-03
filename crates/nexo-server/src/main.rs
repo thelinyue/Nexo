@@ -158,6 +158,8 @@ struct SiteLinkResponse {
     tenant_id: String,
     left_site_id: String,
     right_site_id: String,
+    left_site_name: String,
+    right_site_name: String,
     left_network_id: String,
     right_network_id: String,
     left_network_prefix: String,
@@ -178,6 +180,8 @@ struct SiteLinkResponse {
 struct StaticRouteGuide {
     router_site_id: String,
     destination_site_id: String,
+    router_site_name: String,
+    destination_site_name: String,
     destination_prefix: String,
     next_hop: Option<String>,
 }
@@ -305,7 +309,10 @@ async fn main() -> Result<()> {
             "/api/v1/site-networks/{id}/enable",
             post(enable_site_network),
         )
-        .route("/api/v1/site-links", post(create_site_link))
+        .route(
+            "/api/v1/site-links",
+            get(list_site_links).post(create_site_link),
+        )
         .route("/api/v1/site-links/{id}", get(get_site_link))
         .route("/api/v1/site-links/{id}/disable", post(disable_site_link))
         .route("/api/v1/site-links/{id}/enable", post(enable_site_link))
@@ -1765,6 +1772,37 @@ fn read_site_network_response(
         })
 }
 
+/// 返回所有站点互联及其双向静态路由引导，供组网页面展示。
+async fn list_site_links(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<SiteLinkResponse>>, ApiError> {
+    require_admin(&headers)?;
+    let connection = state
+        .db
+        .lock()
+        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "数据库锁不可用"))?;
+    let ids = {
+        let mut statement = connection
+            .prepare("SELECT id FROM site_links ORDER BY updated_at DESC, id ASC")
+            .map_err(|_| {
+                ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法读取站点互联列表")
+            })?;
+        let ids = statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法读取站点互联列表"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| {
+                ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "站点互联数据格式无效")
+            })?;
+        ids
+    };
+    ids.iter()
+        .map(|id| read_site_link_response(&connection, id))
+        .collect::<Result<Vec<_>, _>>()
+        .map(Json)
+}
+
 /// 创建双向站点互联的 Desired State，并在提交前阻止重叠网段。
 async fn create_site_link(
     State(state): State<AppState>,
@@ -2005,6 +2043,8 @@ fn read_site_link_response(
         tenant_id,
         left_site_id,
         right_site_id,
+        left_site_name,
+        right_site_name,
         left_network_id,
         right_network_id,
         left_network_prefix,
@@ -2017,11 +2057,14 @@ fn read_site_link_response(
     ) = connection
         .query_row(
             "SELECT l.id, l.tenant_id, l.left_site_id, l.right_site_id,
+                    ls.name, rs.name,
                     ln.site_network_id, rn.site_network_id,
                     lg.desired_prefix, rg.desired_prefix,
                     lg_network.publisher_device_id, rg_network.publisher_device_id,
                     l.enabled, l.apply_status, l.apply_error
              FROM site_links l
+             JOIN sites ls ON ls.id = l.left_site_id
+             JOIN sites rs ON rs.id = l.right_site_id
              JOIN site_link_networks ln ON ln.site_link_id = l.id AND ln.side = 'left'
              JOIN site_link_networks rn ON rn.site_link_id = l.id AND rn.side = 'right'
              JOIN site_networks lg_network ON lg_network.id = ln.site_network_id
@@ -2042,9 +2085,11 @@ fn read_site_link_response(
                     row.get::<_, String>(7)?,
                     row.get::<_, String>(8)?,
                     row.get::<_, String>(9)?,
-                    row.get::<_, i64>(10)? != 0,
-                    parse_apply_status(&row.get::<_, String>(11)?),
-                    row.get::<_, Option<String>>(12)?,
+                    row.get::<_, String>(10)?,
+                    row.get::<_, String>(11)?,
+                    row.get::<_, i64>(12)? != 0,
+                    parse_apply_status(&row.get::<_, String>(13)?),
+                    row.get::<_, Option<String>>(14)?,
                 ))
             },
         )
@@ -2068,12 +2113,16 @@ fn read_site_link_response(
         StaticRouteGuide {
             router_site_id: left_site_id.clone(),
             destination_site_id: right_site_id.clone(),
+            router_site_name: left_site_name.clone(),
+            destination_site_name: right_site_name.clone(),
             destination_prefix: right_network_prefix.clone(),
             next_hop: left_gateway_address.clone(),
         },
         StaticRouteGuide {
             router_site_id: right_site_id.clone(),
             destination_site_id: left_site_id.clone(),
+            router_site_name: right_site_name.clone(),
+            destination_site_name: left_site_name.clone(),
             destination_prefix: left_network_prefix.clone(),
             next_hop: right_gateway_address.clone(),
         },
@@ -2083,6 +2132,8 @@ fn read_site_link_response(
         tenant_id,
         left_site_id,
         right_site_id,
+        left_site_name,
+        right_site_name,
         left_network_id,
         right_network_id,
         left_network_prefix,
@@ -3065,6 +3116,8 @@ mod tests {
         .expect("不重叠的站点网络应能创建互联")
         .0;
         assert_eq!(link.apply_status, ApplyStatus::Checking);
+        assert_eq!(link.left_site_name, "家庭");
+        assert_eq!(link.right_site_name, "办公室");
         assert_eq!(link.left_network_prefix, "192.168.10.0/24");
         assert_eq!(link.right_network_prefix, "192.168.20.0/24");
         assert_eq!(link.left_gateway_address.as_deref(), Some("192.168.10.2"));
@@ -3075,17 +3128,27 @@ mod tests {
                 StaticRouteGuide {
                     router_site_id: "site-a".to_owned(),
                     destination_site_id: "site-b".to_owned(),
+                    router_site_name: "家庭".to_owned(),
+                    destination_site_name: "办公室".to_owned(),
                     destination_prefix: "192.168.20.0/24".to_owned(),
                     next_hop: Some("192.168.10.2".to_owned()),
                 },
                 StaticRouteGuide {
                     router_site_id: "site-b".to_owned(),
                     destination_site_id: "site-a".to_owned(),
+                    router_site_name: "办公室".to_owned(),
+                    destination_site_name: "家庭".to_owned(),
                     destination_prefix: "192.168.10.0/24".to_owned(),
                     next_hop: Some("192.168.20.2".to_owned()),
                 },
             ]
         );
+        let links = list_site_links(State(state.clone()), admin_headers())
+            .await
+            .expect("管理员应能读取站点互联列表")
+            .0;
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].id, link.id);
 
         let conflict = create_site_network(
             State(state.clone()),

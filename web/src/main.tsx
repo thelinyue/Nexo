@@ -25,6 +25,27 @@ type Device = {
   gateway_report: GatewayReport | null;
 };
 
+type StaticRouteGuide = {
+  router_site_id: string;
+  destination_site_id: string;
+  router_site_name: string;
+  destination_site_name: string;
+  destination_prefix: string;
+  next_hop: string | null;
+};
+
+type SiteLink = {
+  id: string;
+  left_site_name: string;
+  right_site_name: string;
+  left_network_prefix: string;
+  right_network_prefix: string;
+  static_routes: StaticRouteGuide[];
+  enabled: boolean;
+  apply_status: "disabled" | "checking" | "applying" | "ready" | "retrying" | "failed";
+  apply_error: string | null;
+};
+
 const emptyOverview: Overview = {
   devices: 0,
   running_tunnels: 0,
@@ -35,6 +56,7 @@ const emptyOverview: Overview = {
 function App() {
   const [overview, setOverview] = useState<Overview>(emptyOverview);
   const [devices, setDevices] = useState<Device[]>([]);
+  const [siteLinks, setSiteLinks] = useState<SiteLink[]>([]);
   const [token, setToken] = useState(() => sessionStorage.getItem("nexo-admin-token") ?? "");
   const [activeToken, setActiveToken] = useState(() => sessionStorage.getItem("nexo-admin-token") ?? "");
   const [loading, setLoading] = useState(false);
@@ -61,6 +83,12 @@ function App() {
         throw new Error(body?.error ?? "暂时无法读取设备");
       }
       setDevices((await devicesResponse.json()) as Device[]);
+      const siteLinksResponse = await fetch("/api/v1/site-links", { headers });
+      if (!siteLinksResponse.ok) {
+        const body = (await siteLinksResponse.json().catch(() => null)) as { error?: string } | null;
+        throw new Error(body?.error ?? "暂时无法读取站点互联");
+      }
+      setSiteLinks((await siteLinksResponse.json()) as SiteLink[]);
       if (activeToken.trim()) {
         sessionStorage.setItem("nexo-admin-token", activeToken.trim());
       } else {
@@ -151,14 +179,17 @@ function App() {
                 <h2>让网络归于一处</h2>
               </div>
             </div>
-            <div className="guide-card">
-              <span className="guide-dot" />
-              <div>
-                <strong>静态路由引导</strong>
-                <p>建立站点互联后，Nexo 会给出目标网段与下一跳。路由器由你掌控，Nexo 不会自动修改。</p>
+            {siteLinks.length === 0 ? (
+              <div className="empty-state compact-empty">
+                <div className="empty-icon">↔</div>
+                <strong>还没有站点互联</strong>
+                <span>建立互联后，两侧路由器的配置引导会显示在这里。</span>
               </div>
-            </div>
-            <button className="secondary-button" type="button" disabled>查看组网</button>
+            ) : (
+              <div className="link-list">
+                {siteLinks.slice(0, 3).map((link) => <SiteLinkCard key={link.id} link={link} />)}
+              </div>
+            )}
           </article>
         </section>
 
@@ -215,6 +246,48 @@ function DeviceRow({ device }: { device: Device }) {
       </div>
     </div>
   );
+}
+
+function SiteLinkCard({ link }: { link: SiteLink }) {
+  const status = siteLinkStatus(link.apply_status);
+  return (
+    <div className="site-link-card">
+      <div className="site-link-heading">
+        <div className="site-link-title">
+          <strong>{link.left_site_name}</strong>
+          <span>↔</span>
+          <strong>{link.right_site_name}</strong>
+        </div>
+        <span className={`link-status ${status.kind}`}><i />{status.label}</span>
+      </div>
+      {link.apply_error && <p className="link-error">{link.apply_error}</p>}
+      <div className="route-guide-list">
+        {link.static_routes.map((route) => (
+          <div className="route-guide" key={`${route.router_site_id}-${route.destination_site_id}`}>
+            <span className="route-site">{route.router_site_name}</span>
+            <span className="route-arrow">→</span>
+            <span className="route-destination">{route.destination_site_name} · {route.destination_prefix}</span>
+            <span className="route-via">下一跳：{route.next_hop ?? "等待设备地址"}</span>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function siteLinkStatus(status: SiteLink["apply_status"]): { label: string; kind: string } {
+  switch (status) {
+    case "ready":
+      return { label: "已建立", kind: "ready" };
+    case "retrying":
+      return { label: "自动重试中", kind: "working" };
+    case "failed":
+      return { label: "需要处理", kind: "failed" };
+    case "disabled":
+      return { label: "已关闭", kind: "disabled" };
+    default:
+      return { label: "正在应用", kind: "working" };
+  }
 }
 
 createRoot(document.getElementById("root")!).render(

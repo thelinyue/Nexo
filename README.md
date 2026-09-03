@@ -17,6 +17,7 @@ Nexo 是面向个人自托管环境的设备、隧道和异地组网管理服务
 - 共享网络和站点互联都支持显式启用/关闭；关闭操作会递增 Desired State revision，并下发带 `enabled=false` 的撤销路由，避免 Agent 继续保留旧配置。
 - `nexo-headscale-adapter` 已定义 Nexo 路由申请边界；未配置 API 时返回可展示的 Pending 结果，业务代码不会读取 Headscale 内部数据库。
 - Agent 的能力报告会带上每个已检测局域网接口的本地地址；共享网络和站点互联查询会返回 `gateway_address` 以及双向 `static_routes` 引导，用户可据此把远端网段添加到两侧路由器。Nexo 只展示目标网段和下一跳，不会自动登录或修改路由器。
+- `GET /api/v1/devices` 和 `GET /api/v1/site-links` 已提供给 Web 概览使用；站点互联响应同时返回两侧站点名称，避免 UI 暴露内部 ID。
 - Tunnel/组网配置下发仍是后续切片；当前不会把待签发设备伪装为在线设备。
 
 ## 本地运行

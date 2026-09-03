@@ -75,6 +75,30 @@ button:disabled { cursor: not-allowed; opacity: .55; }
 .guide-dot { flex: 0 0 auto; margin-top: 5px; }
 .guide-card strong { color: #e2ebf5; font-size: 14px; }
 .guide-card p { margin: 6px 0 0; color: #8190a4; font-size: 12px; line-height: 1.6; }
+.compact-empty { min-height: 202px; }
+.link-list { margin-top: 19px; }
+.site-link-card { padding: 13px 0; border-top: 1px solid #202c3d; }
+.site-link-card:first-child { border-top: 0; }
+.site-link-heading { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+.site-link-title { display: flex; align-items: center; gap: 7px; min-width: 0; }
+.site-link-title strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #e2eaf4; font-size: 12px; }
+.site-link-title span { color: #6e7e92; font-size: 12px; }
+.link-status { display: inline-flex; align-items: center; gap: 5px; flex: 0 0 auto; padding: 4px 7px; border-radius: 6px; color: #8b98aa; background: #202b3a; font-size: 10px; }
+.link-status i { width: 5px; height: 5px; border-radius: 50%; background: #8b98aa; }
+.link-status.ready { color: #8ed5b0; background: #173128; }
+.link-status.ready i { background: #74dca5; }
+.link-status.working { color: #d6c187; background: #332d1d; }
+.link-status.working i { background: #dbbe6e; }
+.link-status.failed { color: #e2a6b5; background: #33202a; }
+.link-status.failed i { background: #e2839b; }
+.link-status.disabled { color: #8a96a8; background: #242d3a; }
+.link-error { margin: 8px 0 0; color: #e2a6b5; font-size: 11px; }
+.route-guide-list { display: grid; gap: 6px; margin-top: 10px; }
+.route-guide { display: grid; grid-template-columns: auto auto 1fr; align-items: center; column-gap: 6px; padding: 7px 8px; border-radius: 7px; background: #151f2e; font-size: 10px; }
+.route-site { color: #9aa7b8; }
+.route-arrow { color: #6d7d91; }
+.route-destination { color: #c8d4e2; font-family: ui-monospace, SFMono-Regular, Consolas, monospace; }
+.route-via { grid-column: 1 / -1; margin-top: 4px; color: #718096; }
 .token-bar { display: flex; align-items: center; justify-content: space-between; gap: 22px; margin-top: 13px; padding: 16px 20px; }
 .token-bar strong, .token-bar span { display: block; }
 .token-bar strong { font-size: 13px; }
@@ -116,6 +140,18 @@ button:disabled { cursor: not-allowed; opacity: .55; }
   .refresh-button, .secondary-button { border-color: #c6d2d7; background: rgba(255, 255, 255, .76); color: #263447; }
   .refresh-button:hover, .secondary-button:hover:not(:disabled) { border-color: #70b493; background: #eef8f2; }
   .guide-card { background: rgba(232, 243, 241, .8); }
+  .site-link-card { border-color: #e3e9eb; }
+  .site-link-title strong { color: #172033; }
+  .site-link-title span { color: #8491a2; }
+  .link-status { color: #647286; background: #edf0f2; }
+  .link-status.ready { color: #286c4d; background: #e1f1e9; }
+  .link-status.working { color: #806922; background: #f7f0d9; }
+  .link-status.failed { color: #9b465d; background: #fae7ed; }
+  .link-status.disabled { color: #6d7889; background: #edf0f2; }
+  .link-error { color: #9b465d; }
+  .route-guide { background: rgba(232, 243, 241, .74); }
+  .route-site, .route-destination { color: #344358; }
+  .route-arrow, .route-via { color: #718095; }
   .device-row { border-color: #e3e9eb; }
   .device-identity strong { color: #172033; }
   .device-identity span { color: #718095; }
