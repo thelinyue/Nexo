@@ -3,7 +3,7 @@
 //! Agent 不绑定固定服务端。首次入网时通过环境变量指定目标地址和一次性
 //! token，完成请求后继续作为常驻进程运行；后续控制通道会复用同一配置。
 
-use std::{env, fs, io::BufReader, path::PathBuf, sync::Arc};
+use std::{env, fs, io::BufReader, path::PathBuf, process::Command, sync::Arc};
 
 use anyhow::{Context, Result};
 use get_if_addrs::{get_if_addrs, IfAddr};
@@ -33,6 +33,10 @@ struct AgentRuntimeConfig {
     device_name: String,
     capabilities: Vec<DeviceCapability>,
     state_dir: PathBuf,
+    /// 是否允许 Agent 执行本机 Tailscale 命令；默认关闭，避免部署后意外改动宿主机网络。
+    tailscale_apply_enabled: bool,
+    /// Tailscale 可执行文件路径；容器内通常为 `tailscale`，也支持显式绝对路径。
+    tailscale_bin: String,
 }
 
 impl AgentRuntimeConfig {
@@ -56,6 +60,17 @@ impl AgentRuntimeConfig {
             .filter(|value| !value.trim().is_empty());
         let control_server_name =
             env::var("NEXO_CONTROL_SERVER_NAME").unwrap_or_else(|_| "nexo-server".to_owned());
+        let tailscale_apply_enabled = env::var("NEXO_TAILSCALE_APPLY")
+            .ok()
+            .map(|value| parse_bool_env(&value))
+            .unwrap_or(false);
+        let tailscale_bin = env::var("NEXO_TAILSCALE_BIN")
+            .unwrap_or_else(|_| "tailscale".to_owned())
+            .trim()
+            .to_owned();
+        if tailscale_bin.is_empty() {
+            anyhow::bail!("NEXO_TAILSCALE_BIN 不能为空");
+        }
         Ok(Self {
             server_url,
             control_addr,
@@ -66,8 +81,18 @@ impl AgentRuntimeConfig {
             device_name,
             capabilities,
             state_dir,
+            tailscale_apply_enabled,
+            tailscale_bin,
         })
     }
+}
+
+/// 读取布尔型环境变量；无法识别的值按关闭处理，避免误启用系统命令。
+fn parse_bool_env(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "on"
+    )
 }
 
 #[tokio::main]
@@ -337,7 +362,8 @@ async fn control_session(
             gateway_state: Some(gateway_state),
             ..
         } => {
-            let ack = apply_gateway_desired_state(&gateway_state);
+            let applier = TailscaleRouteApplier::from_config(config);
+            let ack = apply_gateway_desired_state(&gateway_state, &applier);
             last_gateway_revision = Some(ack.revision);
             last_gateway_status = Some(ack.status);
             write_agent_message(
@@ -382,10 +408,11 @@ async fn control_session(
                 ..
             } if last_gateway_revision != Some(gateway_state.revision)
                 || last_gateway_status.is_some_and(|status| {
-                    !matches!(status, ApplyStatus::Ready | ApplyStatus::Disabled)
+                    matches!(status, ApplyStatus::Retrying | ApplyStatus::Failed)
                 }) =>
             {
-                let ack = apply_gateway_desired_state(&gateway_state);
+                let applier = TailscaleRouteApplier::from_config(config);
+                let ack = apply_gateway_desired_state(&gateway_state, &applier);
                 last_gateway_revision = Some(ack.revision);
                 last_gateway_status = Some(ack.status);
                 write_agent_message(
@@ -421,12 +448,94 @@ async fn control_session(
     }
 }
 
+/// 网关路由执行器的稳定边界。
+///
+/// 计划和执行分离，便于测试，也避免后续把 Tailscale CLI 细节泄漏到
+/// 控制协议。执行成功只代表本机命令被接受，不代表 Headscale 已批准路由。
+trait GatewayRouteApplier {
+    fn apply(&self, plan: &TailscaleRoutePlan) -> Result<()>;
+}
+
+/// Tailscale CLI 执行器；只有显式设置 NEXO_TAILSCALE_APPLY=true 才会运行命令。
+///
+/// Nexo 负责传入完整的网关参数，避免把 Exit Node、默认路由等能力混入命令。
+struct TailscaleRouteApplier {
+    enabled: bool,
+    binary: String,
+}
+
+impl TailscaleRouteApplier {
+    /// 根据 Agent 启动配置创建执行器；默认使用演练模式。
+    fn from_config(config: &AgentRuntimeConfig) -> Self {
+        Self {
+            enabled: config.tailscale_apply_enabled,
+            binary: config.tailscale_bin.clone(),
+        }
+    }
+}
+
+impl GatewayRouteApplier for TailscaleRouteApplier {
+    fn apply(&self, plan: &TailscaleRoutePlan) -> Result<()> {
+        if !self.enabled {
+            tracing::info!("Tailscale 命令执行未启用，仅生成网关应用计划");
+            return Ok(());
+        }
+        let mut command = Command::new(&self.binary);
+        command.args(tailscale_command_args(plan));
+        let output = command
+            .output()
+            .with_context(|| format!("无法执行 Tailscale 命令：{}", self.binary))?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+            let stdout = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+            let detail = if stderr.is_empty() { stdout } else { stderr };
+            anyhow::bail!(
+                "Tailscale 网关配置失败（退出码 {:?}）：{}",
+                output.status.code(),
+                if detail.is_empty() {
+                    "命令未返回错误详情"
+                } else {
+                    &detail
+                }
+            );
+        }
+        tracing::info!("Tailscale 网关参数已应用，等待 Headscale 路由批准");
+        Ok(())
+    }
+}
+
+/// 生成固定顺序的 Tailscale 参数，便于审计和单元测试。
+fn tailscale_command_args(plan: &TailscaleRoutePlan) -> Vec<String> {
+    let mut args = vec![
+        "set".to_owned(),
+        format!("--advertise-routes={}", plan.advertise_routes.join(",")),
+        format!("--accept-routes={}", plan.accept_routes),
+    ];
+    if let Some(snat_subnet_routes) = plan.snat_subnet_routes {
+        args.push(format!("--snat-subnet-routes={snat_subnet_routes}"));
+    }
+    args
+}
+
+/// 测试用的无副作用执行器，也对应默认关闭真实 CLI 时的行为。
+#[cfg(test)]
+struct NoopGatewayRouteApplier;
+
+#[cfg(test)]
+impl GatewayRouteApplier for NoopGatewayRouteApplier {
+    fn apply(&self, _plan: &TailscaleRoutePlan) -> Result<()> {
+        Ok(())
+    }
+}
+
 /// 处理服务端下发的网关 Desired State。
 ///
-/// 当前 Agent 只完成协议接收和状态回传，真正的 Tailscale 路由应用会在
-/// 后续适配器接入后填充；因此启用路由明确返回 `checking`，绝不宣称已生效。
-/// 已关闭的路由会返回 `disabled`，让服务端清空对应 Applied State。
-fn apply_gateway_desired_state(state: &GatewayDesiredState) -> GatewayApplyAck {
+/// 执行器成功后，启用路由仍返回 `checking`：Headscale 的批准状态尚未进入
+/// 本地 ACK 链路。全部关闭时返回 `disabled`，让服务端清空 Applied State。
+fn apply_gateway_desired_state(
+    state: &GatewayDesiredState,
+    applier: &dyn GatewayRouteApplier,
+) -> GatewayApplyAck {
     let network_ids: Vec<String> = state
         .routes
         .iter()
@@ -446,6 +555,17 @@ fn apply_gateway_desired_state(state: &GatewayDesiredState) -> GatewayApplyAck {
             };
         }
     };
+    if let Err(error) = applier.apply(&plan) {
+        let error_message = format!("Tailscale 网关应用失败：{error:#}");
+        tracing::error!("{}", error_message);
+        return GatewayApplyAck {
+            revision: state.revision,
+            status: ApplyStatus::Failed,
+            network_ids,
+            applied_network_ids: Vec::new(),
+            error_message: Some(error_message),
+        };
+    }
     if !state.routes.iter().any(|route| route.enabled) {
         tracing::info!(
             revision = state.revision,
@@ -466,7 +586,7 @@ fn apply_gateway_desired_state(state: &GatewayDesiredState) -> GatewayApplyAck {
         advertise_routes = ?plan.advertise_routes,
         accept_routes = plan.accept_routes,
         snat_subnet_routes = ?plan.snat_subnet_routes,
-        "已生成网关 Tailscale 应用计划，等待适配器执行"
+        "网关 Tailscale 参数已应用，等待 Headscale 路由批准"
     );
     GatewayApplyAck {
         revision: state.revision,
@@ -480,16 +600,16 @@ fn apply_gateway_desired_state(state: &GatewayDesiredState) -> GatewayApplyAck {
 /// Agent 交给 Tailscale CLI/本地 API 适配器的最小应用计划。
 ///
 /// 计划只包含 Nexo 已确认的本地发布网段和站点互联是否需要接收远端路由，
-/// 不会把 Exit Node 或默认路由混入其中。当前阶段只生成计划，不执行系统命令。
+/// 不会把 Exit Node 或默认路由混入其中。
 #[derive(Debug, PartialEq, Eq)]
 struct TailscaleRoutePlan {
     advertise_routes: Vec<String>,
     accept_routes: bool,
-    /// 只有站点互联需要明确关闭 SNAT；单站点共享保持 Tailscale 默认行为。
+    /// 站点互联关闭 SNAT，普通共享网络恢复 Tailscale 默认的 SNAT 行为。
     snat_subnet_routes: Option<bool>,
 }
 
-/// 将 Nexo 语义路由转换为未来 Tailscale 适配器所需的参数。
+/// 将 Nexo 语义路由转换为 Tailscale 适配器所需的参数。
 fn build_tailscale_route_plan(state: &GatewayDesiredState) -> Result<TailscaleRoutePlan> {
     let mut advertise_routes = Vec::new();
     let mut accept_routes = false;
@@ -514,7 +634,7 @@ fn build_tailscale_route_plan(state: &GatewayDesiredState) -> Result<TailscaleRo
     Ok(TailscaleRoutePlan {
         advertise_routes,
         accept_routes,
-        snat_subnet_routes: accept_routes.then_some(false),
+        snat_subnet_routes: Some(!accept_routes),
     })
 }
 
@@ -767,7 +887,7 @@ mod tests {
                 enabled: true,
             }],
         };
-        let ack = apply_gateway_desired_state(&state);
+        let ack = apply_gateway_desired_state(&state, &NoopGatewayRouteApplier);
         assert_eq!(ack.revision, 3);
         assert_eq!(ack.status, ApplyStatus::Checking);
         assert_eq!(ack.network_ids, vec!["network-a"]);
@@ -787,7 +907,7 @@ mod tests {
                 enabled: true,
             }],
         };
-        let ack = apply_gateway_desired_state(&state);
+        let ack = apply_gateway_desired_state(&state, &NoopGatewayRouteApplier);
         assert_eq!(ack.status, ApplyStatus::Failed);
         assert_eq!(ack.network_ids, vec!["network-invalid"]);
         assert!(ack.applied_network_ids.is_empty());
@@ -806,7 +926,7 @@ mod tests {
                 enabled: false,
             }],
         };
-        let ack = apply_gateway_desired_state(&state);
+        let ack = apply_gateway_desired_state(&state, &NoopGatewayRouteApplier);
         assert_eq!(ack.status, ApplyStatus::Disabled);
         assert_eq!(ack.network_ids, vec!["network-closed"]);
         assert!(ack.applied_network_ids.is_empty());
@@ -845,5 +965,72 @@ mod tests {
         assert_eq!(plan.advertise_routes, vec!["192.168.10.0/24"]);
         assert!(plan.accept_routes);
         assert_eq!(plan.snat_subnet_routes, Some(false));
+    }
+
+    #[test]
+    fn disabled_tailscale_executor_does_not_require_binary() {
+        let applier = TailscaleRouteApplier {
+            enabled: false,
+            binary: "this-command-should-not-run".to_owned(),
+        };
+        let plan = TailscaleRoutePlan {
+            advertise_routes: vec!["192.168.10.0/24".to_owned()],
+            accept_routes: false,
+            snat_subnet_routes: None,
+        };
+        applier
+            .apply(&plan)
+            .expect("关闭执行开关时不应尝试查找 Tailscale");
+    }
+
+    #[test]
+    fn parse_bool_env_only_accepts_explicit_true_values() {
+        assert!(parse_bool_env("true"));
+        assert!(parse_bool_env(" ON "));
+        assert!(parse_bool_env("1"));
+        assert!(!parse_bool_env("false"));
+        assert!(!parse_bool_env("enabled"));
+    }
+
+    #[test]
+    fn tailscale_command_args_are_limited_to_gateway_flags() {
+        let plan = TailscaleRoutePlan {
+            advertise_routes: vec!["192.168.10.0/24".to_owned(), "192.168.30.0/24".to_owned()],
+            accept_routes: true,
+            snat_subnet_routes: Some(false),
+        };
+        assert_eq!(
+            tailscale_command_args(&plan),
+            vec![
+                "set",
+                "--advertise-routes=192.168.10.0/24,192.168.30.0/24",
+                "--accept-routes=true",
+                "--snat-subnet-routes=false",
+            ]
+        );
+    }
+
+    #[test]
+    fn tailscale_executor_failure_is_reported_as_failed_ack() {
+        let state = GatewayDesiredState {
+            revision: 7,
+            routes: vec![nexo_protocol::GatewayDesiredRoute {
+                network_id: "network-a".to_owned(),
+                site_link_id: None,
+                prefix: "192.168.10.0/24".to_owned(),
+                revision: 7,
+                enabled: true,
+            }],
+        };
+        let applier = TailscaleRouteApplier {
+            enabled: true,
+            binary: "__nexo_missing_tailscale_binary__".to_owned(),
+        };
+        let ack = apply_gateway_desired_state(&state, &applier);
+        assert_eq!(ack.status, ApplyStatus::Failed);
+        assert!(ack
+            .error_message
+            .as_deref()
+            .is_some_and(|message| message.contains("Tailscale 网关应用失败")));
     }
 }
