@@ -24,6 +24,12 @@ pub enum GatewayCapabilityReason {
 pub struct DetectedLocalNetwork {
     pub interface_id: String,
     pub prefix: String,
+    /// Agent 在该局域网接口上的地址，供静态路由引导显示下一跳。
+    ///
+    /// 旧 Agent 的能力报告没有这个字段，因此使用 `Option` 并允许反序列化缺省值；
+    /// 地址缺失时 Nexo 只能提示用户自行确认下一跳，不能猜测或自动修改路由器。
+    #[serde(default)]
+    pub gateway_address: Option<String>,
 }
 
 /// Subnet Gateway 与 Site Gateway 的环境能力报告。

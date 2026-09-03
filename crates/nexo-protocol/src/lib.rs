@@ -255,4 +255,27 @@ mod tests {
             }
         ));
     }
+
+    #[test]
+    fn old_gateway_report_without_local_address_remains_compatible() {
+        let report: GatewayCapabilityReport = serde_json::from_str(
+            r#"{
+                "platform":"linux",
+                "tun_available":true,
+                "net_admin_available":true,
+                "ipv4_forwarding":true,
+                "ipv6_forwarding":true,
+                "local_networks":[{"interface_id":"eth0","prefix":"192.168.10.0/24"}],
+                "subnet_gateway":"ready",
+                "subnet_gateway_reason":null,
+                "site_gateway":"ready",
+                "site_gateway_reason":null
+            }"#,
+        )
+        .expect("旧版网关能力报告应仍可解析");
+        assert_eq!(
+            report.local_networks[0].gateway_address, None,
+            "旧版报告缺少地址时不得猜测下一跳"
+        );
+    }
 }

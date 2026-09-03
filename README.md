@@ -16,9 +16,18 @@ Nexo 是面向个人自托管环境的设备、隧道和异地组网管理服务
 - 服务端会在 mTLS 握手响应及后续心跳确认中下发该设备对应的最新网关 Desired State，Agent 会回传带 revision 的应用 ACK；Agent 已将本地发布网段、远端接收路由和站点互联的 SNAT 策略整理成应用计划。默认只生成计划，设置 `NEXO_TAILSCALE_APPLY=true` 后才执行 Tailscale CLI；命令成功但 Headscale 尚未批准时 ACK 仍保持 `CHECKING`，不会把未生效的路由标记为 `READY`。每次实际应用前 Agent 都会重新检查网关能力；命令失败会按指数退避和抖动重试，不会在每个心跳中重复执行。
 - 共享网络和站点互联都支持显式启用/关闭；关闭操作会递增 Desired State revision，并下发带 `enabled=false` 的撤销路由，避免 Agent 继续保留旧配置。
 - `nexo-headscale-adapter` 已定义 Nexo 路由申请边界；未配置 API 时返回可展示的 Pending 结果，业务代码不会读取 Headscale 内部数据库。
+- Agent 的能力报告会带上每个已检测局域网接口的本地地址；共享网络和站点互联查询会返回 `gateway_address` 以及双向 `static_routes` 引导，用户可据此把远端网段添加到两侧路由器。Nexo 只展示目标网段和下一跳，不会自动登录或修改路由器。
 - Tunnel/组网配置下发仍是后续切片；当前不会把待签发设备伪装为在线设备。
 
 ## 本地运行
+
+Web 概览原型位于 `web/`，使用系统字体与可适配的明暗材质；开发预览可执行：
+
+```powershell
+cd web
+npm install
+npm run build
+```
 
 ```powershell
 $env:NEXO_ADMIN_TOKEN = "仅用于本地开发的管理员凭证"

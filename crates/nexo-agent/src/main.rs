@@ -967,6 +967,7 @@ fn detect_local_networks() -> Vec<DetectedLocalNetwork> {
             Some(DetectedLocalNetwork {
                 interface_id: interface.name,
                 prefix: prefix.to_string(),
+                gateway_address: Some(ip.to_string()),
             })
         })
         .collect()
@@ -1014,6 +1015,7 @@ mod tests {
         let networks = vec![DetectedLocalNetwork {
             interface_id: "eth0".to_owned(),
             prefix: "192.168.10.0/24".to_owned(),
+            gateway_address: None,
         }];
         let reason = gateway_unavailable_reason(true, true, false, true, &networks);
         if cfg!(target_os = "linux") {
@@ -1028,6 +1030,7 @@ mod tests {
         let networks = vec![DetectedLocalNetwork {
             interface_id: "eth0".to_owned(),
             prefix: "192.168.10.0/24".to_owned(),
+            gateway_address: None,
         }];
         let reason = gateway_unavailable_reason(true, true, true, true, &networks);
         if cfg!(target_os = "linux") {

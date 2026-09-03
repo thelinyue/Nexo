@@ -33,7 +33,7 @@ use rcgen::{
     BasicConstraints, CertificateParams, CertificateSigningRequestParams, DistinguishedName,
     DnType, ExtendedKeyUsagePurpose, IsCa, Issuer, KeyPair, KeyUsagePurpose,
 };
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use time::{Duration, OffsetDateTime};
@@ -68,6 +68,22 @@ struct OverviewResponse {
     running_tunnels: i64,
     mesh_devices: i64,
     current_connections: i64,
+}
+
+/// 管理界面使用的设备摘要；不返回设备私钥、证书或其他敏感材料。
+#[derive(Debug, Serialize)]
+struct DeviceResponse {
+    id: String,
+    tenant_id: String,
+    site_id: Option<String>,
+    name: String,
+    os: Option<String>,
+    architecture: Option<String>,
+    agent_version: Option<String>,
+    status: String,
+    capabilities: Vec<DeviceCapability>,
+    gateway_report: Option<GatewayCapabilityReport>,
+    last_seen_at: Option<String>,
 }
 
 /// 管理端创建一次性设备入网凭证的请求。
@@ -115,6 +131,8 @@ struct SiteNetworkResponse {
     name: String,
     publisher_device_id: String,
     interface_id: String,
+    /// Agent 在本地局域网上的地址；路由器应把远端网段指向该地址。
+    gateway_address: Option<String>,
     desired_prefix: String,
     applied_prefix: Option<String>,
     desired_revision: i64,
@@ -142,9 +160,26 @@ struct SiteLinkResponse {
     right_site_id: String,
     left_network_id: String,
     right_network_id: String,
+    left_network_prefix: String,
+    right_network_prefix: String,
+    left_gateway_address: Option<String>,
+    right_gateway_address: Option<String>,
+    static_routes: Vec<StaticRouteGuide>,
     enabled: bool,
     apply_status: ApplyStatus,
     apply_error: Option<String>,
+}
+
+/// 给用户路由器配置静态路由时需要填写的最小信息。
+///
+/// Nexo 只生成引导，不会登录或修改用户路由器；`next_hop` 缺失时表示旧版
+/// Agent 尚未上报本地地址，UI 必须要求用户先确认设备的固定局域网地址。
+#[derive(Debug, Serialize, PartialEq, Eq)]
+struct StaticRouteGuide {
+    router_site_id: String,
+    destination_site_id: String,
+    destination_prefix: String,
+    next_hop: Option<String>,
 }
 
 /// 服务端本地 CA 材料。私钥只在服务端内存中短暂使用，绝不通过 API 返回。
@@ -251,6 +286,7 @@ async fn main() -> Result<()> {
     let app = Router::new()
         .route("/health", get(health))
         .route("/api/v1/overview", get(overview))
+        .route("/api/v1/devices", get(list_devices))
         .route("/api/v1/enrollments", post(create_enrollment))
         .route("/api/v1/enrollments/{id}", get(get_enrollment))
         .route("/api/v1/enrollments/{id}/approve", post(approve_enrollment))
@@ -328,6 +364,73 @@ async fn overview(State(state): State<AppState>) -> Result<Json<OverviewResponse
         mesh_devices,
         current_connections,
     }))
+}
+
+/// 返回设备状态和最近一次网关能力报告，供 Web 展示统一的设备模型。
+async fn list_devices(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<DeviceResponse>>, ApiError> {
+    require_admin(&headers)?;
+    let connection = state
+        .db
+        .lock()
+        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "数据库锁不可用"))?;
+    let mut statement = connection
+        .prepare(
+            "SELECT d.id, d.tenant_id, d.site_id, d.name, d.os, d.architecture,
+                    d.agent_version, d.status, d.capabilities_json, r.report_json,
+                    d.last_seen_at
+             FROM devices d
+             LEFT JOIN device_capability_reports r ON r.device_id = d.id
+             ORDER BY d.updated_at DESC, d.name ASC",
+        )
+        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法读取设备列表"))?;
+    let rows = statement
+        .query_map([], |row| {
+            let capabilities_json: String = row.get(8)?;
+            let report_json: Option<String> = row.get(9)?;
+            Ok((DeviceResponse {
+                id: row.get(0)?,
+                tenant_id: row.get(1)?,
+                site_id: row.get(2)?,
+                name: row.get(3)?,
+                os: row.get(4)?,
+                architecture: row.get(5)?,
+                agent_version: row.get(6)?,
+                status: row.get(7)?,
+                capabilities: serde_json::from_str(&capabilities_json).map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        8,
+                        rusqlite::types::Type::Text,
+                        Box::new(error),
+                    )
+                })?,
+                gateway_report: report_json
+                    .map(|json| {
+                        serde_json::from_str(&json).map_err(|error| {
+                            rusqlite::Error::FromSqlConversionFailure(
+                                9,
+                                rusqlite::types::Type::Text,
+                                Box::new(error),
+                            )
+                        })
+                    })
+                    .transpose()?,
+                last_seen_at: row.get(10)?,
+            },))
+        })
+        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法读取设备列表"))?;
+    rows.map(|row| {
+        row.map(|(device,)| device).map_err(|_| {
+            ApiError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "设备数据格式无效，请让 Agent 重新连接",
+            )
+        })
+    })
+    .collect::<Result<Vec<_>, _>>()
+    .map(Json)
 }
 
 fn count(connection: &Connection, query: &str) -> Result<i64, StatusCode> {
@@ -1501,20 +1604,7 @@ async fn create_site_network(
     transaction
         .commit()
         .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法提交共享网络事务"))?;
-    Ok(Json(SiteNetworkResponse {
-        id,
-        tenant_id: request.tenant_id,
-        site_id: request.site_id,
-        name: request.name,
-        publisher_device_id: request.publisher_device_id,
-        interface_id: request.interface_id,
-        desired_prefix: prefix.to_string(),
-        applied_prefix: None,
-        desired_revision: 1,
-        apply_status: ApplyStatus::Checking,
-        enabled: true,
-        apply_error: None,
-    }))
+    Ok(Json(read_site_network_response(&connection, &id)?))
 }
 
 /// 查询共享网络的 Desired / Applied 状态，供 Web 明确显示“正在检查”或失败原因。
@@ -1653,6 +1743,7 @@ fn read_site_network_response(
                     name: row.get(3)?,
                     publisher_device_id: row.get(4)?,
                     interface_id: row.get(5)?,
+                    gateway_address: None,
                     desired_prefix: row.get(6)?,
                     applied_prefix: row.get(7)?,
                     desired_revision: row.get(8)?,
@@ -1663,6 +1754,15 @@ fn read_site_network_response(
             },
         )
         .map_err(|_| ApiError::new(StatusCode::NOT_FOUND, "共享网络不存在"))
+        .and_then(|mut response| {
+            response.gateway_address = find_gateway_address(
+                connection,
+                &response.publisher_device_id,
+                &response.interface_id,
+                &response.desired_prefix,
+            )?;
+            Ok(response)
+        })
 }
 
 /// 创建双向站点互联的 Desired State，并在提交前阻止重叠网段。
@@ -1799,17 +1899,7 @@ async fn create_site_link(
     transaction
         .commit()
         .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法提交站点互联事务"))?;
-    Ok(Json(SiteLinkResponse {
-        id,
-        tenant_id: request.tenant_id,
-        left_site_id,
-        right_site_id,
-        left_network_id,
-        right_network_id,
-        enabled: true,
-        apply_status: ApplyStatus::Checking,
-        apply_error: None,
-    }))
+    Ok(Json(read_site_link_response(&connection, &id)?))
 }
 
 /// 查询站点互联当前应用状态。
@@ -1910,31 +2000,153 @@ fn read_site_link_response(
     connection: &Connection,
     id: &str,
 ) -> Result<SiteLinkResponse, ApiError> {
-    connection
+    let (
+        id,
+        tenant_id,
+        left_site_id,
+        right_site_id,
+        left_network_id,
+        right_network_id,
+        left_network_prefix,
+        right_network_prefix,
+        left_device_id,
+        right_device_id,
+        enabled,
+        apply_status,
+        apply_error,
+    ) = connection
         .query_row(
             "SELECT l.id, l.tenant_id, l.left_site_id, l.right_site_id,
                     ln.site_network_id, rn.site_network_id,
+                    lg.desired_prefix, rg.desired_prefix,
+                    lg_network.publisher_device_id, rg_network.publisher_device_id,
                     l.enabled, l.apply_status, l.apply_error
              FROM site_links l
              JOIN site_link_networks ln ON ln.site_link_id = l.id AND ln.side = 'left'
              JOIN site_link_networks rn ON rn.site_link_id = l.id AND rn.side = 'right'
+             JOIN site_networks lg_network ON lg_network.id = ln.site_network_id
+             JOIN gateway_network_states lg ON lg.site_network_id = lg_network.id
+             JOIN site_networks rg_network ON rg_network.id = rn.site_network_id
+             JOIN gateway_network_states rg ON rg.site_network_id = rg_network.id
              WHERE l.id = ?1",
             [id],
             |row| {
-                Ok(SiteLinkResponse {
-                    id: row.get(0)?,
-                    tenant_id: row.get(1)?,
-                    left_site_id: row.get(2)?,
-                    right_site_id: row.get(3)?,
-                    left_network_id: row.get(4)?,
-                    right_network_id: row.get(5)?,
-                    enabled: row.get::<_, i64>(6)? != 0,
-                    apply_status: parse_apply_status(&row.get::<_, String>(7)?),
-                    apply_error: row.get(8)?,
-                })
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, String>(7)?,
+                    row.get::<_, String>(8)?,
+                    row.get::<_, String>(9)?,
+                    row.get::<_, i64>(10)? != 0,
+                    parse_apply_status(&row.get::<_, String>(11)?),
+                    row.get::<_, Option<String>>(12)?,
+                ))
             },
         )
-        .map_err(|_| ApiError::new(StatusCode::NOT_FOUND, "站点互联不存在"))
+        .map_err(|error| {
+            tracing::debug!(error = %error, "读取站点互联路由引导失败");
+            ApiError::new(StatusCode::NOT_FOUND, "站点互联不存在")
+        })?;
+    let left_gateway_address = find_gateway_address(
+        connection,
+        &left_device_id,
+        &find_network_interface(connection, &left_network_id)?,
+        &left_network_prefix,
+    )?;
+    let right_gateway_address = find_gateway_address(
+        connection,
+        &right_device_id,
+        &find_network_interface(connection, &right_network_id)?,
+        &right_network_prefix,
+    )?;
+    let static_routes = vec![
+        StaticRouteGuide {
+            router_site_id: left_site_id.clone(),
+            destination_site_id: right_site_id.clone(),
+            destination_prefix: right_network_prefix.clone(),
+            next_hop: left_gateway_address.clone(),
+        },
+        StaticRouteGuide {
+            router_site_id: right_site_id.clone(),
+            destination_site_id: left_site_id.clone(),
+            destination_prefix: left_network_prefix.clone(),
+            next_hop: right_gateway_address.clone(),
+        },
+    ];
+    Ok(SiteLinkResponse {
+        id,
+        tenant_id,
+        left_site_id,
+        right_site_id,
+        left_network_id,
+        right_network_id,
+        left_network_prefix,
+        right_network_prefix,
+        left_gateway_address,
+        right_gateway_address,
+        static_routes,
+        enabled,
+        apply_status,
+        apply_error,
+    })
+}
+
+/// 读取共享网络绑定的网卡名称，用于从能力报告中找到对应的 Agent 地址。
+fn find_network_interface(connection: &Connection, network_id: &str) -> Result<String, ApiError> {
+    connection
+        .query_row(
+            "SELECT interface_id FROM site_networks WHERE id = ?1",
+            [network_id],
+            |row| row.get(0),
+        )
+        .map_err(|_| ApiError::new(StatusCode::NOT_FOUND, "站点共享网络不存在"))
+}
+
+/// 从最近一次能力报告读取指定网卡和网段对应的 Agent 局域网地址。
+fn find_gateway_address(
+    connection: &Connection,
+    device_id: &str,
+    interface_id: &str,
+    prefix: &str,
+) -> Result<Option<String>, ApiError> {
+    let report_json: Option<String> = connection
+        .query_row(
+            "SELECT report_json FROM device_capability_reports WHERE device_id = ?1",
+            [device_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法读取设备能力报告"))?;
+    let Some(report_json) = report_json else {
+        return Ok(None);
+    };
+    let report: GatewayCapabilityReport = serde_json::from_str(&report_json).map_err(|_| {
+        ApiError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "设备网关能力报告格式无效",
+        )
+    })?;
+    let prefix_text = prefix;
+    let prefix = prefix_text
+        .parse::<IpNet>()
+        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "共享网络前缀格式无效"))?;
+    Ok(report
+        .local_networks
+        .iter()
+        .find(|network| network.interface_id == interface_id && network.prefix == prefix_text)
+        .and_then(|network| {
+            let address = network
+                .gateway_address
+                .as_deref()?
+                .parse::<std::net::IpAddr>()
+                .ok()?;
+            prefix.contains(&address).then(|| address.to_string())
+        }))
 }
 
 /// 站点互联两侧选中的共享网络及其网关设备。
@@ -2732,6 +2944,14 @@ mod tests {
             )
             .expect("应能读取设备状态");
         assert_eq!(status, "online");
+        let devices = list_devices(State(state.clone()), admin_headers())
+            .await
+            .expect("管理员应能读取设备摘要")
+            .0;
+        assert_eq!(devices.len(), 1);
+        assert_eq!(devices[0].id, device_id);
+        assert_eq!(devices[0].status, "online");
+        assert!(devices[0].gateway_report.is_none());
         drop(reader);
         task.abort();
     }
@@ -2765,6 +2985,7 @@ mod tests {
                 local_networks: vec![DetectedLocalNetwork {
                     interface_id: "eth0".to_owned(),
                     prefix: "192.168.10.0/24".to_owned(),
+                    gateway_address: Some("192.168.10.2".to_owned()),
                 }],
                 subnet_gateway: CapabilityState::Ready,
                 subnet_gateway_reason: None,
@@ -2776,10 +2997,12 @@ mod tests {
                     DetectedLocalNetwork {
                         interface_id: "eth0".to_owned(),
                         prefix: "192.168.20.0/24".to_owned(),
+                        gateway_address: Some("192.168.20.2".to_owned()),
                     },
                     DetectedLocalNetwork {
                         interface_id: "eth0".to_owned(),
                         prefix: "192.168.10.0/24".to_owned(),
+                        gateway_address: Some("192.168.20.2".to_owned()),
                     },
                 ],
                 ..report_a.clone()
@@ -2842,6 +3065,27 @@ mod tests {
         .expect("不重叠的站点网络应能创建互联")
         .0;
         assert_eq!(link.apply_status, ApplyStatus::Checking);
+        assert_eq!(link.left_network_prefix, "192.168.10.0/24");
+        assert_eq!(link.right_network_prefix, "192.168.20.0/24");
+        assert_eq!(link.left_gateway_address.as_deref(), Some("192.168.10.2"));
+        assert_eq!(link.right_gateway_address.as_deref(), Some("192.168.20.2"));
+        assert_eq!(
+            link.static_routes,
+            vec![
+                StaticRouteGuide {
+                    router_site_id: "site-a".to_owned(),
+                    destination_site_id: "site-b".to_owned(),
+                    destination_prefix: "192.168.20.0/24".to_owned(),
+                    next_hop: Some("192.168.10.2".to_owned()),
+                },
+                StaticRouteGuide {
+                    router_site_id: "site-b".to_owned(),
+                    destination_site_id: "site-a".to_owned(),
+                    destination_prefix: "192.168.10.0/24".to_owned(),
+                    next_hop: Some("192.168.20.2".to_owned()),
+                },
+            ]
+        );
 
         let conflict = create_site_network(
             State(state.clone()),
