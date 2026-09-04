@@ -1,0 +1,52 @@
+# Nexo 第一阶段 Server 镜像：Rust API/Web/Tunnel + 独立 Headscale 子进程。
+# Caddy、公网域名和泛域名证书不在此阶段镜像中。
+FROM node:22.16.0-alpine AS web-build
+WORKDIR /src/web
+COPY web/package.json web/package-lock.json ./
+RUN npm ci --ignore-scripts
+COPY web/ ./
+RUN npm run build
+
+FROM rust:1.89-bookworm AS rust-build
+WORKDIR /src
+COPY Cargo.toml Cargo.lock ./
+COPY crates ./crates
+COPY migrations ./migrations
+COPY --from=web-build /src/web/dist ./web/dist
+RUN cargo build --release -p nexo-server
+
+FROM debian:bookworm-slim
+ARG TARGETARCH=amd64
+ARG HEADSCALE_VERSION=0.29.3
+ARG HEADSCALE_AMD64_SHA256=8dc183758024ed7095cf610fedea0790233613c71353bc8be2715d82ba29b92c
+ARG HEADSCALE_ARM64_SHA256=ecf0099f9aa1efb56e7c74718342a493f7d44a840626a2877ca526e675040f4e
+RUN apt-get update \
+    && apt-get install --no-install-recommends -y ca-certificates curl \
+    && rm -rf /var/lib/apt/lists/* \
+    && case "$TARGETARCH" in \
+         amd64) HS_ARCH=amd64; HS_SHA="$HEADSCALE_AMD64_SHA256" ;; \
+         arm64) HS_ARCH=arm64; HS_SHA="$HEADSCALE_ARM64_SHA256" ;; \
+         *) echo "不支持的目标架构：$TARGETARCH" >&2; exit 1 ;; \
+       esac \
+    && curl --fail --location --silent --show-error \
+         "https://github.com/juanfont/headscale/releases/download/v${HEADSCALE_VERSION}/headscale_${HEADSCALE_VERSION}_linux_${HS_ARCH}" \
+         --output /usr/local/bin/headscale \
+    && echo "$HS_SHA  /usr/local/bin/headscale" | sha256sum --check --status \
+    && chmod 0755 /usr/local/bin/headscale
+COPY --from=rust-build /src/target/release/nexo-server /usr/local/bin/nexo-server
+COPY --from=web-build /src/web/dist /opt/nexo/web
+ENV NEXO_HEADSCALE_ENABLED=true \
+    NEXO_HEADSCALE_BIN=/usr/local/bin/headscale \
+    NEXO_HEADSCALE_VERSION=0.29.3 \
+    NEXO_DATA_DIR=/data/nexo \
+    NEXO_WEB_DIR=/opt/nexo/web \
+    NEXO_HTTP_ADDR=0.0.0.0:9888 \
+    NEXO_CONTROL_ADDR=0.0.0.0:9890 \
+    NEXO_HEADSCALE_LISTEN_ADDR=0.0.0.0:8080 \
+    NEXO_HEADSCALE_API_URL=http://127.0.0.1:8080 \
+    NEXO_HEADSCALE_URL=http://127.0.0.1:8080
+VOLUME ["/data/nexo"]
+EXPOSE 9888 9890
+HEALTHCHECK --interval=10s --timeout=3s --start-period=20s --retries=6 \
+  CMD curl --fail --silent http://127.0.0.1:9888/health >/dev/null || exit 1
+ENTRYPOINT ["/usr/local/bin/nexo-server"]

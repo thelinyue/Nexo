@@ -1,0 +1,53 @@
+name: nexo-phase1
+
+services:
+  nexo-server:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.server
+    environment:
+      NEXO_ADMIN_TOKEN: ${NEXO_ADMIN_TOKEN:?请设置 NEXO_ADMIN_TOKEN}
+      # Headscale 只绑定 Server 容器内部端口；这里的 loopback 映射仅供同机
+      # host-network Agent 使用，不作为公网入口。
+      NEXO_HEADSCALE_LISTEN_ADDR: 0.0.0.0:8080
+      NEXO_HEADSCALE_API_URL: http://127.0.0.1:8080
+      NEXO_HEADSCALE_URL: ${NEXO_HEADSCALE_URL:-http://127.0.0.1:8080}
+      NEXO_MESH_ENDPOINT: ${NEXO_MESH_ENDPOINT:-http://127.0.0.1:8080}
+      NEXO_MESH_DNS_BASE_DOMAIN: ${NEXO_MESH_DNS_BASE_DOMAIN:-mesh.nexo.internal}
+    ports:
+      - "9888:9888"
+      - "9890:9890"
+      - "127.0.0.1:8080:8080"
+    volumes:
+      - nexo-data:/data/nexo
+    restart: unless-stopped
+
+  # 生产部署建议每个站点一个 Agent，使用宿主网络命名空间以便真实转发 LAN。
+  # 只授予 TUN 与 NET_ADMIN，禁止 privileged 和 Docker Socket。
+  nexo-agent:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.agent
+    network_mode: host
+    cap_add:
+      - NET_ADMIN
+    sysctls:
+      net.ipv4.ip_forward: "1"
+      net.ipv6.conf.all.forwarding: "1"
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    environment:
+      NEXO_SERVER_URL: ${NEXO_SERVER_URL:-http://127.0.0.1:9888}
+      NEXO_CONTROL_ADDR: ${NEXO_CONTROL_ADDR:-127.0.0.1:9890}
+      NEXO_CONTROL_SERVER_NAME: ${NEXO_CONTROL_SERVER_NAME:-nexo-server}
+      NEXO_MESH_ENDPOINT: ${NEXO_MESH_ENDPOINT:-http://127.0.0.1:8080}
+      NEXO_ENROLLMENT_TOKEN: ${NEXO_ENROLLMENT_TOKEN:-}
+      NEXO_DEVICE_NAME: ${NEXO_DEVICE_NAME:-Nexo Gateway}
+      NEXO_AGENT_CAPABILITIES: ${NEXO_AGENT_CAPABILITIES:-mesh,subnet_gateway,site_gateway}
+    volumes:
+      - nexo-agent-data:/data/nexo-agent
+    restart: unless-stopped
+
+volumes:
+  nexo-data:
+  nexo-agent-data:

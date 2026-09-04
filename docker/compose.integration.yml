@@ -1,0 +1,118 @@
+name: nexo-phase1-integration
+
+# Linux CI 专用：两个隔离 LAN、两个非 privileged Gateway、Server/Headscale
+# 以及不安装 Nexo/Tailscale 的普通终端。脚本在容器内执行双向 TCP/HTTPS 验收。
+services:
+  nexo-server:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.server
+    environment:
+      NEXO_ADMIN_TOKEN: integration-admin
+      NEXO_HTTP_ADDR: 0.0.0.0:9888
+      NEXO_CONTROL_ADDR: 0.0.0.0:9890
+      NEXO_HEADSCALE_LISTEN_ADDR: 0.0.0.0:8080
+      NEXO_HEADSCALE_API_URL: http://127.0.0.1:8080
+      NEXO_HEADSCALE_URL: http://nexo-server:8080
+      NEXO_MESH_ENDPOINT: http://nexo-server:8080
+      NEXO_MESH_DNS_BASE_DOMAIN: mesh.nexo.internal
+    ports:
+      - "127.0.0.1:19888:9888"
+    networks: [control]
+    volumes: [nexo-data:/data/nexo]
+
+  home-gateway:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.agent
+    cap_add: [NET_ADMIN]
+    sysctls:
+      net.ipv4.ip_forward: "1"
+      net.ipv6.conf.all.forwarding: "1"
+    devices: [/dev/net/tun:/dev/net/tun]
+    networks:
+      control: {}
+      home-lan:
+        ipv4_address: 192.168.10.2
+    volumes: [home-agent-data:/data/nexo-agent]
+    environment:
+      NEXO_SERVER_URL: http://nexo-server:9888
+      NEXO_CONTROL_ADDR: nexo-server:9890
+      NEXO_CONTROL_SERVER_NAME: nexo-server
+      NEXO_ENROLLMENT_TOKEN: ${NEXO_ENROLLMENT_TOKEN:-}
+      NEXO_TAILSCALE_APPLY: "true"
+      NEXO_TAILSCALED_ENABLED: "true"
+      NEXO_AGENT_CAPABILITIES: mesh,subnet_gateway,site_gateway
+      NEXO_DEVICE_NAME: 家庭网关
+
+  office-gateway:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.agent
+    cap_add: [NET_ADMIN]
+    sysctls:
+      net.ipv4.ip_forward: "1"
+      net.ipv6.conf.all.forwarding: "1"
+    devices: [/dev/net/tun:/dev/net/tun]
+    networks:
+      control: {}
+      office-lan:
+        ipv4_address: 192.168.20.2
+    volumes: [office-agent-data:/data/nexo-agent]
+    environment:
+      NEXO_SERVER_URL: http://nexo-server:9888
+      NEXO_CONTROL_ADDR: nexo-server:9890
+      NEXO_CONTROL_SERVER_NAME: nexo-server
+      NEXO_ENROLLMENT_TOKEN: ${NEXO_ENROLLMENT_TOKEN:-}
+      NEXO_TAILSCALE_APPLY: "true"
+      NEXO_TAILSCALED_ENABLED: "true"
+      NEXO_AGENT_CAPABILITIES: mesh,subnet_gateway,site_gateway
+      NEXO_DEVICE_NAME: 办公网关
+
+  home-terminal:
+    build:
+      context: .
+      dockerfile: Dockerfile.integration-terminal
+    command:
+      - --address
+      - 192.168.10.100
+      - --remote-prefix
+      - 192.168.20.0/24
+      - --next-hop
+      - 192.168.10.2
+    cap_add: [NET_ADMIN]
+    networks:
+      home-lan:
+        ipv4_address: 192.168.10.100
+    depends_on: [home-gateway]
+
+  office-terminal:
+    build:
+      context: .
+      dockerfile: Dockerfile.integration-terminal
+    command:
+      - --address
+      - 192.168.20.100
+      - --remote-prefix
+      - 192.168.10.0/24
+      - --next-hop
+      - 192.168.20.2
+    cap_add: [NET_ADMIN]
+    networks:
+      office-lan:
+        ipv4_address: 192.168.20.100
+    depends_on: [office-gateway]
+
+networks:
+  control:
+  home-lan:
+    ipam:
+      config: [{subnet: 192.168.10.0/24}]
+  office-lan:
+    ipam:
+      config: [{subnet: 192.168.20.0/24}]
+
+volumes:
+  nexo-data:
+  home-agent-data:
+  office-agent-data:

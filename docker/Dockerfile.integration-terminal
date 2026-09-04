@@ -1,0 +1,12 @@
+# 仅用于 Linux Site-to-Site 验收的普通终端，不包含 Nexo 或 Tailscale。
+FROM debian:bookworm-slim
+RUN apt-get update \
+    && apt-get install --no-install-recommends -y iproute2 openssl python3 curl \
+    && rm -rf /var/lib/apt/lists/*
+COPY integration-terminal.py /usr/local/bin/integration-terminal.py
+RUN openssl req -x509 -newkey rsa:2048 -nodes -days 2 \
+      -subj "/CN=nexo-integration-terminal" \
+      -keyout /etc/ssl/private/nexo-terminal.key \
+      -out /etc/ssl/certs/nexo-terminal.crt \
+    && chmod 0600 /etc/ssl/private/nexo-terminal.key
+ENTRYPOINT ["python3", "/usr/local/bin/integration-terminal.py"]

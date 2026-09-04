@@ -14,6 +14,10 @@ pub struct Heartbeat {
     pub agent_version: String,
     #[serde(default)]
     pub gateway_report: Option<GatewayCapabilityReport>,
+    /// 可选的当前组网身份；缺少时服务端继续使用已持久化身份，
+    /// 但不会据此把设备重新绑定到另一个节点。
+    #[serde(default)]
+    pub mesh_identity: Option<MeshIdentityReport>,
 }
 
 /// Agent 启动时报告的能力，服务端据此决定可下发的配置。
@@ -68,6 +72,64 @@ pub struct GatewayDesiredState {
     pub routes: Vec<GatewayDesiredRoute>,
 }
 
+/// 服务端为已批准设备下发的一次性组网入网材料。
+///
+/// `auth_key` 只在已经建立的 mTLS 控制通道中短暂传递，Agent 不应写入日志；
+/// 服务端数据库仅保存 `auth_key_id`，不会保存明文密钥。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MeshEnrollmentOffer {
+    pub endpoint: String,
+    pub auth_key: String,
+    pub auth_key_id: String,
+    pub hostname: String,
+    /// 身份恢复时要求 Agent 清理本地旧组网状态；普通首次入网保持 false。
+    #[serde(default)]
+    pub reset: bool,
+    #[serde(default)]
+    pub tenant_id: Option<String>,
+}
+
+/// Agent 上报的稳定组网身份。Node ID 是服务端绑定的唯一依据，地址和主机名
+/// 仅用于运行状态展示及交叉校验，不能触发静默改绑。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MeshIdentityReport {
+    pub node_id: Option<String>,
+    pub hostname: Option<String>,
+    pub ipv4: Option<String>,
+    pub ipv6: Option<String>,
+    pub online: bool,
+}
+
+/// 一条 Desired Route 的真实本地/远端应用结果。
+///
+/// `local_applied` 只有 Agent 实际执行 Tailscale 命令成功后才能为 true；
+/// 生成计划或命令未启用时必须保持 false。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GatewayRouteApplyResult {
+    pub network_id: String,
+    pub site_link_id: Option<String>,
+    pub prefix: String,
+    pub revision: i64,
+    pub enabled: bool,
+    pub local_applied: bool,
+    #[serde(default)]
+    pub control_plane_status: Option<String>,
+    #[serde(default)]
+    pub remote_applied: bool,
+    #[serde(default)]
+    pub error_message: Option<String>,
+}
+
+/// Agent 对每条路由的逐项确认。旧版 Agent 不发送此消息时，服务端保持
+/// “需要升级/正在检查”状态，不会触发 Headscale 批准或 READY。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GatewayRouteApplyReport {
+    pub revision: i64,
+    pub routes: Vec<GatewayRouteApplyResult>,
+    #[serde(default)]
+    pub mesh_identity: Option<MeshIdentityReport>,
+}
+
 /// Agent 对网关 Desired State 的应用确认。
 ///
 /// V1 Agent 尚未接入 Tailscale 路由执行器时会返回 `checking`，并保持
@@ -93,6 +155,8 @@ pub struct AgentHello {
     pub agent_version: String,
     pub capabilities: Vec<DeviceCapability>,
     pub gateway_report: Option<GatewayCapabilityReport>,
+    #[serde(default)]
+    pub mesh_identity: Option<MeshIdentityReport>,
 }
 
 /// 控制通道上 Agent 可以发送的消息。使用显式 type 字段保持协议可扩展。
@@ -103,13 +167,31 @@ pub enum AgentControlMessage {
         device_id: String,
         agent_version: String,
         capabilities: Vec<DeviceCapability>,
+        #[serde(default)]
         gateway_report: Option<GatewayCapabilityReport>,
+        #[serde(default)]
+        mesh_identity: Option<MeshIdentityReport>,
     },
     Heartbeat {
         device_id: String,
         agent_version: String,
         #[serde(default)]
         gateway_report: Option<GatewayCapabilityReport>,
+        #[serde(default)]
+        mesh_identity: Option<MeshIdentityReport>,
+    },
+    /// 组网入网结果；字段全部可选/可空以便服务端安全处理旧 Agent。
+    MeshEnrollmentAck {
+        auth_key_id: String,
+        success: bool,
+        #[serde(default)]
+        identity: Option<MeshIdentityReport>,
+        #[serde(default)]
+        error_message: Option<String>,
+    },
+    /// 逐路由真实应用结果，替代旧版只汇报整体状态的 ACK。
+    GatewayRouteApplyReport {
+        report: GatewayRouteApplyReport,
     },
     GatewayApplyAck {
         ack: GatewayApplyAck,
@@ -123,10 +205,18 @@ pub enum ServerControlMessage {
     HelloAccepted {
         server_time: i64,
         gateway_state: Option<GatewayDesiredState>,
+        #[serde(default)]
+        mesh_enrollment: Option<MeshEnrollmentOffer>,
+        #[serde(default)]
+        protocol_features: Vec<String>,
     },
     HeartbeatAck {
         server_time: i64,
         gateway_state: Option<GatewayDesiredState>,
+        #[serde(default)]
+        mesh_enrollment: Option<MeshEnrollmentOffer>,
+        #[serde(default)]
+        protocol_features: Vec<String>,
     },
     GatewayApplyAccepted {
         revision: i64,
@@ -211,6 +301,8 @@ mod tests {
         let response = ServerControlMessage::HelloAccepted {
             server_time: 123,
             gateway_state: Some(desired.clone()),
+            mesh_enrollment: None,
+            protocol_features: Vec::new(),
         };
         let encoded = serde_json::to_string(&response).expect("控制响应应能序列化");
         let decoded: ServerControlMessage =
@@ -253,6 +345,22 @@ mod tests {
                 gateway_report: None,
                 ..
             }
+        ));
+    }
+
+    #[test]
+    fn old_server_response_without_mesh_fields_remains_compatible() {
+        let response: ServerControlMessage = serde_json::from_str(
+            r#"{"type":"hello_accepted","server_time":1,"gateway_state":null}"#,
+        )
+        .expect("旧 Server 响应缺少组网字段时仍应可解析");
+        assert!(matches!(
+            response,
+            ServerControlMessage::HelloAccepted {
+                mesh_enrollment: None,
+                protocol_features,
+                ..
+            } if protocol_features.is_empty()
         ));
     }
 

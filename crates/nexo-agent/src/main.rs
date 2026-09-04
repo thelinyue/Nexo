@@ -22,12 +22,15 @@ use nexo_core::{
 use nexo_protocol::{
     AgentControlMessage, AgentEnrollmentPollRequest, AgentEnrollmentPollResponse,
     AgentEnrollmentRequest, AgentEnrollmentResponse, GatewayApplyAck, GatewayDesiredState,
+    GatewayRouteApplyReport, GatewayRouteApplyResult, MeshEnrollmentOffer, MeshIdentityReport,
     ServerControlMessage,
 };
 use rcgen::{CertificateParams, DistinguishedName, DnType, KeyPair};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader as AsyncBufReader};
 use tokio::net::TcpStream;
+use tokio::process::{Child, Command as TokioCommand};
+use tokio::sync::Mutex as AsyncMutex;
 use tokio_rustls::{rustls, TlsConnector};
 
 /// Agent 运行时所需的最小配置，避免把服务端地址写死在二进制中。
@@ -44,6 +47,10 @@ struct AgentRuntimeConfig {
     tailscale_apply_enabled: bool,
     /// Tailscale 可执行文件路径；容器内通常为 `tailscale`，也支持显式绝对路径。
     tailscale_bin: String,
+    /// tailscaled 可执行文件路径；二进制与 Agent 分开提供，便于升级和诊断。
+    tailscaled_bin: String,
+    /// 是否由 Agent 负责拉起 tailscaled。网关镜像默认开启，普通设备可关闭。
+    tailscaled_enabled: bool,
 }
 
 impl AgentRuntimeConfig {
@@ -78,6 +85,17 @@ impl AgentRuntimeConfig {
         if tailscale_bin.is_empty() {
             anyhow::bail!("NEXO_TAILSCALE_BIN 不能为空");
         }
+        let tailscaled_bin = env::var("NEXO_TAILSCALED_BIN")
+            .unwrap_or_else(|_| "tailscaled".to_owned())
+            .trim()
+            .to_owned();
+        if tailscaled_bin.is_empty() {
+            anyhow::bail!("NEXO_TAILSCALED_BIN 不能为空");
+        }
+        let tailscaled_enabled = env::var("NEXO_TAILSCALED_ENABLED")
+            .ok()
+            .map(|value| parse_bool_env(&value))
+            .unwrap_or(tailscale_apply_enabled);
         Ok(Self {
             server_url,
             control_addr,
@@ -90,6 +108,8 @@ impl AgentRuntimeConfig {
             state_dir,
             tailscale_apply_enabled,
             tailscale_bin,
+            tailscaled_bin,
+            tailscaled_enabled,
         })
     }
 }
@@ -102,6 +122,98 @@ fn parse_bool_env(value: &str) -> bool {
     )
 }
 
+/// 生成 Tailscale CLI 的本地控制 Socket 全局参数。
+///
+/// `TS_SOCKET` 不是所有版本的 CLI 都会读取；显式传入官方支持的
+/// `--socket=<path>`，确保 Agent 调用的是自己启动的 tailscaled。
+fn tailscale_socket_arg(socket: &std::path::Path) -> String {
+    format!("--socket={}", socket.display())
+}
+
+/// Agent 内置的 tailscaled 子进程管理器。
+///
+/// Tailscale Linux 二进制仍作为镜像中的独立文件提供，不编译进 Nexo Agent；
+/// 网关模式只授予 TUN 与 NET_ADMIN，关闭时不会触碰宿主机网络配置。
+struct TailscaleDaemon {
+    child: Arc<AsyncMutex<Option<Child>>>,
+    socket: PathBuf,
+}
+
+impl std::fmt::Debug for TailscaleDaemon {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("TailscaleDaemon")
+            .field("socket", &self.socket)
+            .finish_non_exhaustive()
+    }
+}
+
+impl TailscaleDaemon {
+    async fn start(config: &AgentRuntimeConfig) -> Result<Option<Self>> {
+        if !config.tailscaled_enabled {
+            return Ok(None);
+        }
+        fs::create_dir_all(&config.state_dir).with_context(|| {
+            format!(
+                "无法创建 Tailscale 状态目录：{}",
+                config.state_dir.display()
+            )
+        })?;
+        let socket = config.state_dir.join("tailscaled.sock");
+        let state = config.state_dir.join("tailscaled.state");
+        let child = TokioCommand::new(&config.tailscaled_bin)
+            .args([
+                "--state",
+                state.to_string_lossy().as_ref(),
+                "--socket",
+                socket.to_string_lossy().as_ref(),
+            ])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::inherit())
+            .stderr(std::process::Stdio::inherit())
+            .spawn()
+            .with_context(|| format!("无法启动 tailscaled：{}", config.tailscaled_bin))?;
+        let daemon = Self {
+            child: Arc::new(AsyncMutex::new(Some(child))),
+            socket,
+        };
+        if let Err(error) = daemon.wait_until_ready().await {
+            // tailscaled 已经启动但未能建立控制 Socket 时立即回收子进程，
+            // 避免 Agent 启动失败后留下孤儿守护进程占用 TUN/状态文件。
+            let _ = daemon.shutdown().await;
+            return Err(error);
+        }
+        tracing::info!(version = "1.102.3", "tailscaled 已启动");
+        Ok(Some(daemon))
+    }
+
+    /// 等待本地控制 Socket 出现，避免 Agent 在 tailscaled 尚未监听时立即执行
+    /// `tailscale up`，将一次正常启动误判为组网失败。
+    async fn wait_until_ready(&self) -> Result<()> {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline {
+            if self.socket.exists() {
+                return Ok(());
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        anyhow::bail!(
+            "tailscaled 未在 10 秒内创建控制 Socket：{}",
+            self.socket.display()
+        )
+    }
+
+    async fn shutdown(&self) -> Result<()> {
+        let mut child = self.child.lock().await;
+        if let Some(process) = child.as_mut() {
+            process.kill().await.context("无法停止 tailscaled")?;
+            let _ = process.wait().await;
+        }
+        *child = None;
+        Ok(())
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -109,8 +221,10 @@ async fn main() -> Result<()> {
         .init();
 
     let config = AgentRuntimeConfig::from_environment()?;
+    let tailscale_daemon = TailscaleDaemon::start(&config).await?;
     let key_pair = load_or_create_key(&config)?;
     let mut identity_ready = identity_is_persisted(&config)?;
+    let mut stop_after_enrollment = false;
     if identity_ready {
         tracing::info!("已加载本地设备身份，跳过一次性入网凭证提交");
     } else if let Some(token) = &config.enrollment_token {
@@ -130,25 +244,49 @@ async fn main() -> Result<()> {
                 tracing::info!("设备身份已保存，后续连接将使用 mTLS 客户端证书");
             } else {
                 tracing::info!("Agent 在领取设备身份前退出");
-                return Ok(());
+                stop_after_enrollment = true;
             }
         }
     } else {
         tracing::info!("未提供 NEXO_ENROLLMENT_TOKEN，Agent 等待后续配置");
     }
     tracing::info!("Nexo Agent 已启动，目标服务端：{}", config.server_url);
-    if identity_ready && config.control_addr.is_some() {
-        run_control_loop(&config, &key_pair).await?;
+    let run_result = if stop_after_enrollment {
+        Ok(())
+    } else if identity_ready && config.control_addr.is_some() {
+        run_control_loop(&config, &key_pair).await
     } else {
         if config.control_addr.is_none() {
             tracing::info!("未配置 NEXO_CONTROL_ADDR，暂不建立 mTLS 控制通道");
         }
-        tokio::signal::ctrl_c()
+        wait_for_shutdown_signal()
             .await
-            .context("Agent 等待退出信号失败")?;
-    }
+            .context("Agent 等待退出信号失败")
+    };
     tracing::info!("Nexo Agent 正在退出");
+    if let Some(daemon) = tailscale_daemon {
+        daemon.shutdown().await?;
+    }
+    run_result?;
     Ok(())
+}
+
+/// 同时响应本地 Ctrl-C 和 Docker 常用的 SIGTERM，确保退出前能回收
+/// Agent 自己启动的 tailscaled 子进程。
+async fn wait_for_shutdown_signal() -> Result<()> {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        let mut terminate = signal(SignalKind::terminate()).context("无法监听 SIGTERM")?;
+        tokio::select! {
+            result = tokio::signal::ctrl_c() => result.context("等待 Ctrl-C 失败"),
+            _ = terminate.recv() => Ok(()),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        tokio::signal::ctrl_c().await.context("等待 Ctrl-C 失败")
+    }
 }
 
 /// 判断 Agent 是否已经完成过身份领取，避免容器重启时重放已消费 token。
@@ -238,9 +376,14 @@ async fn wait_for_approval(
     token: &str,
     enrollment_id: &str,
 ) -> Result<Option<AgentEnrollmentPollResponse>> {
+    let shutdown = wait_for_shutdown_signal();
+    tokio::pin!(shutdown);
     loop {
         tokio::select! {
-            _ = tokio::signal::ctrl_c() => return Ok(None),
+            result = &mut shutdown => {
+                result?;
+                return Ok(None);
+            },
             _ = tokio::time::sleep(std::time::Duration::from_secs(3)) => {}
         }
         let endpoint = format!(
@@ -321,13 +464,18 @@ async fn run_control_loop(config: &AgentRuntimeConfig, key_pair: &KeyPair) -> Re
     if device_id.is_empty() {
         anyhow::bail!("Agent 设备 ID 为空");
     }
+    let shutdown = wait_for_shutdown_signal();
+    tokio::pin!(shutdown);
     loop {
         match control_session(config, key_pair, control_addr, &device_id).await {
             Ok(()) => tracing::warn!("Nexo mTLS 控制连接已断开，5 秒后重连"),
             Err(error) => tracing::warn!("Nexo mTLS 控制连接失败，5 秒后重试：{error:#}"),
         }
         tokio::select! {
-            _ = tokio::signal::ctrl_c() => return Ok(()),
+            result = &mut shutdown => {
+                result?;
+                return Ok(());
+            },
             _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {}
         }
     }
@@ -352,6 +500,7 @@ async fn control_session(
         .context("Nexo mTLS 握手失败")?;
     let mut reader = AsyncBufReader::new(tls_stream);
     let gateway_report = detect_gateway_capabilities();
+    let mesh_identity = query_optional_mesh_identity(config).await;
     write_agent_message(
         reader.get_mut(),
         &AgentControlMessage::Hello {
@@ -359,6 +508,7 @@ async fn control_session(
             agent_version: env!("CARGO_PKG_VERSION").to_owned(),
             capabilities: config.capabilities.clone(),
             gateway_report: Some(gateway_report.clone()),
+            mesh_identity,
         },
     )
     .await?;
@@ -371,14 +521,20 @@ async fn control_session(
     match response {
         ServerControlMessage::HelloAccepted {
             gateway_state: Some(gateway_state),
+            mesh_enrollment,
+            protocol_features,
             ..
         } => {
+            if let Some(offer) = mesh_enrollment {
+                apply_mesh_enrollment_offer(&mut reader, config, &offer).await?;
+            }
             let applier = TailscaleRouteApplier::from_config(config);
-            let ack = apply_gateway_desired_state_with_report(
+            let execution = apply_gateway_desired_state_with_execution(
                 &gateway_state,
                 &applier,
                 Some(&gateway_report),
             );
+            let GatewayApplyExecution { ack, local_applied } = execution;
             last_gateway_revision = Some(ack.revision);
             last_gateway_status = Some(ack.status);
             update_gateway_retry_state(
@@ -399,11 +555,22 @@ async fn control_session(
                 }
                 _ => anyhow::bail!("服务端返回了无效的网关应用确认响应"),
             }
+            if protocol_features
+                .iter()
+                .any(|feature| feature == "gateway_route_report")
+            {
+                send_gateway_route_report(&mut reader, &gateway_state, &ack, local_applied).await?;
+            }
         }
         ServerControlMessage::HelloAccepted {
             gateway_state: None,
+            mesh_enrollment,
             ..
-        } => {}
+        } => {
+            if let Some(offer) = mesh_enrollment {
+                apply_mesh_enrollment_offer(&mut reader, config, &offer).await?;
+            }
+        }
         ServerControlMessage::Error { message } => anyhow::bail!("服务端拒绝控制连接：{message}"),
         ServerControlMessage::HeartbeatAck { .. } => {
             anyhow::bail!("服务端在身份声明前返回了心跳确认")
@@ -415,18 +582,22 @@ async fn control_session(
     loop {
         tokio::time::sleep(std::time::Duration::from_secs(15)).await;
         let heartbeat_gateway_report = detect_gateway_capabilities();
+        let heartbeat_mesh_identity = query_optional_mesh_identity(config).await;
         write_agent_message(
             reader.get_mut(),
             &AgentControlMessage::Heartbeat {
                 device_id: device_id.to_owned(),
                 agent_version: env!("CARGO_PKG_VERSION").to_owned(),
                 gateway_report: Some(heartbeat_gateway_report.clone()),
+                mesh_identity: heartbeat_mesh_identity,
             },
         )
         .await?;
         match read_control_response(&mut reader).await? {
             ServerControlMessage::HeartbeatAck {
                 gateway_state: Some(gateway_state),
+                mesh_enrollment,
+                protocol_features,
                 ..
             } if should_apply_gateway_state(
                 &gateway_state,
@@ -436,12 +607,16 @@ async fn control_session(
                 last_gateway_report.as_ref() != Some(&heartbeat_gateway_report),
             ) =>
             {
+                if let Some(offer) = mesh_enrollment {
+                    apply_mesh_enrollment_offer(&mut reader, config, &offer).await?;
+                }
                 let applier = TailscaleRouteApplier::from_config(config);
-                let ack = apply_gateway_desired_state_with_report(
+                let execution = apply_gateway_desired_state_with_execution(
                     &gateway_state,
                     &applier,
                     Some(&heartbeat_gateway_report),
                 );
+                let GatewayApplyExecution { ack, local_applied } = execution;
                 last_gateway_revision = Some(ack.revision);
                 last_gateway_status = Some(ack.status);
                 update_gateway_retry_state(
@@ -462,15 +637,32 @@ async fn control_session(
                     }
                     _ => anyhow::bail!("服务端返回了无效的网关应用确认响应"),
                 }
+                if protocol_features
+                    .iter()
+                    .any(|feature| feature == "gateway_route_report")
+                {
+                    send_gateway_route_report(&mut reader, &gateway_state, &ack, local_applied)
+                        .await?;
+                }
             }
             ServerControlMessage::HeartbeatAck {
                 gateway_state: None,
+                mesh_enrollment,
                 ..
-            } => {}
+            } => {
+                if let Some(offer) = mesh_enrollment {
+                    apply_mesh_enrollment_offer(&mut reader, config, &offer).await?;
+                }
+            }
             ServerControlMessage::HeartbeatAck {
                 gateway_state: Some(_),
+                mesh_enrollment,
                 ..
-            } => {}
+            } => {
+                if let Some(offer) = mesh_enrollment {
+                    apply_mesh_enrollment_offer(&mut reader, config, &offer).await?;
+                }
+            }
             ServerControlMessage::Error { message } => anyhow::bail!("服务端拒绝心跳：{message}"),
             ServerControlMessage::HelloAccepted { .. } => {
                 anyhow::bail!("服务端重复返回身份确认")
@@ -481,6 +673,242 @@ async fn control_session(
         }
         last_gateway_report = Some(heartbeat_gateway_report);
     }
+}
+
+/// 在兼容旧版整体 ACK 后追加逐路由结果。旧 Server 会忽略未知消息前无法
+/// 返回确认，因此只在收到整体 ACK 后发送，确保 N-1 Agent/Server 仍可通信。
+async fn send_gateway_route_report(
+    reader: &mut AsyncBufReader<tokio_rustls::client::TlsStream<TcpStream>>,
+    state: &GatewayDesiredState,
+    ack: &GatewayApplyAck,
+    local_apply_succeeded: bool,
+) -> Result<()> {
+    let report = GatewayRouteApplyReport {
+        revision: state.revision,
+        routes: state
+            .routes
+            .iter()
+            .map(|route| GatewayRouteApplyResult {
+                network_id: route.network_id.clone(),
+                site_link_id: route.site_link_id.clone(),
+                prefix: route.prefix.clone(),
+                revision: route.revision,
+                enabled: route.enabled,
+                // 只有执行器明确报告本机命令成功，才允许报告本地成功；
+                // 演练模式、开关关闭或具体命令失败都必须保持 false。
+                local_applied: local_apply_succeeded
+                    && !matches!(ack.status, ApplyStatus::Failed | ApplyStatus::Retrying),
+                control_plane_status: None,
+                // Site Gateway 使用 --accept-routes=true 且关闭 SNAT；Tailscale
+                // set 成功后即可确认本地已接受远端路由，Headscale serving 仍由 Server
+                // 单独核对。
+                remote_applied: route.site_link_id.is_some()
+                    && local_apply_succeeded
+                    && !matches!(ack.status, ApplyStatus::Failed | ApplyStatus::Retrying),
+                error_message: ack.error_message.clone(),
+            })
+            .collect(),
+        mesh_identity: None,
+    };
+    write_agent_message(
+        reader.get_mut(),
+        &AgentControlMessage::GatewayRouteApplyReport { report },
+    )
+    .await?;
+    match read_control_response(reader).await? {
+        ServerControlMessage::GatewayApplyAccepted { revision } if revision == state.revision => {
+            Ok(())
+        }
+        ServerControlMessage::Error { message } => {
+            anyhow::bail!("服务端拒绝逐路由应用报告：{message}")
+        }
+        _ => anyhow::bail!("服务端返回了无效的逐路由应用确认响应"),
+    }
+}
+
+/// 使用一次性 Headscale Key 加入组网，并通过 mTLS 回报可交叉校验的运行身份。
+///
+/// Agent 不把 Headscale Node/API Key 暴露到 UI；Key 只存在本函数栈帧，发送确认
+/// 后立即释放。Node ID 由 Server 根据 Key ID 从 Headscale API 解析并绑定。
+async fn apply_mesh_enrollment_offer(
+    reader: &mut AsyncBufReader<tokio_rustls::client::TlsStream<TcpStream>>,
+    config: &AgentRuntimeConfig,
+    offer: &MeshEnrollmentOffer,
+) -> Result<()> {
+    let result = if !config.tailscale_apply_enabled {
+        Err(anyhow::anyhow!("Agent 未启用组网客户端执行"))
+    } else {
+        let socket = config.state_dir.join("tailscaled.sock");
+        let mut command = TokioCommand::new(&config.tailscale_bin);
+        command
+            .env("TS_SOCKET", &socket)
+            .arg(tailscale_socket_arg(&socket))
+            .args([
+                "up",
+                "--login-server",
+                offer.endpoint.as_str(),
+                "--auth-key",
+                offer.auth_key.as_str(),
+                "--hostname",
+                offer.hostname.as_str(),
+                "--accept-dns=true",
+                "--accept-routes=true",
+            ]);
+        if offer.reset {
+            // 身份恢复由管理员明确确认后才会设置 reset；首次入网不会触碰
+            // Agent 已保存的 Tailscale 状态，避免误删正常组网连接。
+            command.arg("--reset");
+        }
+        let output = command.output().await.with_context(|| {
+            format!("无法执行 Tailscale 组网加入命令：{}", config.tailscale_bin)
+        })?;
+        if output.status.success() {
+            Ok(query_tailscale_identity(config).await?)
+        } else {
+            let detail = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+            Err(anyhow::anyhow!(
+                "Tailscale 组网加入失败（退出码 {:?}）：{}",
+                output.status.code(),
+                if detail.is_empty() {
+                    "命令未返回错误详情"
+                } else {
+                    &detail
+                }
+            ))
+        }
+    };
+    let (success, identity, error_message) = match result {
+        Ok(identity) => (true, Some(identity), None),
+        Err(error) => {
+            let message = redact_enrollment_secret(&format!("{error:#}"), &offer.auth_key);
+            tracing::warn!("组网加入失败，服务端将按退避策略重试：{}", message);
+            (false, None, Some(message))
+        }
+    };
+    write_agent_message(
+        reader.get_mut(),
+        &AgentControlMessage::MeshEnrollmentAck {
+            auth_key_id: offer.auth_key_id.clone(),
+            success,
+            identity,
+            error_message,
+        },
+    )
+    .await?;
+    // Server 会返回一个普通 ACK；不把响应内容传给 UI，也不会记录密钥。
+    let _ = read_control_response(reader).await?;
+    Ok(())
+}
+
+/// 防止 Tailscale CLI 异常输出意外回显一次性入网密钥。
+fn redact_enrollment_secret(message: &str, auth_key: &str) -> String {
+    if auth_key.trim().is_empty() {
+        message.to_owned()
+    } else {
+        message.replace(auth_key, "<redacted>")
+    }
+}
+
+async fn query_tailscale_identity(config: &AgentRuntimeConfig) -> Result<MeshIdentityReport> {
+    let socket = config.state_dir.join("tailscaled.sock");
+    let ipv4 = query_tailscale_value(config, &socket, &["ip", "-4"]).await;
+    let ipv6 = query_tailscale_value(config, &socket, &["ip", "-6"]).await;
+    let status = TokioCommand::new(&config.tailscale_bin)
+        .env("TS_SOCKET", &socket)
+        .arg(tailscale_socket_arg(&socket))
+        .args(["status", "--json"])
+        .output()
+        .await;
+    let (node_id, hostname, online) = status
+        .ok()
+        .filter(|output| output.status.success())
+        .and_then(|output| serde_json::from_slice::<serde_json::Value>(&output.stdout).ok())
+        .map(|json| {
+            let self_node = json.get("Self").unwrap_or(&json);
+            let online = self_node
+                .get("Online")
+                .and_then(serde_json::Value::as_bool)
+                .or_else(|| {
+                    json.get("BackendState")
+                        .and_then(serde_json::Value::as_str)
+                        .map(|state| state.eq_ignore_ascii_case("running"))
+                })
+                .unwrap_or(false);
+            (
+                // Tailscale 的 `Self.NodeID` 与 Headscale REST 的数字 Node ID
+                // 对应；`Self.ID` 是稳定节点密钥标识，不能拿来冒充 Headscale ID。
+                self_node
+                    .get("NodeID")
+                    .and_then(parse_tailscale_node_id)
+                    .or_else(|| self_node.get("ID").and_then(parse_tailscale_node_id)),
+                self_node
+                    .get("HostName")
+                    .or_else(|| self_node.get("DNSName"))
+                    .and_then(|value| value.as_str())
+                    .map(str::to_owned),
+                online,
+            )
+        })
+        .unwrap_or((None, None, false));
+    Ok(MeshIdentityReport {
+        node_id,
+        hostname,
+        ipv4,
+        ipv6,
+        online,
+    })
+}
+
+/// 从 Tailscale 状态 JSON 提取可与 Headscale Node ID 交叉校验的字符串。
+/// 不接受空值或 `n...` 形式的稳定节点密钥标识，避免误报身份错配。
+fn parse_tailscale_node_id(value: &serde_json::Value) -> Option<String> {
+    if let Some(number) = value.as_u64() {
+        return Some(number.to_string());
+    }
+    value
+        .as_str()
+        .map(str::trim)
+        .filter(|value| {
+            !value.is_empty() && value.chars().all(|character| character.is_ascii_digit())
+        })
+        .map(str::to_owned)
+}
+
+/// 组网客户端暂时未启动时不发送“全为空”的报告，避免覆盖服务端保存的
+/// 最近一次有效地址；首次入网仍由 Mesh Enrollment ACK 完成身份绑定。
+async fn query_optional_mesh_identity(config: &AgentRuntimeConfig) -> Option<MeshIdentityReport> {
+    if !config.tailscale_apply_enabled || !config.tailscaled_enabled {
+        return None;
+    }
+    query_tailscale_identity(config)
+        .await
+        .ok()
+        .filter(|identity| {
+            identity.online
+                || identity.node_id.is_some()
+                || identity.ipv4.is_some()
+                || identity.ipv6.is_some()
+                || identity.hostname.is_some()
+        })
+}
+
+async fn query_tailscale_value(
+    config: &AgentRuntimeConfig,
+    socket: &std::path::Path,
+    args: &[&str],
+) -> Option<String> {
+    TokioCommand::new(&config.tailscale_bin)
+        .env("TS_SOCKET", socket)
+        .arg(tailscale_socket_arg(socket))
+        .args(args)
+        .output()
+        .await
+        .ok()
+        .filter(|output| output.status.success())
+        .and_then(|output| {
+            let value = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+            (!value.is_empty()).then_some(value)
+        })
 }
 
 /// 判断本次心跳是否需要重新应用网关状态。
@@ -557,7 +985,8 @@ fn retry_jitter_seconds(attempt: u32) -> u64 {
 /// 计划和执行分离，便于测试，也避免后续把 Tailscale CLI 细节泄漏到
 /// 控制协议。执行成功只代表本机命令被接受，不代表 Headscale 已批准路由。
 trait GatewayRouteApplier {
-    fn apply(&self, plan: &TailscaleRoutePlan) -> Result<()>;
+    /// 返回是否确实执行了本机命令；演练/未启用模式必须返回 false。
+    fn apply(&self, plan: &TailscaleRoutePlan) -> Result<bool>;
 }
 
 /// Tailscale CLI 执行器；只有显式设置 NEXO_TAILSCALE_APPLY=true 才会运行命令。
@@ -566,6 +995,7 @@ trait GatewayRouteApplier {
 struct TailscaleRouteApplier {
     enabled: bool,
     binary: String,
+    socket: Option<PathBuf>,
 }
 
 impl TailscaleRouteApplier {
@@ -574,17 +1004,26 @@ impl TailscaleRouteApplier {
         Self {
             enabled: config.tailscale_apply_enabled,
             binary: config.tailscale_bin.clone(),
+            socket: if config.tailscaled_enabled {
+                Some(config.state_dir.join("tailscaled.sock"))
+            } else {
+                None
+            },
         }
     }
 }
 
 impl GatewayRouteApplier for TailscaleRouteApplier {
-    fn apply(&self, plan: &TailscaleRoutePlan) -> Result<()> {
+    fn apply(&self, plan: &TailscaleRoutePlan) -> Result<bool> {
         if !self.enabled {
             tracing::info!("Tailscale 命令执行未启用，仅生成网关应用计划");
-            return Ok(());
+            return Ok(false);
         }
         let mut command = Command::new(&self.binary);
+        if let Some(socket) = &self.socket {
+            command.env("TS_SOCKET", socket);
+            command.arg(tailscale_socket_arg(socket));
+        }
         command.args(tailscale_command_args(plan));
         let output = command
             .output()
@@ -604,7 +1043,7 @@ impl GatewayRouteApplier for TailscaleRouteApplier {
             );
         }
         tracing::info!("Tailscale 网关参数已应用，等待 Headscale 路由批准");
-        Ok(())
+        Ok(true)
     }
 }
 
@@ -627,8 +1066,8 @@ struct NoopGatewayRouteApplier;
 
 #[cfg(test)]
 impl GatewayRouteApplier for NoopGatewayRouteApplier {
-    fn apply(&self, _plan: &TailscaleRoutePlan) -> Result<()> {
-        Ok(())
+    fn apply(&self, _plan: &TailscaleRoutePlan) -> Result<bool> {
+        Ok(true)
     }
 }
 
@@ -645,11 +1084,29 @@ fn apply_gateway_desired_state(
 ///
 /// 执行器成功后，启用路由仍返回 `checking`：Headscale 的批准状态尚未进入
 /// 本地 ACK 链路。全部关闭时返回 `disabled`，让服务端清空 Applied State。
+#[cfg(test)]
 fn apply_gateway_desired_state_with_report(
     state: &GatewayDesiredState,
     applier: &dyn GatewayRouteApplier,
     gateway_report: Option<&GatewayCapabilityReport>,
 ) -> GatewayApplyAck {
+    apply_gateway_desired_state_with_execution(state, applier, gateway_report).ack
+}
+
+/// 网关应用的内部结果；除了兼容旧版整体 ACK，还保留执行器的真实成功标志。
+///
+/// 这个标志不能从 `tailscale_apply_enabled` 推断：开关开启并不代表命令已经
+/// 成功执行，只有执行器返回 `Ok(true)` 时才允许后续逐路由报告触发 Headscale。
+struct GatewayApplyExecution {
+    ack: GatewayApplyAck,
+    local_applied: bool,
+}
+
+fn apply_gateway_desired_state_with_execution(
+    state: &GatewayDesiredState,
+    applier: &dyn GatewayRouteApplier,
+    gateway_report: Option<&GatewayCapabilityReport>,
+) -> GatewayApplyExecution {
     let network_ids: Vec<String> = state
         .routes
         .iter()
@@ -660,50 +1117,65 @@ fn apply_gateway_desired_state_with_report(
         Err(error) => {
             let error_message = format!("服务端下发的网关网络无效：{error}");
             tracing::error!("{}", error_message);
-            return GatewayApplyAck {
-                revision: state.revision,
-                status: ApplyStatus::Failed,
-                network_ids,
-                applied_network_ids: Vec::new(),
-                error_message: Some(error_message),
+            return GatewayApplyExecution {
+                ack: GatewayApplyAck {
+                    revision: state.revision,
+                    status: ApplyStatus::Failed,
+                    network_ids,
+                    applied_network_ids: Vec::new(),
+                    error_message: Some(error_message),
+                },
+                local_applied: false,
             };
         }
     };
     if let Some(report) = gateway_report {
         if let Some(error_message) = gateway_capability_error(state, report) {
             tracing::error!("{}", error_message);
-            return GatewayApplyAck {
-                revision: state.revision,
-                status: ApplyStatus::Failed,
-                network_ids,
-                applied_network_ids: Vec::new(),
-                error_message: Some(error_message),
+            return GatewayApplyExecution {
+                ack: GatewayApplyAck {
+                    revision: state.revision,
+                    status: ApplyStatus::Failed,
+                    network_ids,
+                    applied_network_ids: Vec::new(),
+                    error_message: Some(error_message),
+                },
+                local_applied: false,
             };
         }
     }
-    if let Err(error) = applier.apply(&plan) {
-        let error_message = format!("Tailscale 网关应用失败：{error:#}");
-        tracing::error!("{}", error_message);
-        return GatewayApplyAck {
-            revision: state.revision,
-            status: ApplyStatus::Retrying,
-            network_ids,
-            applied_network_ids: Vec::new(),
-            error_message: Some(error_message),
-        };
-    }
+    let local_applied = match applier.apply(&plan) {
+        Ok(applied) => applied,
+        Err(error) => {
+            let error_message = format!("Tailscale 网关应用失败：{error:#}");
+            tracing::error!("{}", error_message);
+            return GatewayApplyExecution {
+                ack: GatewayApplyAck {
+                    revision: state.revision,
+                    status: ApplyStatus::Retrying,
+                    network_ids,
+                    applied_network_ids: Vec::new(),
+                    error_message: Some(error_message),
+                },
+                local_applied: false,
+            };
+        }
+    };
     if !state.routes.iter().any(|route| route.enabled) {
         tracing::info!(
             revision = state.revision,
             route_count = state.routes.len(),
             "已收到网关路由撤销配置"
         );
-        return GatewayApplyAck {
-            revision: state.revision,
-            status: ApplyStatus::Disabled,
-            network_ids,
-            applied_network_ids: Vec::new(),
-            error_message: None,
+        return GatewayApplyExecution {
+            ack: GatewayApplyAck {
+                revision: state.revision,
+                status: ApplyStatus::Disabled,
+                network_ids,
+                applied_network_ids: Vec::new(),
+                error_message: None,
+            },
+            local_applied,
         };
     }
     tracing::info!(
@@ -714,12 +1186,16 @@ fn apply_gateway_desired_state_with_report(
         snat_subnet_routes = ?plan.snat_subnet_routes,
         "网关 Tailscale 参数已应用，等待 Headscale 路由批准"
     );
-    GatewayApplyAck {
-        revision: state.revision,
-        status: ApplyStatus::Checking,
-        network_ids,
-        applied_network_ids: Vec::new(),
-        error_message: None,
+    GatewayApplyExecution {
+        ack: GatewayApplyAck {
+            revision: state.revision,
+            status: ApplyStatus::Checking,
+            network_ids,
+            // 旧 ACK 不承载 Headscale/逐路由状态，不能让 Server 进入 READY。
+            applied_network_ids: Vec::new(),
+            error_message: None,
+        },
+        local_applied,
     }
 }
 
@@ -1137,6 +1613,7 @@ mod tests {
         let applier = TailscaleRouteApplier {
             enabled: false,
             binary: "this-command-should-not-run".to_owned(),
+            socket: None,
         };
         let plan = TailscaleRoutePlan {
             advertise_routes: vec!["192.168.10.0/24".to_owned()],
@@ -1158,6 +1635,13 @@ mod tests {
     }
 
     #[test]
+    fn enrollment_error_redacts_one_time_secret() {
+        let message =
+            redact_enrollment_secret("tailscale failed for hskey-secret-123", "hskey-secret-123");
+        assert_eq!(message, "tailscale failed for <redacted>");
+    }
+
+    #[test]
     fn tailscale_command_args_are_limited_to_gateway_flags() {
         let plan = TailscaleRoutePlan {
             advertise_routes: vec!["192.168.10.0/24".to_owned(), "192.168.30.0/24".to_owned()],
@@ -1176,6 +1660,14 @@ mod tests {
     }
 
     #[test]
+    fn tailscale_socket_arg_uses_supported_global_flag() {
+        assert_eq!(
+            tailscale_socket_arg(std::path::Path::new("/data/nexo-agent/tailscaled.sock")),
+            "--socket=/data/nexo-agent/tailscaled.sock"
+        );
+    }
+
+    #[test]
     fn tailscale_executor_failure_is_reported_as_retrying_ack() {
         let state = GatewayDesiredState {
             revision: 7,
@@ -1190,6 +1682,7 @@ mod tests {
         let applier = TailscaleRouteApplier {
             enabled: true,
             binary: "__nexo_missing_tailscale_binary__".to_owned(),
+            socket: None,
         };
         let ack = apply_gateway_desired_state(&state, &applier);
         assert_eq!(ack.status, ApplyStatus::Retrying);

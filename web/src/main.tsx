@@ -38,6 +38,26 @@ type Device = {
   agent_version: string | null;
   status: string;
   gateway_report: GatewayReport | null;
+  mesh_status?: "joining" | "connected" | "mesh_offline" | "needs_recovery" | "failed" | "disabled" | "not_joined";
+  mesh_address?: string | null;
+};
+
+type Enrollment = {
+  enrollment_id: string;
+  status: "pending" | "awaiting_approval" | "approved" | "consumed" | "expired" | "revoked";
+  tenant_id: string;
+  site_id: string | null;
+  device_name: string | null;
+  os: string | null;
+  architecture: string | null;
+  agent_version: string | null;
+  expires_at: number;
+  device_id: string | null;
+};
+
+type MeshStatus = {
+  status: "normal" | "starting" | "abnormal" | "version_incompatible";
+  message: string;
 };
 
 type StaticRouteGuide = {
@@ -47,6 +67,7 @@ type StaticRouteGuide = {
   destination_site_name: string;
   destination_prefix: string;
   next_hop: string | null;
+  router_confirmed?: boolean;
 };
 
 type SiteLink = {
@@ -59,6 +80,9 @@ type SiteLink = {
   enabled: boolean;
   apply_status: "disabled" | "checking" | "applying" | "ready" | "retrying" | "failed";
   apply_error: string | null;
+  health_status: "ready" | "degraded" | "failed" | "disabled";
+  health_error: string | null;
+  route_confirmations?: { site_id: string; confirmed_at: string }[];
 };
 
 type SiteNetwork = {
@@ -76,6 +100,8 @@ type SiteNetwork = {
   enabled: boolean;
   apply_status: SiteLink["apply_status"];
   apply_error: string | null;
+  health_status: SiteLink["health_status"];
+  health_error: string | null;
 };
 
 const emptyOverview: Overview = {
@@ -91,6 +117,8 @@ function App() {
   const [sites, setSites] = useState<Site[]>([]);
   const [siteNetworks, setSiteNetworks] = useState<SiteNetwork[]>([]);
   const [siteLinks, setSiteLinks] = useState<SiteLink[]>([]);
+  const [enrollments, setEnrollments] = useState<Enrollment[]>([]);
+  const [meshStatus, setMeshStatus] = useState<MeshStatus | null>(null);
   const [token, setToken] = useState(() => sessionStorage.getItem("nexo-admin-token") ?? "");
   const [activeToken, setActiveToken] = useState(() => sessionStorage.getItem("nexo-admin-token") ?? "");
   const [loading, setLoading] = useState(false);
@@ -127,6 +155,16 @@ function App() {
         throw new Error(body?.error ?? "暂时无法读取站点");
       }
       setSites((await sitesResponse.json()) as Site[]);
+      const [enrollmentResponse, meshResponse] = await Promise.all([
+        fetch("/api/v1/enrollments", { headers }),
+        fetch("/api/v1/mesh/status", { headers }),
+      ]);
+      if (enrollmentResponse.ok) {
+        setEnrollments((await enrollmentResponse.json()) as Enrollment[]);
+      }
+      if (meshResponse.ok) {
+        setMeshStatus((await meshResponse.json()) as MeshStatus);
+      }
       const [siteNetworksResponse, siteLinksResponse] = await Promise.all([
         fetch("/api/v1/site-networks", { headers }),
         fetch("/api/v1/site-links", { headers }),
@@ -152,6 +190,53 @@ function App() {
       setLoading(false);
     }
   }, [activeToken]);
+
+  const approveEnrollment = useCallback(async (enrollment: Enrollment) => {
+    setError(null);
+    try {
+      const response = await fetch(`/api/v1/enrollments/${encodeURIComponent(enrollment.enrollment_id)}/approve`, {
+        method: "POST",
+        headers: activeToken.trim() ? { "x-nexo-admin-token": activeToken.trim() } : {},
+      });
+      const body: unknown = await response.json().catch(() => null);
+      if (!response.ok) {
+        throw new Error(readApiError(body, "暂时无法批准设备"));
+      }
+      await refreshOverview();
+    } catch (requestError) {
+      setError(requestError instanceof Error ? requestError.message : "暂时无法批准设备");
+    }
+  }, [activeToken, refreshOverview]);
+
+  const recheckSiteLink = useCallback(async (link: SiteLink) => {
+    setError(null);
+    try {
+      const response = await fetch(`/api/v1/site-links/${encodeURIComponent(link.id)}/recheck`, {
+        method: "POST",
+        headers: activeToken.trim() ? { "x-nexo-admin-token": activeToken.trim() } : {},
+      });
+      const body: unknown = await response.json().catch(() => null);
+      if (!response.ok) throw new Error(readApiError(body, "暂时无法重新检测站点互联"));
+      await refreshOverview();
+    } catch (requestError) {
+      setError(requestError instanceof Error ? requestError.message : "暂时无法重新检测站点互联");
+    }
+  }, [activeToken, refreshOverview]);
+
+  const confirmRoute = useCallback(async (link: SiteLink, siteId: string) => {
+    setError(null);
+    try {
+      const response = await fetch(`/api/v1/site-links/${encodeURIComponent(link.id)}/router-confirmations/${encodeURIComponent(siteId)}`, {
+        method: "POST",
+        headers: activeToken.trim() ? { "x-nexo-admin-token": activeToken.trim() } : {},
+      });
+      const body: unknown = await response.json().catch(() => null);
+      if (!response.ok) throw new Error(readApiError(body, "暂时无法保存路由确认"));
+      await refreshOverview();
+    } catch (requestError) {
+      setError(requestError instanceof Error ? requestError.message : "暂时无法保存路由确认");
+    }
+  }, [activeToken, refreshOverview]);
 
   /** 共享网络开关复用服务端 Desired State，避免 UI 本地状态与 Agent 脱节。 */
   const toggleSiteNetwork = useCallback(async (network: SiteNetwork) => {
@@ -240,6 +325,7 @@ function App() {
         </div>
         <nav aria-label="主导航">
           <a className="nav-item active" href="#overview">概览</a>
+          <a className="nav-item" href="#enrollments">入网请求</a>
           <a className="nav-item" href="#devices">设备</a>
           <a className="nav-item" href="#shared-networks">共享网络</a>
           <a className="nav-item" href="#networks">组网</a>
@@ -265,6 +351,35 @@ function App() {
           <Metric label="运行中的隧道" value={overview.running_tunnels} hint="当前已生效" />
           <Metric label="异地组网设备" value={overview.mesh_devices} hint="正在参与组网" />
           <Metric label="当前连接" value={overview.current_connections} hint="最近在线的设备" />
+        </section>
+
+        <section className="panel enrollment-panel" id="enrollments">
+          <div className="panel-heading">
+            <div>
+              <p className="eyebrow">添加设备</p>
+              <h2>批准后自动加入组网</h2>
+            </div>
+            <span className={`status-pill ${meshStatus?.status === "normal" ? "ready" : ""}`}><i />{meshStatus?.message ?? "组网状态检查中"}</span>
+          </div>
+          {enrollments.filter((item) => item.status === "awaiting_approval").length === 0 ? (
+            <div className="empty-state compact-empty">
+              <div className="empty-icon">＋</div>
+              <strong>没有待批准设备</strong>
+              <span>Agent 提交入网请求后，会在这里等待你的确认。</span>
+            </div>
+          ) : (
+            <div className="enrollment-list">
+              {enrollments.filter((item) => item.status === "awaiting_approval").map((item) => (
+                <div className="enrollment-row" key={item.enrollment_id}>
+                  <div>
+                    <strong>{item.device_name ?? "未命名设备"}</strong>
+                    <span>{[item.os, item.architecture, item.agent_version].filter(Boolean).join(" · ") || "设备信息待上报"}</span>
+                  </div>
+                  <button className="primary-button" type="button" onClick={() => void approveEnrollment(item)}>批准设备</button>
+                </div>
+              ))}
+            </div>
+          )}
         </section>
 
         {error && (
@@ -328,6 +443,8 @@ function App() {
                     link={link}
                     actionPending={actionLinkId === link.id}
                     onToggle={() => void toggleSiteLink(link)}
+                    onRecheck={() => void recheckSiteLink(link)}
+                    onConfirmRoute={(siteId) => void confirmRoute(link, siteId)}
                   />
                 ))}
               </div>
@@ -417,6 +534,8 @@ function DeviceRow({ device }: { device: Device }) {
       </div>
       <div className="device-capabilities">
         <span className={`device-status ${online ? "online" : "offline"}`}><i />{online ? "在线" : "离线"}</span>
+        <span className={`capability ${device.mesh_status === "connected" ? "ready" : ""}`}>异地组网：{meshStatusLabel(device.mesh_status)}</span>
+        {device.mesh_address && <span className="capability">{device.mesh_address}</span>}
         {device.gateway_report && (
           <span className={`capability ${subnetReady ? "ready" : ""}`}>共享网络 {subnetReady ? "可用" : "待检查"}</span>
         )}
@@ -745,12 +864,17 @@ function SiteLinkCard({
   link,
   actionPending,
   onToggle,
+  onRecheck,
+  onConfirmRoute,
 }: {
   link: SiteLink;
   actionPending: boolean;
   onToggle: () => void;
+  onRecheck: () => void;
+  onConfirmRoute: (siteId: string) => void;
 }) {
   const status = siteLinkStatus(link.apply_status);
+  const health = gatewayHealthStatus(link.health_status);
   return (
     <div className="site-link-card">
       <div className="site-link-heading">
@@ -761,6 +885,7 @@ function SiteLinkCard({
         </div>
         <div className="site-link-actions">
           <span className={`link-status ${status.kind}`}><i />{status.label}</span>
+          <span className={`link-status ${health.kind}`}><i />{health.label}</span>
           <button
             className="link-action"
             type="button"
@@ -770,9 +895,11 @@ function SiteLinkCard({
           >
             {actionPending ? "处理中…" : link.enabled ? "关闭" : "启用"}
           </button>
+          <button className="link-action" type="button" onClick={onRecheck} disabled={actionPending}>重新检测</button>
         </div>
       </div>
       {link.apply_error && <p className="link-error">{link.apply_error}</p>}
+      {link.health_error && link.health_error !== link.apply_error && <p className="link-health-error">健康提示：{link.health_error}</p>}
       <div className="route-guide-list">
         {link.static_routes.map((route) => (
           <div className="route-guide" key={`${route.router_site_id}-${route.destination_site_id}`}>
@@ -780,6 +907,13 @@ function SiteLinkCard({
             <span className="route-arrow">→</span>
             <span className="route-destination">{route.destination_site_name} · {route.destination_prefix}</span>
             <span className="route-via">下一跳：{route.next_hop ?? "等待设备地址"}</span>
+            {route.router_confirmed ? (
+              <span className="route-confirmed">已确认</span>
+            ) : (
+              <button className="route-confirm-button" type="button" onClick={() => onConfirmRoute(route.router_site_id)}>
+                我已完成配置
+              </button>
+            )}
           </div>
         ))}
       </div>
@@ -798,6 +932,7 @@ function SiteNetworkRow({
   onToggle: () => void;
 }) {
   const status = siteLinkStatus(network.apply_status);
+  const health = gatewayHealthStatus(network.health_status);
   return (
     <div className="network-row">
       <div className="network-identity">
@@ -811,7 +946,7 @@ function SiteNetworkRow({
           {network.applied_prefix
             ? `已确认生效：${network.applied_prefix}`
             : network.enabled
-              ? "已确认生效：等待设备 ACK"
+              ? "实际状态：等待设备确认"
               : "已确认生效：未共享"}
         </small>
         <small>下一跳：{network.gateway_address ?? "等待设备地址"}</small>
@@ -819,6 +954,7 @@ function SiteNetworkRow({
       {network.apply_error && <p className="network-error">{network.apply_error}</p>}
       <div className="network-actions">
         <span className={`link-status ${status.kind}`}><i />{status.label}</span>
+        <span className={`link-status ${health.kind}`}><i />{health.label}</span>
         <button
           className="link-action"
           type="button"
@@ -829,8 +965,44 @@ function SiteNetworkRow({
           {actionPending ? "处理中…" : network.enabled ? "停止共享" : "重新启用"}
         </button>
       </div>
+      {network.health_error && network.health_error !== network.apply_error && <p className="network-health-error">健康提示：{network.health_error}</p>}
     </div>
   );
+}
+
+/** 网关健康状态翻译；与 Desired / Applied 状态并列，避免把设备在线当成路由可用。 */
+function gatewayHealthStatus(status: SiteLink["health_status"]): { label: string; kind: string } {
+  switch (status) {
+    case "ready":
+      return { label: "网关正常", kind: "ready" };
+    case "degraded":
+      return { label: "状态受限", kind: "working" };
+    case "failed":
+      return { label: "网关异常", kind: "failed" };
+    case "disabled":
+      return { label: "未启用", kind: "disabled" };
+    default:
+      return { label: "状态检查中", kind: "working" };
+  }
+}
+
+function meshStatusLabel(status: Device["mesh_status"]): string {
+  switch (status) {
+    case "joining":
+      return "加入中";
+    case "connected":
+      return "已连接";
+    case "mesh_offline":
+      return "暂时离线";
+    case "needs_recovery":
+      return "需要恢复";
+    case "failed":
+      return "异常";
+    case "disabled":
+      return "未启用";
+    default:
+      return "未加入";
+  }
 }
 
 function siteLinkStatus(status: SiteLink["apply_status"]): { label: string; kind: string } {

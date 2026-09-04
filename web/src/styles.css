@@ -49,6 +49,13 @@ button:disabled { cursor: not-allowed; opacity: .55; }
 .notice { display: flex; gap: 11px; margin: 20px 0 0; padding: 13px 15px; border-radius: 10px; font-size: 13px; }
 .notice.error { border: 1px solid #713e4c; background: #291a24; color: #f5b6c4; }
 .notice span { color: #c68d9d; }
+.enrollment-panel { margin-top: 13px; min-height: 0; }
+.enrollment-list { margin-top: 18px; }
+.enrollment-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 12px 0; border-top: 1px solid #202c3d; }
+.enrollment-row:first-child { border-top: 0; }
+.enrollment-row strong, .enrollment-row span { display: block; }
+.enrollment-row strong { color: #e2eaf4; font-size: 13px; }
+.enrollment-row span { margin-top: 4px; color: #738196; font-size: 11px; }
 .workspace-grid { display: grid; grid-template-columns: 1.25fr .75fr; gap: 13px; margin-top: 13px; }
 .panel { min-height: 275px; padding: 24px; }
 .panel-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 14px; }
@@ -97,7 +104,8 @@ button:disabled { cursor: not-allowed; opacity: .55; }
 .link-status.failed { color: #e2a6b5; background: #33202a; }
 .link-status.failed i { background: #e2839b; }
 .link-status.disabled { color: #8a96a8; background: #242d3a; }
-.link-error { margin: 8px 0 0; color: #e2a6b5; font-size: 11px; }
+.link-error, .link-health-error { margin: 8px 0 0; color: #e2a6b5; font-size: 11px; }
+.link-health-error { color: #d6c187; }
 .link-action { border: 1px solid #2d3a4d; border-radius: 7px; background: transparent; color: #9eacbd; padding: 4px 8px; font-size: 10px; }
 .link-action:hover:not(:disabled) { border-color: #6bb895; color: #b9f0d2; background: #1a2e2c; }
 .link-action:active:not(:disabled) { transform: scale(.97); transition: transform 100ms ease-out; }
@@ -108,6 +116,9 @@ button:disabled { cursor: not-allowed; opacity: .55; }
 .route-arrow { color: #6d7d91; }
 .route-destination { color: #c8d4e2; font-family: ui-monospace, SFMono-Regular, Consolas, monospace; }
 .route-via { grid-column: 1 / -1; margin-top: 4px; color: #718096; }
+.route-confirmed { justify-self: end; color: #8ed5b0; font-size: 10px; }
+.route-confirm-button { justify-self: end; border: 1px solid #2d3a4d; border-radius: 7px; background: transparent; color: #9eacbd; padding: 4px 8px; font-size: 10px; }
+.route-confirm-button:hover { border-color: #6bb895; color: #b9f0d2; background: #1a2e2c; }
 .shared-network-panel { margin-top: 13px; }
 .network-list { margin-top: 19px; }
 .network-row { display: grid; grid-template-columns: minmax(150px, 1fr) minmax(210px, 1.2fr) auto; align-items: center; gap: 14px; padding: 14px 0; border-top: 1px solid #202c3d; }
@@ -121,7 +132,8 @@ button:disabled { cursor: not-allowed; opacity: .55; }
 .network-prefix small { color: #718096; font-size: 10px; }
 .network-prefix .network-applied { flex-basis: 100%; }
 .network-actions { display: inline-flex; align-items: center; justify-content: flex-end; gap: 7px; }
-.network-error { grid-column: 1 / -1; margin: -4px 0 0; color: #e2a6b5; font-size: 11px; }
+.network-error, .network-health-error { grid-column: 1 / -1; margin: -4px 0 0; color: #e2a6b5; font-size: 11px; }
+.network-health-error { color: #d6c187; }
 .inline-form { display: grid; gap: 13px; margin: 19px 0 7px; padding: 15px; border: 1px solid #2b394c; border-radius: 11px; background: rgba(15, 22, 33, .66); }
 .form-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px; }
 .form-grid-link { grid-template-columns: repeat(4, minmax(0, 1fr)); }
@@ -192,8 +204,14 @@ button:disabled { cursor: not-allowed; opacity: .55; }
   .link-status.failed { color: #9b465d; background: #fae7ed; }
   .link-status.disabled { color: #6d7889; background: #edf0f2; }
   .link-error { color: #9b465d; }
+  .link-health-error { color: #806922; }
   .link-action { border-color: #c6d2d7; color: #536277; }
   .link-action:hover:not(:disabled) { border-color: #70b493; color: #286c4d; background: #eef8f2; }
+  .enrollment-row { border-color: #e3e9eb; }
+  .enrollment-row strong { color: #172033; }
+  .enrollment-row span { color: #718095; }
+  .route-confirm-button { border-color: #c6d2d7; color: #536277; }
+  .route-confirm-button:hover { border-color: #70b493; color: #286c4d; background: #eef8f2; }
   .route-guide { background: rgba(232, 243, 241, .74); }
   .route-site, .route-destination { color: #344358; }
   .route-arrow, .route-via { color: #718095; }
@@ -202,6 +220,7 @@ button:disabled { cursor: not-allowed; opacity: .55; }
   .network-identity span, .network-prefix span, .network-prefix small { color: #718095; }
   .network-prefix code { color: #344358; }
   .network-error { color: #9b465d; }
+  .network-health-error { color: #806922; }
   .inline-form { border-color: #d8e1e3; background: rgba(242, 248, 247, .82); }
   .inline-form label > span { color: #718095; }
   .inline-form input, .inline-form select { border-color: #c6d2d7; background: rgba(255, 255, 255, .82); color: #172033; }
