@@ -73,6 +73,15 @@ mod tests {
     }
 
     #[test]
+    fn rejects_ipv6_default_route() {
+        let network = IpNet::from_str("::/0").unwrap();
+        assert_eq!(
+            validate_published_network(network),
+            Err(NetworkError::DefaultRoute)
+        );
+    }
+
+    #[test]
     fn accepts_private_lan() {
         let network = IpNet::from_str("192.168.10.0/24").unwrap();
         assert!(validate_published_network(network).is_ok());

@@ -206,8 +206,25 @@ impl TailscaleDaemon {
     async fn shutdown(&self) -> Result<()> {
         let mut child = self.child.lock().await;
         if let Some(process) = child.as_mut() {
+            // `Child::kill` 在 Unix 上发送 SIGKILL，可能来不及把节点密钥和
+            // 网络状态完整写回持久卷。优先发送 SIGTERM 让 tailscaled 自己
+            // 收尾；只有它在短时间内没有退出时才使用强制终止兜底。
+            #[cfg(unix)]
+            if let Some(pid) = process.id() {
+                let result = unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
+                if result != 0 {
+                    tracing::warn!(pid, "无法向 tailscaled 发送优雅退出信号，将等待其自行退出");
+                }
+            }
+            #[cfg(not(unix))]
             process.kill().await.context("无法停止 tailscaled")?;
-            let _ = process.wait().await;
+
+            let exited = tokio::time::timeout(Duration::from_secs(5), process.wait()).await;
+            if !matches!(exited, Ok(Ok(_))) {
+                tracing::warn!("tailscaled 未在 5 秒内退出，将强制终止");
+                process.kill().await.context("无法强制停止 tailscaled")?;
+                process.wait().await.context("无法等待 tailscaled 退出")?;
+            }
         }
         *child = None;
         Ok(())
@@ -863,13 +880,15 @@ async fn query_tailscale_identity(config: &AgentRuntimeConfig) -> Result<MeshIde
 /// 不接受空值或 `n...` 形式的稳定节点密钥标识，避免误报身份错配。
 fn parse_tailscale_node_id(value: &serde_json::Value) -> Option<String> {
     if let Some(number) = value.as_u64() {
-        return Some(number.to_string());
+        return (number > 0).then(|| number.to_string());
     }
     value
         .as_str()
         .map(str::trim)
         .filter(|value| {
-            !value.is_empty() && value.chars().all(|character| character.is_ascii_digit())
+            !value.is_empty()
+                && value != &"0"
+                && value.chars().all(|character| character.is_ascii_digit())
         })
         .map(str::to_owned)
 }
@@ -1436,7 +1455,9 @@ fn detect_local_networks() -> Vec<DetectedLocalNetwork> {
                 IfAddr::V4(address) => (address.ip.into(), address.netmask.into()),
                 IfAddr::V6(address) => (address.ip.into(), address.netmask.into()),
             };
-            let prefix = IpNet::with_netmask(ip, netmask).ok()?;
+            // 能力报告中的 prefix 必须是规范网络地址，而不是带主机位的
+            // `192.168.10.2/24`；否则服务端无法和用户选择的 CIDR 精确匹配。
+            let prefix = IpNet::with_netmask(ip, netmask).ok()?.trunc();
             if validate_published_network(prefix).is_err() {
                 return None;
             }
@@ -1632,6 +1653,16 @@ mod tests {
         assert!(parse_bool_env("1"));
         assert!(!parse_bool_env("false"));
         assert!(!parse_bool_env("enabled"));
+    }
+
+    #[test]
+    fn transient_zero_tailscale_node_id_is_not_reported_as_identity() {
+        assert_eq!(parse_tailscale_node_id(&serde_json::json!(0)), None);
+        assert_eq!(parse_tailscale_node_id(&serde_json::json!("0")), None);
+        assert_eq!(
+            parse_tailscale_node_id(&serde_json::json!(2)),
+            Some("2".to_owned())
+        );
     }
 
     #[test]

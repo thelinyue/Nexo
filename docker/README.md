@@ -20,7 +20,8 @@ Agent Gateway 只需要：
 3. 验证双向大文件 TCP/HTTPS 和真实源 IP；
 4. 关闭 Link、依次重启 Agent/Server，检查 Mesh 保持在线且路由自动收敛。
 
-在 Linux Docker 主机上可直接执行完整验收（需要 `docker`、`curl`、`jq`）：
+在原生 Linux 或具备 Docker Engine 的 WSL2 环境中可直接执行完整验收
+（需要 `docker`、`curl`、`jq`）：
 
 ```bash
 bash docker/site-to-site-smoke.sh
@@ -34,4 +35,4 @@ Server 内置 Headscale 默认开启 MagicDNS，组网名称后缀为 `mesh.nexo
 生产部署可通过 `NEXO_MESH_DNS_BASE_DOMAIN` 指定其他内部域名。公网 Caddy、公开域名
 和泛域名证书仍属于第二阶段。
 
-当前 Windows 开发机没有 Docker CLI，不能在本机宣称该真实 Linux 拓扑已通过。
+如果 Windows 侧没有 Docker CLI，请从已安装 Docker Engine 的 WSL2 发行版中执行上述命令。

@@ -813,6 +813,7 @@ dependencies = [
  "anyhow",
  "get_if_addrs",
  "ipnet",
+ "libc",
  "nexo-core",
  "nexo-protocol",
  "rcgen",

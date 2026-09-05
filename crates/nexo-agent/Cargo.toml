@@ -7,6 +7,7 @@ license.workspace = true
 [dependencies]
 anyhow.workspace = true
 get_if_addrs.workspace = true
+libc.workspace = true
 ipnet.workspace = true
 nexo-core = { path = "../nexo-core" }
 nexo-protocol = { path = "../nexo-protocol" }

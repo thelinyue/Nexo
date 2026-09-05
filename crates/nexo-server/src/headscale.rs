@@ -23,6 +23,7 @@ use tokio::{
 
 pub const HEADSCALE_VERSION: &str = "0.29.3";
 pub const TAILSCALE_VERSION: &str = "1.102.3";
+const DEFAULT_DERP_MAP_URL: &str = "https://controlplane.tailscale.com/derpmap/default";
 const API_KEY_LIFETIME_SECONDS: u64 = 90 * 24 * 60 * 60;
 const API_KEY_ROTATE_BEFORE_SECONDS: u64 = 14 * 24 * 60 * 60;
 
@@ -285,26 +286,20 @@ impl HeadscaleSupervisor {
         fs::create_dir_all(&headscale_dir)?;
         let database_path = headscale_dir.join("headscale.db");
         let noise_key_path = headscale_dir.join("noise_private.key");
-        let policy_path = headscale_dir.join("policy.hujson");
         let unix_socket_path = headscale_dir.join("headscale.sock");
         let content = format!(
-            "server_url: {server_url}\nlisten_addr: {listen}\nmetrics_listen_addr: 127.0.0.1:9090\nnoise:\n  private_key_path: {noise}\nprefixes:\n  v4: 100.64.0.0/10\n  v6: fd7a:115c:a1e0::/48\nderp:\n  server:\n    enabled: false\n  urls: []\ndatabase:\n  type: sqlite\n  sqlite:\n    path: {database}\npolicy:\n  mode: file\n  path: {policy}\ndns:\n  magic_dns: true\n  base_domain: {dns_domain}\n  override_local_dns: true\n  nameservers:\n    # Headscale 0.29.x 在 override_local_dns 开启时要求至少一个上游 DNS。\n    # MagicDNS 仍负责 mesh.nexo.internal，其他名称交给这些公共解析器。\n    global:\n      - 1.1.1.1\n      - 1.0.0.1\n      - 2606:4700:4700::1111\n      - 2606:4700:4700::1001\n    split: {{}}\n  search_domains: []\n  extra_records: []\nunix_socket: {unix_socket}\nunix_socket_permission: \"0600\"\nlog:\n  level: info\n",
+            "server_url: {server_url}\nlisten_addr: {listen}\nmetrics_listen_addr: 127.0.0.1:9090\nnoise:\n  private_key_path: {noise}\nprefixes:\n  v4: 100.64.0.0/10\n  v6: fd7a:115c:a1e0::/48\nderp:\n  server:\n    enabled: false\n  # Headscale 0.29.x 即使不运行内置 DERP Server，也要求初始 DERPMap 非空。\n  # 使用官方默认地图提供 NAT 穿透回退；可达节点优先走 WireGuard 直连。\n  urls:\n    - {derp_url}\n  paths: []\n  auto_update_enabled: true\n  update_frequency: 3h\ndatabase:\n  type: sqlite\n  sqlite:\n    path: {database}\npolicy:\n  # Headscale 0.29.x 只有 database 模式支持通过官方 API 更新策略。\n  mode: database\ndns:\n  magic_dns: true\n  base_domain: {dns_domain}\n  override_local_dns: true\n  nameservers:\n    # Headscale 0.29.x 在 override_local_dns 开启时要求至少一个上游 DNS。\n    # MagicDNS 仍负责 mesh.nexo.internal，其他名称交给这些公共解析器。\n    global:\n      - 1.1.1.1\n      - 1.0.0.1\n      - 2606:4700:4700::1111\n      - 2606:4700:4700::1001\n    split: {{}}\n  search_domains: []\n  extra_records: []\nunix_socket: {unix_socket}\nunix_socket_permission: \"0600\"\nlog:\n  level: info\n",
             server_url = yaml_quote(&self.config.server_url),
             listen = yaml_quote(&self.config.listen_addr),
             noise = yaml_quote(&noise_key_path.to_string_lossy()),
             database = yaml_quote(&database_path.to_string_lossy()),
-            policy = yaml_quote(&policy_path.to_string_lossy()),
             dns_domain = yaml_quote(&self.config.dns_base_domain),
             unix_socket = yaml_quote(&unix_socket_path.to_string_lossy()),
+            derp_url = yaml_quote(DEFAULT_DERP_MAP_URL),
         );
         let temporary = self.config.config_path().with_extension("yaml.tmp");
         fs::write(&temporary, content)?;
         fs::rename(temporary, self.config.config_path())?;
-        // Headscale 在启动时会立即读取 file policy；先落一个显式空策略，
-        // 避免首次启动因文件不存在失败。后续由 Nexo Policy 协调器覆盖它。
-        if !policy_path.exists() {
-            fs::write(&policy_path, "{\n  \"grants\": []\n}\n")?;
-        }
         Ok(())
     }
 
@@ -429,20 +424,27 @@ impl HeadscaleSupervisor {
     }
 
     pub async fn wait_until_healthy(&self, timeout: Duration) -> Result<()> {
-        let client = Client::builder().timeout(Duration::from_secs(3)).build()?;
         let started = std::time::Instant::now();
         while started.elapsed() < timeout {
-            if let Ok(response) = client
-                .get(format!(
-                    "{}/api/v1/health",
-                    self.config.api_url.trim_end_matches('/')
-                ))
-                .send()
-                .await
-            {
-                if response.status().is_success() {
-                    return Ok(());
-                }
+            // Headscale 0.29.x 的 HTTP health 端点也要求 Bearer API Key，
+            // 但首次启动时 Key 尚未创建。官方 CLI 通过 Unix Socket 检查
+            // 同一进程，更适合用来判断 Supervisor 是否可以继续 Bootstrap。
+            let health = tokio::time::timeout(
+                Duration::from_secs(3),
+                Command::new(&self.config.binary)
+                    .args([
+                        "--config",
+                        self.config.config_path().to_string_lossy().as_ref(),
+                        "health",
+                    ])
+                    .output(),
+            )
+            .await;
+            if matches!(health, Ok(Ok(output)) if output.status.success()) {
+                return Ok(());
+            }
+            if self.stopping.load(Ordering::SeqCst) {
+                break;
             }
             tokio::time::sleep(Duration::from_millis(250)).await;
         }

@@ -1592,45 +1592,84 @@ fn refresh_site_link_apply_status(transaction: &rusqlite::Transaction<'_>) -> Re
            -- 关闭互联不能依赖共享网络本身的状态：共享网络仍可能继续
            -- 对租户组网开放。只有两侧 Agent 都 ACK 了该 Link 的撤销路由，
            -- 才能把 Link 标记为 DISABLED。
-           WHEN enabled = 0 AND NOT EXISTS (
-             SELECT 1
-             FROM site_link_networks local_link
-             JOIN site_networks local_n
-               ON local_n.id = local_link.site_network_id
-             JOIN site_link_networks remote_link
-               ON remote_link.site_link_id = local_link.site_link_id
-              AND remote_link.side <> local_link.side
-             JOIN site_networks remote_n
-               ON remote_n.id = remote_link.site_network_id
-             LEFT JOIN gateway_route_applies a
-               ON a.device_id = local_n.publisher_device_id
-              AND a.network_id = remote_n.id
-              AND a.site_link_id = site_links.id
+            -- 关闭后的终态必须同时满足：两侧当前 revision 都有逐路由
+            -- ACK，且本地、控制平面、远端接受状态全部已撤销。不能用
+            -- 旧 revision 或后台投影的默认值提前宣称 DISABLED。
+            WHEN enabled = 0
+             AND EXISTS (
+              SELECT 1
+              FROM site_link_networks local_link
+              JOIN site_networks local_n
+                ON local_n.id = local_link.site_network_id
+              JOIN site_link_networks remote_link
+                ON remote_link.site_link_id = local_link.site_link_id
+               AND remote_link.side <> local_link.side
+              JOIN site_networks remote_n
+                ON remote_n.id = remote_link.site_network_id
+              JOIN gateway_route_applies a
+                ON a.device_id = local_n.publisher_device_id
+               AND a.network_id = remote_n.id
+               AND a.site_link_id = site_links.id
+               AND a.desired_revision >= site_links.apply_revision
+             )
+             AND NOT EXISTS (
+              SELECT 1
+              FROM site_link_networks local_link
+              JOIN site_networks local_n
+                ON local_n.id = local_link.site_network_id
+              JOIN site_link_networks remote_link
+                ON remote_link.site_link_id = local_link.site_link_id
+               AND remote_link.side <> local_link.side
+              JOIN site_networks remote_n
+                ON remote_n.id = remote_link.site_network_id
+              LEFT JOIN gateway_route_applies a
+                ON a.device_id = local_n.publisher_device_id
+               AND a.network_id = remote_n.id
+               AND a.site_link_id = site_links.id
+               AND a.desired_revision >= site_links.apply_revision
+               WHERE local_link.site_link_id = site_links.id
+                 AND (COALESCE(a.local_status, '') <> 'disabled'
+                   OR COALESCE(a.remote_status, '') <> 'disabled'
+                   OR COALESCE(a.control_plane_status, '') <> 'disabled')
+            ) THEN 'disabled'
+            WHEN enabled = 0 THEN 'checking'
+            WHEN EXISTS (
+              SELECT 1
+              FROM site_link_networks ln
+              JOIN gateway_network_states g
+                ON g.site_network_id = ln.site_network_id
+              WHERE ln.site_link_id = site_links.id
+                AND g.apply_status = 'retrying'
+            ) THEN 'retrying'
+            WHEN EXISTS (
+              SELECT 1
+              FROM site_link_networks local_link
+              JOIN site_networks local_n
+                ON local_n.id = local_link.site_network_id
+              JOIN gateway_network_states local_g
+                ON local_g.site_network_id = local_n.id
+              JOIN devices d
+                ON d.id = local_n.publisher_device_id
+              LEFT JOIN mesh_identities m
+                ON m.nexo_device_id = local_n.publisher_device_id
+              JOIN site_link_networks remote_link
+                ON remote_link.site_link_id = local_link.site_link_id
+               AND remote_link.side <> local_link.side
+              JOIN site_networks remote_n
+                ON remote_n.id = remote_link.site_network_id
               WHERE local_link.site_link_id = site_links.id
-                AND (COALESCE(a.local_status, '') <> 'disabled'
-                  OR COALESCE(a.remote_status, '') <> 'disabled'
-                  OR COALESCE(a.control_plane_status, '') <> 'disabled')
-           ) THEN 'disabled'
-           WHEN enabled = 0 THEN 'checking'
-           WHEN EXISTS (
-             SELECT 1 FROM site_link_networks ln
-             JOIN site_networks n ON n.id = ln.site_network_id
-             JOIN gateway_network_states g ON g.site_network_id = n.id
-             LEFT JOIN mesh_identities m ON m.nexo_device_id = n.publisher_device_id
-             WHERE ln.site_link_id = site_links.id
-               AND (g.apply_status <> 'ready'
-                     OR EXISTS (SELECT 1 FROM devices d
-                                WHERE d.id = n.publisher_device_id
-                                  AND d.status <> 'online')
-                     OR COALESCE(m.state, '') <> 'ready'
-                     OR COALESCE(m.online, 0) <> 1
-                     OR NOT EXISTS (
-                 SELECT 1 FROM gateway_route_applies a
-                 WHERE a.device_id = n.publisher_device_id
-                   AND a.network_id = n.id
-                   AND a.site_link_id = site_links.id
-                   AND a.local_status = 'applied'
-                   AND a.control_plane_status = 'serving'
+                AND (local_g.apply_status <> 'ready'
+                      OR d.status <> 'online'
+                      OR COALESCE(m.state, '') <> 'ready'
+                      OR COALESCE(m.online, 0) <> 1
+                      OR NOT EXISTS (
+                  SELECT 1
+                  FROM gateway_route_applies a
+                  WHERE a.device_id = local_n.publisher_device_id
+                    AND a.network_id = remote_n.id
+                    AND a.site_link_id = site_links.id
+                    AND a.local_status = 'applied'
+                    AND a.control_plane_status = 'serving'
                    AND a.remote_status = 'accepted'))
            ) THEN 'checking'
            ELSE 'ready' END,
@@ -1741,7 +1780,7 @@ async fn ensure_mesh_enrollment_for_device_locked(state: &AppState, device_id: &
                                     .unwrap_or_else(|_| "http://headscale:8080".to_owned()),
                                 auth_key: plaintext,
                                 auth_key_id: key.id,
-                                hostname: device_name,
+                                hostname: mesh_hostname(&tenant_id, &device_name, device_id),
                                 reset: false,
                                 tenant_id: Some(tenant_id),
                             },
@@ -1799,6 +1838,63 @@ async fn ensure_mesh_enrollment_for_device_locked(state: &AppState, device_id: &
         }
     }
     start_mesh_enrollment_locked(state, device_id, &tenant_id, &device_name, false).await
+}
+
+/// 生成只供 Tailscale 使用的稳定 DNS 主机名。
+///
+/// 设备显示名可以是中文或包含标点，但 Tailscale 只接受 ASCII DNS 标签。
+/// 因此这里把租户和设备名称分别规范化，并始终附加设备 ID 短后缀，避免
+/// 同名设备依赖 Headscale 的隐式冲突后缀。该名称只进入 Mesh Enrollment，
+/// Web 仍然显示用户设置的原始设备名称。
+fn mesh_hostname(tenant_id: &str, device_name: &str, device_id: &str) -> String {
+    const MAX_LABEL_LENGTH: usize = 63;
+
+    let tenant_slug = dns_label_slug(tenant_id);
+    let device_slug = dns_label_slug(device_name);
+    let tenant_slug = if tenant_slug.is_empty() {
+        "tenant"
+    } else {
+        tenant_slug.as_str()
+    };
+    let device_slug = if device_slug.is_empty() {
+        "device"
+    } else {
+        device_slug.as_str()
+    };
+    let id_suffix = dns_label_slug(device_id)
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric())
+        .take(32)
+        .collect::<String>();
+    let id_suffix = if id_suffix.is_empty() {
+        "node".to_owned()
+    } else {
+        id_suffix
+    };
+
+    // 先保留 ID 后缀，再截断用户输入，确保长名称不会丢掉稳定唯一部分。
+    let prefix = format!("{tenant_slug}-{device_slug}");
+    let prefix_length = MAX_LABEL_LENGTH.saturating_sub(id_suffix.len() + 1);
+    let prefix = prefix
+        .chars()
+        .take(prefix_length)
+        .collect::<String>()
+        .trim_end_matches('-')
+        .to_owned();
+    format!("{prefix}-{id_suffix}")
+}
+
+/// 把任意用户文本压缩为 DNS 标签可接受的 ASCII 片段。
+fn dns_label_slug(value: &str) -> String {
+    let mut slug = String::new();
+    for character in value.chars() {
+        if character.is_ascii_alphanumeric() {
+            slug.push(character.to_ascii_lowercase());
+        } else if !slug.is_empty() && !slug.ends_with('-') {
+            slug.push('-');
+        }
+    }
+    slug.trim_matches('-').to_owned()
 }
 
 /// 将 Headscale 节点投影为 Nexo 可持久化的运行身份；不把底层 Node 模型返回给 Web。
@@ -1874,14 +1970,14 @@ async fn recover_mesh_offers(state: &AppState) -> Result<()> {
             continue;
         };
         state.mesh_offers.lock().await.insert(
-            device_id,
+            device_id.clone(),
             MeshEnrollmentOffer {
                 endpoint: env::var("NEXO_MESH_ENDPOINT")
                     .or_else(|_| env::var("NEXO_HEADSCALE_URL"))
                     .unwrap_or_else(|_| "http://headscale:8080".to_owned()),
                 auth_key: plaintext,
                 auth_key_id: key.id,
-                hostname: device_name,
+                hostname: mesh_hostname(&tenant_id, &device_name, &device_id),
                 reset: false,
                 tenant_id: Some(tenant_id),
             },
@@ -2063,7 +2159,10 @@ fn record_mesh_identity_report(
         return Ok(());
     };
 
+    // tailscaled 重启初期可能返回 NodeID=0 且 Online=false；这只是本地
+    // 守护进程尚未完成注册，不代表身份已经改变。等它上线后再执行严格比对。
     if state_name == "ready"
+        && identity.online
         && reported_node_id.is_some_and(|reported| reported != expected_node_id)
     {
         let reported = reported_node_id.unwrap_or_default();
@@ -2157,6 +2256,17 @@ fn apply_gateway_route_report(
         .lock()
         .map_err(|_| anyhow::anyhow!("数据库锁不可用"))?;
     let transaction = connection.unchecked_transaction()?;
+    // 身份错配后，服务端会把所有网关 Desired Route 屏蔽为禁用。报告中的
+    // `enabled=false` 是撤销动作，不应再被“网络本身仍启用”这一字段拒绝，
+    // 否则控制通道会在撤销完成前反复断开，Mesh 也无法保持在线供恢复使用。
+    let identity_mismatch = transaction
+        .query_row(
+            "SELECT state FROM mesh_identities WHERE nexo_device_id = ?1",
+            [device_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+        .is_some_and(|state| state == "mesh_identity_mismatch");
     if report.routes.is_empty() {
         transaction.execute(
             "UPDATE gateway_route_applies SET local_status = 'upgrade_required',
@@ -2221,12 +2331,15 @@ fn apply_gateway_route_report(
                 )
                 .optional()?
         };
-        let Some((expected_prefix, expected_enabled, expected_revision)) = expected else {
+        let Some((expected_prefix, mut expected_enabled, expected_revision)) = expected else {
             anyhow::bail!(
                 "设备 {device_id} 上报了未授权的网关路由 {}",
                 route.network_id
             );
         };
+        if identity_mismatch {
+            expected_enabled = false;
+        }
         if expected_prefix != route.prefix {
             anyhow::bail!(
                 "设备 {device_id} 上报的网段 {} 与当前期望 {} 不一致",
@@ -2246,6 +2359,16 @@ fn apply_gateway_route_report(
             );
         }
         if route.enabled != expected_enabled {
+            tracing::warn!(
+                device_id = %device_id,
+                network_id = %route.network_id,
+                site_link_id = %site_link_key,
+                reported_revision = route.revision,
+                expected_revision,
+                reported_enabled = route.enabled,
+                expected_enabled,
+                "设备上报的网关开关与当前期望不一致，将拒绝本次控制消息"
+            );
             anyhow::bail!("设备 {device_id} 上报的网关开关与当前期望不一致");
         }
         let local_status = if !route.enabled {
@@ -2573,6 +2696,18 @@ async fn reconcile_headscale_routes(state: &AppState, device_id: &str) -> Result
         rows.collect::<rusqlite::Result<Vec<_>>>()?
     };
     for (link_id, remote_network_id, remote_device_id, revision, enabled) in site_routes {
+        // 关闭 Link 时，必须先看到当前 revision 的 Agent 撤销 ACK，才允许
+        // 把控制平面状态推进到 disabled。旧 revision 的行只能继续显示检查中。
+        let current_route: Option<(String, String, String, Option<String>)> = transaction
+            .query_row(
+                "SELECT local_status, control_plane_status, remote_status, last_error
+                 FROM gateway_route_applies
+                 WHERE device_id = ?1 AND network_id = ?2 AND site_link_id = ?3
+                   AND desired_revision >= ?4",
+                rusqlite::params![device_id, remote_network_id, link_id, revision],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .optional()?;
         let remote_route: Option<(String, String, Option<String>)> = transaction
             .query_row(
                 "SELECT local_status, control_plane_status, last_error
@@ -2583,7 +2718,20 @@ async fn reconcile_headscale_routes(state: &AppState, device_id: &str) -> Result
             )
             .optional()?;
         let (control_status, error): (String, Option<String>) = if !enabled {
-            ("disabled".to_owned(), None)
+            match current_route {
+                Some((local_status, _, remote_status, _))
+                    if local_status == "disabled" && remote_status == "disabled" =>
+                {
+                    // Agent 已确认撤销本地和远端接受状态；当前函数刚完成
+                    // Headscale API 检查，因此现在才可确认控制平面已撤销。
+                    ("disabled".to_owned(), None)
+                }
+                Some((_, control_status, _, error)) => (control_status, error),
+                None => (
+                    "pending".to_owned(),
+                    Some("等待 Agent 确认撤销站点路由".to_owned()),
+                ),
+            }
         } else if let Some((local_status, control_status, error)) = remote_route {
             if local_status == "applied" && control_status == "serving" {
                 ("serving".to_owned(), None)
@@ -3276,11 +3424,7 @@ async fn start_mesh_enrollment_locked(
             .unwrap_or_else(|_| "http://headscale:8080".to_owned()),
         auth_key: plaintext,
         auth_key_id: key.id,
-        hostname: if device_name.trim().is_empty() {
-            format!("nexo-{device_id}")
-        } else {
-            device_name.to_owned()
-        },
+        hostname: mesh_hostname(tenant_id, device_name, device_id),
         reset,
         tenant_id: Some(tenant_id.to_owned()),
     };
@@ -4602,18 +4746,26 @@ fn find_gateway_address(
     let prefix = prefix_text
         .parse::<IpNet>()
         .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "共享网络前缀格式无效"))?;
-    Ok(report
+    // Linux 接口编号可能在容器重启后交换（例如控制网与 LAN 的 eth0/eth1），
+    // CIDR 才是用户选择的稳定标识。优先沿用原接口，找不到时按同一网段回退。
+    let network = report
         .local_networks
         .iter()
         .find(|network| network.interface_id == interface_id && network.prefix == prefix_text)
-        .and_then(|network| {
-            let address = network
-                .gateway_address
-                .as_deref()?
-                .parse::<std::net::IpAddr>()
-                .ok()?;
-            prefix.contains(&address).then(|| address.to_string())
-        }))
+        .or_else(|| {
+            report
+                .local_networks
+                .iter()
+                .find(|network| network.prefix == prefix_text)
+        });
+    Ok(network.and_then(|network| {
+        let address = network
+            .gateway_address
+            .as_deref()?
+            .parse::<std::net::IpAddr>()
+            .ok()?;
+        prefix.contains(&address).then(|| address.to_string())
+    }))
 }
 
 /// 计算共享网络自身的健康状态。
@@ -4626,18 +4778,20 @@ fn gateway_network_health(
     device_id: &str,
     interface_id: &str,
     prefix: &str,
-    enabled: bool,
+    _enabled: bool,
     apply_status: ApplyStatus,
     apply_error: Option<&str>,
 ) -> Result<(GatewayHealthStatus, Option<String>), ApiError> {
-    if !enabled || apply_status == ApplyStatus::Disabled {
-        return Ok((GatewayHealthStatus::Disabled, None));
-    }
     if apply_status == ApplyStatus::Failed {
         return Ok((
             GatewayHealthStatus::Failed,
             Some(apply_error.unwrap_or("共享网络应用失败").to_owned()),
         ));
+    }
+    // `enabled=false` 只表示 Desired State 已关闭；撤销仍可能在 Agent
+    // 或 Headscale 中进行。只有完整应用状态进入 Disabled 才能对外宣称关闭。
+    if apply_status == ApplyStatus::Disabled {
+        return Ok((GatewayHealthStatus::Disabled, None));
     }
     let (device_health, device_error) =
         inspect_gateway_device(connection, device_id, interface_id, prefix, false)?;
@@ -4684,18 +4838,20 @@ fn site_link_health(
     link_id: &str,
     left: (&str, &str, &str),
     right: (&str, &str, &str),
-    enabled: bool,
+    _enabled: bool,
     apply_status: ApplyStatus,
     apply_error: Option<&str>,
 ) -> Result<(GatewayHealthStatus, Option<String>), ApiError> {
-    if !enabled || apply_status == ApplyStatus::Disabled {
-        return Ok((GatewayHealthStatus::Disabled, None));
-    }
     if apply_status == ApplyStatus::Failed {
         return Ok((
             GatewayHealthStatus::Failed,
             Some(apply_error.unwrap_or("站点互联应用失败").to_owned()),
         ));
+    }
+    // Link 关闭后仍需等待两侧路由撤销 ACK；在此之前继续显示检查中，
+    // 避免 UI 或验收脚本把旧内核路由误认为已经清理。
+    if apply_status == ApplyStatus::Disabled {
+        return Ok((GatewayHealthStatus::Disabled, None));
     }
     let (left_health, left_error) =
         inspect_gateway_device(connection, left.0, left.1, left.2, true)?;
@@ -4742,10 +4898,21 @@ fn site_link_health(
         }
         let route_ready: i64 = connection
             .query_row(
-                "SELECT COUNT(*) FROM gateway_route_applies a
-                 JOIN site_link_networks ln ON ln.site_link_id = ?1
-                 WHERE a.network_id = ln.site_network_id
-                   AND a.site_link_id = ?1 AND a.local_status = 'applied'
+                "SELECT COUNT(*)
+                 FROM site_link_networks local_link
+                 JOIN site_networks local_n
+                   ON local_n.id = local_link.site_network_id
+                 JOIN site_link_networks remote_link
+                   ON remote_link.site_link_id = local_link.site_link_id
+                  AND remote_link.side <> local_link.side
+                 JOIN site_networks remote_n
+                   ON remote_n.id = remote_link.site_network_id
+                 JOIN gateway_route_applies a
+                   ON a.device_id = local_n.publisher_device_id
+                  AND a.network_id = remote_n.id
+                  AND a.site_link_id = ?1
+                 WHERE local_link.site_link_id = ?1
+                   AND a.local_status = 'applied'
                    AND a.control_plane_status = 'serving' AND a.remote_status = 'accepted'",
                 [link_id],
                 |row| row.get(0),
@@ -4771,7 +4938,7 @@ fn site_link_health(
 fn inspect_gateway_device(
     connection: &Connection,
     device_id: &str,
-    interface_id: &str,
+    _interface_id: &str,
     prefix: &str,
     site_gateway: bool,
 ) -> Result<(GatewayHealthStatus, Option<String>), ApiError> {
@@ -4850,7 +5017,7 @@ fn inspect_gateway_device(
     if !report
         .local_networks
         .iter()
-        .any(|network| network.interface_id == interface_id && network.prefix == prefix)
+        .any(|network| network.prefix == prefix)
     {
         return Ok((
             GatewayHealthStatus::Failed,
@@ -5108,6 +5275,65 @@ mod tests {
         }
     }
 
+    #[test]
+    fn mesh_hostname_is_dns_safe_stable_and_unique_for_same_names() {
+        let chinese = mesh_hostname(
+            "default",
+            "家庭网关",
+            "550e8400-e29b-41d4-a716-446655440000",
+        );
+        assert_eq!(chinese, "default-device-550e8400e29b41d4a716446655440000");
+        assert_eq!(
+            chinese,
+            mesh_hostname(
+                "default",
+                "家庭网关",
+                "550e8400-e29b-41d4-a716-446655440000"
+            )
+        );
+
+        let first = mesh_hostname(
+            "Tenant One",
+            "Home NAS",
+            "00000000-0000-0000-0000-000000000001",
+        );
+        let second = mesh_hostname(
+            "Tenant One",
+            "Home NAS",
+            "00000000-0000-0000-0000-000000000002",
+        );
+        assert_eq!(
+            first,
+            "tenant-one-home-nas-00000000000000000000000000000001"
+        );
+        assert_ne!(first, second);
+        for hostname in [first, second] {
+            assert!(hostname.len() <= 63);
+            assert!(hostname
+                .chars()
+                .all(|character| character.is_ascii_lowercase()
+                    || character.is_ascii_digit()
+                    || character == '-'));
+            assert!(hostname.chars().next().is_some_and(|character| character
+                .is_ascii_lowercase()
+                || character.is_ascii_digit()));
+            assert!(hostname.chars().last().is_some_and(|character| character
+                .is_ascii_lowercase()
+                || character.is_ascii_digit()));
+        }
+
+        let empty = mesh_hostname("", "!@#", "");
+        assert_eq!(empty, "tenant-device-node");
+
+        let long = mesh_hostname(
+            &"Tenant".repeat(30),
+            &"Display Name".repeat(30),
+            "550e8400-e29b-41d4-a716-446655440000",
+        );
+        assert!(long.len() <= 63);
+        assert!(long.ends_with("-550e8400e29b41d4a716446655440000"));
+    }
+
     #[tokio::test]
     async fn overview_requires_admin_token() {
         env::set_var("NEXO_ADMIN_TOKEN", "test-admin");
@@ -5123,6 +5349,43 @@ mod tests {
             .0;
         assert_eq!(response.devices, 0);
         assert_eq!(response.current_connections, 0);
+    }
+
+    #[tokio::test]
+    async fn gateway_api_rejects_default_routes_and_unknown_tenants() {
+        env::set_var("NEXO_ADMIN_TOKEN", "test-admin");
+        let state = test_state();
+        for prefix in ["0.0.0.0/0", "::/0"] {
+            let error = create_site_network(
+                State(state.clone()),
+                admin_headers(),
+                Json(CreateSiteNetworkRequest {
+                    tenant_id: "default".to_owned(),
+                    site_id: "site-missing".to_owned(),
+                    name: "默认路由".to_owned(),
+                    publisher_device_id: "device-missing".to_owned(),
+                    interface_id: "eth0".to_owned(),
+                    prefix: prefix.to_owned(),
+                }),
+            )
+            .await
+            .expect_err("默认路由不应进入网关 Desired State");
+            assert_eq!(error.status, StatusCode::BAD_REQUEST);
+            assert!(error.message.contains("默认路由"));
+        }
+
+        let error = create_site(
+            State(state),
+            admin_headers(),
+            Json(CreateSiteRequest {
+                tenant_id: "missing-tenant".to_owned(),
+                name: "错误租户".to_owned(),
+            }),
+        )
+        .await
+        .expect_err("不存在的租户不应创建站点");
+        assert_eq!(error.status, StatusCode::NOT_FOUND);
+        assert_eq!(error.message, "租户不存在");
     }
 
     #[test]
