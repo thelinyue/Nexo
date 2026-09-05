@@ -16,14 +16,18 @@ license = "AGPL-3.0-only"
 
 [workspace.dependencies]
 anyhow = "1"
+argon2 = "0.5"
 async-trait = "0.1"
 axum = "0.8"
 base64 = "0.22"
 bytes = "1"
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+futures-io = "0.3"
 hex = "0.4"
 get_if_addrs = "0.5"
 ipnet = { version = "2", features = ["serde"] }
 libc = "0.2"
+clap = { version = "4", features = ["derive"] }
 rand = "0.8"
 rcgen = { version = "0.14", features = ["x509-parser"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
@@ -37,7 +41,10 @@ thiserror = "2"
 time = "0.3"
 tokio = { version = "1", features = ["io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "logging", "tls12"] }
+tokio-util = { version = "0.7", features = ["compat"] }
+yamux = "0.14"
 tower-http = { version = "0.6", features = ["fs"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 uuid = { version = "1", features = ["v4"] }
+x509-parser = "0.18"

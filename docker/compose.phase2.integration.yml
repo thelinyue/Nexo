@@ -1,0 +1,198 @@
+name: nexo-phase2-integration
+
+# 阶段二 Linux Docker 验收拓扑：Server/Headscale/Caddy 在一个受限容器内，
+# 两台 Gateway 使用独立 LAN，普通终端不安装 Nexo 或 Tailscale。脚本会在
+# 启动前通过 NEXO_PHASE2_CERT_DIR 提供仅用于验收的本地 CA/证书。
+services:
+  nexo-server:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.server
+    environment:
+      NEXO_ADMIN_TOKEN: ${NEXO_ADMIN_TOKEN:-integration-admin}
+      NEXO_HTTP_ADDR: 0.0.0.0:8280
+      NEXO_PUBLIC_BACKEND_ADDR: 127.0.0.1:9888
+      NEXO_CONTROL_ADDR: 0.0.0.0:9890
+      NEXO_TUNNEL_ADDR: 0.0.0.0:9891
+      NEXO_TUNNEL_ENDPOINT: 172.29.0.2:9891
+      NEXO_HEADSCALE_ENABLED: "true"
+      NEXO_HEADSCALE_LISTEN_ADDR: 127.0.0.1:8281
+      NEXO_HEADSCALE_API_URL: http://127.0.0.1:8281
+      # Headscale 只绑定 Server loopback；正式 HTTPS 就绪前，Supervisor
+      # 使用这个仅供 Nexo 自身访问的地址，启用公网入口后会自动切换为
+      # https://mesh.phase2.test。
+      NEXO_HEADSCALE_URL: http://127.0.0.1:8281
+      NEXO_MESH_INTERNAL_URL: http://127.0.0.1:8281
+      NEXO_MESH_DNS_BASE_DOMAIN: mesh.nexo.internal
+      NEXO_CADDY_ENABLED: "true"
+      NEXO_CADDY_BIN: /usr/local/bin/caddy
+      NEXO_CADDY_ADMIN_URL: http://127.0.0.1:8290
+      NEXO_DATA_DIR: /data/nexo
+      NEXO_WEB_DIR: /opt/nexo/web
+    extra_hosts:
+      - "mesh.phase2.test:127.0.0.1"
+      - "nexo.phase2.test:127.0.0.1"
+    ports:
+      - "127.0.0.1:29828:8280"
+      - "127.0.0.1:29890:9890"
+      - "127.0.0.1:29891:9891"
+      - "127.0.0.1:28080:80"
+      - "127.0.0.1:28443:443"
+      - "127.0.0.1:22000:20000"
+    networks:
+      control:
+        ipv4_address: 172.29.0.2
+    volumes:
+      - nexo-phase2-data:/data/nexo
+
+  home-gateway:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.agent
+    cap_add: [NET_ADMIN]
+    devices: [/dev/net/tun:/dev/net/tun]
+    sysctls:
+      net.ipv4.ip_forward: "1"
+      net.ipv4.conf.all.src_valid_mark: "1"
+      net.ipv4.conf.default.rp_filter: "0"
+      net.ipv6.conf.all.forwarding: "1"
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - >-
+        cp /run/nexo-phase2-certs/mesh-ca.crt /usr/local/share/ca-certificates/nexo-phase2.crt
+        && update-ca-certificates >/dev/null
+        && iptables -A FORWARD -o eth0 -d 192.168.20.0/24 -j REJECT
+        && exec /usr/local/bin/nexo-agent
+    extra_hosts:
+      - "mesh.phase2.test:172.29.0.2"
+      - "nexo.phase2.test:172.29.0.2"
+    environment:
+      NEXO_SERVER_URL: http://172.29.0.2:8280
+      NEXO_CONTROL_ADDR: 172.29.0.2:9890
+      NEXO_CONTROL_SERVER_NAME: nexo-server
+      NEXO_TUNNEL_ADDR: 172.29.0.2:9891
+      NEXO_TUNNEL_SERVER_NAME: nexo-server
+      NEXO_ENROLLMENT_TOKEN: ${NEXO_HOME_ENROLLMENT_TOKEN:-}
+      NEXO_DEVICE_NAME: 家庭网关
+      NEXO_TAILSCALE_APPLY: "true"
+      NEXO_TAILSCALED_ENABLED: "true"
+      NEXO_AGENT_CAPABILITIES: mesh,subnet_gateway,site_gateway,tunnel
+      NEXO_STATE_DIR: /data/nexo-agent
+    volumes:
+      - ${NEXO_PHASE2_CERT_DIR:?NEXO_PHASE2_CERT_DIR 未设置}:/run/nexo-phase2-certs:ro
+      - home-phase2-agent-data:/data/nexo-agent
+    networks:
+      control: {}
+      home-lan:
+        ipv4_address: 192.168.10.2
+    depends_on: [nexo-server]
+
+  office-gateway:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.agent
+    cap_add: [NET_ADMIN]
+    devices: [/dev/net/tun:/dev/net/tun]
+    sysctls:
+      net.ipv4.ip_forward: "1"
+      net.ipv4.conf.all.src_valid_mark: "1"
+      net.ipv4.conf.default.rp_filter: "0"
+      net.ipv6.conf.all.forwarding: "1"
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - >-
+        cp /run/nexo-phase2-certs/mesh-ca.crt /usr/local/share/ca-certificates/nexo-phase2.crt
+        && update-ca-certificates >/dev/null
+        && iptables -A FORWARD -o eth0 -d 192.168.10.0/24 -j REJECT
+        && exec /usr/local/bin/nexo-agent
+    extra_hosts:
+      - "mesh.phase2.test:172.29.0.2"
+      - "nexo.phase2.test:172.29.0.2"
+    environment:
+      NEXO_SERVER_URL: http://172.29.0.2:8280
+      NEXO_CONTROL_ADDR: 172.29.0.2:9890
+      NEXO_CONTROL_SERVER_NAME: nexo-server
+      NEXO_TUNNEL_ADDR: 172.29.0.2:9891
+      NEXO_TUNNEL_SERVER_NAME: nexo-server
+      NEXO_ENROLLMENT_TOKEN: ${NEXO_OFFICE_ENROLLMENT_TOKEN:-}
+      NEXO_DEVICE_NAME: 办公网关
+      NEXO_TAILSCALE_APPLY: "true"
+      NEXO_TAILSCALED_ENABLED: "true"
+      NEXO_AGENT_CAPABILITIES: mesh,subnet_gateway,site_gateway,tunnel
+      NEXO_STATE_DIR: /data/nexo-agent
+    volumes:
+      - ${NEXO_PHASE2_CERT_DIR:?NEXO_PHASE2_CERT_DIR 未设置}:/run/nexo-phase2-certs:ro
+      - office-phase2-agent-data:/data/nexo-agent
+    networks:
+      control: {}
+      office-lan:
+        ipv4_address: 192.168.20.2
+    depends_on: [nexo-server]
+
+  home-terminal:
+    build:
+      context: .
+      dockerfile: Dockerfile.integration-terminal
+    command:
+      - --address
+      - 192.168.10.100
+      - --remote-prefix
+      - 192.168.20.0/24
+      - --next-hop
+      - 192.168.10.2
+    cap_add: [NET_ADMIN]
+    networks:
+      home-lan:
+        ipv4_address: 192.168.10.100
+    depends_on: [home-gateway]
+
+  office-terminal:
+    build:
+      context: .
+      dockerfile: Dockerfile.integration-terminal
+    command:
+      - --address
+      - 192.168.20.100
+      - --remote-prefix
+      - 192.168.10.0/24
+      - --next-hop
+      - 192.168.20.2
+    cap_add: [NET_ADMIN]
+    networks:
+      office-lan:
+        ipv4_address: 192.168.20.100
+    depends_on: [office-gateway]
+
+  # 与 Gateway 共享 control bridge 的普通容器，用于证明 8281/8290
+  # 只绑定 Server loopback，外部容器不能直接访问内部管理端口。
+  outside-probe:
+    build:
+      context: .
+      dockerfile: Dockerfile.integration-terminal
+    entrypoint: ["sleep"]
+    command: ["infinity"]
+    networks:
+      control:
+        ipv4_address: 172.29.0.50
+
+networks:
+  control:
+    ipam:
+      config: [{subnet: 172.29.0.0/16}]
+  home-lan:
+    driver_opts:
+      com.docker.network.bridge.enable_icc: "true"
+      com.docker.network.bridge.gateway_mode_ipv4: "nat-unprotected"
+    ipam:
+      config: [{subnet: 192.168.10.0/24}]
+  office-lan:
+    driver_opts:
+      com.docker.network.bridge.enable_icc: "true"
+      com.docker.network.bridge.gateway_mode_ipv4: "nat-unprotected"
+    ipam:
+      config: [{subnet: 192.168.20.0/24}]
+
+volumes:
+  nexo-phase2-data:
+  home-phase2-agent-data:
+  office-phase2-agent-data:

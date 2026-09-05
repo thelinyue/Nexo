@@ -9,15 +9,17 @@ services:
       dockerfile: docker/Dockerfile.server
     environment:
       NEXO_ADMIN_TOKEN: integration-admin
-      NEXO_HTTP_ADDR: 0.0.0.0:9888
+      NEXO_HTTP_ADDR: 0.0.0.0:8280
       NEXO_CONTROL_ADDR: 0.0.0.0:9890
-      NEXO_HEADSCALE_LISTEN_ADDR: 0.0.0.0:8080
-      NEXO_HEADSCALE_API_URL: http://127.0.0.1:8080
-      NEXO_HEADSCALE_URL: http://172.27.0.2:8080
-      NEXO_MESH_ENDPOINT: http://172.27.0.2:8080
+      NEXO_HEADSCALE_LISTEN_ADDR: 0.0.0.0:8281
+      NEXO_HEADSCALE_API_URL: http://127.0.0.1:8281
+      NEXO_HEADSCALE_URL: http://172.27.0.2:8281
+      NEXO_MESH_ENDPOINT: http://172.27.0.2:8281
+      # 集成拓扑使用内部 HTTP Mesh 地址；生产 Compose 不设置此开关。
+      NEXO_MESH_ALLOW_INSECURE: "true"
       NEXO_MESH_DNS_BASE_DOMAIN: mesh.nexo.internal
     ports:
-      - "127.0.0.1:19888:9888"
+      - "127.0.0.1:19828:8280"
     networks:
       control:
         ipv4_address: 172.27.0.2
@@ -52,7 +54,7 @@ services:
     environment:
       # Tailscale MagicDNS 会接管容器 resolver；控制面使用固定地址，
       # 避免 Agent 重启时暂时无法解析 Docker 服务名。
-      NEXO_SERVER_URL: http://172.27.0.2:9888
+      NEXO_SERVER_URL: http://172.27.0.2:8280
       NEXO_CONTROL_ADDR: 172.27.0.2:9890
       NEXO_CONTROL_SERVER_NAME: nexo-server
       NEXO_ENROLLMENT_TOKEN: ${NEXO_HOME_ENROLLMENT_TOKEN:-}
@@ -84,7 +86,7 @@ services:
         ipv4_address: 192.168.20.2
     volumes: [office-agent-data:/data/nexo-agent]
     environment:
-      NEXO_SERVER_URL: http://172.27.0.2:9888
+      NEXO_SERVER_URL: http://172.27.0.2:8280
       NEXO_CONTROL_ADDR: 172.27.0.2:9890
       NEXO_CONTROL_SERVER_NAME: nexo-server
       NEXO_ENROLLMENT_TOKEN: ${NEXO_OFFICE_ENROLLMENT_TOKEN:-}

@@ -1,131 +1,106 @@
 # Nexo（联巢）
 
-Nexo 是面向个人自托管环境的设备、隧道和异地组网管理服务。
+Nexo 是面向个人自托管、NAS/HomeLab 和小型网络环境的设备、异地组网与公网访问管理服务。
+它把设备、共享网络、站点互联、Web 服务和 TCP 端口集中到一个 Web 界面中，正常使用不需要编辑配置文件。
 
-## 当前开发阶段
+## 第二阶段能力
 
-第一阶段已经建立内置 Headscale 与真实 Site Gateway 的状态边界：
+- 首次打开 LAN 管理入口完成管理员初始化，之后使用 Argon2id 密码和服务端 Session 登录。
+- 设备通过一次性入网请求加入 Nexo，批准后自动建立异地组网身份。
+- Subnet Gateway 和 Site Gateway 保留第一阶段的双向 LAN 互联、真实源 IP 和稳定设备身份。
+- “公网访问”支持 TCP 端口以及 HTTP/HTTPS Web Service；Web Service 通过受限本地桥接，不暴露 Origin 端口。
+- 配置了根域名后，内置公网入口提供泛域名证书和 `nexo.<domain>` 管理入口、`mesh.<domain>` 组网入口。
+- Caddy、Headscale 和 Tailscale 是镜像中的独立组件，由 Nexo 负责协调；普通用户不需要操作它们的配置或命令。
 
-- 管理端创建一次性入网凭证，明文只返回一次，数据库只保存摘要。
-- Agent 可以通过 `NEXO_SERVER_URL` 指向任意 Nexo Server。
-- Agent 在本地生成私钥和 CSR，提交设备信息后进入 `awaiting_approval`。
-- 服务端首次启动生成设备身份 CA；管理员批准后签发仅用于 TLS 客户端认证的设备证书。
-- Agent 自动轮询审批结果并一次性领取证书链，状态随后变为 `consumed`；私钥始终留在 Agent。
-- 服务端同时监听独立的 mTLS 控制通道；Agent 领取证书后会使用设备证书持续发送心跳，服务端只接受证书指纹与设备 ID 匹配的连接。
-- Agent 在控制通道首次握手时只读探测 TUN、NET_ADMIN、IP 转发和本地直连网段，并上报结构化的 Subnet Gateway / Site Gateway 能力状态；探测不会修改宿主机网络配置，也不会自动发布网段。
-- 服务端会在 mTLS 握手响应及后续心跳确认中下发该设备对应的最新网关 Desired State，Agent 会回传带 revision 的应用 ACK；Agent 已将本地发布网段、远端接收路由和站点互联的 SNAT 策略整理成应用计划。默认只生成计划，设置 `NEXO_TAILSCALE_APPLY=true` 后才执行 Tailscale CLI；命令成功但 Headscale 尚未批准时 ACK 仍保持 `CHECKING`，不会把未生效的路由标记为 `READY`。每次实际应用前 Agent 都会重新检查网关能力；命令失败会按指数退避和抖动重试，不会在每个心跳中重复执行。
-- 共享网络和站点互联都支持显式启用/关闭；关闭操作会递增 Desired State revision，并下发带 `enabled=false` 的撤销路由，避免 Agent 继续保留旧配置。
-- Server 镜像内置固定版本的 Headscale 子进程；Supervisor 负责配置生成、健康检查、退避重启和优雅关闭。Nexo 只通过异步 HTTP Adapter 调用 Headscale API，不读取 Headscale 内部数据库。
-- Headscale API Key 只保存在权限受限的独立 Secret 文件；首次启动和剩余 14 天时会先自检新 Key，再原子切换并吊销旧 Key。运行期间也会定期检查轮换，明文不进入 SQLite、日志或 Web API。
-- Web 批准设备后，Agent 通过 mTLS 控制通道领取一次性 Mesh Enrollment；Server 根据 Pre-auth Key ID 绑定稳定 Node ID。重启会恢复未完成尝试，身份错配只能通过携带旧 Node ID 和明确确认的高级恢复接口处理。
-- Agent 镜像内置独立的固定版本 Tailscale/tailscaled 文件；Site Gateway 始终使用 `accept-routes=true`、`snat-subnet-routes=false`，保留真实 LAN 源地址，不实现 Exit Node、默认路由或网段转换。
-- 内置 Headscale 默认启用 MagicDNS（后缀默认为 `mesh.nexo.internal`，可用 `NEXO_MESH_DNS_BASE_DOMAIN` 调整）；Agent 通过 `accept-dns=true` 接收组网名称解析。
-- 每条网关路由分别记录本地应用、Headscale 发现/批准/Serving 和对端接受状态；没有逐路由 ACK、Headscale Serving 或两侧静态路由确认时，UI 不会显示 `READY`。
-- Agent 的能力报告会带上每个已检测局域网接口的本地地址；共享网络和站点互联查询会返回 `gateway_address` 以及双向 `static_routes` 引导，用户可据此把远端网段添加到两侧路由器。Nexo 只展示目标网段和下一跳，不会自动登录或修改路由器。
-- `GET /api/v1/sites`、`GET /api/v1/devices`、`GET /api/v1/site-networks` 和 `GET /api/v1/site-links` 已提供给 Web 概览及创建表单使用；共享网络和站点互联响应同时返回用户可读名称、网段和应用状态，避免 UI 暴露内部 ID。
-- Web 概览中的“新建共享网络”和“新建互联”会根据设备最近上报的能力与本地网段生成可选项；提交后立即回读 Desired / Applied 状态，服务端返回的网段冲突或能力错误会直接显示在表单内。
-- 共享网络和站点互联响应额外返回独立的 `health_status` / `health_error`；健康状态会综合设备在线、能力报告、本地网段和应用确认，`ready` 才表示当前网关条件完整，`degraded` 只表示仍在等待或设备暂时离线，`failed` 表示需要处理的能力或数据问题。
-- 公网 Tunnel、Caddy、公开域名和泛域名证书仍属于第二阶段；当前不会把待签发设备伪装为在线设备。
+当前阶段明确不包含 Exit Node、默认路由、UDP、TLS passthrough、NAT 转换、跨租户共享或 Caddy 路径路由。
 
-## 本地运行
+## 固定端口
 
-Web 概览原型位于 `web/`，使用系统字体与可适配的明暗材质；开发预览可执行：
+| 端口 | 用途 | 暴露范围 |
+| --- | --- | --- |
+| `8280` | LAN HTTP 管理入口 | `0.0.0.0` |
+| `9888` | Caddy 到 Nexo 的本机 HTTPS 管理后端 | `127.0.0.1` |
+| `8281` | 内置组网控制服务 | `127.0.0.1` |
+| `8290` | Caddy 管理 API | `127.0.0.1` |
+| `9890` | Agent mTLS 控制通道 | `0.0.0.0` |
+| `9891` | Tunnel TLS/Yamux 数据通道 | `0.0.0.0` |
+| `80/443` | 公网 HTTP/HTTPS 入口 | `0.0.0.0` |
+| `20000-29999` | 自动分配的公网 TCP Tunnel 端口 | `0.0.0.0` |
 
-```powershell
-cd web
-npm install
-npm run build
-```
+`8281` 和 `8290` 不应映射到公网。LAN 页面会持续提示当前为未加密 HTTP，建议只在可信局域网使用；正式公网管理应使用 HTTPS。
 
-Linux Docker 的第一阶段闭环部署和双向 Site-to-Site 验收见 [`docker/README.md`](docker/README.md)。
+## 本地开发
+
+服务端默认监听 `0.0.0.0:8280`，设备控制通道默认监听 `0.0.0.0:9890`。未设置 `NEXO_HEADSCALE_ENABLED` 或 `NEXO_CADDY_ENABLED` 时，本地开发不会启动宿主机上的未知组件。
 
 ```powershell
-$env:NEXO_ADMIN_TOKEN = "仅用于本地开发的管理员凭证"
-$env:NEXO_HTTP_ADDR = "127.0.0.1:9888"
-# 可选：默认 0.0.0.0:9890，Agent 通过此地址建立 mTLS 控制通道
+$env:NEXO_HTTP_ADDR = "127.0.0.1:8280"
 $env:NEXO_CONTROL_ADDR = "127.0.0.1:9890"
-# 若 Agent 连接地址不是 nexo-server，可与 Agent 设置相同的证书名称
-$env:NEXO_CONTROL_SERVER_NAME = "nexo-server"
 cargo run -p nexo-server
 ```
 
-管理端点要求 `X-Nexo-Admin-Token` 请求头。未配置 `NEXO_ADMIN_TOKEN` 时，创建和审批接口会拒绝请求。
-
-创建入网凭证：
+首次启动后，在本机读取一次性初始化口令：
 
 ```powershell
-curl.exe -X POST http://127.0.0.1:9888/api/v1/enrollments `
-  -H "content-type: application/json" `
-  -H "x-nexo-admin-token: 仅用于本地开发的管理员凭证" `
-  -d '{"tenant_id":"default","ttl_seconds":900}'
+cargo run -p nexo-server -- bootstrap-code
 ```
 
-Agent 使用响应中的 `token`：
+打开 `http://127.0.0.1:8280`，输入口令、管理员用户名和不少于 12 个字符的密码。创建首个管理员后，Bootstrap Code Secret 会永久销毁。
+
+忘记密码时，必须在拥有本地 Docker/主机权限的环境执行：
 
 ```powershell
-$env:NEXO_SERVER_URL = "http://127.0.0.1:9888"
-$env:NEXO_CONTROL_ADDR = "127.0.0.1:9890"
-$env:NEXO_CONTROL_SERVER_NAME = "nexo-server"
-$env:NEXO_ENROLLMENT_TOKEN = "一次性 token"
-$env:NEXO_DEVICE_NAME = "家庭 NAS"
-# 可选：默认 ./data/nexo-agent；容器部署建议挂载持久卷
-$env:NEXO_STATE_DIR = "./data/nexo-agent"
-# 可选：显式启用本机 Tailscale CLI；默认 false，仅生成计划
-$env:NEXO_TAILSCALE_APPLY = "true"
-# 可选：Tailscale 二进制路径，默认从 PATH 查找 tailscale
-$env:NEXO_TAILSCALE_BIN = "tailscale"
-cargo run -p nexo-agent
+cargo run -p nexo-server -- admin recover
 ```
 
-Agent 会显示 `awaiting_approval` 并等待管理员批准。管理员可查询并批准：
+命令只显示 10 分钟有效、仅可使用一次的 Recovery Code；在恢复页面设置新密码后，所有旧 Session 会立即吊销。旧版 `recover` 命令仍兼容，但新部署统一使用 `admin recover`。
 
-```powershell
-curl.exe -H "x-nexo-admin-token: 仅用于本地开发的管理员凭证" `
-  http://127.0.0.1:9888/api/v1/enrollments/入网请求 ID
-curl.exe -X POST `
-  -H "x-nexo-admin-token: 仅用于本地开发的管理员凭证" `
-  http://127.0.0.1:9888/api/v1/enrollments/入网请求 ID/approve
+官方 Server 镜像同样提供 `nexo` 命令别名：
+
+```bash
+docker compose -f docker/compose.phase2.yml exec nexo-server nexo admin recover
 ```
 
-批准后 Agent 会自动领取并保存以下本地材料：
+## Docker 部署
 
-- `device-key.pem`：Agent 私钥，只在 Agent 本地生成和使用。
-- `device-cert.pem`：服务端签发的设备客户端证书。
-- `server-ca.pem`：验证 Nexo Server 身份的 CA 证书。
-- `device-id`：服务端分配的设备 ID。
+生产示例见 [`docker/compose.phase2.yml`](docker/compose.phase2.yml)。它使用 host network，保留真实 LAN 转发所需的最小权限：Agent 只授予 `/dev/net/tun` 和 `NET_ADMIN`，不使用 `privileged` 或 Docker Socket。
 
-如果设置了 `NEXO_CONTROL_ADDR`，Agent 领取身份后会自动连接 mTLS 控制通道，首次连接和后续心跳都会更新服务端设备在线状态。控制通道服务端证书由 Nexo 自有设备 CA 签发，名称默认是 `nexo-server`；通过 Docker Compose 部署时应让 Agent 使用能解析到服务端的名称，并同步设置 `NEXO_CONTROL_SERVER_NAME`。
+在原生 Linux 或具备 Docker Engine 的 WSL2 发行版中运行：
 
-## 网关 Desired State API
-
-Agent 首次通过 mTLS 控制通道上报本地网卡、TUN、NET_ADMIN 和 IP 转发探测结果。管理员在此基础上明确选择共享网络：
-
-```powershell
-curl.exe -X POST http://127.0.0.1:9888/api/v1/site-networks `
-  -H "content-type: application/json" `
-  -H "x-nexo-admin-token: 仅用于本地开发的管理员凭证" `
-  -d '{"tenant_id":"default","site_id":"站点 ID","name":"家庭网络","publisher_device_id":"设备 ID","interface_id":"eth0","prefix":"192.168.10.0/24"}'
+```bash
+docker compose -f docker/compose.phase2.yml up -d --build
 ```
 
-接口会检查设备最近上报的能力和网卡前缀，只创建 `CHECKING` 的 Desired State；服务端随后通过 mTLS 下发本地及站点互联所需的目标网段。`applied_prefix` 仍为空，直到 Agent 与 Headscale Adapter 完成真实路由应用并回传逐路由结果，且 Headscale 已发现、批准并提供路由。两个站点的互联使用 `/api/v1/site-links`，提交前会拒绝重叠网段并要求两端网关在线且具备站点网关能力。Nexo 不会自动修改用户路由器，但会在 Linux 网关中应用 Tailscale 转发参数。
+如需验收第一阶段 Site-to-Site 拓扑：
 
-关闭或重新启用配置：
-
-```powershell
-# 关闭共享本地网络；Agent 会收到撤销路由
-curl.exe -X POST -H "x-nexo-admin-token: 仅用于本地开发的管理员凭证" `
-  http://127.0.0.1:9888/api/v1/site-networks/网络 ID/disable
-
-# 重新启用共享本地网络
-curl.exe -X POST -H "x-nexo-admin-token: 仅用于本地开发的管理员凭证" `
-  http://127.0.0.1:9888/api/v1/site-networks/网络 ID/enable
-
-# 站点互联同样支持 /disable 和 /enable
-curl.exe -X POST -H "x-nexo-admin-token: 仅用于本地开发的管理员凭证" `
-  http://127.0.0.1:9888/api/v1/site-links/互联 ID/disable
+```bash
+bash docker/site-to-site-smoke.sh
 ```
 
-接口响应中的 `enabled`、`desired_revision`、`apply_status` 和 `applied_prefix` 分别表示配置开关、期望版本、应用阶段和已确认的网段；`CHECKING` 不等于路由已经生效。
+验收拓扑只使用固定的 `nexo-phase1-integration` Compose 项目和测试卷，失败时先输出相关状态与日志，然后清理自身资源，不会触碰其他项目或 `.edge-screenshot/`。
 
-生产部署应通过 HTTPS 保护管理 API，并使用后续管理员 Session 替换开发阶段的 Bootstrap Token；
-同时应保护 Nexo 数据目录，因为其中包含服务端设备 CA 私钥。
+## Web Service 与 TCP Tunnel
+
+管理员登录后，在“公网访问”页面选择：
+
+- **Web 服务**：填写访问名称、本地地址和端口，选择 HTTP 或 HTTPS Origin。HTTP 服务只走 80；HTTPS 服务走 443，80 对同名主机返回 308 跳转。
+- **TCP 端口**：选择自动分配或手动填写 `20000-29999` 中的端口。端口占用会在保存前由 Server 和宿主机同时检查。
+
+修改流程始终显示“正在应用 / 已生效 / 应用失败”，失败时保留上一份 Applied 配置。证书私钥、Cloudflare Token 和自定义 CA 只保存为 `0600` Secret 文件，不会进入数据库导出、日志或 API 响应。
+
+## 组网
+
+设备、共享本地网络和站点互联均通过 Web Desired State 管理。Nexo 会拒绝默认路由、重叠网段和错误租户；Site Gateway 使用不改写源地址的策略。关闭站点互联只撤销两侧路由，组网设备本身仍保持连接。
+
+公网域名配置完成前，已有设备信息仍可查看，但新的公网组网入口和新的网关应用会保持受限状态。更换已经被设备或 Web Service 使用的根域名前，必须先移除这些依赖。
+
+## 开发检查
+
+```bash
+cargo fmt --all -- --check
+cargo test --workspace
+cargo clippy --workspace --all-targets -- -D warnings
+cd web && npm run build
+bash -n docker/site-to-site-smoke.sh
+git diff --check
+```

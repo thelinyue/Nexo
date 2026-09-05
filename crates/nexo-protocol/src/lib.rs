@@ -145,6 +145,54 @@ pub struct GatewayApplyAck {
     pub error_message: Option<String>,
 }
 
+/// 公网访问的一条 Tunnel 期望配置。
+///
+/// 该结构只携带 Agent 连接本地服务所需的最小信息；公网监听和域名由
+/// Server/Caddy 管理，Agent 不需要理解证书或反向代理配置。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TunnelDesiredState {
+    pub tunnel_id: String,
+    pub protocol: String,
+    pub local_address: String,
+    pub local_port: u16,
+    #[serde(default)]
+    pub hostname: Option<String>,
+    /// Web Service 回源协议；TCP Tunnel 为 None。该字段保持可选，
+    /// 让旧版 Agent 能解析新版 Server 的响应而不会把未知字段当成错误。
+    #[serde(default)]
+    pub origin_protocol: Option<String>,
+    /// HTTPS Origin 的 TLS Server Name；为空时 Agent 使用连接地址。
+    #[serde(default)]
+    pub origin_tls_server_name: Option<String>,
+    /// Origin 证书校验方式：system、custom_ca 或 insecure。
+    #[serde(default)]
+    pub origin_tls_verification: Option<String>,
+    /// 自定义 CA 只通过已建立的 mTLS 控制通道下发，不落入 UI、日志或
+    /// SQLite；旧版 Agent 会忽略该可选字段并保持升级所需状态。
+    #[serde(default)]
+    pub origin_ca_pem: Option<String>,
+    pub revision: i64,
+    pub enabled: bool,
+}
+
+/// Agent 对单条 Tunnel 的实际应用结果。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TunnelApplyResult {
+    pub tunnel_id: String,
+    pub revision: i64,
+    pub applied: bool,
+    pub status: String,
+    #[serde(default)]
+    pub error_message: Option<String>,
+}
+
+/// Server 给 Agent 的数据通道入口；字段可选以兼容没有 Tunnel 数据面的旧 Server。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TunnelDataEndpoint {
+    pub address: String,
+    pub server_name: String,
+}
+
 /// Agent 建立 mTLS 控制通道后发送的身份声明。
 ///
 /// 设备证书才是认证依据；这里的 device_id 只用于服务端查找设备并校验
@@ -196,6 +244,10 @@ pub enum AgentControlMessage {
     GatewayApplyAck {
         ack: GatewayApplyAck,
     },
+    /// Agent 真实应用 Tunnel 后逐条回报；旧 Server 会忽略未知消息前的兼容路径。
+    TunnelApplyReport {
+        results: Vec<TunnelApplyResult>,
+    },
 }
 
 /// 服务端对控制通道消息的响应。
@@ -209,6 +261,10 @@ pub enum ServerControlMessage {
         mesh_enrollment: Option<MeshEnrollmentOffer>,
         #[serde(default)]
         protocol_features: Vec<String>,
+        #[serde(default)]
+        tunnels: Vec<TunnelDesiredState>,
+        #[serde(default)]
+        tunnel_endpoint: Option<TunnelDataEndpoint>,
     },
     HeartbeatAck {
         server_time: i64,
@@ -217,9 +273,17 @@ pub enum ServerControlMessage {
         mesh_enrollment: Option<MeshEnrollmentOffer>,
         #[serde(default)]
         protocol_features: Vec<String>,
+        #[serde(default)]
+        tunnels: Vec<TunnelDesiredState>,
+        #[serde(default)]
+        tunnel_endpoint: Option<TunnelDataEndpoint>,
     },
     GatewayApplyAccepted {
         revision: i64,
+    },
+    TunnelApplyAccepted {
+        #[serde(default)]
+        tunnel_ids: Vec<String>,
     },
     Error {
         message: String,
@@ -303,6 +367,8 @@ mod tests {
             gateway_state: Some(desired.clone()),
             mesh_enrollment: None,
             protocol_features: Vec::new(),
+            tunnels: Vec::new(),
+            tunnel_endpoint: None,
         };
         let encoded = serde_json::to_string(&response).expect("控制响应应能序列化");
         let decoded: ServerControlMessage =

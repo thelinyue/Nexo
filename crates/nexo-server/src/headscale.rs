@@ -12,7 +12,7 @@ use std::{
     process::Stdio,
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc,
+        Arc, RwLock,
     },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -34,6 +34,9 @@ pub enum MeshComponentStatus {
     Normal,
     Starting,
     Abnormal,
+    /// Headscale 本身可用，但正式 HTTPS 入口或 Caddy 尚未就绪；
+    /// 设备可以保留 Nexo 控制连接，新的组网应用会被暂停。
+    Restricted,
     VersionIncompatible,
 }
 
@@ -66,11 +69,11 @@ impl HeadscaleRuntimeConfig {
             binary,
             data_dir,
             listen_addr: env::var("NEXO_HEADSCALE_LISTEN_ADDR")
-                .unwrap_or_else(|_| "0.0.0.0:8080".to_owned()),
+                .unwrap_or_else(|_| "127.0.0.1:8281".to_owned()),
             api_url: env::var("NEXO_HEADSCALE_API_URL")
-                .unwrap_or_else(|_| "http://127.0.0.1:8080".to_owned()),
+                .unwrap_or_else(|_| "http://127.0.0.1:8281".to_owned()),
             server_url: env::var("NEXO_HEADSCALE_URL")
-                .unwrap_or_else(|_| "http://nexo-server:8080".to_owned()),
+                .unwrap_or_else(|_| "http://nexo-server:8281".to_owned()),
             dns_base_domain: env::var("NEXO_MESH_DNS_BASE_DOMAIN")
                 .unwrap_or_else(|_| "mesh.nexo.internal".to_owned()),
             enabled,
@@ -83,6 +86,19 @@ impl HeadscaleRuntimeConfig {
 
     pub fn secret_path(&self) -> PathBuf {
         self.data_dir.join("headscale").join("nexo-api-key.secret")
+    }
+
+    /// 返回 Agent 在没有正式公网入口时使用的内部登录地址。
+    ///
+    /// 生产部署可以通过 `NEXO_MESH_INTERNAL_URL` 指定宿主机/LAN 可达地址；
+    /// 集成拓扑继续兼容阶段一的 `NEXO_MESH_ENDPOINT`。两者都未设置时使用
+    /// API 地址作为保守回退，此时 Server 仍会阻止新的生产 Mesh Enrollment。
+    pub fn internal_server_url(&self) -> String {
+        env::var("NEXO_MESH_INTERNAL_URL")
+            .or_else(|_| env::var("NEXO_MESH_ENDPOINT"))
+            .unwrap_or_else(|_| self.api_url.clone())
+            .trim_end_matches('/')
+            .to_owned()
     }
 }
 
@@ -179,7 +195,15 @@ impl ApiKeyManager {
             tracing::info!("Headscale API Key 剩余有效期不足 14 天，开始轮换");
         }
         let (new_key, new_expiry) = self.create_key(now).await?;
-        self.check_new_key(api_url, &new_key).await?;
+        if let Err(error) = self.check_new_key(api_url, &new_key).await {
+            // CLI 创建成功但 HTTP 自检失败时，不能把这把永远不会写入
+            // Secret 的 Key 留在 Headscale 中；吊销失败只影响清理，原始
+            // 自检错误仍返回给后台重试器。
+            if let Err(expire_error) = self.expire_key(&new_key).await {
+                tracing::warn!("Headscale 临时 API Key 清理失败：{expire_error:#}");
+            }
+            return Err(error);
+        }
         self.write_atomic(&new_key, new_expiry)?;
         if let Some((old_key, _)) = current {
             if let Err(error) = self.expire_key(&old_key).await {
@@ -253,9 +277,12 @@ impl ApiKeyManager {
 /// 子进程 Supervisor：生成配置、启动、健康等待、指数退避重启和关闭。
 pub struct HeadscaleSupervisor {
     config: HeadscaleRuntimeConfig,
+    /// 根域名修改后会更新 Headscale 的登录地址；其余启动参数保持不变。
+    server_url: Arc<RwLock<String>>,
     child: Arc<Mutex<Option<Child>>>,
     stopping: Arc<AtomicBool>,
     shutdown_notify: Arc<Notify>,
+    restart_requested: Arc<AtomicBool>,
 }
 
 impl std::fmt::Debug for HeadscaleSupervisor {
@@ -270,10 +297,12 @@ impl std::fmt::Debug for HeadscaleSupervisor {
 impl HeadscaleSupervisor {
     pub fn new(config: HeadscaleRuntimeConfig) -> Self {
         Self {
+            server_url: Arc::new(RwLock::new(config.server_url.clone())),
             config,
             child: Arc::new(Mutex::new(None)),
             stopping: Arc::new(AtomicBool::new(false)),
             shutdown_notify: Arc::new(Notify::new()),
+            restart_requested: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -281,7 +310,25 @@ impl HeadscaleSupervisor {
         &self.config
     }
 
+    /// 读取当前写入 Headscale 配置的登录地址；公网域名更新后，后续
+    /// Mesh Enrollment 必须使用这份状态，而不能继续读取旧环境变量。
+    pub fn server_url(&self) -> String {
+        self.server_url
+            .read()
+            .map(|value| value.clone())
+            .unwrap_or_else(|_| self.config.server_url.clone())
+    }
+
     pub fn write_config(&self) -> Result<()> {
+        let server_url = self
+            .server_url
+            .read()
+            .map_err(|_| anyhow!("Headscale 公网地址锁不可用"))?
+            .clone();
+        self.write_config_with_server_url(&server_url)
+    }
+
+    fn write_config_with_server_url(&self, server_url: &str) -> Result<()> {
         let headscale_dir = self.config.data_dir.join("headscale");
         fs::create_dir_all(&headscale_dir)?;
         let database_path = headscale_dir.join("headscale.db");
@@ -289,7 +336,7 @@ impl HeadscaleSupervisor {
         let unix_socket_path = headscale_dir.join("headscale.sock");
         let content = format!(
             "server_url: {server_url}\nlisten_addr: {listen}\nmetrics_listen_addr: 127.0.0.1:9090\nnoise:\n  private_key_path: {noise}\nprefixes:\n  v4: 100.64.0.0/10\n  v6: fd7a:115c:a1e0::/48\nderp:\n  server:\n    enabled: false\n  # Headscale 0.29.x 即使不运行内置 DERP Server，也要求初始 DERPMap 非空。\n  # 使用官方默认地图提供 NAT 穿透回退；可达节点优先走 WireGuard 直连。\n  urls:\n    - {derp_url}\n  paths: []\n  auto_update_enabled: true\n  update_frequency: 3h\ndatabase:\n  type: sqlite\n  sqlite:\n    path: {database}\npolicy:\n  # Headscale 0.29.x 只有 database 模式支持通过官方 API 更新策略。\n  mode: database\ndns:\n  magic_dns: true\n  base_domain: {dns_domain}\n  override_local_dns: true\n  nameservers:\n    # Headscale 0.29.x 在 override_local_dns 开启时要求至少一个上游 DNS。\n    # MagicDNS 仍负责 mesh.nexo.internal，其他名称交给这些公共解析器。\n    global:\n      - 1.1.1.1\n      - 1.0.0.1\n      - 2606:4700:4700::1111\n      - 2606:4700:4700::1001\n    split: {{}}\n  search_domains: []\n  extra_records: []\nunix_socket: {unix_socket}\nunix_socket_permission: \"0600\"\nlog:\n  level: info\n",
-            server_url = yaml_quote(&self.config.server_url),
+            server_url = yaml_quote(server_url),
             listen = yaml_quote(&self.config.listen_addr),
             noise = yaml_quote(&noise_key_path.to_string_lossy()),
             database = yaml_quote(&database_path.to_string_lossy()),
@@ -303,6 +350,36 @@ impl HeadscaleSupervisor {
         Ok(())
     }
 
+    /// 根域名修改后同步 Headscale 的设备登录地址。
+    ///
+    /// Headscale 只在启动时读取 `server_url`，因此先写入配置，再通知
+    /// Supervisor 优雅重启子进程。重启期间 Nexo HTTP 与 TCP Tunnel 不受影响。
+    pub async fn update_server_url(&self, server_url: impl Into<String>) -> Result<()> {
+        let server_url = server_url.into().trim_end_matches('/').to_owned();
+        if !(server_url.starts_with("https://") || server_url.starts_with("http://")) {
+            return Err(anyhow!("Headscale 公网地址必须使用 HTTP 或 HTTPS"));
+        }
+        if server_url.len() <= 8 {
+            return Err(anyhow!("Headscale 公网地址不能为空"));
+        }
+        {
+            let mut current = self
+                .server_url
+                .write()
+                .map_err(|_| anyhow!("Headscale 公网地址锁不可用"))?;
+            if *current == server_url {
+                return Ok(());
+            }
+            *current = server_url;
+        }
+        self.write_config()?;
+        if self.config.enabled {
+            self.restart_requested.store(true, Ordering::SeqCst);
+            self.shutdown_notify.notify_one();
+        }
+        Ok(())
+    }
+
     /// 启动已配置的 Headscale；未启用时返回 None，方便本地开发运行 Server。
     pub async fn start(self: Arc<Self>) -> Result<MeshComponentStatus> {
         if !self.config.enabled {
@@ -310,7 +387,12 @@ impl HeadscaleSupervisor {
         }
         self.write_config()?;
         self.stopping.store(false, Ordering::SeqCst);
-        self.spawn_once().await?;
+        self.restart_requested.store(false, Ordering::SeqCst);
+        // 首次启动失败不能拖垮 Nexo Core；监控循环会以指数退避重试，
+        // 让 LAN 管理、Agent 注册和公网 TCP Tunnel 先继续提供服务。
+        if let Err(error) = self.spawn_once().await {
+            tracing::error!("Headscale 首次启动失败，将在后台自动重试：{error:#}");
+        }
         let supervisor = self.clone();
         tokio::spawn(async move {
             supervisor.monitor_loop().await;
@@ -357,7 +439,15 @@ impl HeadscaleSupervisor {
                 let delay = supervisor_backoff(attempt);
                 tokio::select! {
                     _ = tokio::time::sleep(delay) => {}
-                    _ = self.shutdown_notify.notified() => break,
+                    _ = self.shutdown_notify.notified() => {
+                        if self.stopping.load(Ordering::SeqCst) {
+                            break;
+                        }
+                        if self.restart_requested.swap(false, Ordering::SeqCst) {
+                            continue;
+                        }
+                        break;
+                    },
                 }
                 if self.stopping.load(Ordering::SeqCst) {
                     break;
@@ -369,17 +459,32 @@ impl HeadscaleSupervisor {
                 }
                 continue;
             };
-            let status = tokio::select! {
-                status = child.wait() => Some(status),
+            enum MonitorSignal {
+                Exited(std::io::Result<std::process::ExitStatus>),
+                Restart,
+                Stop,
+            }
+            let signal = tokio::select! {
+                status = child.wait() => MonitorSignal::Exited(status),
                 _ = self.shutdown_notify.notified() => {
                     if let Err(error) = stop_child_gracefully(&mut child).await {
                         tracing::warn!("停止 Headscale 子进程失败：{error:#}");
                     }
-                    None
+                    if self.stopping.load(Ordering::SeqCst) {
+                        MonitorSignal::Stop
+                    } else if self.restart_requested.swap(false, Ordering::SeqCst) {
+                        MonitorSignal::Restart
+                    } else {
+                        MonitorSignal::Stop
+                    }
                 }
             };
-            let Some(status) = status else {
-                break;
+            let MonitorSignal::Exited(status) = signal else {
+                if matches!(signal, MonitorSignal::Stop) {
+                    break;
+                }
+                attempt = 0;
+                continue;
             };
             if self.stopping.load(Ordering::SeqCst) {
                 break;
@@ -410,6 +515,7 @@ impl HeadscaleSupervisor {
     /// 优雅停止子进程，避免 Nexo 退出时留下孤儿 Headscale。
     pub async fn shutdown(&self) -> Result<()> {
         self.stopping.store(true, Ordering::SeqCst);
+        self.restart_requested.store(false, Ordering::SeqCst);
         // `notify_one` 会保留一个 permit，即使 Supervisor 尚未进入 select；
         // 使用 notify_waiters 可能在这个竞态窗口丢失关闭信号。
         self.shutdown_notify.notify_one();
@@ -423,6 +529,7 @@ impl HeadscaleSupervisor {
         Ok(())
     }
 
+    #[allow(dead_code)]
     pub async fn wait_until_healthy(&self, timeout: Duration) -> Result<()> {
         let started = std::time::Instant::now();
         while started.elapsed() < timeout {

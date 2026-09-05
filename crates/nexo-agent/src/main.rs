@@ -4,9 +4,10 @@
 //! token，完成请求后继续作为常驻进程运行；后续控制通道会复用同一配置。
 
 use std::{
+    collections::HashMap,
     env, fs,
     io::BufReader,
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::Command,
     sync::Arc,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -23,8 +24,9 @@ use nexo_protocol::{
     AgentControlMessage, AgentEnrollmentPollRequest, AgentEnrollmentPollResponse,
     AgentEnrollmentRequest, AgentEnrollmentResponse, GatewayApplyAck, GatewayDesiredState,
     GatewayRouteApplyReport, GatewayRouteApplyResult, MeshEnrollmentOffer, MeshIdentityReport,
-    ServerControlMessage,
+    ServerControlMessage, TunnelApplyResult, TunnelDesiredState,
 };
+use nexo_tunnel::{into_tokio_io, next_inbound, read_logical_header, yamux_connection};
 use rcgen::{CertificateParams, DistinguishedName, DnType, KeyPair};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader as AsyncBufReader};
@@ -35,6 +37,7 @@ use tokio_rustls::{rustls, TlsConnector};
 
 /// Agent 运行时所需的最小配置，避免把服务端地址写死在二进制中。
 /// Agent 的启动配置；服务端地址和控制通道地址均可在容器环境变量中指定。
+#[derive(Clone)]
 struct AgentRuntimeConfig {
     server_url: String,
     control_addr: Option<String>,
@@ -51,6 +54,9 @@ struct AgentRuntimeConfig {
     tailscaled_bin: String,
     /// 是否由 Agent 负责拉起 tailscaled。网关镜像默认开启，普通设备可关闭。
     tailscaled_enabled: bool,
+    /// 公网 Tunnel 数据连接地址；为空时只运行控制面和组网能力。
+    tunnel_addr: Option<String>,
+    tunnel_server_name: String,
 }
 
 impl AgentRuntimeConfig {
@@ -96,6 +102,11 @@ impl AgentRuntimeConfig {
             .ok()
             .map(|value| parse_bool_env(&value))
             .unwrap_or(tailscale_apply_enabled);
+        let tunnel_addr = env::var("NEXO_TUNNEL_ADDR")
+            .ok()
+            .filter(|value| !value.trim().is_empty());
+        let tunnel_server_name =
+            env::var("NEXO_TUNNEL_SERVER_NAME").unwrap_or_else(|_| control_server_name.clone());
         Ok(Self {
             server_url,
             control_addr,
@@ -110,6 +121,8 @@ impl AgentRuntimeConfig {
             tailscale_bin,
             tailscaled_bin,
             tailscaled_enabled,
+            tunnel_addr,
+            tunnel_server_name,
         })
     }
 }
@@ -239,8 +252,10 @@ async fn main() -> Result<()> {
 
     let config = AgentRuntimeConfig::from_environment()?;
     let tailscale_daemon = TailscaleDaemon::start(&config).await?;
-    let key_pair = load_or_create_key(&config)?;
+    // 先检查身份材料是否完整，再决定是否允许生成新的设备私钥；残缺的
+    // 证书/私钥组合必须显式修复，不能静默拼接成另一套身份。
     let mut identity_ready = identity_is_persisted(&config)?;
+    let key_pair = load_or_create_key(&config)?;
     let mut stop_after_enrollment = false;
     if identity_ready {
         tracing::info!("已加载本地设备身份，跳过一次性入网凭证提交");
@@ -309,6 +324,7 @@ async fn wait_for_shutdown_signal() -> Result<()> {
 /// 判断 Agent 是否已经完成过身份领取，避免容器重启时重放已消费 token。
 fn identity_is_persisted(config: &AgentRuntimeConfig) -> Result<bool> {
     let paths = [
+        config.state_dir.join("device-key.pem"),
         config.state_dir.join("device-cert.pem"),
         config.state_dir.join("server-ca.pem"),
         config.state_dir.join("device-id"),
@@ -333,11 +349,13 @@ fn load_or_create_key(config: &AgentRuntimeConfig) -> Result<KeyPair> {
     if path.exists() {
         let pem = fs::read_to_string(&path)
             .with_context(|| format!("无法读取 Agent 私钥：{}", path.display()))?;
+        set_private_permissions(&path)
+            .with_context(|| format!("无法保护 Agent 私钥：{}", path.display()))?;
         return KeyPair::from_pem(&pem).context("Agent 私钥格式无效");
     }
     let key_pair = KeyPair::generate().context("无法生成 Agent 设备私钥")?;
-    fs::write(&path, key_pair.serialize_pem())
-        .with_context(|| format!("无法保存 Agent 私钥：{}", path.display()))?;
+    write_private_file(&path, key_pair.serialize_pem().as_bytes())
+        .with_context(|| format!("无法原子保存 Agent 私钥：{}", path.display()))?;
     Ok(key_pair)
 }
 
@@ -455,14 +473,120 @@ fn persist_identity(
         .ca_certificate_pem
         .as_deref()
         .context("审批响应缺少服务端 CA 证书")?;
-    fs::write(config.state_dir.join("device-cert.pem"), certificate_pem)
-        .context("无法保存 Agent 设备证书")?;
-    fs::write(config.state_dir.join("server-ca.pem"), ca_certificate_pem)
-        .context("无法保存 Nexo Server CA 证书")?;
-    if let Some(device_id) = &approval.device_id {
-        fs::write(config.state_dir.join("device-id"), device_id)
-            .context("无法保存 Agent 设备 ID")?;
+    let device_id = approval
+        .device_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .context("审批响应缺少设备 ID")?;
+    let files = [
+        (
+            config.state_dir.join("device-cert.pem"),
+            certificate_pem.as_bytes(),
+        ),
+        (
+            config.state_dir.join("server-ca.pem"),
+            ca_certificate_pem.as_bytes(),
+        ),
+        (config.state_dir.join("device-id"), device_id.as_bytes()),
+    ];
+    let previous = files
+        .iter()
+        .map(|(path, _)| read_optional_file(path))
+        .collect::<Result<Vec<_>>>()?;
+    let write_result = files
+        .iter()
+        .try_for_each(|(path, value)| write_private_file(path, value));
+    if let Err(error) = write_result {
+        // 三份材料共同组成一次身份领取；任一文件失败都恢复旧快照，避免
+        // 下次启动把半套证书当成已入网状态。
+        let mut restore_errors = Vec::new();
+        for ((path, _), old) in files.iter().zip(previous.iter()) {
+            if let Err(restore_error) = restore_optional_file(path, old.as_deref()) {
+                restore_errors.push(format!("{}: {restore_error}", path.display()));
+            }
+        }
+        if !restore_errors.is_empty() {
+            tracing::error!(
+                "Agent 身份材料写入失败且回滚不完整：{}",
+                restore_errors.join("；")
+            );
+        }
+        return Err(error).context("无法完整保存 Agent 身份材料");
     }
+    Ok(())
+}
+
+/// 读取一个可选的身份材料快照；除不存在外的错误都必须中止写入，避免
+/// 回滚时把不可读文件误判成“原来不存在”。
+fn read_optional_file(path: &Path) -> Result<Option<Vec<u8>>> {
+    match fs::read(path) {
+        Ok(value) => Ok(Some(value)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => {
+            Err(error).with_context(|| format!("无法读取身份材料快照：{}", path.display()))
+        }
+    }
+}
+
+/// 原子写入 Agent 私钥、证书和设备 ID，并在 Unix 上固定为 0600。
+fn write_private_file(path: &Path, value: &[u8]) -> std::io::Result<()> {
+    let parent = path.parent().ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "身份材料路径缺少父目录")
+    })?;
+    fs::create_dir_all(parent)?;
+    let temporary = parent.join(format!(
+        ".{}.{}.tmp",
+        path.file_name().unwrap_or_default().to_string_lossy(),
+        std::process::id()
+    ));
+    if let Err(error) = fs::write(&temporary, value) {
+        let _ = fs::remove_file(&temporary);
+        return Err(error);
+    }
+    if let Err(error) = set_private_permissions(&temporary) {
+        let _ = fs::remove_file(&temporary);
+        return Err(error);
+    }
+    if let Err(error) = replace_private_file(&temporary, path) {
+        let _ = fs::remove_file(&temporary);
+        return Err(error);
+    }
+    set_private_permissions(path)
+}
+
+fn replace_private_file(temporary: &Path, destination: &Path) -> std::io::Result<()> {
+    match fs::rename(temporary, destination) {
+        Ok(()) => Ok(()),
+        // Unix 的 rename 会替换目标；Windows 不允许覆盖已有文件，使用同一目录
+        // 临时文件并删除旧文件后切换，仍避免半写入内容被读到。
+        Err(error) if cfg!(windows) && error.kind() == std::io::ErrorKind::AlreadyExists => {
+            fs::remove_file(destination)?;
+            fs::rename(temporary, destination)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn restore_optional_file(path: &Path, previous: Option<&[u8]>) -> std::io::Result<()> {
+    match previous {
+        Some(value) => write_private_file(path, value),
+        None => match fs::remove_file(path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error),
+        },
+    }
+}
+
+fn set_private_permissions(path: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+    }
+    #[cfg(not(unix))]
+    let _ = path;
     Ok(())
 }
 
@@ -483,14 +607,56 @@ async fn run_control_loop(config: &AgentRuntimeConfig, key_pair: &KeyPair) -> Re
     }
     let shutdown = wait_for_shutdown_signal();
     tokio::pin!(shutdown);
+    let desired_tunnels = Arc::new(AsyncMutex::new(HashMap::<
+        String,
+        nexo_protocol::TunnelDesiredState,
+    >::new()));
+    // 数据面先以环境变量作为兼容初始值；正式地址由 Server 控制响应下发，
+    // 这样同一个 Agent 可以在不改容器配置的情况下切换到当前入口。
+    let tunnel_endpoint = Arc::new(AsyncMutex::new(config.tunnel_addr.clone().map(|address| {
+        nexo_protocol::TunnelDataEndpoint {
+            address,
+            server_name: config.tunnel_server_name.clone(),
+        }
+    })));
+    let tunnel_task = {
+        let tunnel_config = config.clone();
+        let tunnel_key = key_pair.serialize_pem();
+        let tunnel_desired = desired_tunnels.clone();
+        let tunnel_endpoint_state = tunnel_endpoint.clone();
+        Some(tokio::spawn(async move {
+            run_tunnel_data_loop(
+                tunnel_config,
+                tunnel_key,
+                tunnel_endpoint_state,
+                tunnel_desired,
+            )
+            .await;
+        }))
+    };
     loop {
-        match control_session(config, key_pair, control_addr, &device_id).await {
+        match control_session(
+            config,
+            key_pair,
+            control_addr,
+            &device_id,
+            &desired_tunnels,
+            &tunnel_endpoint,
+        )
+        .await
+        {
             Ok(()) => tracing::warn!("Nexo mTLS 控制连接已断开，5 秒后重连"),
             Err(error) => tracing::warn!("Nexo mTLS 控制连接失败，5 秒后重试：{error:#}"),
         }
+        // 控制面失联后立即清空本地允许列表；数据面可能因为网络抖动
+        // 继续存活，但在重新拿到最新 Desired State 前不能接受公网连接。
+        clear_desired_tunnels(&desired_tunnels).await;
         tokio::select! {
             result = &mut shutdown => {
                 result?;
+                if let Some(task) = &tunnel_task {
+                    task.abort();
+                }
                 return Ok(());
             },
             _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {}
@@ -504,6 +670,8 @@ async fn control_session(
     key_pair: &KeyPair,
     control_addr: &str,
     device_id: &str,
+    desired_tunnels: &Arc<AsyncMutex<HashMap<String, nexo_protocol::TunnelDesiredState>>>,
+    tunnel_endpoint: &Arc<AsyncMutex<Option<nexo_protocol::TunnelDataEndpoint>>>,
 ) -> Result<()> {
     let connector = build_tls_connector(config, key_pair)?;
     let server_name = ServerName::try_from(config.control_server_name.clone())
@@ -530,6 +698,7 @@ async fn control_session(
     )
     .await?;
     let response = read_control_response(&mut reader).await?;
+    apply_server_tunnel_endpoint(tunnel_endpoint, &response).await;
     let mut last_gateway_revision = None;
     let mut last_gateway_status = None;
     let mut gateway_retry_attempt = 0;
@@ -540,8 +709,10 @@ async fn control_session(
             gateway_state: Some(gateway_state),
             mesh_enrollment,
             protocol_features,
+            tunnels,
             ..
         } => {
+            replace_desired_tunnels(desired_tunnels, &tunnels).await;
             if let Some(offer) = mesh_enrollment {
                 apply_mesh_enrollment_offer(&mut reader, config, &offer).await?;
             }
@@ -578,14 +749,29 @@ async fn control_session(
             {
                 send_gateway_route_report(&mut reader, &gateway_state, &ack, local_applied).await?;
             }
+            if protocol_features
+                .iter()
+                .any(|feature| feature == "tunnel_desired_state")
+            {
+                send_tunnel_apply_report(&mut reader, &tunnels, config).await?;
+            }
         }
         ServerControlMessage::HelloAccepted {
             gateway_state: None,
             mesh_enrollment,
+            protocol_features,
+            tunnels,
             ..
         } => {
+            replace_desired_tunnels(desired_tunnels, &tunnels).await;
             if let Some(offer) = mesh_enrollment {
                 apply_mesh_enrollment_offer(&mut reader, config, &offer).await?;
+            }
+            if protocol_features
+                .iter()
+                .any(|feature| feature == "tunnel_desired_state")
+            {
+                send_tunnel_apply_report(&mut reader, &tunnels, config).await?;
             }
         }
         ServerControlMessage::Error { message } => anyhow::bail!("服务端拒绝控制连接：{message}"),
@@ -594,6 +780,9 @@ async fn control_session(
         }
         ServerControlMessage::GatewayApplyAccepted { .. } => {
             anyhow::bail!("服务端在身份声明前返回了网关确认")
+        }
+        ServerControlMessage::TunnelApplyAccepted { .. } => {
+            anyhow::bail!("服务端在身份声明前返回了 Tunnel 确认")
         }
     }
     loop {
@@ -610,11 +799,14 @@ async fn control_session(
             },
         )
         .await?;
-        match read_control_response(&mut reader).await? {
+        let heartbeat_response = read_control_response(&mut reader).await?;
+        apply_server_tunnel_endpoint(tunnel_endpoint, &heartbeat_response).await;
+        match heartbeat_response {
             ServerControlMessage::HeartbeatAck {
                 gateway_state: Some(gateway_state),
                 mesh_enrollment,
                 protocol_features,
+                tunnels,
                 ..
             } if should_apply_gateway_state(
                 &gateway_state,
@@ -624,6 +816,7 @@ async fn control_session(
                 last_gateway_report.as_ref() != Some(&heartbeat_gateway_report),
             ) =>
             {
+                replace_desired_tunnels(desired_tunnels, &tunnels).await;
                 if let Some(offer) = mesh_enrollment {
                     apply_mesh_enrollment_offer(&mut reader, config, &offer).await?;
                 }
@@ -661,23 +854,47 @@ async fn control_session(
                     send_gateway_route_report(&mut reader, &gateway_state, &ack, local_applied)
                         .await?;
                 }
+                if protocol_features
+                    .iter()
+                    .any(|feature| feature == "tunnel_desired_state")
+                {
+                    send_tunnel_apply_report(&mut reader, &tunnels, config).await?;
+                }
             }
             ServerControlMessage::HeartbeatAck {
                 gateway_state: None,
                 mesh_enrollment,
+                protocol_features,
+                tunnels,
                 ..
             } => {
+                replace_desired_tunnels(desired_tunnels, &tunnels).await;
                 if let Some(offer) = mesh_enrollment {
                     apply_mesh_enrollment_offer(&mut reader, config, &offer).await?;
+                }
+                if protocol_features
+                    .iter()
+                    .any(|feature| feature == "tunnel_desired_state")
+                {
+                    send_tunnel_apply_report(&mut reader, &tunnels, config).await?;
                 }
             }
             ServerControlMessage::HeartbeatAck {
                 gateway_state: Some(_),
                 mesh_enrollment,
+                protocol_features,
+                tunnels,
                 ..
             } => {
+                replace_desired_tunnels(desired_tunnels, &tunnels).await;
                 if let Some(offer) = mesh_enrollment {
                     apply_mesh_enrollment_offer(&mut reader, config, &offer).await?;
+                }
+                if protocol_features
+                    .iter()
+                    .any(|feature| feature == "tunnel_desired_state")
+                {
+                    send_tunnel_apply_report(&mut reader, &tunnels, config).await?;
                 }
             }
             ServerControlMessage::Error { message } => anyhow::bail!("服务端拒绝心跳：{message}"),
@@ -687,9 +904,202 @@ async fn control_session(
             ServerControlMessage::GatewayApplyAccepted { .. } => {
                 anyhow::bail!("服务端在心跳期间返回了网关确认")
             }
+            ServerControlMessage::TunnelApplyAccepted { .. } => {
+                anyhow::bail!("服务端在心跳期间返回了 Tunnel 确认")
+            }
         }
         last_gateway_report = Some(heartbeat_gateway_report);
     }
+}
+
+async fn replace_desired_tunnels(
+    desired: &Arc<AsyncMutex<HashMap<String, nexo_protocol::TunnelDesiredState>>>,
+    tunnels: &[nexo_protocol::TunnelDesiredState],
+) {
+    let mut guard = desired.lock().await;
+    guard.clear();
+    guard.extend(
+        tunnels
+            .iter()
+            .cloned()
+            .map(|tunnel| (tunnel.tunnel_id.clone(), tunnel)),
+    );
+}
+
+/// 清空控制面失联期间的公网访问白名单。
+///
+/// 数据通道与控制通道是两条可独立重连的连接；如果只关闭控制连接而
+/// 保留旧 HashMap，Agent 会在服务端已经撤销 Tunnel 后继续连接本地 Origin。
+async fn clear_desired_tunnels(
+    desired: &Arc<AsyncMutex<HashMap<String, nexo_protocol::TunnelDesiredState>>>,
+) {
+    desired.lock().await.clear();
+}
+
+/// Agent Tunnel 数据会话的重连循环。控制面只更新允许访问的 Desired State，
+/// 数据面断开后按退避重连，不把公网监听暴露在 Agent 容器上。
+async fn run_tunnel_data_loop(
+    config: AgentRuntimeConfig,
+    key_pem: String,
+    endpoint: Arc<AsyncMutex<Option<nexo_protocol::TunnelDataEndpoint>>>,
+    desired: Arc<AsyncMutex<HashMap<String, nexo_protocol::TunnelDesiredState>>>,
+) {
+    let key_pair = match KeyPair::from_pem(&key_pem) {
+        Ok(key_pair) => key_pair,
+        Err(error) => {
+            tracing::error!("无法加载 Tunnel 数据通道客户端私钥：{error}");
+            return;
+        }
+    };
+    let mut attempt = 0_u32;
+    loop {
+        let Some(current_endpoint) = endpoint.lock().await.clone() else {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            continue;
+        };
+        let address = current_endpoint.address;
+        let stream =
+            match tokio::time::timeout(Duration::from_secs(10), TcpStream::connect(&address)).await
+            {
+                Ok(Ok(stream)) => stream,
+                Ok(Err(error)) => {
+                    attempt = attempt.saturating_add(1);
+                    let delay =
+                        Duration::from_secs((2_u64.saturating_mul(1 << attempt.min(5))).min(60));
+                    tracing::debug!("Tunnel 数据通道连接失败，{delay:?} 后重试：{error}");
+                    tokio::time::sleep(delay).await;
+                    continue;
+                }
+                Err(_) => {
+                    attempt = attempt.saturating_add(1);
+                    let delay =
+                        Duration::from_secs((2_u64.saturating_mul(1 << attempt.min(5))).min(60));
+                    tracing::debug!("Tunnel 数据通道连接超时，{delay:?} 后重试");
+                    tokio::time::sleep(delay).await;
+                    continue;
+                }
+            };
+        let connector = match build_tls_connector(&config, &key_pair) {
+            Ok(connector) => connector,
+            Err(error) => {
+                tracing::error!("无法构建 Tunnel mTLS 客户端：{error:#}");
+                return;
+            }
+        };
+        let server_name =
+            match ServerName::try_from(if current_endpoint.server_name.trim().is_empty() {
+                config.tunnel_server_name.clone()
+            } else {
+                current_endpoint.server_name.clone()
+            }) {
+                Ok(name) => name,
+                Err(_) => {
+                    tracing::error!("NEXO_TUNNEL_SERVER_NAME 不是有效的 DNS 名称");
+                    return;
+                }
+            };
+        let tls_stream = match tokio::time::timeout(
+            Duration::from_secs(10),
+            connector.connect(server_name, stream),
+        )
+        .await
+        {
+            Ok(Ok(stream)) => stream,
+            Ok(Err(error)) => {
+                tracing::debug!("Tunnel mTLS 握手失败，将重试：{error}");
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                continue;
+            }
+            Err(_) => {
+                tracing::debug!("Tunnel mTLS 握手超时，将重试");
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                continue;
+            }
+        };
+        attempt = 0;
+        let mut connection = yamux_connection(tls_stream, yamux::Mode::Client);
+        tracing::info!("Tunnel 数据通道已连接：{address}");
+        loop {
+            match next_inbound(&mut connection).await {
+                Ok(Some(stream)) => {
+                    let desired = desired.clone();
+                    tokio::spawn(async move {
+                        if let Err(error) = handle_tunnel_stream(stream, desired).await {
+                            tracing::debug!("Tunnel 逻辑流已关闭：{error:#}");
+                        }
+                    });
+                }
+                Ok(None) => break,
+                Err(error) => {
+                    tracing::debug!("Tunnel Yamux 会话异常：{error}");
+                    break;
+                }
+            }
+        }
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+}
+
+/// 从控制面更新数据通道入口；无效或空地址只记录为受限状态，
+/// 保留上一份可用地址，避免一次错误响应让已建立的 Tunnel 立即失联。
+async fn apply_server_tunnel_endpoint(
+    endpoint: &Arc<AsyncMutex<Option<nexo_protocol::TunnelDataEndpoint>>>,
+    response: &ServerControlMessage,
+) {
+    let next = match response {
+        ServerControlMessage::HelloAccepted {
+            tunnel_endpoint, ..
+        }
+        | ServerControlMessage::HeartbeatAck {
+            tunnel_endpoint, ..
+        } => tunnel_endpoint.as_ref(),
+        _ => None,
+    };
+    let Some(next) = next else {
+        return;
+    };
+    if next.address.trim().is_empty() || next.server_name.trim().is_empty() {
+        tracing::warn!("服务端下发的数据通道地址无效，继续使用上一份地址");
+        return;
+    }
+    let mut current = endpoint.lock().await;
+    if current.as_ref() != Some(next) {
+        tracing::info!("已更新 Tunnel 数据通道入口");
+        *current = Some(next.clone());
+    }
+}
+
+async fn handle_tunnel_stream(
+    stream: yamux::Stream,
+    desired: Arc<AsyncMutex<HashMap<String, nexo_protocol::TunnelDesiredState>>>,
+) -> Result<()> {
+    let mut stream_io = into_tokio_io(stream);
+    let header = read_logical_header(&mut stream_io)
+        .await
+        .map_err(|error| anyhow::anyhow!("Tunnel 逻辑流首部无效：{error}"))?;
+    let tunnel = desired.lock().await.get(&header.tunnel_id).cloned();
+    let Some(tunnel) = tunnel else {
+        anyhow::bail!("Tunnel 未在当前 Desired State 中");
+    };
+    if !tunnel.enabled {
+        anyhow::bail!("Tunnel 已关闭");
+    }
+    if !matches!(tunnel.protocol.as_str(), "tcp" | "http" | "https") {
+        anyhow::bail!("Tunnel 协议不受支持");
+    }
+    match connect_origin(&tunnel).await? {
+        OriginConnection::Plain(mut local) => {
+            tokio::io::copy_bidirectional(&mut local, &mut stream_io)
+                .await
+                .context("Tunnel 本地转发失败")?;
+        }
+        OriginConnection::Tls(mut local) => {
+            tokio::io::copy_bidirectional(&mut local, &mut stream_io)
+                .await
+                .context("HTTPS Origin Tunnel 转发失败")?;
+        }
+    }
+    Ok(())
 }
 
 /// 在兼容旧版整体 ACK 后追加逐路由结果。旧 Server 会忽略未知消息前无法
@@ -743,6 +1153,268 @@ async fn send_gateway_route_report(
     }
 }
 
+/// 对服务端下发的 Tunnel Desired State 做真实本地探测。
+///
+/// 这里只确认 Agent 能否连接本地 Origin，不会因为“收到配置”就伪造
+/// `ready`；公网监听和 Caddy 状态由 Server 侧另行确认。
+async fn send_tunnel_apply_report(
+    reader: &mut AsyncBufReader<tokio_rustls::client::TlsStream<TcpStream>>,
+    tunnels: &[TunnelDesiredState],
+    _config: &AgentRuntimeConfig,
+) -> Result<()> {
+    let mut results = Vec::with_capacity(tunnels.len());
+    for tunnel in tunnels {
+        if !tunnel.enabled {
+            results.push(TunnelApplyResult {
+                tunnel_id: tunnel.tunnel_id.clone(),
+                revision: tunnel.revision,
+                applied: true,
+                status: "disabled".to_owned(),
+                error_message: None,
+            });
+            continue;
+        }
+        let probe = tokio::time::timeout(Duration::from_secs(5), connect_origin(tunnel)).await;
+        match probe {
+            Ok(Ok(stream)) => {
+                drop(stream);
+                results.push(TunnelApplyResult {
+                    tunnel_id: tunnel.tunnel_id.clone(),
+                    revision: tunnel.revision,
+                    applied: true,
+                    status: "ready".to_owned(),
+                    error_message: None,
+                });
+            }
+            Ok(Err(error)) => {
+                // `connect_origin` 的错误会包含本地目标和 TLS 阶段，
+                // 直接回传给管理界面即可；不会包含任何 Secret 明文。
+                let message = format!("本地服务暂时无法连接：{error:#}");
+                results.push(TunnelApplyResult {
+                    tunnel_id: tunnel.tunnel_id.clone(),
+                    revision: tunnel.revision,
+                    applied: false,
+                    status: "retrying".to_owned(),
+                    error_message: Some(message),
+                });
+            }
+            Err(_) => {
+                let message = "本地服务连接超时".to_owned();
+                results.push(TunnelApplyResult {
+                    tunnel_id: tunnel.tunnel_id.clone(),
+                    revision: tunnel.revision,
+                    applied: false,
+                    status: "retrying".to_owned(),
+                    error_message: Some(message),
+                });
+            }
+        }
+    }
+    if results.is_empty() {
+        return Ok(());
+    }
+    write_agent_message(
+        reader.get_mut(),
+        &AgentControlMessage::TunnelApplyReport {
+            results: results.clone(),
+        },
+    )
+    .await?;
+    match read_control_response(reader).await? {
+        ServerControlMessage::TunnelApplyAccepted { tunnel_ids } => {
+            let accepted: std::collections::HashSet<_> = tunnel_ids.into_iter().collect();
+            if accepted.len() != results.len() {
+                anyhow::bail!("服务端只接受了部分 Tunnel 应用结果");
+            }
+        }
+        ServerControlMessage::Error { message } => {
+            anyhow::bail!("服务端拒绝 Tunnel 应用结果：{message}")
+        }
+        _ => anyhow::bail!("服务端返回了无效的 Tunnel 应用确认响应"),
+    }
+    Ok(())
+}
+
+/// Agent 到本地 Origin 的连接形态。Web Service 的 HTTP 请求始终由 Caddy
+/// 以明文写入 Nexo Unix Socket；只有这里根据 Desired State 对 HTTPS Origin
+/// 建立 TLS，避免把公网入口证书和用户本地服务证书混在同一层处理。
+enum OriginConnection {
+    Plain(TcpStream),
+    Tls(Box<tokio_rustls::client::TlsStream<TcpStream>>),
+}
+
+/// 连接并（按需）完成本地 Origin TLS 握手。握手成功后才算 Agent 的
+/// Tunnel 应用成功，因而 Web UI 不会把“只收到配置”显示为已生效。
+async fn connect_origin(tunnel: &TunnelDesiredState) -> Result<OriginConnection> {
+    let target = format_tcp_target(&tunnel.local_address, tunnel.local_port);
+    let stream = tokio::time::timeout(Duration::from_secs(10), TcpStream::connect(&target))
+        .await
+        .with_context(|| format!("连接本地 Tunnel 服务超时：{target}"))??;
+    let origin_protocol =
+        tunnel
+            .origin_protocol
+            .as_deref()
+            .unwrap_or(if tunnel.protocol == "https" {
+                "https"
+            } else {
+                "http"
+            });
+    if origin_protocol != "https" {
+        return Ok(OriginConnection::Plain(stream));
+    }
+
+    let connector = build_origin_tls_connector(tunnel)?;
+    let server_name = origin_server_name(tunnel)?;
+    let tls_stream = tokio::time::timeout(
+        Duration::from_secs(10),
+        connector.connect(server_name, stream),
+    )
+    .await
+    .context("本地 HTTPS Origin TLS 握手超时")?
+    .context("本地 HTTPS Origin TLS 握手失败")?;
+    Ok(OriginConnection::Tls(Box::new(tls_stream)))
+}
+
+fn origin_server_name(tunnel: &TunnelDesiredState) -> Result<ServerName<'static>> {
+    let value = tunnel
+        .origin_tls_server_name
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or(&tunnel.local_address)
+        .trim()
+        .trim_end_matches('.')
+        .to_owned();
+    if let Ok(address) = value.parse::<std::net::IpAddr>() {
+        return Ok(ServerName::IpAddress(address.into()));
+    }
+    ServerName::try_from(value).map_err(|_| anyhow::anyhow!("HTTPS Origin Server Name 无效"))
+}
+
+/// 构建 HTTPS Origin 校验器。system 模式读取容器操作系统的 CA bundle，
+/// custom_ca 只使用服务端通过 mTLS 下发的单个 Web Service CA；insecure
+/// 是显式高级选项，只跳过证书链校验而仍保留 TLS 握手签名校验。
+fn build_origin_tls_connector(tunnel: &TunnelDesiredState) -> Result<TlsConnector> {
+    let verification = tunnel
+        .origin_tls_verification
+        .as_deref()
+        .unwrap_or("system");
+    if verification == "insecure" {
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let verifier = SkipOriginCertificateVerification(provider);
+        let config = rustls::ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(verifier))
+            .with_no_client_auth();
+        return Ok(TlsConnector::from(Arc::new(config)));
+    }
+
+    let certificates = if verification == "custom_ca" {
+        let pem = tunnel
+            .origin_ca_pem
+            .as_deref()
+            .filter(|pem| !pem.trim().is_empty())
+            .context("HTTPS Origin 缺少自定义 CA")?;
+        parse_certificates(pem).context("HTTPS Origin 自定义 CA 格式无效")?
+    } else if verification == "system" {
+        load_system_root_certificates()?
+    } else {
+        anyhow::bail!("HTTPS Origin 证书校验方式不受支持：{verification}");
+    };
+    let mut roots = rustls::RootCertStore::empty();
+    for certificate in certificates {
+        roots
+            .add(certificate)
+            .context("HTTPS Origin CA 证书无法加入信任库")?;
+    }
+    if roots.is_empty() {
+        anyhow::bail!("HTTPS Origin CA 信任库为空");
+    }
+    let config = rustls::ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    Ok(TlsConnector::from(Arc::new(config)))
+}
+
+/// Linux 容器通常把系统 CA 放在 `/etc/ssl/certs/ca-certificates.crt`；
+/// 同时尊重 SSL_CERT_FILE 与 RHEL 系路径，便于在不同发行版中保持 system
+/// 校验语义。找不到任何有效证书时明确失败，而不是静默降级到不安全模式。
+fn load_system_root_certificates() -> Result<Vec<CertificateDer<'static>>> {
+    let mut paths = Vec::new();
+    if let Some(path) = env::var_os("SSL_CERT_FILE") {
+        paths.push(PathBuf::from(path));
+    }
+    paths.extend([
+        PathBuf::from("/etc/ssl/certs/ca-certificates.crt"),
+        PathBuf::from("/etc/pki/tls/certs/ca-bundle.crt"),
+    ]);
+    let mut certificates = Vec::new();
+    for path in paths {
+        let Ok(pem) = fs::read_to_string(&path) else {
+            continue;
+        };
+        if let Ok(mut parsed) = parse_certificates(&pem) {
+            certificates.append(&mut parsed);
+        }
+        if !certificates.is_empty() {
+            break;
+        }
+    }
+    if certificates.is_empty() {
+        anyhow::bail!("无法读取操作系统 CA 证书，请改用自定义 CA 或检查容器 CA 包");
+    }
+    Ok(certificates)
+}
+
+/// `insecure` 仅是用户明确选择的本地 Origin 高级选项；TLS 内部签名仍
+/// 交给 rustls 当前 crypto provider 验证，避免把损坏的握手误当成成功。
+#[derive(Debug)]
+struct SkipOriginCertificateVerification(Arc<rustls::crypto::CryptoProvider>);
+
+impl rustls::client::danger::ServerCertVerifier for SkipOriginCertificateVerification {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &ServerName<'_>,
+        _ocsp: &[u8],
+        _now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &self.0.signature_verification_algorithms,
+        )
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &self.0.signature_verification_algorithms,
+        )
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.0.signature_verification_algorithms.supported_schemes()
+    }
+}
+
 /// 使用一次性 Headscale Key 加入组网，并通过 mTLS 回报可交叉校验的运行身份。
 ///
 /// Agent 不把 Headscale Node/API Key 暴露到 UI；Key 只存在本函数栈帧，发送确认
@@ -760,17 +1432,7 @@ async fn apply_mesh_enrollment_offer(
         command
             .env("TS_SOCKET", &socket)
             .arg(tailscale_socket_arg(&socket))
-            .args([
-                "up",
-                "--login-server",
-                offer.endpoint.as_str(),
-                "--auth-key",
-                offer.auth_key.as_str(),
-                "--hostname",
-                offer.hostname.as_str(),
-                "--accept-dns=true",
-                "--accept-routes=true",
-            ]);
+            .args(mesh_enrollment_command_args(offer));
         if offer.reset {
             // 身份恢复由管理员明确确认后才会设置 reset；首次入网不会触碰
             // Agent 已保存的 Tailscale 状态，避免误删正常组网连接。
@@ -817,12 +1479,43 @@ async fn apply_mesh_enrollment_offer(
     Ok(())
 }
 
+/// 生成首次组网加入命令的固定参数。
+///
+/// `tailscale up` 会同时建立普通 Mesh 和站点网关所需的基础策略。关闭
+/// Subnet Route SNAT 可以保留真实 LAN 源地址；Subnet Gateway 在收到实际
+/// Desired State 后会通过 `tailscale set` 恢复适合自身能力的策略。
+fn mesh_enrollment_command_args(offer: &MeshEnrollmentOffer) -> Vec<String> {
+    vec![
+        "up".to_owned(),
+        "--login-server".to_owned(),
+        offer.endpoint.clone(),
+        "--auth-key".to_owned(),
+        offer.auth_key.clone(),
+        "--hostname".to_owned(),
+        offer.hostname.clone(),
+        "--accept-dns=true".to_owned(),
+        "--accept-routes=true".to_owned(),
+        "--snat-subnet-routes=false".to_owned(),
+    ]
+}
+
 /// 防止 Tailscale CLI 异常输出意外回显一次性入网密钥。
 fn redact_enrollment_secret(message: &str, auth_key: &str) -> String {
     if auth_key.trim().is_empty() {
         message.to_owned()
     } else {
         message.replace(auth_key, "<redacted>")
+    }
+}
+
+/// 组合本地 TCP 目标地址；IPv6 必须使用方括号包裹，避免把地址中的冒号
+/// 误解析为端口分隔符。Server 侧只接受 IP 或 DNS 名称，因此无需支持带端口
+/// 的用户输入，所有端口都来自已校验的 `u16` 字段。
+fn format_tcp_target(address: &str, port: u16) -> String {
+    if address.parse::<std::net::Ipv6Addr>().is_ok() {
+        format!("[{address}]:{port}")
+    } else {
+        format!("{address}:{port}")
     }
 }
 
@@ -1673,6 +2366,21 @@ mod tests {
     }
 
     #[test]
+    fn tcp_target_formats_ipv4_and_dns_without_brackets() {
+        assert_eq!(format_tcp_target("127.0.0.1", 8808), "127.0.0.1:8808");
+        assert_eq!(
+            format_tcp_target("origin.internal", 443),
+            "origin.internal:443"
+        );
+    }
+
+    #[test]
+    fn tcp_target_wraps_ipv6_literals() {
+        assert_eq!(format_tcp_target("::1", 8808), "[::1]:8808");
+        assert_eq!(format_tcp_target("2001:db8::10", 443), "[2001:db8::10]:443");
+    }
+
+    #[test]
     fn tailscale_command_args_are_limited_to_gateway_flags() {
         let plan = TailscaleRoutePlan {
             advertise_routes: vec!["192.168.10.0/24".to_owned(), "192.168.30.0/24".to_owned()],
@@ -1684,6 +2392,33 @@ mod tests {
             vec![
                 "set",
                 "--advertise-routes=192.168.10.0/24,192.168.30.0/24",
+                "--accept-routes=true",
+                "--snat-subnet-routes=false",
+            ]
+        );
+    }
+
+    #[test]
+    fn mesh_enrollment_disables_subnet_route_snat() {
+        let offer = MeshEnrollmentOffer {
+            endpoint: "https://mesh.example.com".to_owned(),
+            auth_key: "one-time-key".to_owned(),
+            auth_key_id: "key-id".to_owned(),
+            hostname: "default-gateway-ab12".to_owned(),
+            reset: false,
+            tenant_id: Some("default".to_owned()),
+        };
+        assert_eq!(
+            mesh_enrollment_command_args(&offer),
+            vec![
+                "up",
+                "--login-server",
+                "https://mesh.example.com",
+                "--auth-key",
+                "one-time-key",
+                "--hostname",
+                "default-gateway-ab12",
+                "--accept-dns=true",
                 "--accept-routes=true",
                 "--snat-subnet-routes=false",
             ]

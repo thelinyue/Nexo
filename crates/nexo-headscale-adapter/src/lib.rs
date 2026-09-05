@@ -206,6 +206,17 @@ impl HeadscaleHttpAdapter {
         )
     }
 
+    /// 创建尚未拿到 API Key 的适配器。
+    ///
+    /// Server 启动时不能因为 Headscale 尚未完成启动而阻塞 LAN 管理入口；
+    /// 适配器先以 Pending 身份存在，后台 Bootstrap 成功后再热切换密钥。
+    pub fn new_unconfigured(base_url: impl Into<String>) -> Result<Self> {
+        Self::with_client_unconfigured(
+            Client::builder().timeout(Duration::from_secs(10)).build()?,
+            base_url,
+        )
+    }
+
     /// 注入 Client 便于集成测试和自定义超时策略。
     pub fn with_client(
         client: Client,
@@ -224,6 +235,19 @@ impl HeadscaleHttpAdapter {
             client,
             base_url,
             api_key: Arc::new(RwLock::new(api_key)),
+        })
+    }
+
+    /// 测试和恢复路径使用的无密钥构造器；普通调用仍应使用 [`Self::new`]。
+    pub fn with_client_unconfigured(client: Client, base_url: impl Into<String>) -> Result<Self> {
+        let base_url = base_url.into().trim_end_matches('/').to_owned();
+        if base_url.is_empty() {
+            return Err(anyhow!("Headscale 地址不能为空"));
+        }
+        Ok(Self {
+            client,
+            base_url,
+            api_key: Arc::new(RwLock::new(String::new())),
         })
     }
 
@@ -247,10 +271,15 @@ impl HeadscaleHttpAdapter {
             .read()
             .map(|key| key.clone())
             .unwrap_or_default();
-        self.client
+        let request = self
+            .client
             .request(method, format!("{}{}", self.base_url, path))
-            .bearer_auth(api_key)
-            .header(reqwest::header::ACCEPT, "application/json")
+            .header(reqwest::header::ACCEPT, "application/json");
+        if api_key.trim().is_empty() {
+            request
+        } else {
+            request.bearer_auth(api_key)
+        }
     }
 
     async fn send_json<T: for<'de> Deserialize<'de>>(

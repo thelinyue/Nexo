@@ -6,6 +6,13 @@ license.workspace = true
 
 [dependencies]
 bytes.workspace = true
+futures-io.workspace = true
+futures-util.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+rustls.workspace = true
 tokio.workspace = true
+tokio-util.workspace = true
 tracing.workspace = true
-
+yamux.workspace = true

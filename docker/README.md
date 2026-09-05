@@ -1,8 +1,9 @@
-# Nexo 第一阶段容器
+# Nexo Server/Agent 容器
 
 `compose.phase1.yml` 提供 Server 与 Agent 的最小部署示例。Server 容器内的
-Headscale 只在容器内部网络监听；示例仅把 8080 映射到宿主机 loopback 供同机
-host-network Agent 使用，不作为公网入口。第二阶段再加入 Caddy、公开域名和泛域名证书。
+Headscale 使用 `8281`，只允许本机/容器内部访问，不作为公网入口。第二阶段的
+Caddy 公网入口使用 `80/443`，管理入口使用 `8280`，Agent 控制通道使用 `9890`，
+Tunnel 数据通道使用 `9891`。
 
 Agent Gateway 只需要：
 
@@ -36,3 +37,7 @@ Server 内置 Headscale 默认开启 MagicDNS，组网名称后缀为 `mesh.nexo
 和泛域名证书仍属于第二阶段。
 
 如果 Windows 侧没有 Docker CLI，请从已安装 Docker Engine 的 WSL2 发行版中执行上述命令。
+
+管理员恢复需要本地 Docker 权限，可执行 `docker compose -f docker/compose.phase2.yml
+exec nexo-server nexo admin recover` 获取一次性 Recovery Code；恢复码不会写入
+SQLite 或普通日志，输入恢复页面后会立即吊销全部旧 Session。
