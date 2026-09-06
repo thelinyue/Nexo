@@ -2,6 +2,17 @@
 
 本项目使用 [Semantic Versioning](https://semver.org/) 记录公开版本。
 
+## [0.1.6] - 2026-09-07
+
+### Added
+
+- 增加未分配 Tunnel 保留、手动共享网络、多网段 SiteLink 及逐路由状态展示。
+- 增加 Tunnel 批量分配、启停和删除，以及设备和 SiteLink 的编辑能力。
+
+### Changed
+
+- Headscale 节点支持同步重命名，站点互联支持按地址族维护下一跳。
+
 ## [0.1.5] - 2026-09-06
 
 ### Added
@@ -85,6 +96,7 @@
 - API Key、DNS Token、私钥和自定义 CA 保存为受限 Secret 文件。
 
 [0.1.5]: https://github.com/thelinyue/Nexo/releases/tag/v0.1.5
+[0.1.6]: https://github.com/thelinyue/Nexo/releases/tag/v0.1.6
 [0.1.4]: https://github.com/thelinyue/Nexo/releases/tag/v0.1.4
 [0.1.3]: https://github.com/thelinyue/Nexo/releases/tag/v0.1.3
 [0.1.2]: https://github.com/thelinyue/Nexo/releases/tag/v0.1.2

@@ -17,9 +17,10 @@ pub enum NetworkError {
     OverlayNetwork,
 }
 
-/// 校验用户从 Agent 网卡快照中选择的网络前缀。
+/// 校验自动探测或管理员手动填写的局域网前缀。
 ///
-/// V1 不接受任意手工输入的路由，只允许后续由接口快照证明其为直连网络。
+/// 该函数只负责网络边界安全性；是否必须出现在 Agent 网卡快照中，
+/// 由服务端根据共享网络的来源模式另行决定。
 pub fn validate_published_network(prefix: IpNet) -> Result<(), NetworkError> {
     let network = prefix.network();
     if prefix.prefix_len() == 0 {

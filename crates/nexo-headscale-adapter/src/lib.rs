@@ -166,6 +166,12 @@ struct ApproveRoutesResponse {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct RenameNodeResponse {
+    node: Option<HeadscaleNode>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct HealthResponse {
     #[serde(default)]
     database_connectivity: bool,
@@ -450,6 +456,21 @@ impl HeadscaleHttpAdapter {
             .await
     }
 
+    /// 使用 Headscale 官方接口同步更新节点访问名。
+    pub async fn rename_node(&self, node_id: &str, new_name: &str) -> Result<HeadscaleNode> {
+        let path = format!(
+            "/api/v1/node/{}/rename/{}",
+            urlencoding(node_id),
+            urlencoding(new_name),
+        );
+        let response: RenameNodeResponse = self
+            .send_json(self.request(Method::POST, &path), "重命名设备组网节点")
+            .await?;
+        response
+            .node
+            .ok_or_else(|| anyhow!("Headscale 重命名响应缺少节点"))
+    }
+
     pub async fn set_policy(&self, policy: &str) -> Result<()> {
         self.send_empty(
             self.request(Method::PUT, "/api/v1/policy")
@@ -589,6 +610,10 @@ pub trait HeadscaleControlPlane: Send + Sync {
         Err(anyhow!("Headscale 节点删除 API 尚未配置"))
     }
 
+    async fn rename_node(&self, _node_id: &str, _new_name: &str) -> Result<HeadscaleNode> {
+        Err(anyhow!("Headscale 节点重命名 API 尚未配置"))
+    }
+
     async fn set_policy(&self, _policy: &str) -> Result<()> {
         Err(anyhow!("Headscale Policy API 尚未配置"))
     }
@@ -700,6 +725,10 @@ impl HeadscaleControlPlane for HeadscaleHttpAdapter {
 
     async fn delete_node(&self, node_id: &str) -> Result<()> {
         HeadscaleHttpAdapter::delete_node(self, node_id).await
+    }
+
+    async fn rename_node(&self, node_id: &str, new_name: &str) -> Result<HeadscaleNode> {
+        HeadscaleHttpAdapter::rename_node(self, node_id, new_name).await
     }
 
     async fn set_policy(&self, policy: &str) -> Result<()> {
@@ -892,6 +921,32 @@ mod tests {
             .delete_node("42")
             .await
             .expect("官方节点删除接口应成功");
+        server.await.expect("测试 HTTP 服务应完成");
+    }
+
+    #[tokio::test]
+    async fn rename_node_uses_encoded_official_endpoint() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("测试 HTTP 监听器应能启动");
+        let address = listener.local_addr().expect("测试监听器应有地址");
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("应接受节点重命名请求");
+            let request = read_http_request(&mut stream).await;
+            assert!(request.starts_with("POST /api/v1/node/42/rename/%E8%AE%BE%E5%A4%87-1 "));
+            write_json_response(
+                &mut stream,
+                r#"{"node":{"id":"42","name":"tenant-device-42"}}"#,
+            )
+            .await;
+        });
+        let adapter = HeadscaleHttpAdapter::new(format!("http://{address}"), "test-secret")
+            .expect("测试适配器应能创建");
+        let node = adapter
+            .rename_node("42", "设备-1")
+            .await
+            .expect("官方节点重命名接口应成功");
+        assert_eq!(node.name, "tenant-device-42");
         server.await.expect("测试 HTTP 服务应完成");
     }
 

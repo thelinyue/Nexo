@@ -3,7 +3,7 @@
 Nexo 是面向个人自托管、NAS/HomeLab 和小型网络环境的设备、异地组网与公网访问管理服务。
 它把设备、共享网络、站点互联、Web 服务和 TCP 端口集中到一个 Web 界面中，正常使用不需要编辑配置文件。
 
-## v0.1.5 快速开始
+## v0.1.6 快速开始
 
 当前版本仅支持 `linux/amd64` Docker。Server 与 Agent 使用独立镜像，
 Agent 可以安装在其他家庭、办公室或 VPS 上并加入任意 Nexo Server。
@@ -18,7 +18,7 @@ name: nexo
 
 services:
   nexo-server:
-    image: ghcr.io/thelinyue/nexo-server:0.1.5
+    image: ghcr.io/thelinyue/nexo-server:0.1.6
     container_name: nexo-server
     network_mode: host
     environment:
@@ -58,7 +58,7 @@ name: nexo-agent
 
 services:
   nexo-agent:
-    image: ghcr.io/thelinyue/nexo-agent:0.1.5
+    image: ghcr.io/thelinyue/nexo-agent:0.1.6
     container_name: nexo-agent
     network_mode: host
     cap_add:
@@ -148,7 +148,7 @@ docker compose -f docker/compose.phase2.yml exec nexo-server nexo admin recover
 ## Docker 部署
 
 正式发布使用仓库根目录的 [`compose.yml`](compose.yml) 和
-[`compose.agent.yml`](compose.agent.yml)，镜像标签固定为 `0.1.5`，不会隐式
+[`compose.agent.yml`](compose.agent.yml)，镜像标签固定为 `0.1.6`，不会隐式
 升级。开发环境的源码构建示例仍保留在 [`docker/compose.phase2.yml`](docker/compose.phase2.yml)。
 它们使用 host network，保留真实 LAN 转发所需的最小权限：Agent 只授予
 `/dev/net/tun` 和 `NET_ADMIN`，不使用 `privileged` 或 Docker Socket。
