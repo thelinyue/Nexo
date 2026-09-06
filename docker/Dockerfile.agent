@@ -1,20 +1,30 @@
 # Nexo Agent 镜像。Tailscale 二进制保持独立文件，不编译进 nexo-agent。
 FROM ghcr.io/tailscale/tailscale:v1.102.3@sha256:8c42c4574ab066384fcb72f69e086a2ff1dd3652eb6f56856cee34bcf0d2f680 AS tailscale
 
-FROM rust:1.89-bookworm AS rust-build
+FROM rust:1.89-bookworm@sha256:948f9b08a66e7fe01b03a98ef1c7568292e07ec2e4fe90d88c07bb14563c84ff AS rust-build
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
 COPY migrations ./migrations
 RUN cargo build --release -p nexo-agent
 
-FROM debian:bookworm-slim
+FROM debian:bookworm-slim@sha256:87c9c526ce4d2415131fd9a14f477bc5c1c97dcb9f16bd735d6a88979f2e7ba0
+ARG NEXO_VERSION=0.1.0
+ARG NEXO_REVISION=unknown
 RUN apt-get update \
     && apt-get install --no-install-recommends -y ca-certificates iproute2 iptables \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=rust-build /src/target/release/nexo-agent /usr/local/bin/nexo-agent
 COPY --from=tailscale /usr/local/bin/tailscale /usr/local/bin/tailscale
 COPY --from=tailscale /usr/local/bin/tailscaled /usr/local/bin/tailscaled
+COPY LICENSE THIRD_PARTY_NOTICES.md /usr/share/doc/nexo/
+COPY licenses /usr/share/doc/nexo/licenses
+LABEL org.opencontainers.image.title="Nexo Agent" \
+      org.opencontainers.image.description="Nexo 联巢设备代理与网关运行时" \
+      org.opencontainers.image.source="https://github.com/thelinyue/Nexo" \
+      org.opencontainers.image.version="${NEXO_VERSION}" \
+      org.opencontainers.image.revision="${NEXO_REVISION}" \
+      org.opencontainers.image.licenses="AGPL-3.0-only"
 ENV NEXO_STATE_DIR=/data/nexo-agent \
     NEXO_TAILSCALE_BIN=/usr/local/bin/tailscale \
     NEXO_TAILSCALED_BIN=/usr/local/bin/tailscaled \

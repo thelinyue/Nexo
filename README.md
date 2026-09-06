@@ -3,6 +3,36 @@
 Nexo 是面向个人自托管、NAS/HomeLab 和小型网络环境的设备、异地组网与公网访问管理服务。
 它把设备、共享网络、站点互联、Web 服务和 TCP 端口集中到一个 Web 界面中，正常使用不需要编辑配置文件。
 
+## v0.1.0 快速开始
+
+首个正式版本仅支持 `linux/amd64` Docker。Server 与 Agent 使用独立镜像，
+Agent 可以安装在其他家庭、办公室或 VPS 上并加入任意 Nexo Server。
+
+从 [v0.1.0 Release](https://github.com/thelinyue/Nexo/releases/tag/v0.1.0)
+下载 `nexo-v0.1.0-docker.tar.gz` 并解压，然后：
+
+```bash
+cp .env.example .env
+# 编辑 .env 中的公网或 LAN 可达地址
+docker compose up -d
+docker compose exec nexo-server nexo bootstrap-code
+```
+
+打开 `http://<Server-LAN-IP>:8280`，使用一次性口令创建管理员。公网域名和
+证书继续在 Web 中配置；未配置 HTTPS 时，LAN 管理入口仍可使用，但新的组网
+应用会保持受限状态。
+
+在其他站点部署 Agent：
+
+```bash
+# 在该站点准备相同的 .env，并将地址指向目标 Nexo Server
+docker compose -f compose.agent.yml up -d
+```
+
+首次启动前，将 Web 中创建的一次性入网 Token 填入 `NEXO_ENROLLMENT_TOKEN`。
+设备成功加入后立即从 `.env` 中删除 Token，再次执行 Compose 应用配置。Agent
+身份保存在 `./data/nexo-agent`，不会绑定到生成 Token 的那台 Server 镜像。
+
 ## 第二阶段能力
 
 - 首次打开 LAN 管理入口完成管理员初始化，之后使用 Argon2id 密码和服务端 Session 登录。
@@ -63,7 +93,11 @@ docker compose -f docker/compose.phase2.yml exec nexo-server nexo admin recover
 
 ## Docker 部署
 
-生产示例见 [`docker/compose.phase2.yml`](docker/compose.phase2.yml)。它使用 host network，保留真实 LAN 转发所需的最小权限：Agent 只授予 `/dev/net/tun` 和 `NET_ADMIN`，不使用 `privileged` 或 Docker Socket。
+正式发布使用仓库根目录的 [`compose.yml`](compose.yml) 和
+[`compose.agent.yml`](compose.agent.yml)，镜像标签固定为 `0.1.0`，不会隐式
+升级。开发环境的源码构建示例仍保留在 [`docker/compose.phase2.yml`](docker/compose.phase2.yml)。
+它们使用 host network，保留真实 LAN 转发所需的最小权限：Agent 只授予
+`/dev/net/tun` 和 `NET_ADMIN`，不使用 `privileged` 或 Docker Socket。
 
 在原生 Linux 或具备 Docker Engine 的 WSL2 发行版中运行：
 
@@ -78,6 +112,31 @@ bash docker/site-to-site-smoke.sh
 ```
 
 验收拓扑只使用固定的 `nexo-phase1-integration` Compose 项目和测试卷，失败时先输出相关状态与日志，然后清理自身资源，不会触碰其他项目或 `.edge-screenshot/`。
+
+## 数据备份、恢复与升级
+
+Nexo Server 的 SQLite、身份、API Key、证书和其他 Secret 均位于
+`./data/nexo`。备份必须覆盖整个目录，不能只复制 `nexo.db`。一致性备份流程：
+
+```bash
+docker compose stop nexo-server
+tar -C . -czf nexo-data-$(date +%Y%m%d-%H%M%S).tar.gz data/nexo
+docker compose start nexo-server
+```
+
+Agent 的 `./data/nexo-agent` 保存设备身份；重装站点前也应单独备份。恢复时先
+停止对应容器，把现有数据目录移到安全位置，再解压完整备份并启动。恢复后检查
+管理员登录、设备身份、Tunnel 和组网状态是否自动收敛。
+
+升级时先完成备份，再将 Compose 中两个镜像改为同一个新版本号，执行：
+
+```bash
+docker compose pull
+docker compose up -d
+```
+
+数据库迁移只向前执行。升级后的数据目录不得直接交给旧版本二进制；需要回滚时，
+必须同时恢复升级前的完整数据备份和对应旧镜像。
 
 ## Web Service 与 TCP Tunnel
 

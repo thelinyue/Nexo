@@ -1,0 +1,33 @@
+name: nexo
+
+# Nexo v0.1.0 Server 正式部署。内置组件只监听本机回环地址，公网入口、
+# Agent 控制通道和 Tunnel 数据通道由宿主机网络直接提供。
+services:
+  nexo-server:
+    image: ghcr.io/thelinyue/nexo-server:0.1.0
+    container_name: nexo-server
+    network_mode: host
+    environment:
+      NEXO_HTTP_ADDR: 0.0.0.0:8280
+      NEXO_PUBLIC_BACKEND_ADDR: 127.0.0.1:9888
+      NEXO_CONTROL_ADDR: 0.0.0.0:9890
+      NEXO_TUNNEL_ADDR: 0.0.0.0:9891
+      NEXO_TUNNEL_ENDPOINT: ${NEXO_TUNNEL_ENDPOINT:?请在 .env 中填写 NEXO_TUNNEL_ENDPOINT}
+      NEXO_HEADSCALE_ENABLED: "true"
+      NEXO_HEADSCALE_LISTEN_ADDR: 127.0.0.1:8281
+      NEXO_HEADSCALE_API_URL: http://127.0.0.1:8281
+      NEXO_HEADSCALE_URL: ${NEXO_MESH_ENDPOINT:?请在 .env 中填写 NEXO_MESH_ENDPOINT}
+      NEXO_MESH_DNS_BASE_DOMAIN: ${NEXO_MESH_DNS_BASE_DOMAIN:-mesh.nexo.internal}
+      NEXO_CADDY_ENABLED: "true"
+      NEXO_CADDY_BIN: /usr/local/bin/caddy
+      NEXO_CADDY_ADMIN_URL: http://127.0.0.1:8290
+      NEXO_DATA_DIR: /data/nexo
+      NEXO_WEB_DIR: /opt/nexo/web
+    volumes:
+      - ./data/nexo:/data/nexo
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "curl --fail --silent http://127.0.0.1:8280/health >/dev/null"]
+      interval: 10s
+      timeout: 3s
+      retries: 6

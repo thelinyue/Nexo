@@ -1,0 +1,55 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+
+permissions:
+  contents: read
+
+jobs:
+  quality:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: 检出源码
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: 安装固定 Rust 工具链
+        run: |
+          rustup toolchain install 1.89.0 --profile minimal --component rustfmt,clippy
+          rustup default 1.89.0
+
+      - name: 安装 Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22.16.0
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Rust 格式检查
+        run: cargo fmt --all -- --check
+      - name: Rust 测试
+        run: cargo test --workspace --locked
+      - name: Rust 静态检查
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: 安装 Web 依赖
+        working-directory: web
+        run: npm ci --ignore-scripts
+      - name: 构建 Web
+        working-directory: web
+        run: npm run build
+      - name: 安装 Chromium
+        working-directory: web
+        run: npx playwright install --with-deps chromium
+      - name: 浏览器发布验收
+        working-directory: web
+        run: npm run test:e2e
+      - name: Shell 语法检查
+        run: |
+          bash -n docker/site-to-site-smoke.sh
+          bash -n docker/cloudflare-acme-smoke.sh
+      - name: 工作区差异检查
+        run: git diff --check

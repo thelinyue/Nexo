@@ -14,6 +14,7 @@ use std::{
 };
 
 use anyhow::{Context, Result};
+use clap::Parser;
 use get_if_addrs::{get_if_addrs, IfAddr};
 use ipnet::IpNet;
 use nexo_core::{
@@ -34,6 +35,12 @@ use tokio::net::TcpStream;
 use tokio::process::{Child, Command as TokioCommand};
 use tokio::sync::Mutex as AsyncMutex;
 use tokio_rustls::{rustls, TlsConnector};
+
+/// Agent 只提供版本查询；运行配置继续通过容器环境变量传入，避免同时维护
+/// CLI 与环境变量两套部署接口。
+#[derive(Debug, Parser)]
+#[command(name = "nexo-agent", version, about = "Nexo 联巢设备代理")]
+struct Cli {}
 
 /// Agent 运行时所需的最小配置，避免把服务端地址写死在二进制中。
 /// Agent 的启动配置；服务端地址和控制通道地址均可在容器环境变量中指定。
@@ -246,6 +253,7 @@ impl TailscaleDaemon {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    Cli::parse();
     tracing_subscriber::fmt()
         .with_env_filter("nexo_agent=info")
         .init();

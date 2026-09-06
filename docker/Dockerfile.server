@@ -1,13 +1,13 @@
 # Nexo 第二阶段 Server 镜像：Rust API/Web/Tunnel + Caddy + 独立 Headscale 子进程。
 # Caddy、Headscale 和 Nexo 以独立子进程集成；公网入口由 Caddy 管理。
-FROM node:22.16.0-alpine AS web-build
+FROM node:22.16.0-alpine@sha256:41e4389f3d988d2ed55392df4db1420ad048ae53324a8e2b7c6d19508288107e AS web-build
 WORKDIR /src/web
 COPY web/package.json web/package-lock.json ./
 RUN npm ci --ignore-scripts
 COPY web/ ./
 RUN npm run build
 
-FROM rust:1.89-bookworm AS rust-build
+FROM rust:1.89-bookworm@sha256:948f9b08a66e7fe01b03a98ef1c7568292e07ec2e4fe90d88c07bb14563c84ff AS rust-build
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
@@ -15,7 +15,7 @@ COPY migrations ./migrations
 COPY --from=web-build /src/web/dist ./web/dist
 RUN cargo build --release -p nexo-server
 
-FROM golang:1.25.1-bookworm AS caddy-build
+FROM golang:1.25.1-bookworm@sha256:c423747fbd96fd8f0b1102d947f51f9b266060217478e5f9bf86f145969562ee AS caddy-build
 ARG CADDY_VERSION=2.11.4
 ARG XCADDY_VERSION=0.4.7
 ARG CLOUDFLARE_MODULE_VERSION=0.2.4
@@ -26,7 +26,9 @@ RUN go install "github.com/caddyserver/xcaddy/cmd/xcaddy@v${XCADDY_VERSION}" \
     && /usr/local/bin/caddy version | grep -q "v${CADDY_VERSION}" \
     && /usr/local/bin/caddy list-modules | grep -q "dns.providers.cloudflare"
 
-FROM debian:bookworm-slim
+FROM debian:bookworm-slim@sha256:87c9c526ce4d2415131fd9a14f477bc5c1c97dcb9f16bd735d6a88979f2e7ba0
+ARG NEXO_VERSION=0.1.0
+ARG NEXO_REVISION=unknown
 ARG TARGETARCH=amd64
 ARG HEADSCALE_VERSION=0.29.3
 ARG CADDY_VERSION=2.11.4
@@ -50,7 +52,15 @@ RUN apt-get update \
 COPY --from=rust-build /src/target/release/nexo-server /usr/local/bin/nexo-server
 COPY --from=caddy-build /usr/local/bin/caddy /usr/local/bin/caddy
 COPY --from=web-build /src/web/dist /opt/nexo/web
+COPY LICENSE THIRD_PARTY_NOTICES.md /usr/share/doc/nexo/
+COPY licenses /usr/share/doc/nexo/licenses
 RUN ln -s /usr/local/bin/nexo-server /usr/local/bin/nexo
+LABEL org.opencontainers.image.title="Nexo Server" \
+      org.opencontainers.image.description="Nexo 联巢服务端、Web、公网入口与组网控制服务" \
+      org.opencontainers.image.source="https://github.com/thelinyue/Nexo" \
+      org.opencontainers.image.version="${NEXO_VERSION}" \
+      org.opencontainers.image.revision="${NEXO_REVISION}" \
+      org.opencontainers.image.licenses="AGPL-3.0-only"
 ENV NEXO_HEADSCALE_ENABLED=true \
     NEXO_HEADSCALE_BIN=/usr/local/bin/headscale \
     NEXO_HEADSCALE_VERSION=0.29.3 \

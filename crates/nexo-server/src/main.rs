@@ -65,7 +65,7 @@ use x509_parser::{extensions::GeneralName, pem::parse_x509_pem};
 use headscale::{ApiKeyManager, HeadscaleRuntimeConfig, HeadscaleSupervisor};
 
 #[derive(Debug, Parser)]
-#[command(name = "nexo", about = "Nexo 联巢服务端管理命令")]
+#[command(name = "nexo", version, about = "Nexo 联巢服务端管理命令")]
 struct Cli {
     #[command(subcommand)]
     command: Option<CliCommand>,
