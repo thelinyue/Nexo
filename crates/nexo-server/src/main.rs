@@ -5862,12 +5862,10 @@ fn apply_gateway_route_report(
             "disabled"
         } else if route.local_applied {
             "applied"
+        } else if route.error_message.is_some() {
+            "failed"
         } else {
-            if route.error_message.is_some() {
-                "failed"
-            } else {
-                "upgrade_required"
-            }
+            "upgrade_required"
         };
         let control_plane_status = route
             .control_plane_status
