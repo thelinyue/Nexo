@@ -33,7 +33,7 @@ CREATE TABLE IF NOT EXISTS mesh_enrollment_attempts (
     nexo_device_id TEXT NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
     tenant_id TEXT NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
     headscale_pre_auth_key_id TEXT NOT NULL UNIQUE,
-    expires_at TEXT NOT NULL,
+    expires_at INTEGER NOT NULL,
     state TEXT NOT NULL DEFAULT 'issued'
         CHECK (state IN ('issued', 'consumed', 'expired', 'revoked', 'failed')),
     last_error TEXT,

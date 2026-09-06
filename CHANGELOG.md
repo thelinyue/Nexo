@@ -2,6 +2,23 @@
 
 本项目使用 [Semantic Versioning](https://semver.org/) 记录公开版本。
 
+## [0.1.4] - 2026-09-06
+
+### Added
+
+- 增加 Web PWA 安装能力、离线应用壳和移动端图标资源。
+- 重整网络互联页面，按站点集中管理共享网络、站点互联和静态路由确认。
+
+### Changed
+
+- 统一穿透服务、域名与 HTTPS 的用户界面和错误日志表述。
+- 统一 API 时间字段为 Unix 秒，并为 Tunnel 数据连接启用 TCP keepalive。
+- 正式镜像和 Compose 配置升级至 `0.1.4`，默认日志时区为 `Asia/Shanghai`。
+
+### Fixed
+
+- 为历史数据库中的时间字段补充一次性类型迁移，避免时间字段读取失败。
+
 ## [0.1.3] - 2026-09-06
 
 ### Added
@@ -50,6 +67,8 @@
 - 管理密码使用 Argon2id；LAN HTTP 与公网 HTTPS Session 相互隔离。
 - API Key、DNS Token、私钥和自定义 CA 保存为受限 Secret 文件。
 
+[0.1.4]: https://github.com/thelinyue/Nexo/releases/tag/v0.1.4
+[0.1.3]: https://github.com/thelinyue/Nexo/releases/tag/v0.1.3
 [0.1.2]: https://github.com/thelinyue/Nexo/releases/tag/v0.1.2
 [0.1.1]: https://github.com/thelinyue/Nexo/releases/tag/v0.1.1
 [0.1.0]: https://github.com/thelinyue/Nexo/releases/tag/v0.1.0

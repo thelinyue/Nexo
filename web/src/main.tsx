@@ -7,7 +7,10 @@ import {
   ArrowRight,
   Building2,
   CheckCircle2,
+  ChevronDown,
   CircleAlert,
+  Eye,
+  EyeOff,
   Globe2,
   KeyRound,
   LayoutDashboard,
@@ -22,19 +25,20 @@ import {
   Share2,
   ShieldCheck,
   UserPlus,
+  WifiOff,
   X,
 } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
+import { registerSW } from "virtual:pwa-register";
 import "./styles.css";
 
 type AppRoute =
   | "#/overview"
   | "#/devices/list"
   | "#/devices/enrollments"
-  | "#/public-access"
-  | "#/networks/sites"
-  | "#/networks/shared"
-  | "#/networks/links"
+  | "#/public-access/tunnels"
+  | "#/public-access/domain"
+  | "#/networks"
   | "#/settings";
 
 type PrimaryRoute = "overview" | "devices" | "public-access" | "networks" | "settings";
@@ -49,8 +53,8 @@ type NavigationItem = {
 const navigationItems: NavigationItem[] = [
   { id: "overview", label: "概览", href: "#/overview", icon: LayoutDashboard },
   { id: "devices", label: "设备", href: "#/devices/list", icon: MonitorSmartphone },
-  { id: "public-access", label: "公网访问", href: "#/public-access", icon: Globe2 },
-  { id: "networks", label: "网络互联", href: "#/networks/sites", icon: Network },
+  { id: "public-access", label: "公网访问", href: "#/public-access/tunnels", icon: Globe2 },
+  { id: "networks", label: "网络互联", href: "#/networks", icon: Network },
   { id: "settings", label: "设置", href: "#/settings", icon: Settings },
 ];
 
@@ -58,27 +62,46 @@ const validRoutes = new Set<AppRoute>([
   "#/overview",
   "#/devices/list",
   "#/devices/enrollments",
-  "#/public-access",
-  "#/networks/sites",
-  "#/networks/shared",
-  "#/networks/links",
+  "#/public-access/tunnels",
+  "#/public-access/domain",
+  "#/networks",
   "#/settings",
 ]);
 
 /** Hash 路由避免改变服务端静态托管，同时让每个管理页面可以刷新和前进后退。 */
 function readRoute(): AppRoute {
-  const hash = window.location.hash as AppRoute;
-  if (validRoutes.has(hash)) return hash;
+  const hash = window.location.hash;
+  if (hash === "#/public-access") {
+    window.history.replaceState(null, "", `${window.location.pathname}${window.location.search}#/public-access/tunnels`);
+    return "#/public-access/tunnels";
+  }
+  if (["#/networks/sites", "#/networks/shared", "#/networks/links"].includes(hash)) {
+    window.history.replaceState(null, "", `${window.location.pathname}${window.location.search}#/networks`);
+    return "#/networks";
+  }
+  const route = hash as AppRoute;
+  if (validRoutes.has(route)) return route;
   window.history.replaceState(null, "", `${window.location.pathname}${window.location.search}#/overview`);
   return "#/overview";
 }
 
 function primaryRoute(route: AppRoute): PrimaryRoute {
   if (route.startsWith("#/devices/")) return "devices";
-  if (route === "#/public-access") return "public-access";
-  if (route.startsWith("#/networks/")) return "networks";
+  if (route.startsWith("#/public-access/")) return "public-access";
+  if (route === "#/networks") return "networks";
   if (route === "#/settings") return "settings";
   return "overview";
+}
+
+/** 子页面标题直接描述当前位置，一级导航只负责标识所属能力。 */
+function routeTitle(route: AppRoute): string {
+  if (route === "#/devices/list") return "设备";
+  if (route === "#/devices/enrollments") return "入网请求";
+  if (route === "#/public-access/tunnels") return "内网穿透";
+  if (route === "#/public-access/domain") return "域名与 HTTPS";
+  if (route === "#/networks") return "网络互联";
+  if (route === "#/settings") return "设置";
+  return "概览";
 }
 
 type Overview = {
@@ -178,6 +201,7 @@ type Device = {
   gateway_report: GatewayReport | null;
   mesh_status?: "joining" | "connected" | "mesh_offline" | "needs_recovery" | "failed" | "disabled" | "not_joined";
   mesh_address?: string | null;
+  last_seen_at: number | null;
 };
 
 type Enrollment = {
@@ -216,6 +240,10 @@ type StaticRouteGuide = {
 
 type SiteLink = {
   id: string;
+  left_site_id: string;
+  right_site_id: string;
+  left_network_id: string;
+  right_network_id: string;
   left_site_name: string;
   right_site_name: string;
   left_network_prefix: string;
@@ -226,7 +254,7 @@ type SiteLink = {
   apply_error: string | null;
   health_status: "ready" | "degraded" | "failed" | "disabled";
   health_error: string | null;
-  route_confirmations?: { site_id: string; confirmed_at: string }[];
+  route_confirmations?: { site_id: string; confirmed_at: number }[];
 };
 
 type SiteNetwork = {
@@ -280,8 +308,8 @@ function Dashboard({
   const [loading, setLoading] = useState(false);
   const [actionLinkId, setActionLinkId] = useState<string | null>(null);
   const [actionNetworkId, setActionNetworkId] = useState<string | null>(null);
-  const [showNetworkForm, setShowNetworkForm] = useState(false);
-  const [showLinkForm, setShowLinkForm] = useState(false);
+  const [networkFormSiteId, setNetworkFormSiteId] = useState<string | null>(null);
+  const [linkFormSiteId, setLinkFormSiteId] = useState<string | null>(null);
   const [showTunnelForm, setShowTunnelForm] = useState(false);
   const [showSiteForm, setShowSiteForm] = useState(false);
   const [editingTunnel, setEditingTunnel] = useState<Tunnel | null>(null);
@@ -296,8 +324,7 @@ function Dashboard({
   }, []);
 
   useEffect(() => {
-    const title = navigationItems.find((item) => item.id === primaryRoute(route))?.label ?? "概览";
-    document.title = `${title} - Nexo`;
+    document.title = `${routeTitle(route)} - Nexo`;
     setMobileNavigationOpen(false);
     window.requestAnimationFrame(() => document.querySelector<HTMLElement>("#main-content h1")?.focus());
   }, [route]);
@@ -318,7 +345,7 @@ function Dashboard({
         const [nextOverview, nextEnrollments, nextTunnels, nextNetworks, nextLinks] = await Promise.all([
           read<Overview>("/api/v1/overview", "暂时无法读取概览"),
           read<Enrollment[]>("/api/v1/enrollments", "暂时无法读取入网请求"),
-          read<Tunnel[]>("/api/v1/tunnels", "暂时无法读取公网访问"),
+          read<Tunnel[]>("/api/v1/tunnels", "暂时无法读取穿透服务"),
           read<SiteNetwork[]>("/api/v1/site-networks", "暂时无法读取共享网络"),
           read<SiteLink[]>("/api/v1/site-links", "暂时无法读取站点互联"),
         ]);
@@ -333,12 +360,15 @@ function Dashboard({
         ]);
         setDevices(nextDevices); setSites(nextSites); setEnrollments(nextEnrollments); setMeshStatus(nextMeshStatus);
       } else if (page === "public-access") {
-        const [nextEntry, nextTunnels, nextDevices] = await Promise.all([
-          read<PublicEntry>("/api/v1/settings/public-entry", "暂时无法读取公网入口"),
-          read<Tunnel[]>("/api/v1/tunnels", "暂时无法读取公网访问"),
-          read<Device[]>("/api/v1/devices", "暂时无法读取设备"),
-        ]);
-        setPublicEntry(nextEntry); setTunnels(nextTunnels); setDevices(nextDevices);
+        if (route === "#/public-access/domain") {
+          setPublicEntry(await read<PublicEntry>("/api/v1/settings/public-entry", "暂时无法读取域名与 HTTPS 配置"));
+        } else {
+          const [nextTunnels, nextDevices] = await Promise.all([
+            read<Tunnel[]>("/api/v1/tunnels", "暂时无法读取穿透服务"),
+            read<Device[]>("/api/v1/devices", "暂时无法读取设备"),
+          ]);
+          setTunnels(nextTunnels); setDevices(nextDevices);
+        }
       } else if (page === "networks") {
         const [nextSites, nextDevices, nextNetworks, nextLinks] = await Promise.all([
           read<Site[]>("/api/v1/sites", "暂时无法读取站点"),
@@ -457,7 +487,7 @@ function Dashboard({
     item.apply_status === "checking" || item.apply_status === "applying" || item.apply_status === "retrying",
   );
   useEffect(() => {
-    if (!hasPendingGatewayChanges || !route.startsWith("#/networks/")) {
+    if (!hasPendingGatewayChanges || route !== "#/networks") {
       return;
     }
     const timer = window.setInterval(() => {
@@ -478,7 +508,7 @@ function Dashboard({
       <MobileHeader onOpen={() => setMobileNavigationOpen(true)} />
       {mobileNavigationOpen && <MobileNavigation route={route} onClose={() => setMobileNavigationOpen(false)} />}
 
-      <main className="content" id="main-content">
+      <main className="content" id="main-content" aria-busy={loading}>
         <div className="page-transition" key={route}>
           {route === "#/overview" && (
             <OverviewPage
@@ -488,7 +518,6 @@ function Dashboard({
               tunnels={tunnels}
               siteNetworks={siteNetworks}
               siteLinks={siteLinks}
-              loading={loading}
               error={error}
               onRefresh={refreshCurrentPage}
             />
@@ -500,7 +529,6 @@ function Dashboard({
               sites={sites}
               enrollments={enrollments}
               meshStatus={meshStatus}
-              loading={loading}
               error={error}
               showEnrollmentForm={showEnrollmentForm}
               onToggleEnrollmentForm={() => setShowEnrollmentForm((visible) => !visible)}
@@ -510,12 +538,12 @@ function Dashboard({
               onRefresh={refreshCurrentPage}
             />
           )}
-          {route === "#/public-access" && (
+          {route.startsWith("#/public-access/") && (
             <PublicAccessPage
+              route={route}
               publicEntry={publicEntry}
               tunnels={tunnels}
               devices={devices}
-              loading={loading}
               error={error}
               request={request}
               showCreate={showTunnelForm}
@@ -526,24 +554,22 @@ function Dashboard({
               onEdit={(tunnel, trigger) => { setEditingTunnel(tunnel); setEditTrigger(trigger); }}
             />
           )}
-          {route.startsWith("#/networks/") && (
+          {route === "#/networks" && (
             <NetworksPage
-              route={route}
               sites={sites}
               devices={devices}
               siteNetworks={siteNetworks}
               siteLinks={siteLinks}
-              loading={loading}
               error={error}
               request={request}
               showSiteForm={showSiteForm}
-              showNetworkForm={showNetworkForm}
-              showLinkForm={showLinkForm}
+              networkFormSiteId={networkFormSiteId}
+              linkFormSiteId={linkFormSiteId}
               onToggleSiteForm={() => setShowSiteForm((visible) => !visible)}
-              onOpenNetworkForm={() => setShowNetworkForm(true)}
-              onCloseNetworkForm={() => setShowNetworkForm(false)}
-              onOpenLinkForm={() => setShowLinkForm(true)}
-              onCloseLinkForm={() => setShowLinkForm(false)}
+              onOpenNetworkForm={setNetworkFormSiteId}
+              onCloseNetworkForm={() => setNetworkFormSiteId(null)}
+              onOpenLinkForm={setLinkFormSiteId}
+              onCloseLinkForm={() => setLinkFormSiteId(null)}
               onToggleNetwork={toggleSiteNetwork}
               onToggleLink={toggleSiteLink}
               onRecheckLink={recheckSiteLink}
@@ -660,15 +686,11 @@ function PageHeader({
   eyebrow,
   title,
   subtitle,
-  loading,
-  onRefresh,
   action,
 }: {
   eyebrow: string;
   title: string;
   subtitle: string;
-  loading?: boolean;
-  onRefresh?: () => Promise<void>;
   action?: ReactNode;
 }) {
   return (
@@ -679,12 +701,6 @@ function PageHeader({
         <p className="subtitle">{subtitle}</p>
       </div>
       <div className="page-actions">
-        {onRefresh && (
-          <button className="secondary-button" type="button" onClick={() => void onRefresh()} disabled={loading}>
-            <RefreshCw size={16} className={loading ? "spin" : ""} aria-hidden="true" />
-            {loading ? "读取中" : "刷新"}
-          </button>
-        )}
         {action}
       </div>
     </header>
@@ -735,7 +751,6 @@ function OverviewPage({
   tunnels,
   siteNetworks,
   siteLinks,
-  loading,
   error,
   onRefresh,
 }: {
@@ -745,7 +760,6 @@ function OverviewPage({
   tunnels: Tunnel[];
   siteNetworks: SiteNetwork[];
   siteLinks: SiteLink[];
-  loading: boolean;
   error: string | null;
   onRefresh: () => Promise<void>;
 }) {
@@ -758,14 +772,14 @@ function OverviewPage({
   const applyingNetworks = siteNetworks.filter((item) => ["checking", "applying", "retrying"].includes(item.apply_status)).length;
   const applyingLinks = siteLinks.filter((item) => ["checking", "applying", "retrying"].includes(item.apply_status)).length;
   const applyingResources = applyingTunnels + applyingNetworks + applyingLinks;
-  const failedHref: AppRoute = failedTunnels ? "#/public-access" : failedNetworks ? "#/networks/shared" : failedLinks ? "#/networks/links" : "#/overview";
-  const applyingHref: AppRoute = applyingTunnels ? "#/public-access" : applyingNetworks ? "#/networks/shared" : "#/networks/links";
+  const failedHref: AppRoute = failedTunnels ? "#/public-access/tunnels" : failedNetworks || failedLinks ? "#/networks" : "#/overview";
+  const applyingHref: AppRoute = applyingTunnels ? "#/public-access/tunnels" : "#/networks";
   return (
     <>
-      <PageHeader eyebrow="运行状态" title="概览" subtitle="先处理异常，再进入具体页面完成配置。" loading={loading} onRefresh={onRefresh} />
+      <PageHeader eyebrow="运行状态" title="概览" subtitle="先处理异常，再进入具体页面完成配置。" />
       <section className="metric-grid" aria-label="系统概览">
         <Metric label="设备" value={overview.devices} hint="已加入 Nexo" />
-        <Metric label="已生效公网访问" value={overview.running_tunnels} hint="公网入口可用" />
+        <Metric label="已生效穿透服务" value={overview.running_tunnels} hint="公网地址可用" />
         <Metric label="互联设备" value={overview.mesh_devices} hint="已加入网络互联" />
         <Metric label="在线设备" value={overview.current_connections} hint="当前与服务端连接" />
       </section>
@@ -774,7 +788,7 @@ function OverviewPage({
         <div className="notice warning" role="status">
           <AlertTriangle size={18} aria-hidden="true" />
           <div><strong>当前为未加密 HTTP</strong><span>仅在可信局域网使用；需要远程管理时，请先配置公网 HTTPS。</span></div>
-          <a className="notice-action" href="#/public-access">前往配置</a>
+          <a className="notice-action" href="#/public-access/domain">前往配置</a>
         </div>
       )}
       <section className="overview-grid">
@@ -790,8 +804,8 @@ function OverviewPage({
           <div className="panel-heading"><div><p className="eyebrow">快速前往</p><h2>继续管理</h2></div></div>
           <div className="quick-links">
             <QuickLink icon={MonitorSmartphone} title="设备与入网" detail="查看在线状态或添加设备" href="#/devices/list" />
-            <QuickLink icon={Globe2} title="公网访问" detail="管理 Web 服务与 TCP 端口" href="#/public-access" />
-            <QuickLink icon={Network} title="网络互联" detail="配置站点、共享网络与互联" href="#/networks/sites" />
+            <QuickLink icon={Globe2} title="内网穿透" detail="管理 Web 服务与 TCP 端口" href="#/public-access/tunnels" />
+            <QuickLink icon={Network} title="网络互联" detail="配置站点、共享网络与互联" href="#/networks" />
           </div>
         </article>
       </section>
@@ -826,7 +840,6 @@ function DevicesPage({
   sites,
   enrollments,
   meshStatus,
-  loading,
   error,
   showEnrollmentForm,
   onToggleEnrollmentForm,
@@ -840,7 +853,6 @@ function DevicesPage({
   sites: Site[];
   enrollments: Enrollment[];
   meshStatus: MeshStatus | null;
-  loading: boolean;
   error: string | null;
   showEnrollmentForm: boolean;
   onToggleEnrollmentForm: () => void;
@@ -857,8 +869,6 @@ function DevicesPage({
         eyebrow="设备管理"
         title={enrollmentView ? "入网请求" : "设备"}
         subtitle={enrollmentView ? "生成一次性配置，并批准可信设备加入。" : "查看设备在线状态、地址与网关能力。"}
-        loading={loading}
-        onRefresh={onRefresh}
         action={enrollmentView ? (
           <button className="primary-button" type="button" onClick={onToggleEnrollmentForm} aria-expanded={showEnrollmentForm}>
             <Plus size={16} aria-hidden="true" />添加设备
@@ -901,10 +911,10 @@ function DevicesPage({
 }
 
 function PublicAccessPage({
+  route,
   publicEntry,
   tunnels,
   devices,
-  loading,
   error,
   request,
   showCreate,
@@ -914,10 +924,10 @@ function PublicAccessPage({
   onTunnelChanged,
   onEdit,
 }: {
+  route: AppRoute;
   publicEntry: PublicEntry | null;
   tunnels: Tunnel[];
   devices: Device[];
-  loading: boolean;
   error: string | null;
   request: ApiRequest;
   showCreate: boolean;
@@ -927,29 +937,79 @@ function PublicAccessPage({
   onTunnelChanged: (updated: Tunnel) => void;
   onEdit: (tunnel: Tunnel, trigger: HTMLButtonElement) => void;
 }) {
+  const tunnelsView = route === "#/public-access/tunnels";
+  const [showEntrySettings, setShowEntrySettings] = useState(false);
+  const [entryChecking, setEntryChecking] = useState(false);
+  const [entryActionError, setEntryActionError] = useState<string | null>(null);
+  const entryConfigured = Boolean(publicEntry?.base_domain);
+  const entryStatusKind = publicEntry?.apply_status === "ready"
+    ? "ready"
+    : publicEntry?.apply_status === "error"
+      ? "error"
+      : "working";
+  const certificateLabel = publicEntry?.https_enabled
+    ? publicEntry.certificate_not_after
+      ? `有效期至 ${new Date(publicEntry.certificate_not_after * 1000).toLocaleDateString()}`
+      : "等待证书签发"
+    : "未启用";
+
+  const recheckEntry = async () => {
+    setEntryChecking(true);
+    setEntryActionError(null);
+    try {
+      const response = await request("/api/v1/settings/public-entry/recheck", { method: "POST" });
+      const body: unknown = await response.json().catch(() => null);
+      if (!response.ok) throw new Error(readApiError(body, "暂时无法重新检测域名与 HTTPS"));
+      await onRefresh();
+    } catch (requestError) {
+      setEntryActionError(requestError instanceof Error ? requestError.message : "暂时无法重新检测域名与 HTTPS");
+    } finally {
+      setEntryChecking(false);
+    }
+  };
+
   return (
     <>
       <PageHeader
-        eyebrow="公网入口"
-        title="公网访问"
-        subtitle="为设备上的 Web 服务或 TCP 端口建立受控入口。"
-        loading={loading}
-        onRefresh={onRefresh}
-        action={<button className="primary-button" type="button" onClick={onOpenCreate}><Plus size={16} aria-hidden="true" />新建公网访问</button>}
+        eyebrow="公网访问"
+        title={tunnelsView ? "内网穿透" : "域名与 HTTPS"}
+        subtitle={tunnelsView ? "将设备上的 Web 服务或 TCP 端口安全开放到公网。" : "配置公网根域名、HTTPS 和证书来源。"}
+        action={tunnelsView ? <button className="primary-button" type="button" onClick={onOpenCreate}><Plus size={16} aria-hidden="true" />添加穿透服务</button> : undefined}
       />
+      <SectionTabs label="公网访问页面" route={route} items={[
+        { href: "#/public-access/tunnels", label: "内网穿透", icon: Globe2 },
+        { href: "#/public-access/domain", label: "域名与 HTTPS", icon: ShieldCheck },
+      ]} />
       <PageError error={error} onRetry={onRefresh} />
-      <section className="panel page-panel public-entry-panel">
-        <div className="panel-heading">
-          <div><p className="eyebrow">入口设置</p><h2>域名与 HTTPS</h2></div>
-          <span className={`status-pill ${publicEntry?.apply_status === "ready" ? "ready" : "working"}`}><i />{publicEntryLabel(publicEntry)}</span>
+      {!tunnelsView && <section className="panel page-panel public-entry-panel">
+        <div className="public-entry-summary">
+          <div className="public-entry-copy">
+            <p className="eyebrow">访问基础配置</p>
+            <h2>域名与证书状态</h2>
+            <p>根域名同时用于 Web 服务地址和 Nexo 的公网服务地址。</p>
+          </div>
+          <div className="public-entry-actions">
+            <span className={`status-pill ${entryStatusKind}`}><i />{publicEntryLabel(publicEntry)}</span>
+            <button className="secondary-button" type="button" onClick={() => void recheckEntry()} disabled={!publicEntry || entryChecking}>
+              <RefreshCw size={16} aria-hidden="true" />{entryChecking ? "检测中…" : "重新检测"}
+            </button>
+            <button className="secondary-button" type="button" onClick={() => setShowEntrySettings(true)} disabled={!publicEntry}>
+              <Settings size={16} aria-hidden="true" />{entryConfigured ? "编辑域名与 HTTPS" : "配置域名与 HTTPS"}
+            </button>
+          </div>
         </div>
-        {publicEntry?.base_domain && <p className="panel-note">入口域名：{publicEntry.base_domain} · {publicEntry.https_enabled ? "HTTPS 已开启" : "仅 HTTP"}</p>}
-        <PublicEntrySettings entry={publicEntry} request={request} onChanged={onRefresh} />
-      </section>
-      <section className="panel page-panel">
-        <div className="panel-heading"><div><p className="eyebrow">内网穿透</p><h2>{tunnels.length} 个公网入口</h2></div></div>
+        <dl className="public-entry-facts" aria-label="域名与 HTTPS 配置摘要">
+          <div><dt>根域名</dt><dd>{publicEntry?.base_domain ?? "尚未配置"}</dd></div>
+          <div><dt>访问协议</dt><dd>{publicEntry?.https_enabled ? "HTTPS" : "HTTP"}</dd></div>
+          <div><dt>证书</dt><dd>{certificateLabel}</dd></div>
+        </dl>
+        {entryActionError && <p className="network-error" role="alert">{entryActionError}</p>}
+        {publicEntry?.apply_error && <p className="network-error">{publicEntry.apply_error}</p>}
+      </section>}
+      {tunnelsView && <section className="panel page-panel">
+        <div className="panel-heading"><div><p className="eyebrow">穿透服务</p><h2>{tunnels.length} 个穿透服务</h2></div></div>
         {tunnels.length === 0 ? (
-          <EmptyState icon={Globe2} title="还没有公网访问" detail="新建 Web 服务或 TCP 端口后，配置生效状态会显示在这里。" />
+          <EmptyState icon={Globe2} title="还没有穿透服务" detail="添加 Web 服务或 TCP 端口后，配置生效状态会显示在这里。" />
         ) : (
           <div className="tunnel-list">
             {tunnels.map((tunnel) => (
@@ -963,10 +1023,25 @@ function PublicAccessPage({
             ))}
           </div>
         )}
-      </section>
-      {showCreate && (
-        <FormDialog eyebrow="公网访问" title="新建公网访问" description="选择设备和本地服务，Nexo 会创建对应的公网入口。" onClose={onCloseCreate}>
+      </section>}
+      {tunnelsView && showCreate && (
+        <FormDialog eyebrow="内网穿透" title="添加穿透服务" description="选择设备和本地服务，将 Web 服务或 TCP 端口开放到公网。" onClose={onCloseCreate}>
           <CreateTunnelForm devices={devices} request={request} onCancel={onCloseCreate} onCreated={async () => { onCloseCreate(); await onRefresh(); }} />
+        </FormDialog>
+      )}
+      {!tunnelsView && showEntrySettings && publicEntry && (
+        <FormDialog
+          eyebrow="域名与 HTTPS"
+          title={entryConfigured ? "编辑域名与 HTTPS" : "配置域名与 HTTPS"}
+          description="配置公网根域名、HTTPS 和证书来源。"
+          onClose={() => setShowEntrySettings(false)}
+        >
+          <PublicEntrySettings
+            entry={publicEntry}
+            request={request}
+            onCancel={() => setShowEntrySettings(false)}
+            onSaved={async () => { await onRefresh(); setEntryActionError(null); setShowEntrySettings(false); }}
+          />
         </FormDialog>
       )}
     </>
@@ -974,17 +1049,15 @@ function PublicAccessPage({
 }
 
 function NetworksPage({
-  route,
   sites,
   devices,
   siteNetworks,
   siteLinks,
-  loading,
   error,
   request,
   showSiteForm,
-  showNetworkForm,
-  showLinkForm,
+  networkFormSiteId,
+  linkFormSiteId,
   onToggleSiteForm,
   onOpenNetworkForm,
   onCloseNetworkForm,
@@ -998,21 +1071,19 @@ function NetworksPage({
   actionLinkId,
   onRefresh,
 }: {
-  route: AppRoute;
   sites: Site[];
   devices: Device[];
   siteNetworks: SiteNetwork[];
   siteLinks: SiteLink[];
-  loading: boolean;
   error: string | null;
   request: ApiRequest;
   showSiteForm: boolean;
-  showNetworkForm: boolean;
-  showLinkForm: boolean;
+  networkFormSiteId: string | null;
+  linkFormSiteId: string | null;
   onToggleSiteForm: () => void;
-  onOpenNetworkForm: () => void;
+  onOpenNetworkForm: (siteId: string) => void;
   onCloseNetworkForm: () => void;
-  onOpenLinkForm: () => void;
+  onOpenLinkForm: (siteId: string) => void;
   onCloseLinkForm: () => void;
   onToggleNetwork: (network: SiteNetwork) => Promise<void>;
   onToggleLink: (link: SiteLink) => Promise<void>;
@@ -1022,60 +1093,100 @@ function NetworksPage({
   actionLinkId: string | null;
   onRefresh: () => Promise<void>;
 }) {
-  const sitesView = route === "#/networks/sites";
-  const sharedView = route === "#/networks/shared";
-  const title = sitesView ? "站点" : sharedView ? "共享网络" : "站点互联";
-  const subtitle = sitesView ? "用站点表示家庭、办公室等独立局域网。" : sharedView ? "将设备已探测到的本地网段共享给其他站点。" : "连接两个站点的共享网络，并完成两侧静态路由。";
-  const action = sitesView ? (
+  const [expandedSiteIds, setExpandedSiteIds] = useState<Set<string>>(() => new Set());
+  const networkFormSite = sites.find((site) => site.id === networkFormSiteId);
+  const linkFormSite = sites.find((site) => site.id === linkFormSiteId);
+
+  /** 展开状态按站点独立保存，便于同时对照两个站点的互联状态。 */
+  const toggleSite = (siteId: string) => {
+    setExpandedSiteIds((current) => {
+      const next = new Set(current);
+      if (next.has(siteId)) next.delete(siteId);
+      else next.add(siteId);
+      return next;
+    });
+  };
+
+  const action = (
     <button className="primary-button" type="button" onClick={onToggleSiteForm} aria-expanded={showSiteForm}><Plus size={16} aria-hidden="true" />新建站点</button>
-  ) : sharedView ? (
-    <button className="primary-button" type="button" onClick={onOpenNetworkForm}><Plus size={16} aria-hidden="true" />新建共享网络</button>
-  ) : (
-    <button className="primary-button" type="button" onClick={onOpenLinkForm}><Plus size={16} aria-hidden="true" />新建站点互联</button>
   );
   return (
     <>
-      <PageHeader eyebrow="局域网互联" title={title} subtitle={subtitle} loading={loading} onRefresh={onRefresh} action={action} />
-      <SectionTabs label="网络互联页面" route={route} items={[
-        { href: "#/networks/sites", label: `站点 (${sites.length})`, icon: Building2 },
-        { href: "#/networks/shared", label: `共享网络 (${siteNetworks.length})`, icon: Share2 },
-        { href: "#/networks/links", label: `站点互联 (${siteLinks.length})`, icon: Network },
-      ]} />
+      <PageHeader eyebrow="局域网互联" title="网络互联" subtitle="按站点管理网关、共享网络、互联关系和本站静态路由。" action={action} />
       <PageError error={error} onRetry={onRefresh} />
-      {sitesView && (
-        <section className="panel page-panel">
-          {showSiteForm && <CreateSiteForm request={request} onCreated={onRefresh} onDone={onToggleSiteForm} />}
-          {sites.length === 0 ? <EmptyState icon={Building2} title="还没有站点" detail="创建家庭、办公室等站点后，才能配置共享网络。" /> : (
-            <div className="site-list">{sites.map((site) => <div className="site-row" key={site.id}><span className="site-icon"><Building2 size={18} aria-hidden="true" /></span><div><strong>{site.name}</strong><span>{devices.filter((device) => device.site_id === site.id).length} 台设备</span></div></div>)}</div>
-          )}
-        </section>
-      )}
-      {sharedView && (
-        <section className="panel page-panel">
-          {siteNetworks.length === 0 ? <EmptyState icon={Share2} title="还没有共享网络" detail="选择站点内的网关设备及其已探测网段。" /> : (
-            <div className="network-list">{siteNetworks.map((network) => <SiteNetworkRow key={network.id} network={network} actionPending={actionNetworkId === network.id} onToggle={() => void onToggleNetwork(network)} />)}</div>
-          )}
-        </section>
-      )}
-      {!sitesView && !sharedView && (
-        <section className="panel page-panel">
-          {siteLinks.length === 0 ? <EmptyState icon={Network} title="还没有站点互联" detail="先在两侧创建共享网络，再建立双向互联。" /> : (
-            <div className="link-list">{siteLinks.map((link) => <SiteLinkCard key={link.id} link={link} actionPending={actionLinkId === link.id} onToggle={() => void onToggleLink(link)} onRecheck={() => void onRecheckLink(link)} onConfirmRoute={(siteId) => void onConfirmRoute(link, siteId)} />)}</div>
-          )}
-        </section>
-      )}
-      {showNetworkForm && (
-        <FormDialog eyebrow="共享网络" title="新建共享网络" description="选择站点、网关设备及其最近探测到的本地网段。" onClose={onCloseNetworkForm}>
-          <CreateSiteNetworkForm sites={sites} devices={devices} request={request} onCancel={onCloseNetworkForm} onCreated={async () => { onCloseNetworkForm(); await onRefresh(); }} />
+      <section className="panel page-panel network-sites-panel">
+        {showSiteForm && <CreateSiteForm request={request} onCreated={onRefresh} onDone={onToggleSiteForm} />}
+        {sites.length === 0 ? <EmptyState icon={Building2} title="还没有站点" detail="创建家庭、办公室等站点后，才能配置共享网络。" /> : (
+          <div className="network-site-list">
+            <div className="network-site-columns" aria-hidden="true">
+              <span>站点</span><span>网关设备</span><span>共享网络</span><span>互联关系</span><span />
+            </div>
+            {sites.map((site) => {
+              const siteDevices = devices.filter((device) => device.site_id === site.id);
+              const gatewayDevices = siteDevices.filter((device) =>
+                device.gateway_report?.subnet_gateway === "ready" || device.gateway_report?.site_gateway === "ready",
+              );
+              const subnetGatewayDevices = siteDevices.filter((device) =>
+                device.gateway_report?.subnet_gateway === "ready" && (device.gateway_report.local_networks?.length ?? 0) > 0,
+              );
+              const networks = siteNetworks.filter((network) => network.site_id === site.id);
+              const links = siteLinks.filter((link) => link.left_site_id === site.id || link.right_site_id === site.id);
+              const networkIssues = networks.filter(hasGatewayIssue).length;
+              const linkIssues = links.filter(hasGatewayIssue).length;
+              const connectedSites = new Set(links.map((link) => link.left_site_id === site.id ? link.right_site_id : link.left_site_id));
+              const enabledNetworks = networks.filter((network) => network.enabled);
+              const targetSites = sites.filter((candidate) => candidate.id !== site.id && candidate.tenant_id === site.tenant_id && siteNetworks.some((network) => network.site_id === candidate.id && network.enabled));
+              const canAddNetwork = subnetGatewayDevices.length > 0;
+              const canConnect = enabledNetworks.length > 0 && targetSites.length > 0;
+              const expanded = expandedSiteIds.has(site.id);
+              const detailsId = `site-network-details-${site.id}`;
+              return (
+                <article className={`network-site${expanded ? " expanded" : ""}`} key={site.id}>
+                  <div className="network-site-summary">
+                    <div className="network-site-identity"><span className="site-icon"><Building2 size={18} aria-hidden="true" /></span><div><strong>{site.name}</strong><span>{siteDevices.length} 台设备</span></div></div>
+                    <div className="network-site-fact"><span className="network-site-label">网关设备</span><strong>{gatewayDevices.length ? gatewayDevices.map((device) => device.name).join("、") : "尚未就绪"}</strong></div>
+                    <div className="network-site-fact"><span className="network-site-label">共享网络</span><strong>{networks.length} 个{networkIssues ? ` · ${networkIssues} 个异常` : " · 无异常"}</strong></div>
+                    <div className="network-site-fact"><span className="network-site-label">互联关系</span><strong>{connectedSites.size} 个站点{linkIssues ? ` · ${linkIssues} 个异常` : " · 无异常"}</strong></div>
+                    <button className="network-site-toggle" type="button" aria-expanded={expanded} aria-controls={detailsId} aria-label={`${expanded ? "收起" : "展开"}${site.name}`} onClick={() => toggleSite(site.id)}>
+                      <ChevronDown size={18} aria-hidden="true" />
+                    </button>
+                  </div>
+                  {expanded && (
+                    <div className="network-site-details" id={detailsId}>
+                      <section className="network-inline-section" aria-labelledby={`${detailsId}-networks`}>
+                        <div className="network-inline-heading"><div><h2 id={`${detailsId}-networks`}>共享网络</h2><p>本站向已连接站点开放的局域网网段。</p></div><button className="secondary-button compact-button" type="button" onClick={() => onOpenNetworkForm(site.id)} disabled={!canAddNetwork}><Plus size={15} aria-hidden="true" />添加共享网络</button></div>
+                        {!canAddNetwork && <p className="network-prerequisite">需要本站有一台共享网络能力就绪、且已探测到本地网段的设备。</p>}
+                        {networks.length === 0 ? <p className="network-inline-empty">本站还没有共享网络。</p> : <div className="network-list">{networks.map((network) => <SiteNetworkRow key={network.id} network={network} actionPending={actionNetworkId === network.id} onToggle={() => void onToggleNetwork(network)} />)}</div>}
+                      </section>
+                      <section className="network-inline-section" aria-labelledby={`${detailsId}-links`}>
+                        <div className="network-inline-heading"><div><h2 id={`${detailsId}-links`}>互联关系</h2><p>本站与其他站点的连接，以及本站需要配置的静态路由。</p></div><button className="secondary-button compact-button" type="button" onClick={() => onOpenLinkForm(site.id)} disabled={!canConnect}><Plus size={15} aria-hidden="true" />连接站点</button></div>
+                        {!canConnect && <p className="network-prerequisite">{enabledNetworks.length === 0 ? "请先为本站添加并启用一个共享网络。" : "需要另一个站点具备已启用的共享网络。"}</p>}
+                        {links.length === 0 ? <p className="network-inline-empty">本站还没有连接其他站点。</p> : <div className="link-list">{links.map((link) => <SiteLinkCard key={link.id} link={link} currentSiteId={site.id} actionPending={actionLinkId === link.id} onToggle={() => void onToggleLink(link)} onRecheck={() => void onRecheckLink(link)} onConfirmRoute={(siteId) => void onConfirmRoute(link, siteId)} />)}</div>}
+                      </section>
+                    </div>
+                  )}
+                </article>
+              );
+            })}
+          </div>
+        )}
+      </section>
+      {networkFormSite && (
+        <FormDialog eyebrow="共享网络" title="添加共享网络" description={`为“${networkFormSite.name}”选择网关设备及其最近探测到的本地网段。`} onClose={onCloseNetworkForm}>
+          <CreateSiteNetworkForm sourceSiteId={networkFormSite.id} sites={sites} devices={devices} request={request} onCancel={onCloseNetworkForm} onCreated={async () => { onCloseNetworkForm(); await onRefresh(); }} />
         </FormDialog>
       )}
-      {showLinkForm && (
-        <FormDialog eyebrow="站点互联" title="新建站点互联" description="选择两个不同站点的共享网络，建立仅限这两个站点的双向连接。" onClose={onCloseLinkForm}>
-          <CreateSiteLinkForm sites={sites} siteNetworks={siteNetworks} request={request} onCancel={onCloseLinkForm} onCreated={async () => { onCloseLinkForm(); await onRefresh(); }} />
+      {linkFormSite && (
+        <FormDialog eyebrow="站点互联" title="连接站点" description={`从“${linkFormSite.name}”发起，仅连接两个站点所选的共享网络。`} onClose={onCloseLinkForm}>
+          <CreateSiteLinkForm sourceSiteId={linkFormSite.id} sites={sites} siteNetworks={siteNetworks} request={request} onCancel={onCloseLinkForm} onCreated={async () => { onCloseLinkForm(); await onRefresh(); }} />
         </FormDialog>
       )}
     </>
   );
+}
+
+function hasGatewayIssue(item: SiteNetwork | SiteLink): boolean {
+  return item.apply_status === "failed" || item.health_status === "failed" || item.health_status === "degraded";
 }
 
 /**
@@ -1206,12 +1317,12 @@ function SettingsPage({
 
   return (
     <>
-      <PageHeader eyebrow="系统管理" title="设置" subtitle="修改管理员密码并管理仍有效的登录会话。" loading={loading} onRefresh={loadSessions} />
+      <PageHeader eyebrow="系统管理" title="设置" subtitle="修改管理员密码并管理仍有效的登录会话。" />
       <PageError error={error} onRetry={loadSessions} />
       {auth.local_http_warning && (
         <div className="notice warning" role="status"><AlertTriangle size={18} aria-hidden="true" /><div><strong>当前通过局域网 HTTP 登录</strong><span>这个入口只应在可信网络内使用。</span></div></div>
       )}
-      <div className="settings-layout">
+      <div className="settings-layout" aria-busy={loading}>
         <section className="panel settings-section">
           <div className="settings-heading"><span className="settings-icon"><KeyRound size={19} aria-hidden="true" /></span><div><h2>修改密码</h2><p>更新后，所有登录会话都会失效。</p></div></div>
           <form className="settings-form" aria-busy={changingPassword} onSubmit={async (event) => {
@@ -1320,19 +1431,21 @@ function DeviceRow({ device }: { device: Device }) {
  * 表单提交后由服务端再次校验能力和网段，避免浏览器状态成为配置真源。
  */
 function CreateSiteNetworkForm({
+  sourceSiteId,
   sites,
   devices,
   request,
   onCancel,
   onCreated,
 }: {
+  sourceSiteId: string;
   sites: Site[];
   devices: Device[];
   request: ApiRequest;
   onCancel: () => void;
   onCreated: () => Promise<void>;
 }) {
-  const [siteId, setSiteId] = useState(sites[0]?.id ?? "");
+  const siteId = sourceSiteId;
   const [deviceId, setDeviceId] = useState("");
   const [networkKey, setNetworkKey] = useState("");
   const [name, setName] = useState("");
@@ -1346,22 +1459,7 @@ function CreateSiteNetworkForm({
   const localNetworks = selectedDevice?.gateway_report?.local_networks ?? [];
   const selectedNetwork = localNetworks.find((network) => `${network.interface_id}|${network.prefix}` === networkKey);
 
-  /**
-   * 页面会定时重新读取 Agent 能力；如果站点、设备或网段在此期间变化，
-   * 及时清空失效选择，避免表单提交一个已经不存在的设备状态。
-   */
-  useEffect(() => {
-    if (!siteId && sites.length > 0) {
-      setSiteId(sites[0].id);
-      return;
-    }
-    if (siteId && !sites.some((site) => site.id === siteId)) {
-      setSiteId(sites[0]?.id ?? "");
-      setDeviceId("");
-      setNetworkKey("");
-    }
-  }, [siteId, sites]);
-
+  /** Agent 能力更新后清空失效选择，避免提交已经不存在的设备状态。 */
   useEffect(() => {
     if (deviceId && !eligibleDevices.some((device) => device.id === deviceId)) {
       setDeviceId("");
@@ -1424,13 +1522,8 @@ function CreateSiteNetworkForm({
         </label>
         <label>
           <span>站点</span>
-          <select
-            value={siteId}
-            onChange={(event) => { setSiteId(event.target.value); setDeviceId(""); setNetworkKey(""); }}
-            required
-          >
-            <option value="">选择站点</option>
-            {sites.map((site) => <option key={site.id} value={site.id}>{site.name}</option>)}
+          <select value={siteId} disabled aria-label="来源站点">
+            {selectedSite && <option value={selectedSite.id}>{selectedSite.name}</option>}
           </select>
         </label>
         <label>
@@ -1479,12 +1572,14 @@ function CreateSiteNetworkForm({
 
 /** 站点互联创建表单：两侧只允许选择已启用的共享网络，冲突由服务端最终裁决。 */
 function CreateSiteLinkForm({
+  sourceSiteId,
   sites,
   siteNetworks,
   request,
   onCancel,
   onCreated,
 }: {
+  sourceSiteId: string;
   sites: Site[];
   siteNetworks: SiteNetwork[];
   request: ApiRequest;
@@ -1492,40 +1587,36 @@ function CreateSiteLinkForm({
   onCreated: () => Promise<void>;
 }) {
   const availableNetworks = siteNetworks.filter((network) => network.enabled);
-  const availableSites = sites.filter((site) => availableNetworks.some((network) => network.site_id === site.id));
-  const [leftSiteId, setLeftSiteId] = useState(availableSites[0]?.id ?? "");
-  const [rightSiteId, setRightSiteId] = useState(availableSites[1]?.id ?? availableSites[0]?.id ?? "");
+  const leftSiteId = sourceSiteId;
+  const leftSite = sites.find((site) => site.id === leftSiteId);
+  const targetSites = sites.filter((site) =>
+    site.id !== leftSiteId
+    && site.tenant_id === leftSite?.tenant_id
+    && availableNetworks.some((network) => network.site_id === site.id),
+  );
+  const [rightSiteId, setRightSiteId] = useState(targetSites[0]?.id ?? "");
   const [leftNetworkId, setLeftNetworkId] = useState("");
   const [rightNetworkId, setRightNetworkId] = useState("");
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const leftNetworks = availableNetworks.filter((network) => network.site_id === leftSiteId);
   const rightNetworks = availableNetworks.filter((network) => network.site_id === rightSiteId);
-  const leftSite = sites.find((site) => site.id === leftSiteId);
   const rightSite = sites.find((site) => site.id === rightSiteId);
 
   /**
-   * 轮询期间共享网络可能被关闭或删除；站点选择失效时同步回到当前可用站点，
-   * 并清理对应网络，避免把旧站点 ID 继续带入提交请求。
+   * 轮询期间共享网络可能被关闭或删除；目标站点失效时回到当前可用项，
+   * 来源站点始终由打开弹窗的站点行锁定。
    */
   useEffect(() => {
-    if (!leftSiteId && availableSites.length > 0) {
-      setLeftSiteId(availableSites[0].id);
-      setLeftNetworkId("");
-    }
-    if (!rightSiteId && availableSites.length > 0) {
-      setRightSiteId(availableSites[1]?.id ?? availableSites[0].id);
+    if (!rightSiteId && targetSites.length > 0) {
+      setRightSiteId(targetSites[0].id);
       setRightNetworkId("");
     }
-    if (leftSiteId && !availableSites.some((site) => site.id === leftSiteId)) {
-      setLeftSiteId(availableSites[0]?.id ?? "");
-      setLeftNetworkId("");
-    }
-    if (rightSiteId && !availableSites.some((site) => site.id === rightSiteId)) {
-      setRightSiteId(availableSites[1]?.id ?? availableSites[0]?.id ?? "");
+    if (rightSiteId && !targetSites.some((site) => site.id === rightSiteId)) {
+      setRightSiteId(targetSites[0]?.id ?? "");
       setRightNetworkId("");
     }
-  }, [availableSites, leftSiteId, rightSiteId]);
+  }, [rightSiteId, targetSites]);
 
   useEffect(() => {
     if (leftNetworkId && !leftNetworks.some((network) => network.id === leftNetworkId)) {
@@ -1587,28 +1678,27 @@ function CreateSiteLinkForm({
       <fieldset className="form-grid form-grid-link" disabled={submitting}>
         <legend className="sr-only">站点互联信息</legend>
         <label>
-          <span>站点 A</span>
-          <select value={leftSiteId} onChange={(event) => { setLeftSiteId(event.target.value); setLeftNetworkId(""); }} required>
-            <option value="">选择站点</option>
-            {availableSites.map((site) => <option key={site.id} value={site.id}>{site.name}</option>)}
+          <span>来源站点</span>
+          <select value={leftSiteId} disabled aria-label="来源站点">
+            {leftSite && <option value={leftSite.id}>{leftSite.name}</option>}
           </select>
         </label>
         <label>
-          <span>网络 A</span>
+          <span>来源共享网络</span>
           <select value={leftNetworkId} onChange={(event) => setLeftNetworkId(event.target.value)} required disabled={!leftSiteId}>
             <option value="">选择共享网络</option>
             {leftNetworks.map((network) => <option key={network.id} value={network.id}>{network.name} · {network.desired_prefix}</option>)}
           </select>
         </label>
         <label>
-          <span>站点 B</span>
+          <span>目标站点</span>
           <select value={rightSiteId} onChange={(event) => { setRightSiteId(event.target.value); setRightNetworkId(""); }} required>
             <option value="">选择站点</option>
-            {availableSites.map((site) => <option key={site.id} value={site.id}>{site.name}</option>)}
+            {targetSites.map((site) => <option key={site.id} value={site.id}>{site.name}</option>)}
           </select>
         </label>
         <label>
-          <span>网络 B</span>
+          <span>目标共享网络</span>
           <select value={rightNetworkId} onChange={(event) => setRightNetworkId(event.target.value)} required disabled={!rightSiteId}>
             <option value="">选择共享网络</option>
             {rightNetworks.map((network) => <option key={network.id} value={network.id}>{network.name} · {network.desired_prefix}</option>)}
@@ -1629,7 +1719,7 @@ function CreateSiteLinkForm({
   );
 }
 
-const RELEASE_AGENT_IMAGE = "ghcr.io/thelinyue/nexo-agent:0.1.3";
+const RELEASE_AGENT_IMAGE = "ghcr.io/thelinyue/nexo-agent:0.1.4";
 
 function buildAgentCompose(serverUrl: string, token: string): string {
   return `name: nexo-agent
@@ -1647,6 +1737,7 @@ services:
       net.ipv4.ip_forward: "1"
       net.ipv6.conf.all.forwarding: "1"
     environment:
+      TZ: \${TZ:-Asia/Shanghai}
       NEXO_SERVER_URL: ${JSON.stringify(serverUrl)}
       NEXO_ENROLLMENT_TOKEN: ${JSON.stringify(token)}
     volumes:
@@ -1801,27 +1892,28 @@ function readApiError(body: unknown, fallback: string): string {
 }
 
 function publicEntryLabel(entry: PublicEntry | null): string {
-  if (!entry) return "入口状态检查中";
+  if (!entry) return "域名与 HTTPS 状态检查中";
   switch (entry.apply_status.toLowerCase()) {
-    case "ready": return "公网入口正常";
-    case "configuring": return "公网入口配置中";
-    case "error": return "公网入口配置失败";
-    default: return "公网入口尚未配置";
+    case "ready": return "域名与 HTTPS 已生效";
+    case "configuring":
+    case "checking":
+    case "applying": return "域名与 HTTPS 配置中";
+    case "error": return "域名与 HTTPS 配置失败";
+    default: return "域名与 HTTPS 尚未配置";
   }
 }
 
-/**
- * 公网入口设置：把域名、HTTPS 和证书材料放在同一个可校验的流程里。
- * 文件内容只在提交瞬间读取，服务端成功写入 0600 Secret 后浏览器不再保留正文。
- */
+/** 域名与 HTTPS 弹窗表单：普通配置与敏感材料一次提交，失败时保留现场供用户修正。 */
 function PublicEntrySettings({
   entry,
   request,
-  onChanged,
+  onCancel,
+  onSaved,
 }: {
-  entry: PublicEntry | null;
+  entry: PublicEntry;
   request: ApiRequest;
-  onChanged: () => Promise<void>;
+  onCancel: () => void;
+  onSaved: () => Promise<void>;
 }) {
   const [domain, setDomain] = useState("");
   const [httpsEnabled, setHttpsEnabled] = useState(false);
@@ -1829,14 +1921,12 @@ function PublicEntrySettings({
   const [acmeEnvironment, setAcmeEnvironment] = useState("production");
   const [certificateFile, setCertificateFile] = useState<File | null>(null);
   const [privateKeyFile, setPrivateKeyFile] = useState<File | null>(null);
-  const [cloudflareTokenFile, setCloudflareTokenFile] = useState<File | null>(null);
+  const [cloudflareToken, setCloudflareToken] = useState("");
+  const [showCloudflareToken, setShowCloudflareToken] = useState(false);
   const [busy, setBusy] = useState(false);
-  const [checking, setChecking] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [message, setMessage] = useState<string | null>(null);
 
   useEffect(() => {
-    if (!entry) return;
     setDomain(entry.base_domain ?? "");
     setHttpsEnabled(entry.https_enabled);
     setCertificateMode(entry.certificate_mode);
@@ -1860,7 +1950,6 @@ function PublicEntrySettings({
     }
     setBusy(true);
     setError(null);
-    setMessage(null);
     try {
       const response = await request("/api/v1/settings/public-entry", {
         method: "PUT",
@@ -1873,15 +1962,16 @@ function PublicEntrySettings({
         }),
       });
       const body: unknown = await response.json().catch(() => null);
-      if (!response.ok) throw new Error(readApiError(body, "暂时无法保存公网入口设置"));
+      if (!response.ok) throw new Error(readApiError(body, "暂时无法保存域名与 HTTPS 设置"));
 
       const secrets: Record<string, string> = {};
-      if (certificateFile && privateKeyFile) {
+      if (certificateMode === "manual" && certificateFile && privateKeyFile) {
         secrets.certificate_pem = await certificateFile.text();
         secrets.private_key_pem = await privateKeyFile.text();
       }
-      if (cloudflareTokenFile) {
-        secrets.cloudflare_token = (await cloudflareTokenFile.text()).trim();
+      const trimmedCloudflareToken = cloudflareToken.trim();
+      if (httpsEnabled && certificateMode === "cloudflare" && trimmedCloudflareToken) {
+        secrets.cloudflare_token = trimmedCloudflareToken;
       }
       if (Object.keys(secrets).length > 0) {
         const secretResponse = await request("/api/v1/settings/public-entry/certificate", {
@@ -1893,56 +1983,23 @@ function PublicEntrySettings({
         if (!secretResponse.ok) throw new Error(readApiError(secretBody, "证书或访问凭据上传失败"));
         setCertificateFile(null);
         setPrivateKeyFile(null);
-        setCloudflareTokenFile(null);
+        setCloudflareToken("");
+        setShowCloudflareToken(false);
       }
-      setMessage("公网入口设置已保存，正在检查配置生效状态");
-      await onChanged();
+      await onSaved();
     } catch (requestError) {
-      setError(requestError instanceof Error ? requestError.message : "暂时无法保存公网入口设置");
+      setError(requestError instanceof Error ? requestError.message : "暂时无法保存域名与 HTTPS 设置");
     } finally {
       setBusy(false);
     }
   };
 
-  const recheck = async () => {
-    setChecking(true);
-    setError(null);
-    setMessage(null);
-    try {
-      const response = await request("/api/v1/settings/public-entry/recheck", { method: "POST" });
-      const body: unknown = await response.json().catch(() => null);
-      if (!response.ok) throw new Error(readApiError(body, "暂时无法重新检测公网入口"));
-      await onChanged();
-      setMessage("公网入口检测已完成");
-    } catch (requestError) {
-      setError(requestError instanceof Error ? requestError.message : "暂时无法重新检测公网入口");
-    } finally {
-      setChecking(false);
-    }
-  };
-
-  if (!entry) {
-    return <div className="public-entry-settings"><span className="form-hint">正在读取公网入口设置…</span></div>;
-  }
-  const resolved = entry.dns_check?.resolved ?? [];
-  const rootDns = entry.dns_check?.root;
-  const wildcardDns = entry.dns_check?.wildcard;
-  const dnsValue = (value?: { resolved?: string[]; error?: string }) =>
-    value?.resolved?.length ? value.resolved.join("、") : value?.error ?? "未解析";
   return (
-    <div className="public-entry-settings">
-      <div className="public-entry-heading">
-        <div>
-          <strong>公网入口</strong>
-          <span>为 Web 服务配置入口域名和 HTTPS。</span>
-        </div>
-        <span className={`entry-state ${entry.apply_status.toLowerCase()}`}><i />{publicEntryLabel(entry)}</span>
-      </div>
-      <form className="inline-form public-entry-form" onSubmit={save}>
+      <form className="inline-form network-form-table public-entry-form" aria-busy={busy} onSubmit={save}>
         <div className="form-grid public-entry-form-grid">
           <label>
             <span>根域名</span>
-            <input value={domain} onChange={(event) => setDomain(event.target.value)} placeholder="example.com" inputMode="url" />
+            <input autoFocus value={domain} onChange={(event) => setDomain(event.target.value)} placeholder="example.com" inputMode="url" />
           </label>
           <label>
             <span>HTTPS</span>
@@ -1966,31 +2023,49 @@ function PublicEntrySettings({
               <option value="staging">测试环境</option>
             </select>
           </label>
-        </div>
-        {httpsEnabled && certificateMode === "manual" && (
-          <div className="secret-picker-grid">
+          {httpsEnabled && certificateMode === "manual" && (
+            <>
             <label><span>证书文件</span><input type="file" accept=".pem,.crt,text/plain" onChange={(event) => setCertificateFile(event.currentTarget.files?.[0] ?? null)} /></label>
             <label><span>私钥文件</span><input type="file" accept=".pem,.key,text/plain" onChange={(event) => setPrivateKeyFile(event.currentTarget.files?.[0] ?? null)} /></label>
-          </div>
-        )}
-        {httpsEnabled && certificateMode === "cloudflare" && (
-          <label className="secret-picker"><span>Cloudflare API Token 文件</span><input type="file" accept="text/plain,.txt" onChange={(event) => setCloudflareTokenFile(event.currentTarget.files?.[0] ?? null)} /><small>API Token 只会写入服务端受限文件，不会显示在页面或日志中。</small></label>
-        )}
-        <div className="form-footer">
-          <span className="form-hint">HTTP 使用 80 端口，HTTPS 使用 443 端口；子域名前缀 nexo 和 mesh 已由系统保留。</span>
+            </>
+          )}
+          {httpsEnabled && certificateMode === "cloudflare" && (
+            <div className="public-entry-form-row">
+              <label htmlFor="public-entry-cloudflare-token">Cloudflare API Token</label>
+              <div className="field-control">
+                <div className="secret-input-control">
+                  <input
+                    id="public-entry-cloudflare-token"
+                    type={showCloudflareToken ? "text" : "password"}
+                    value={cloudflareToken}
+                    onChange={(event) => setCloudflareToken(event.target.value)}
+                    placeholder="留空则保留已保存的 Token"
+                    autoComplete="off"
+                    autoCapitalize="none"
+                    spellCheck={false}
+                  />
+                  <button
+                    className="secret-visibility-button"
+                    type="button"
+                    aria-label={`${showCloudflareToken ? "隐藏" : "显示"} Cloudflare API Token`}
+                    aria-pressed={showCloudflareToken}
+                    onClick={() => setShowCloudflareToken((visible) => !visible)}
+                  >
+                    {showCloudflareToken ? <EyeOff size={18} aria-hidden="true" /> : <Eye size={18} aria-hidden="true" />}
+                  </button>
+                </div>
+                <small>留空不会覆盖已保存的 Token；首次配置时请输入。Token 不会显示在页面或日志中。</small>
+              </div>
+            </div>
+          )}
+        </div>
+        <p className="form-hint">HTTP 使用 80 端口，HTTPS 使用 443 端口；子域名前缀 nexo 和 mesh 已由系统保留。</p>
+        {error && <p className="form-error" role="alert">{error}</p>}
+        <div className="dialog-actions">
+          <button className="secondary-button" type="button" onClick={onCancel} disabled={busy}>取消</button>
           <button className="primary-button" type="submit" disabled={busy}>{busy ? "保存中…" : "保存设置"}</button>
         </div>
-        {error && <p className="form-error" role="alert">{error}</p>}
-        {message && <p className="form-success" role="status">{message}</p>}
       </form>
-      <div className="public-entry-meta">
-        <span>DNS 根域名：{rootDns ? dnsValue(rootDns) : resolved.length > 0 ? resolved.join("、") : entry.dns_check?.error ?? "尚未检测"}</span>
-        <span>DNS 泛域名：{wildcardDns ? dnsValue(wildcardDns) : "尚未检测"}</span>
-        <span>{entry.certificate_not_after ? `证书有效期至 ${new Date(entry.certificate_not_after * 1000).toLocaleDateString()}` : "尚无证书信息"}</span>
-        <button className="link-action" type="button" onClick={() => void recheck()} disabled={checking}>{checking ? "检测中…" : "重新检测"}</button>
-      </div>
-      {entry.apply_error && <p className="network-error">{entry.apply_error}</p>}
-    </div>
   );
 }
 
@@ -2006,7 +2081,7 @@ function validateTunnelPorts(localPortValue: string, publicPortValue: string) {
   return { localPort, publicPort } as const;
 }
 
-/** 公网访问创建表单：仅展示设备、本地服务和用户可理解的访问模式。 */
+/** 穿透服务创建表单：仅展示设备、本地服务和用户可理解的访问模式。 */
 function CreateTunnelForm({
   devices,
   request,
@@ -2060,14 +2135,14 @@ function CreateTunnelForm({
           }),
         });
         const body: unknown = await response.json().catch(() => null);
-        if (!response.ok) throw new Error(readApiError(body, "暂时无法创建公网访问"));
+        if (!response.ok) throw new Error(readApiError(body, "暂时无法添加穿透服务"));
         setName(""); setHostname(""); setPublicPort(""); await onCreated();
       } catch (requestError) {
-        setError(requestError instanceof Error ? requestError.message : "暂时无法创建公网访问");
+        setError(requestError instanceof Error ? requestError.message : "暂时无法添加穿透服务");
       } finally { setSubmitting(false); }
     }}>
       <fieldset className="form-grid tunnel-form-grid" disabled={submitting}>
-        <legend className="sr-only">公网访问信息</legend>
+        <legend className="sr-only">穿透服务信息</legend>
         <label><span>显示名称（可选）</span><input value={name} onChange={(event) => setName(event.target.value)} placeholder="例如：家庭媒体库" /></label>
         <label><span>设备</span><select value={deviceId} onChange={(event) => setDeviceId(event.target.value)} required><option value="">选择设备</option>{devices.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</select>{validation?.field === "device" && <small className="field-error" role="alert">{validation.message}</small>}</label>
         <label><span>公网协议</span><select value={protocol} onChange={(event) => { const value = event.target.value as Tunnel["protocol"]; setProtocol(value); if (value === "https") setOriginProtocol("https"); }}><option value="http">HTTP</option><option value="https">HTTPS</option><option value="tcp">TCP</option></select></label>
@@ -2090,14 +2165,14 @@ function CreateTunnelForm({
         <span className="form-hint">{protocol === "tcp" ? "公网端口范围：20000-29999。" : "子域名前缀会与入口域名组合为完整访问地址。"}</span>
         <div className="form-actions">
           <button className="secondary-button" type="button" onClick={onCancel} disabled={submitting}>取消</button>
-          <button className="primary-button" type="submit" disabled={submitting || !device}>{submitting ? "创建中…" : "创建公网访问"}</button>
+          <button className="primary-button" type="submit" disabled={submitting || !device}>{submitting ? "添加中…" : "添加穿透服务"}</button>
         </div>
       </div>
     </form>
   );
 }
 
-/** 公网访问编辑弹窗：基础字段可修改，未展示的 TLS 元数据按适用性原样保留。 */
+/** 穿透服务编辑弹窗：基础字段可修改，未展示的 TLS 元数据按适用性原样保留。 */
 function EditTunnelDialog({
   tunnel,
   devices,
@@ -2127,9 +2202,9 @@ function EditTunnelDialog({
 
   return (
     <FormDialog
-      eyebrow="公网访问"
-      title="编辑公网访问"
-      description="修改公网入口与设备本地服务之间的连接信息。"
+      eyebrow="内网穿透"
+      title="编辑穿透服务"
+      description="修改公网地址与设备本地服务之间的连接信息。"
       onClose={onClose}
       returnFocus={returnFocus}
     >
@@ -2168,17 +2243,17 @@ function EditTunnelDialog({
             }),
           });
           const body: unknown = await response.json().catch(() => null);
-          if (!response.ok) throw new Error(readApiError(body, "暂时无法保存公网访问"));
+          if (!response.ok) throw new Error(readApiError(body, "暂时无法保存穿透服务"));
           onUpdated(body as Tunnel);
           onClose();
         } catch (requestError) {
-          setError(requestError instanceof Error ? requestError.message : "暂时无法保存公网访问");
+          setError(requestError instanceof Error ? requestError.message : "暂时无法保存穿透服务");
         } finally {
           setSubmitting(false);
         }
       }}>
         <fieldset className="form-grid tunnel-edit-grid" disabled={submitting}>
-          <legend className="sr-only">公网访问编辑信息</legend>
+          <legend className="sr-only">穿透服务编辑信息</legend>
           <label><span>显示名称</span><input autoFocus value={name} onChange={(event) => setName(event.target.value)} required />{validation?.field === "name" && <small className="field-error" role="alert">{validation.message}</small>}</label>
           <label><span>设备</span><select value={deviceId} onChange={(event) => setDeviceId(event.target.value)} required>{devices.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</select>{validation?.field === "device" && <small className="field-error" role="alert">{validation.message}</small>}</label>
           <label><span>公网协议</span><select value={protocol} onChange={(event) => { const value = event.target.value as Tunnel["protocol"]; setProtocol(value); if (value === "https") setOriginProtocol("https"); }}><option value="http">HTTP</option><option value="https">HTTPS</option><option value="tcp">TCP</option></select></label>
@@ -2234,10 +2309,10 @@ function TunnelRow({
           try {
             const response = await request(`/api/v1/tunnels/${encodeURIComponent(tunnel.id)}/${tunnel.enabled ? "disable" : "enable"}`, { method: "POST" });
             const body: unknown = await response.json().catch(() => null);
-            if (!response.ok) throw new Error(readApiError(body, tunnel.enabled ? "暂时无法关闭公网访问" : "暂时无法启用公网访问"));
+            if (!response.ok) throw new Error(readApiError(body, tunnel.enabled ? "暂时无法关闭穿透服务" : "暂时无法启用穿透服务"));
             onChanged(body as Tunnel);
           } catch (requestError) {
-            setError(requestError instanceof Error ? requestError.message : "暂时无法更新公网访问");
+            setError(requestError instanceof Error ? requestError.message : "暂时无法更新穿透服务");
           } finally {
             setPending(false);
           }
@@ -2252,12 +2327,14 @@ function TunnelRow({
 /** 站点互联摘要卡片：只显示用户需要的站点、网段、下一跳和应用状态。 */
 function SiteLinkCard({
   link,
+  currentSiteId,
   actionPending,
   onToggle,
   onRecheck,
   onConfirmRoute,
 }: {
   link: SiteLink;
+  currentSiteId: string;
   actionPending: boolean;
   onToggle: () => void;
   onRecheck: () => void;
@@ -2265,13 +2342,16 @@ function SiteLinkCard({
 }) {
   const status = siteLinkStatus(link.apply_status);
   const health = gatewayHealthStatus(link.health_status);
+  const currentSiteName = link.left_site_id === currentSiteId ? link.left_site_name : link.right_site_name;
+  const otherSiteName = link.left_site_id === currentSiteId ? link.right_site_name : link.left_site_name;
+  const currentRoutes = link.static_routes.filter((route) => route.router_site_id === currentSiteId);
   return (
     <div className="site-link-card">
       <div className="site-link-heading">
         <div className="site-link-title">
-          <strong>{link.left_site_name}</strong>
+          <strong>{currentSiteName}</strong>
           <span>↔</span>
-          <strong>{link.right_site_name}</strong>
+          <strong>{otherSiteName}</strong>
         </div>
         <div className="site-link-actions">
           <span className={`link-status ${status.kind}`}><i />{status.label}</span>
@@ -2291,7 +2371,7 @@ function SiteLinkCard({
       {link.apply_error && <p className="link-error">{link.apply_error}</p>}
       {link.health_error && link.health_error !== link.apply_error && <p className="link-health-error">网关状态：{link.health_error}</p>}
       <div className="route-guide-list">
-        {link.static_routes.map((route) => (
+        {currentRoutes.map((route) => (
           <div className="route-guide" key={`${route.router_site_id}-${route.destination_site_id}`}>
             <span className="route-site">{route.router_site_name}</span>
             <span className="route-arrow">→</span>
@@ -2306,6 +2386,7 @@ function SiteLinkCard({
             )}
           </div>
         ))}
+        {currentRoutes.length === 0 && <p className="network-inline-empty">本站暂时没有需要确认的静态路由。</p>}
       </div>
     </div>
   );
@@ -2418,6 +2499,43 @@ function AuthShell({ children }: { children: ReactNode }) {
   return <main className="auth-shell"><div className="auth-panel"><div className="brand-mark auth-brand"><span className="brand-icon">N</span><span><strong>Nexo</strong><small>联巢</small></span></div>{children}</div></main>;
 }
 
+/** 鉴权状态读取失败单独呈现，避免断网时误导用户重新初始化实例。 */
+function ConnectionErrorScreen({ busy, onRetry }: { busy: boolean; onRetry: () => Promise<void> }) {
+  return (
+    <AuthShell>
+      <span className="connection-error-icon"><WifiOff size={24} aria-hidden="true" /></span>
+      <p className="eyebrow">连接中断</p>
+      <h1>无法连接 Nexo</h1>
+      <p className="auth-copy">请检查网络或确认 Nexo 服务正在运行，然后重试。</p>
+      <button className="primary-button" type="button" disabled={busy} onClick={() => void onRetry()}>
+        <RefreshCw size={16} className={busy ? "spin" : ""} aria-hidden="true" />
+        {busy ? "正在重试…" : "重试"}
+      </button>
+    </AuthShell>
+  );
+}
+
+/** 新版本只给出可控提示；是否刷新始终由用户决定，填写中的表单不会丢失。 */
+function PwaUpdatePrompt() {
+  const [needRefresh, setNeedRefresh] = useState(false);
+  const updateServiceWorker = useRef<((reloadPage?: boolean) => Promise<void>) | null>(null);
+
+  useEffect(() => {
+    updateServiceWorker.current = registerSW({ onNeedRefresh: () => setNeedRefresh(true) });
+  }, []);
+
+  if (!needRefresh) return null;
+  return (
+    <aside className="update-prompt" role="status" aria-label="Nexo 新版本提示">
+      <div><strong>发现 Nexo 新版本</strong><span>准备好后再更新，当前填写内容不会被强制刷新。</span></div>
+      <div className="update-actions">
+        <button className="secondary-button compact-button" type="button" onClick={() => setNeedRefresh(false)}>稍后</button>
+        <button className="primary-button compact-button" type="button" onClick={() => void updateServiceWorker.current?.(true)}>立即更新</button>
+      </div>
+    </aside>
+  );
+}
+
 function InitializeScreen({ onDone }: { onDone: (body: AuthStatus & { csrf_token?: string | null }) => void }) {
   const [bootstrapCode, setBootstrapCode] = useState("");
   const [username, setUsername] = useState("admin");
@@ -2450,8 +2568,24 @@ function App() {
   const [auth, setAuth] = useState<AuthStatus | null>(null);
   const [csrfToken, setCsrfToken] = useState<string | null>(null);
   const [checking, setChecking] = useState(true);
+  const [authConnectionError, setAuthConnectionError] = useState(false);
   const [loginNotice, setLoginNotice] = useState<string | null>(null);
-  useEffect(() => { void fetch("/api/v1/auth/status", { credentials: "same-origin" }).then(async (response) => { const body = await response.json() as AuthStatus; setAuth(body); setCsrfToken(body.csrf_token); }).catch(() => setAuth({ initialized: false, authenticated: false, username: null, channel: null, csrf_token: null, local_http_warning: true })).finally(() => setChecking(false)); }, []);
+  const checkAuth = useCallback(async () => {
+    setChecking(true);
+    setAuthConnectionError(false);
+    try {
+      const response = await fetch("/api/v1/auth/status", { credentials: "same-origin", cache: "no-store" });
+      if (!response.ok) throw new Error("auth status unavailable");
+      const body = await response.json() as AuthStatus;
+      setAuth(body);
+      setCsrfToken(body.csrf_token);
+    } catch {
+      setAuthConnectionError(true);
+    } finally {
+      setChecking(false);
+    }
+  }, []);
+  useEffect(() => { void checkAuth(); }, [checkAuth]);
   const request = useCallback<ApiRequest>(async (input, init = {}) => {
     const headers = new Headers(init.headers);
     const method = (init.method ?? "GET").toString().toUpperCase();
@@ -2463,7 +2597,8 @@ function App() {
   const onAuthenticated = useCallback((next: AuthStatus & { csrf_token?: string | null }) => { setAuth(next); setCsrfToken(next.csrf_token ?? null); setLoginNotice(null); }, []);
   const onLogout = useCallback(async () => { await request("/api/v1/auth/logout", { method: "POST" }); setCsrfToken(null); setAuth((current) => current ? { ...current, authenticated: false, csrf_token: null } : current); }, [request]);
   const onSessionEnded = useCallback((message: string) => { setLoginNotice(message); setCsrfToken(null); setAuth((current) => current ? { ...current, authenticated: false, csrf_token: null } : current); }, []);
-  if (checking || !auth) return <AuthShell><p className="auth-copy">正在检查登录会话…</p></AuthShell>;
+  if (checking) return <AuthShell><p className="auth-copy">正在检查登录会话…</p></AuthShell>;
+  if (authConnectionError || !auth) return <ConnectionErrorScreen busy={checking} onRetry={checkAuth} />;
   if (!auth.initialized) return <InitializeScreen onDone={onAuthenticated} />;
   if (!auth.authenticated) return <LoginScreen onDone={onAuthenticated} notice={loginNotice} />;
   return <Dashboard request={request} auth={auth} onLogout={onLogout} onSessionEnded={onSessionEnded} />;
@@ -2472,5 +2607,6 @@ function App() {
 createRoot(document.getElementById("root")!).render(
   <StrictMode>
     <App />
+    <PwaUpdatePrompt />
   </StrictMode>,
 );

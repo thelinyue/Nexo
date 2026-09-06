@@ -26,7 +26,7 @@ CREATE TABLE IF NOT EXISTS device_identities (
     certificate_pem TEXT,
     certificate_fingerprint TEXT,
     issued_at TEXT,
-    expires_at TEXT,
+    expires_at INTEGER,
     revoked_at TEXT
 );
 

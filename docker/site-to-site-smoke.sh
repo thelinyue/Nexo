@@ -467,6 +467,29 @@ done
 for pid in "${tcp_pids[@]}"; do wait "$pid"; done
 echo "✓ TCP Tunnel 并发连接通过"
 
+echo "模拟 9891 黑洞，验证既有公网入口及时降级并自动恢复"
+blackhole_started_at="$(date +%s)"
+dc exec -T home-gateway iptables -I OUTPUT 1 \
+  -p tcp -d 172.29.0.2 --dport 9891 -j DROP
+wait_for "9891 黑洞后两个既有 Web 入口降级" \
+  "api '$HTTP_URL/api/v1/tunnels' | jq -e --arg http '$http_tunnel' --arg https '$https_tunnel' \
+    '[.[] | select((.id == \$http or .id == \$https) and .apply_status == \"checking\" and .apply_error == \"等待 Agent Tunnel 数据连接\")] | length == 2'" 50
+blackhole_detected_after="$(( $(date +%s) - blackhole_started_at ))"
+if ((blackhole_detected_after > 100)); then
+  echo "9891 黑洞检测耗时 ${blackhole_detected_after}s，超过 100 秒验收上限" >&2
+  exit 1
+fi
+echo "✓ 9891 黑洞在 ${blackhole_detected_after}s 内被识别"
+dc exec -T home-gateway iptables -D OUTPUT \
+  -p tcp -d 172.29.0.2 --dport 9891 -j DROP
+wait_for "HTTP Tunnel 自动重连并恢复 READY" \
+  "api '$HTTP_URL/api/v1/tunnels/$http_tunnel' | jq -e '.apply_status == \"ready\"'" 90
+wait_for "HTTPS Tunnel 自动重连并恢复 READY" \
+  "api '$HTTP_URL/api/v1/tunnels/$https_tunnel' | jq -e '.apply_status == \"ready\"'" 90
+public_request http plain."$PUBLIC_DOMAIN" /source | grep -q 'source=192.168.10.2'
+public_request https secure."$PUBLIC_DOMAIN" /source | grep -q 'source=192.168.10.2'
+echo "✓ 两个既有 Web 公网入口已恢复可访问"
+
 echo "验证 HTTP Session 与 HTTPS Session 不能交叉复用"
 local_status="$(api "$HTTP_URL/api/v1/auth/status")"
 [[ "$(printf '%s' "$local_status" | jq -r '.authenticated')" == true ]]

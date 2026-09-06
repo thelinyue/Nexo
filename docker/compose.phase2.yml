@@ -9,6 +9,7 @@ services:
       dockerfile: docker/Dockerfile.server
     network_mode: host
     environment:
+      TZ: ${TZ:-Asia/Shanghai}
       NEXO_HTTP_ADDR: 0.0.0.0:8280
       NEXO_PUBLIC_BACKEND_ADDR: 127.0.0.1:9888
       NEXO_CONTROL_ADDR: 0.0.0.0:9890
@@ -50,6 +51,7 @@ services:
       net.ipv4.ip_forward: "1"
       net.ipv6.conf.all.forwarding: "1"
     environment:
+      TZ: ${TZ:-Asia/Shanghai}
       NEXO_SERVER_URL: ${NEXO_SERVER_URL:-http://127.0.0.1:8280}
       NEXO_CONTROL_ADDR: ${NEXO_CONTROL_ADDR:-127.0.0.1:9890}
       NEXO_CONTROL_SERVER_NAME: ${NEXO_CONTROL_SERVER_NAME:-nexo-server}

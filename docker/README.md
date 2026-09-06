@@ -1,8 +1,9 @@
 # Nexo Server/Agent 容器
 
-正式部署直接使用仓库根目录的 `compose.yml` 和 `compose.agent.yml`。Server
-不需要环境变量，Agent 只需要 `NEXO_SERVER_URL` 和首次入网的一次性
-`NEXO_ENROLLMENT_TOKEN`。Server 容器内的组网服务使用 `8281`，只允许
+正式部署直接使用仓库根目录的 `compose.yml` 和 `compose.agent.yml`。`TZ`
+可覆盖 Server、Agent 和内置子进程的日志时区，默认是 `Asia/Shanghai`；Agent
+另需 `NEXO_SERVER_URL` 和首次入网的一次性 `NEXO_ENROLLMENT_TOKEN`。Server
+容器内的组网服务使用 `8281`，只允许
 本机访问，不作为公网入口。内置
 Caddy 公网入口使用 `80/443`，管理入口使用 `8280`，Agent 控制通道使用 `9890`，
 Tunnel 数据通道使用 `9891`。

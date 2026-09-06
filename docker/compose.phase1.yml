@@ -6,6 +6,7 @@ services:
       context: ..
       dockerfile: docker/Dockerfile.server
     environment:
+      TZ: ${TZ:-Asia/Shanghai}
       NEXO_ADMIN_TOKEN: ${NEXO_ADMIN_TOKEN:?请设置 NEXO_ADMIN_TOKEN}
       # Headscale 只绑定 Server 容器内部端口；这里的 loopback 映射仅供同机
       # host-network Agent 使用，不作为公网入口。
@@ -40,6 +41,7 @@ services:
     devices:
       - /dev/net/tun:/dev/net/tun
     environment:
+      TZ: ${TZ:-Asia/Shanghai}
       NEXO_SERVER_URL: ${NEXO_SERVER_URL:-http://127.0.0.1:8280}
       NEXO_CONTROL_ADDR: ${NEXO_CONTROL_ADDR:-127.0.0.1:9890}
       NEXO_CONTROL_SERVER_NAME: ${NEXO_CONTROL_SERVER_NAME:-nexo-server}

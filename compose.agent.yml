@@ -4,7 +4,7 @@ name: nexo-agent
 # 任意 Nexo Server，不要求与 Server 位于同一台主机。
 services:
   nexo-agent:
-    image: ghcr.io/thelinyue/nexo-agent:0.1.3
+    image: ghcr.io/thelinyue/nexo-agent:0.1.4
     container_name: nexo-agent
     network_mode: host
     cap_add:
@@ -15,6 +15,7 @@ services:
       net.ipv4.ip_forward: "1"
       net.ipv6.conf.all.forwarding: "1"
     environment:
+      TZ: ${TZ:-Asia/Shanghai}
       NEXO_SERVER_URL: ${NEXO_SERVER_URL:?请在 .env 中填写 NEXO_SERVER_URL}
       NEXO_ENROLLMENT_TOKEN: ${NEXO_ENROLLMENT_TOKEN:-}
     volumes:

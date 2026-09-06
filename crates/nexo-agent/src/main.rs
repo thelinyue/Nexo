@@ -27,7 +27,10 @@ use nexo_protocol::{
     GatewayRouteApplyReport, GatewayRouteApplyResult, MeshEnrollmentOffer, MeshIdentityReport,
     ServerControlMessage, TunnelApplyResult, TunnelDesiredState,
 };
-use nexo_tunnel::{into_tokio_io, next_inbound, read_logical_header, yamux_connection};
+use nexo_tunnel::{
+    configure_tunnel_tcp_keepalive, into_tokio_io, next_inbound, read_logical_header,
+    yamux_connection,
+};
 use rcgen::{CertificateParams, DistinguishedName, DnType, KeyPair};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader as AsyncBufReader};
@@ -284,6 +287,7 @@ impl TailscaleDaemon {
 async fn main() -> Result<()> {
     Cli::parse();
     tracing_subscriber::fmt()
+        .with_timer(tracing_subscriber::fmt::time::ChronoLocal::rfc_3339())
         .with_env_filter("nexo_agent=info")
         .init();
 
@@ -1010,7 +1014,7 @@ async fn run_tunnel_data_loop(
                     attempt = attempt.saturating_add(1);
                     let delay =
                         Duration::from_secs((2_u64.saturating_mul(1 << attempt.min(5))).min(60));
-                    tracing::debug!("Tunnel 数据通道连接失败，{delay:?} 后重试：{error}");
+                    tracing::warn!("Tunnel 数据通道连接失败，{delay:?} 后自动重试：{error}");
                     tokio::time::sleep(delay).await;
                     continue;
                 }
@@ -1018,11 +1022,16 @@ async fn run_tunnel_data_loop(
                     attempt = attempt.saturating_add(1);
                     let delay =
                         Duration::from_secs((2_u64.saturating_mul(1 << attempt.min(5))).min(60));
-                    tracing::debug!("Tunnel 数据通道连接超时，{delay:?} 后重试");
+                    tracing::warn!("Tunnel 数据通道连接超时，{delay:?} 后自动重试");
                     tokio::time::sleep(delay).await;
                     continue;
                 }
             };
+        if let Err(error) = configure_tunnel_tcp_keepalive(&stream) {
+            tracing::warn!("无法配置 Tunnel TCP 保活，5 秒后自动重试：{error}");
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            continue;
+        }
         let connector = match build_tls_connector(&config, &key_pair) {
             Ok(connector) => connector,
             Err(error) => {
@@ -1050,12 +1059,12 @@ async fn run_tunnel_data_loop(
         {
             Ok(Ok(stream)) => stream,
             Ok(Err(error)) => {
-                tracing::debug!("Tunnel mTLS 握手失败，将重试：{error}");
+                tracing::warn!("Tunnel mTLS 握手失败，5 秒后自动重试：{error}");
                 tokio::time::sleep(Duration::from_secs(5)).await;
                 continue;
             }
             Err(_) => {
-                tracing::debug!("Tunnel mTLS 握手超时，将重试");
+                tracing::warn!("Tunnel mTLS 握手超时，5 秒后自动重试");
                 tokio::time::sleep(Duration::from_secs(5)).await;
                 continue;
             }
@@ -1073,9 +1082,12 @@ async fn run_tunnel_data_loop(
                         }
                     });
                 }
-                Ok(None) => break,
+                Ok(None) => {
+                    tracing::warn!("Tunnel 数据通道已由服务端关闭，2 秒后自动重连");
+                    break;
+                }
                 Err(error) => {
-                    tracing::debug!("Tunnel Yamux 会话异常：{error}");
+                    tracing::warn!("Tunnel 数据通道已断开，2 秒后自动重连：{error}");
                     break;
                 }
             }

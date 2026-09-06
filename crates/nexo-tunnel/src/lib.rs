@@ -5,10 +5,11 @@
 //! 后续字节原样转发到 Agent 本地 TCP 服务。这里不实现 UDP、TLS passthrough
 //! 或应用层认证，避免把公网访问入口和网络组网边界混在一起。
 
-use std::task::Poll;
+use std::{io, task::Poll, time::Duration};
 
 use futures_util::future::poll_fn;
 use serde::{Deserialize, Serialize};
+use socket2::{SockRef, TcpKeepalive};
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio_util::compat::{Compat, FuturesAsyncReadCompatExt, TokioAsyncReadCompatExt};
@@ -17,6 +18,21 @@ pub const PROTOCOL_VERSION: u8 = 1;
 pub const MAX_HEADER_BYTES: usize = 8 * 1024;
 pub const DEFAULT_MAX_STREAMS: usize = 128;
 pub const DEFAULT_MAX_CONNECTION_WINDOW: usize = 64 * 1024 * 1024;
+pub const TCP_KEEPALIVE_IDLE: Duration = Duration::from_secs(30);
+pub const TCP_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
+pub const TCP_KEEPALIVE_RETRIES: u32 = 3;
+
+/// 为长期空闲的 Tunnel 数据连接启用跨平台 TCP keepalive。
+///
+/// Yamux 在没有逻辑流时不会主动产生网络流量；短周期内核探测既能防止常见
+/// NAT 空闲回收，也能让黑洞连接及时唤醒 Yamux 驱动并进入 Agent 重连循环。
+pub fn configure_tunnel_tcp_keepalive(stream: &tokio::net::TcpStream) -> io::Result<()> {
+    let keepalive = TcpKeepalive::new()
+        .with_time(TCP_KEEPALIVE_IDLE)
+        .with_interval(TCP_KEEPALIVE_INTERVAL)
+        .with_retries(TCP_KEEPALIVE_RETRIES);
+    SockRef::from(stream).set_tcp_keepalive(&keepalive)
+}
 
 /// 公网访问模式；HTTP/HTTPS 的应用层终止由 Caddy 完成，数据面仍是 TCP。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -228,5 +244,26 @@ mod tests {
     fn protocol_names_are_stable() {
         assert_eq!(TunnelProtocol::Tcp.as_str(), "tcp");
         assert_eq!(TunnelProtocol::Https.as_str(), "https");
+    }
+
+    #[tokio::test]
+    async fn tunnel_tcp_keepalive_is_enabled_on_connected_socket() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("应能监听测试端口");
+        let address = listener.local_addr().expect("应能读取测试地址");
+        let accept = tokio::spawn(async move { listener.accept().await });
+        let stream = tokio::net::TcpStream::connect(address)
+            .await
+            .expect("应能建立测试连接");
+        let _peer = accept.await.expect("接受任务不应失败").expect("应接受连接");
+
+        configure_tunnel_tcp_keepalive(&stream).expect("应能配置 Tunnel TCP keepalive");
+        assert!(SockRef::from(&stream)
+            .keepalive()
+            .expect("应能读取 keepalive 状态"));
+        assert_eq!(TCP_KEEPALIVE_IDLE, Duration::from_secs(30));
+        assert_eq!(TCP_KEEPALIVE_INTERVAL, Duration::from_secs(10));
+        assert_eq!(TCP_KEEPALIVE_RETRIES, 3);
     }
 }

@@ -3,7 +3,7 @@
 Nexo 是面向个人自托管、NAS/HomeLab 和小型网络环境的设备、异地组网与公网访问管理服务。
 它把设备、共享网络、站点互联、Web 服务和 TCP 端口集中到一个 Web 界面中，正常使用不需要编辑配置文件。
 
-## v0.1.3 快速开始
+## v0.1.4 快速开始
 
 当前版本仅支持 `linux/amd64` Docker。Server 与 Agent 使用独立镜像，
 Agent 可以安装在其他家庭、办公室或 VPS 上并加入任意 Nexo Server。
@@ -18,9 +18,11 @@ name: nexo
 
 services:
   nexo-server:
-    image: ghcr.io/thelinyue/nexo-server:0.1.3
+    image: ghcr.io/thelinyue/nexo-server:0.1.4
     container_name: nexo-server
     network_mode: host
+    environment:
+      TZ: ${TZ:-Asia/Shanghai}
     volumes:
       - ./data/nexo:/data/nexo
     restart: unless-stopped
@@ -56,7 +58,7 @@ name: nexo-agent
 
 services:
   nexo-agent:
-    image: ghcr.io/thelinyue/nexo-agent:0.1.3
+    image: ghcr.io/thelinyue/nexo-agent:0.1.4
     container_name: nexo-agent
     network_mode: host
     cap_add:
@@ -67,6 +69,7 @@ services:
       net.ipv4.ip_forward: "1"
       net.ipv6.conf.all.forwarding: "1"
     environment:
+      TZ: ${TZ:-Asia/Shanghai}
       NEXO_SERVER_URL: "http://192.168.1.10:8280"
       NEXO_ENROLLMENT_TOKEN: "请替换为 Web 生成的一次性 Token"
     volumes:
@@ -76,10 +79,11 @@ services:
 
 | 环境变量 | 用途 | 格式与示例 | 要求 |
 | --- | --- | --- | --- |
+| `TZ` | Server、Agent 及内置子进程的日志时区 | `Asia/Shanghai`、`UTC` | 可选，默认 `Asia/Shanghai`；使用 IANA 时区名称 |
 | `NEXO_SERVER_URL` | Agent 首次联系的 Nexo 管理地址，并用于自动推导同一主机的 `9890/9891` | `http://192.168.1.10:8280` 或 `https://nexo.example.com` | 必填；必须能从 Agent 所在网络访问 |
 | `NEXO_ENROLLMENT_TOKEN` | 授权一台设备提交入网请求 | Web 生成的短时字符串 | 首次入网必填且属于敏感信息；领取设备身份后失效，可从 Compose 或 `.env` 删除 |
 
-设备名称、所属站点、公网域名、证书、共享网络和公网访问都在 Web 中管理。
+设备名称、所属站点、域名与 HTTPS、共享网络和穿透服务都在 Web 中管理。
 官方镜像内的组件路径、监听地址、能力开关和数据目录不需要用户设置。Agent
 身份保存在 `./data/nexo-agent`，容器重启后不会再次使用已经失效的 Token。
 
@@ -88,8 +92,8 @@ services:
 - 首次打开 LAN 管理入口完成管理员初始化，之后使用 Argon2id 密码和服务端 Session 登录。
 - 设备通过一次性入网请求加入 Nexo，批准后自动建立异地组网身份。
 - Subnet Gateway 和 Site Gateway 保留第一阶段的双向 LAN 互联、真实源 IP 和稳定设备身份。
-- “公网访问”支持 TCP 端口以及 HTTP/HTTPS Web Service；Web Service 通过受限本地桥接，不暴露 Origin 端口。
-- 配置了根域名后，内置公网入口提供泛域名证书和 `nexo.<domain>` 管理入口、`mesh.<domain>` 组网入口。
+- “公网访问”下的“内网穿透”支持 TCP 端口以及 HTTP/HTTPS Web Service；每条资源称为“穿透服务”，Web Service 通过受限本地桥接，不暴露 Origin 端口。
+- “域名与 HTTPS”负责根域名、证书来源和生效状态；配置后提供泛域名证书和 `nexo.<domain>` 管理地址、`mesh.<domain>` 组网地址。
 - Caddy、Headscale 和 Tailscale 是镜像中的独立组件，由 Nexo 负责协调；普通用户不需要操作它们的配置或命令。
 
 当前阶段明确不包含 Exit Node、默认路由、UDP、TLS passthrough、NAT 转换、跨租户共享或 Caddy 路径路由。
@@ -144,7 +148,7 @@ docker compose -f docker/compose.phase2.yml exec nexo-server nexo admin recover
 ## Docker 部署
 
 正式发布使用仓库根目录的 [`compose.yml`](compose.yml) 和
-[`compose.agent.yml`](compose.agent.yml)，镜像标签固定为 `0.1.3`，不会隐式
+[`compose.agent.yml`](compose.agent.yml)，镜像标签固定为 `0.1.4`，不会隐式
 升级。开发环境的源码构建示例仍保留在 [`docker/compose.phase2.yml`](docker/compose.phase2.yml)。
 它们使用 host network，保留真实 LAN 转发所需的最小权限：Agent 只授予
 `/dev/net/tun` 和 `NET_ADMIN`，不使用 `privileged` 或 Docker Socket。
@@ -192,14 +196,20 @@ docker compose up -d
 数据库迁移只向前执行。升级后的数据目录不得直接交给旧版本二进制；需要回滚时，
 必须同时恢复升级前的完整数据备份和对应旧镜像。
 
-## Web Service 与 TCP Tunnel
+## 穿透服务
 
-管理员登录后，在“公网访问”页面选择：
+管理员登录后，在“公网访问 > 内网穿透”页面添加穿透服务：
 
 - **Web 服务**：填写访问名称、本地地址和端口，选择 HTTP 或 HTTPS Origin。HTTP 服务只走 80；HTTPS 服务走 443，80 对同名主机返回 308 跳转。
 - **TCP 端口**：选择自动分配或手动填写 `20000-29999` 中的端口。端口占用会在保存前由 Server 和宿主机同时检查。
 
-修改流程始终显示“正在应用 / 已生效 / 应用失败”，失败时保留上一份 Applied 配置。证书私钥、Cloudflare Token 和自定义 CA 只保存为 `0600` Secret 文件，不会进入数据库导出、日志或 API 响应。
+修改流程始终显示“配置生效中 / 已生效 / 配置失败”，失败时保留上一份 Applied 配置。证书私钥、Cloudflare Token 和自定义 CA 只保存为 `0600` Secret 文件，不会进入数据库导出、日志或 API 响应。
+
+## Web PWA
+
+Nexo Web 可从支持 PWA 的桌面或移动浏览器安装，启动地址为 `/#/overview`。Service Worker 只预缓存应用壳和带版本的静态资源；`/api/` 请求始终联网，账户、设备、穿透服务和网络数据不会写入离线缓存。断网时页面会显示“无法连接 Nexo”并提供重试，新版本也只在用户确认后刷新。
+
+浏览器设备模拟用于验证响应式布局与 Service Worker 行为，不能替代真实 iOS Safari 主屏幕模式或 Android 安装后的验收。
 
 ## 组网
 

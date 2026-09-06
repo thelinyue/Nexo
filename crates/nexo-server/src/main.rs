@@ -44,7 +44,10 @@ use nexo_protocol::{
     GatewayDesiredState, GatewayRouteApplyReport, MeshEnrollmentOffer, MeshIdentityReport,
     ServerControlMessage, TunnelApplyResult, TunnelDataEndpoint, TunnelDesiredState,
 };
-use nexo_tunnel::{into_tokio_io, new_outbound, write_logical_header, LogicalStreamHeader};
+use nexo_tunnel::{
+    configure_tunnel_tcp_keepalive, into_tokio_io, new_outbound, write_logical_header,
+    LogicalStreamHeader,
+};
 use rcgen::{
     BasicConstraints, CertificateParams, CertificateSigningRequestParams, DistinguishedName,
     DnType, ExtendedKeyUsagePurpose, IsCa, Issuer, KeyPair, KeyUsagePurpose,
@@ -103,6 +106,8 @@ const MESH_IDENTITY_MIGRATION: &str = include_str!("../../../migrations/0007_mes
 const GATEWAY_ROUTE_APPLY_MIGRATION: &str =
     include_str!("../../../migrations/0008_gateway_route_applies.sql");
 const PHASE2_MIGRATION: &str = include_str!("../../../migrations/0010_phase2_public_access.sql");
+const TIME_CONSISTENCY_MIGRATION: &str =
+    include_str!("../../../migrations/0011_time_consistency.sql");
 
 #[derive(Clone)]
 pub(crate) struct AppState {
@@ -350,7 +355,7 @@ struct DeviceResponse {
     /// 组网对用户只显示加入进度，不暴露 Headscale Node/API Key。
     mesh_status: String,
     mesh_address: Option<String>,
-    last_seen_at: Option<String>,
+    last_seen_at: Option<i64>,
 }
 
 /// 站点目录摘要；Web 只需要用户可读名称和租户归属，不暴露站点内部关系。
@@ -443,7 +448,7 @@ struct RecoverMeshIdentityResponse {
 #[derive(Debug, Serialize)]
 struct RouteConfirmationResponse {
     site_id: String,
-    confirmed_at: String,
+    confirmed_at: i64,
 }
 
 /// 管理员明确选择要共享的本地网络。
@@ -597,6 +602,7 @@ impl IntoResponse for ApiError {
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
+        .with_timer(tracing_subscriber::fmt::time::ChronoLocal::rfc_3339())
         .with_env_filter("nexo_server=info")
         .init();
 
@@ -634,6 +640,7 @@ async fn main() -> Result<()> {
     connection
         .execute_batch(PHASE2_MIGRATION)
         .context("无法初始化第二阶段公网访问数据表")?;
+    apply_time_consistency_migration(&connection).context("无法统一数据库时间字段")?;
     ensure_phase2_tunnel_columns(&connection).context("无法初始化第二阶段 Tunnel 字段")?;
     ensure_mesh_identity_online_column(&connection).context("无法初始化组网在线状态字段")?;
     ensure_server_ca(&connection).context("无法初始化服务端设备身份 CA")?;
@@ -968,6 +975,7 @@ fn run_cli_command(command: CliCommand) -> Result<()> {
     connection.execute_batch(MESH_IDENTITY_MIGRATION)?;
     connection.execute_batch(GATEWAY_ROUTE_APPLY_MIGRATION)?;
     connection.execute_batch(PHASE2_MIGRATION)?;
+    apply_time_consistency_migration(&connection)?;
     ensure_phase2_tunnel_columns(&connection)?;
     ensure_mesh_identity_online_column(&connection)?;
     let data_dir = db_path.parent().context("Nexo 数据库路径缺少父目录")?;
@@ -1039,6 +1047,25 @@ fn ensure_mesh_identity_online_column(connection: &Connection) -> Result<()> {
         "INSERT OR IGNORE INTO schema_migrations (version) VALUES (9)",
         [],
     )?;
+    Ok(())
+}
+
+/// 一次性修复早期数据库中被声明为 TEXT 的 Unix 秒字段。
+///
+/// SQLite 会依据 TEXT 亲和性把绑定的整数保存成文本，rusqlite 随后无法按
+/// `i64` 读取。迁移在事务中重建两张无下游外键引用的表，失败时保留旧表。
+fn apply_time_consistency_migration(connection: &Connection) -> Result<()> {
+    let applied = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version = 11)",
+        [],
+        |row| row.get::<_, bool>(0),
+    )?;
+    if applied {
+        return Ok(());
+    }
+    let transaction = connection.unchecked_transaction()?;
+    transaction.execute_batch(TIME_CONSISTENCY_MIGRATION)?;
+    transaction.commit()?;
     Ok(())
 }
 
@@ -1217,12 +1244,12 @@ async fn list_tunnels(
              WHERE t.deleted_at IS NULL AND t.tenant_id = ?1
              ORDER BY t.updated_at DESC, t.name ASC",
         )
-        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法读取公网访问列表"))?;
+        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法读取穿透服务列表"))?;
     let rows = statement
         .query_map([tenant_id], tunnel_response_from_row)
-        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法读取公网访问列表"))?;
+        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法读取穿透服务列表"))?;
     rows.map(|row| {
-        row.map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "公网访问数据格式无效"))
+        row.map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "穿透服务数据格式无效"))
     })
     .collect::<Result<Vec<_>, _>>()
     .map(Json)
@@ -1245,7 +1272,7 @@ async fn get_tunnel(
             tunnel_response_from_row,
         )
         .map(Json)
-        .map_err(|_| ApiError::new(StatusCode::NOT_FOUND, "公网访问配置不存在"))
+        .map_err(|_| ApiError::new(StatusCode::NOT_FOUND, "穿透服务不存在"))
 }
 
 async fn create_tunnel(
@@ -1326,7 +1353,7 @@ async fn create_tunnel(
             )
             .map_err(|error| {
                 tracing::error!("保存公网访问配置失败：{error}");
-                ApiError::new(StatusCode::CONFLICT, "公网访问配置与现有记录冲突")
+                ApiError::new(StatusCode::CONFLICT, "穿透服务与现有记录冲突")
             })?;
         connection
             .execute(
@@ -1338,7 +1365,7 @@ async fn create_tunnel(
             .map_err(|_| {
                 ApiError::new(
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    "无法创建公网访问应用状态",
+                    "无法创建穿透服务应用状态",
                 )
             })?;
         (public_port, audit_tenant, audit_protocol)
@@ -1369,7 +1396,7 @@ async fn create_tunnel(
             .map_err(|_| {
                 ApiError::new(
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    "无法写入公网访问审计记录",
+                    "无法写入穿透服务审计记录",
                 )
             })?;
     }
@@ -1386,12 +1413,7 @@ async fn create_tunnel(
                 tunnel_response_from_row,
             )
             .map(Json)
-            .map_err(|_| {
-                ApiError::new(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "无法读取新建公网访问配置",
-                )
-            })
+            .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法读取新建穿透服务"))
     };
     if response.is_ok() {
         for rollback in &mut secret_rollbacks {
@@ -1438,11 +1460,11 @@ async fn update_tunnel(
                     ))
                 },
             )
-            .map_err(|_| ApiError::new(StatusCode::NOT_FOUND, "公网访问配置不存在"))?;
+            .map_err(|_| ApiError::new(StatusCode::NOT_FOUND, "穿透服务不存在"))?;
         if old.1 != normalized.tenant_id {
             return Err(ApiError::new(
                 StatusCode::FORBIDDEN,
-                "公网访问配置不属于当前租户",
+                "穿透服务不属于当前租户",
             ));
         }
         let requested_port = normalized.public_port.or_else(|| {
@@ -1541,9 +1563,7 @@ async fn update_tunnel(
                     tenant_id,
                 ],
             )
-            .map_err(|_| {
-                ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法更新公网访问配置")
-            })?;
+            .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法更新穿透服务"))?;
     }
     if let Some(old_path) = old_origin_ca_path.as_deref() {
         let keep_old_path = origin_ca_path
@@ -1582,7 +1602,7 @@ async fn update_tunnel(
             .map_err(|_| {
                 ApiError::new(
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    "无法读取更新后的公网访问配置",
+                    "无法读取更新后的穿透服务",
                 )
             })
     };
@@ -1699,8 +1719,8 @@ async fn delete_tunnel(
                 |row| row.get(0),
             )
             .optional()
-            .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法读取公网访问配置"))?
-            .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "公网访问配置不存在"))?;
+            .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法读取穿透服务"))?
+            .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "穿透服务不存在"))?;
         let revision = current_revision.saturating_add(1).max(1);
         transaction
             .execute(
@@ -1727,7 +1747,7 @@ async fn delete_tunnel(
         "pending": true,
         "id": id,
         "revision": deletion_revision,
-        "message": "已停止公网入口，等待设备确认删除"
+        "message": "已关闭穿透服务，等待设备确认"
     })))
 }
 
@@ -1766,10 +1786,10 @@ async fn recheck_tunnel(
                 rusqlite::params![id, tenant_id],
             )
             .map_err(|_| {
-                ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法重新检测公网访问")
+                ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法重新检测穿透服务")
             })?;
         if changed == 0 {
-            return Err(ApiError::new(StatusCode::NOT_FOUND, "公网访问配置不存在"));
+            return Err(ApiError::new(StatusCode::NOT_FOUND, "穿透服务不存在"));
         }
     }
     reconcile_caddy_config_best_effort(&state).await;
@@ -1784,7 +1804,7 @@ async fn recheck_tunnel(
             tunnel_response_from_row,
         )
         .map(Json)
-        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法读取公网访问状态"))
+        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法读取穿透服务状态"))
 }
 
 async fn set_tunnel_enabled(
@@ -1807,8 +1827,8 @@ async fn set_tunnel_enabled(
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .optional()
-            .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法读取公网访问配置"))?
-            .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "公网访问配置不存在"))?;
+            .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法读取穿透服务"))?
+            .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "穿透服务不存在"))?;
         let changed = connection
             .execute(
                 "UPDATE tunnels SET enabled = ?1, apply_status = ?2,
@@ -1824,10 +1844,10 @@ async fn set_tunnel_enabled(
                 ],
             )
             .map_err(|_| {
-                ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法更新公网访问开关")
+                ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法更新穿透服务开关")
             })?;
         if changed == 0 {
-            return Err(ApiError::new(StatusCode::NOT_FOUND, "公网访问配置不存在"));
+            return Err(ApiError::new(StatusCode::NOT_FOUND, "穿透服务不存在"));
         }
         (protocol, public_port)
     };
@@ -1858,7 +1878,7 @@ async fn set_tunnel_enabled(
             tunnel_response_from_row,
         )
         .map(Json)
-        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法读取公网访问状态"))
+        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法读取穿透服务状态"))
 }
 
 struct NormalizedTunnelRequest {
@@ -1896,7 +1916,7 @@ fn normalize_tunnel_request(
     if !matches!(protocol.as_str(), "tcp" | "http" | "https") {
         return Err(ApiError::new(
             StatusCode::BAD_REQUEST,
-            "公网访问模式只能是 TCP、HTTP 或 HTTPS",
+            "穿透服务类型只能是 TCP、HTTP 或 HTTPS",
         ));
     }
     if request.local_port == 0 {
@@ -2181,9 +2201,12 @@ async fn get_public_entry(
         .lock()
         .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "数据库锁不可用"))?;
     ensure_public_entry_scope(&connection, &tenant_id)?;
-    read_public_entry(&connection)
-        .map(Json)
-        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法读取公网入口设置"))
+    read_public_entry(&connection).map(Json).map_err(|_| {
+        ApiError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "无法读取域名与 HTTPS 设置",
+        )
+    })
 }
 
 async fn update_public_entry(
@@ -2247,7 +2270,10 @@ async fn update_public_entry(
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .map_err(|_| {
-                ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法读取公网入口设置")
+                ApiError::new(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "无法读取域名与 HTTPS 设置",
+                )
             })?;
         if current.0 != domain {
             // 根域名一旦被组网身份使用，失败、离线或错配状态仍可能在
@@ -2292,7 +2318,7 @@ async fn update_public_entry(
                     tenant_id
                 ],
             )
-            .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法保存公网入口设置"))?;
+            .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法保存域名与 HTTPS 设置"))?;
     }
     sync_headscale_server_url(&state).await;
     reconcile_caddy_config_best_effort(&state).await;
@@ -2303,7 +2329,7 @@ async fn update_public_entry(
     read_public_entry(&connection).map(Json).map_err(|_| {
         ApiError::new(
             StatusCode::INTERNAL_SERVER_ERROR,
-            "无法读取已保存的公网入口设置",
+            "无法读取已保存的域名与 HTTPS 设置",
         )
     })
 }
@@ -2402,9 +2428,12 @@ async fn upload_public_entry_secret(
             .db
             .lock()
             .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "数据库锁不可用"))?;
-        read_public_entry(&connection)
-            .map(Json)
-            .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法读取公网入口设置"))
+        read_public_entry(&connection).map(Json).map_err(|_| {
+            ApiError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "无法读取域名与 HTTPS 设置",
+            )
+        })
     };
     if response.is_ok() {
         for rollback in &mut secret_rollbacks {
@@ -2497,8 +2526,12 @@ async fn recheck_public_entry(
             .lock()
             .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "数据库锁不可用"))?;
         ensure_public_entry_scope(&connection, &tenant_id)?;
-        read_public_entry(&connection)
-            .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法读取公网入口设置"))?
+        read_public_entry(&connection).map_err(|_| {
+            ApiError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "无法读取域名与 HTTPS 设置",
+            )
+        })?
     };
     let domain = snapshot.base_domain.clone();
     let dns_check = if let Some(domain) = domain.as_deref() {
@@ -2522,7 +2555,7 @@ async fn recheck_public_entry(
     };
     let error_message = if status == "error" {
         if !caddy_ready {
-            Some("Caddy 公网入口暂不可用")
+            Some("域名与 HTTPS 服务暂不可用")
         } else {
             Some("域名或证书材料尚未准备好")
         }
@@ -2544,11 +2577,11 @@ async fn recheck_public_entry(
                 dns_check.to_string()
             ],
         )
-        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法保存公网入口检测结果"))?;
+        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法保存域名与 HTTPS 检测结果"))?;
     read_public_entry(&connection).map(Json).map_err(|_| {
         ApiError::new(
             StatusCode::INTERNAL_SERVER_ERROR,
-            "无法读取公网入口检测结果",
+            "无法读取域名与 HTTPS 检测结果",
         )
     })
 }
@@ -2592,16 +2625,21 @@ fn ensure_public_entry_scope(connection: &Connection, tenant_id: &str) -> Result
             |row| row.get(0),
         )
         .optional()
-        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法读取公网入口租户"))?;
+        .map_err(|_| {
+            ApiError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "无法读取域名与 HTTPS 配置租户",
+            )
+        })?;
     match owner {
         Some(owner) if owner == tenant_id => Ok(()),
         Some(_) => Err(ApiError::new(
             StatusCode::FORBIDDEN,
-            "公网入口不属于当前租户",
+            "域名与 HTTPS 配置不属于当前租户",
         )),
         None => Err(ApiError::new(
             StatusCode::INTERNAL_SERVER_ERROR,
-            "公网入口设置不存在",
+            "域名与 HTTPS 设置不存在",
         )),
     }
 }
@@ -2738,7 +2776,7 @@ async fn reconcile_caddy_config_best_effort(state: &AppState) {
         if !state.caddy.config().enabled {
             state.caddy.write_startup_config(&config)?;
             let (status, message) = if entry.https_enabled {
-                ("error", Some("Caddy 公网入口未启用"))
+                ("error", Some("域名与 HTTPS 尚未启用"))
             } else {
                 ("not_configured", None)
             };
@@ -3034,7 +3072,7 @@ async fn list_devices(
         .prepare(
             "SELECT d.id, d.tenant_id, d.site_id, d.name, d.os, d.architecture,
                     d.agent_version, d.status, d.capabilities_json, r.report_json,
-                    m.state, m.tailscale_ipv4, m.online, d.last_seen_at,
+                    m.state, m.tailscale_ipv4, m.online, unixepoch(d.last_seen_at),
                     (SELECT a.state FROM mesh_enrollment_attempts a
                      WHERE a.nexo_device_id = d.id
                      ORDER BY a.created_at DESC LIMIT 1)
@@ -3861,6 +3899,7 @@ async fn serve_tunnel_connection(
     stream: tokio::net::TcpStream,
     state: AppState,
 ) -> Result<()> {
+    configure_tunnel_tcp_keepalive(&stream).context("无法配置 Tunnel TCP 保活")?;
     let tls_stream =
         tokio::time::timeout(std::time::Duration::from_secs(10), acceptor.accept(stream))
             .await
@@ -3912,7 +3951,9 @@ async fn serve_tunnel_connection(
         refresh_tunnel_readiness(&readiness_state, &readiness_device_id).await;
     });
     let mut connection = nexo_tunnel::yamux_connection(tls_stream, yamux::Mode::Server);
-    let result = serve_tunnel_session(&mut connection, receiver, cancel, &state, &device_id).await;
+    let result = serve_tunnel_session(&mut connection, receiver, cancel, &state, &device_id)
+        .await
+        .with_context(|| format!("设备 {device_id} 的 Tunnel 数据会话异常"));
     // 旧会话退出时不能误删刚刚建立的新会话；Sender::same_channel 用来确认
     // 当前 Map 中仍然是本连接对应的通道。
     let mut sessions = state.tunnel_sessions.lock().await;
@@ -4537,12 +4578,15 @@ fn apply_tunnel_results(
             deletion_revision,
             origin_ca_path,
             bridge_socket_path,
+            row_applied_revision,
+            current_apply_status,
         )) = transaction
             .query_row(
                 "SELECT apply_revision, enabled, protocol, local_address, local_port, hostname,
                         origin_protocol, origin_tls_server_name, origin_tls_verification,
                         deletion_requested, deletion_revision,
-                        origin_ca_secret_path, bridge_socket_path
+                        origin_ca_secret_path, bridge_socket_path,
+                        applied_revision, apply_status
                  FROM tunnels WHERE id = ?1 AND device_id = ?2 AND deleted_at IS NULL",
                 rusqlite::params![result.tunnel_id, device_id],
                 |row| {
@@ -4560,6 +4604,8 @@ fn apply_tunnel_results(
                         row.get::<_, Option<i64>>(10)?,
                         row.get::<_, Option<String>>(11)?,
                         row.get::<_, Option<String>>(12)?,
+                        row.get::<_, i64>(13)?,
+                        row.get::<_, String>(14)?,
                     ))
                 },
             )
@@ -4578,8 +4624,14 @@ fn apply_tunnel_results(
         }
         // Agent 只证明了本地 Origin 探测结果；公网数据会话、监听器和 Caddy
         // 的实际状态由 Server 侧后续汇总，不能在这里直接宣称 Tunnel ready。
+        let repeated_ready_ack = enabled
+            && result.applied
+            && result.revision == row_applied_revision
+            && current_apply_status == "ready";
         let status = if !enabled {
             "disabled"
+        } else if repeated_ready_ack {
+            "ready"
         } else if result.applied {
             "checking"
         } else {
@@ -4844,13 +4896,13 @@ async fn refresh_tunnel_readiness(state: &AppState, device_id: &str) {
         } else if !listener_ids.contains(&tunnel_id) {
             (
                 "checking".to_owned(),
-                Some("公网入口监听尚未生效".to_owned()),
+                Some("穿透服务监听尚未生效".to_owned()),
                 false,
             )
         } else if !caddy_healthy && matches!(protocol.as_str(), "http" | "https") {
             (
                 "retrying".to_owned(),
-                Some("Web 公网入口暂时不可用".to_owned()),
+                Some("Web 穿透服务暂时不可用".to_owned()),
                 false,
             )
         } else if matches!(protocol.as_str(), "http" | "https")
@@ -6514,7 +6566,7 @@ async fn mesh_application_allowed(state: &AppState) -> bool {
 }
 
 fn mesh_restriction_message() -> &'static str {
-    "公网 HTTPS 入口尚未就绪，新的组网加入和网关应用已暂停"
+    "域名与 HTTPS 尚未就绪，新的组网加入和网关应用已暂停"
 }
 
 /// 创建一个 15 分钟（或显式指定时长）的待入网凭证。
@@ -8313,10 +8365,10 @@ fn site_link_route_confirmation(
     connection: &Connection,
     link_id: &str,
     site_id: &str,
-) -> Result<Option<String>, ApiError> {
+) -> Result<Option<i64>, ApiError> {
     connection
         .query_row(
-            "SELECT confirmed_at FROM site_link_route_confirmations
+            "SELECT unixepoch(confirmed_at) FROM site_link_route_confirmations
              WHERE site_link_id = ?1 AND site_id = ?2",
             rusqlite::params![link_id, site_id],
             |row| row.get(0),
@@ -8910,6 +8962,7 @@ mod tests {
         connection
             .execute_batch(PHASE2_MIGRATION)
             .expect("应初始化第二阶段公网访问表");
+        apply_time_consistency_migration(&connection).expect("应统一测试数据库时间字段");
         ensure_phase2_tunnel_columns(&connection).expect("应初始化第二阶段 Tunnel 字段");
         ensure_mesh_identity_online_column(&connection).expect("应初始化组网在线状态字段");
         ensure_server_ca(&connection).expect("应初始化测试 CA");
@@ -9065,6 +9118,203 @@ mod tests {
         assert_eq!(report["wildcard"]["hostname"], "*.example.com");
         assert_eq!(report["wildcard"]["error"], "泛域名未解析");
         assert!(report["error"].as_str().unwrap().contains("泛域名未解析"));
+    }
+
+    #[test]
+    fn time_consistency_migration_converts_legacy_text_epochs_once() {
+        let connection = Connection::open_in_memory().expect("应打开迁移测试数据库");
+        connection
+            .execute_batch(
+                "CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY);
+                 CREATE TABLE devices (id TEXT PRIMARY KEY);
+                 CREATE TABLE tenants (id TEXT PRIMARY KEY);
+                 INSERT INTO devices (id) VALUES ('device-1');
+                 INSERT INTO tenants (id) VALUES ('tenant-1');
+                 CREATE TABLE device_identities (
+                     device_id TEXT PRIMARY KEY REFERENCES devices(id) ON DELETE CASCADE,
+                     certificate_pem TEXT, certificate_fingerprint TEXT, issued_at TEXT,
+                     expires_at TEXT, revoked_at TEXT
+                 );
+                 CREATE TABLE mesh_enrollment_attempts (
+                     id TEXT PRIMARY KEY,
+                     nexo_device_id TEXT NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
+                     tenant_id TEXT NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+                     headscale_pre_auth_key_id TEXT NOT NULL UNIQUE,
+                     expires_at TEXT NOT NULL,
+                     state TEXT NOT NULL DEFAULT 'issued', last_error TEXT,
+                     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                 );
+                 CREATE INDEX idx_mesh_enrollment_attempts_device
+                     ON mesh_enrollment_attempts (nexo_device_id, created_at DESC);
+                 INSERT INTO device_identities (device_id, expires_at)
+                     VALUES ('device-1', '1893456000');
+                 INSERT INTO mesh_enrollment_attempts
+                     (id, nexo_device_id, tenant_id, headscale_pre_auth_key_id, expires_at)
+                     VALUES ('attempt-1', 'device-1', 'tenant-1', 'key-1', '1893456000');",
+            )
+            .expect("应创建旧版时间字段");
+
+        apply_time_consistency_migration(&connection).expect("旧版时间字段应迁移成功");
+        apply_time_consistency_migration(&connection).expect("重复迁移应保持幂等");
+
+        for table in ["device_identities", "mesh_enrollment_attempts"] {
+            let field_type: String = connection
+                .query_row(
+                    &format!(
+                        "SELECT type FROM pragma_table_info('{table}') WHERE name = 'expires_at'"
+                    ),
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("应读取迁移后的字段类型");
+            assert_eq!(field_type, "INTEGER");
+            let (value, storage): (i64, String) = connection
+                .query_row(
+                    &format!("SELECT expires_at, typeof(expires_at) FROM {table} LIMIT 1"),
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .expect("迁移后的 Unix 秒应能按整数读取");
+            assert_eq!(value, 1_893_456_000);
+            assert_eq!(storage, "integer");
+        }
+        let index_exists: bool = connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master
+                 WHERE type = 'index' AND name = 'idx_mesh_enrollment_attempts_device')",
+                [],
+                |row| row.get(0),
+            )
+            .expect("应检查迁移后的索引");
+        assert!(index_exists);
+    }
+
+    #[test]
+    fn repeated_successful_tunnel_ack_keeps_ready_state() {
+        let state = test_state();
+        insert_test_tunnel(&state, true);
+        let success = TunnelApplyResult {
+            tunnel_id: "tunnel-1".to_owned(),
+            revision: 3,
+            applied: true,
+            status: "checking".to_owned(),
+            error_message: None,
+        };
+
+        apply_tunnel_results(&state, "tunnel-device", std::slice::from_ref(&success))
+            .expect("相同 revision 的成功 ACK 应被接受");
+        let ready: String = state
+            .db
+            .lock()
+            .expect("数据库锁应可用")
+            .query_row(
+                "SELECT apply_status FROM tunnels WHERE id = 'tunnel-1'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("应读取 Tunnel 状态");
+        assert_eq!(ready, "ready");
+
+        state
+            .db
+            .lock()
+            .expect("数据库锁应可用")
+            .execute(
+                "UPDATE tunnels SET apply_revision = 4 WHERE id = 'tunnel-1'",
+                [],
+            )
+            .expect("应模拟新配置 revision");
+        apply_tunnel_results(
+            &state,
+            "tunnel-device",
+            &[TunnelApplyResult {
+                revision: 4,
+                ..success
+            }],
+        )
+        .expect("新 revision 的成功 ACK 应被接受");
+        let checking: String = state
+            .db
+            .lock()
+            .expect("数据库锁应可用")
+            .query_row(
+                "SELECT apply_status FROM tunnels WHERE id = 'tunnel-1'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("应读取新配置状态");
+        assert_eq!(checking, "checking");
+    }
+
+    #[tokio::test]
+    async fn api_time_fields_are_unix_seconds() {
+        let state = test_state();
+        {
+            let connection = state.db.lock().expect("数据库锁应可用");
+            connection
+                .execute_batch(
+                    "INSERT INTO sites (id, tenant_id, name) VALUES
+                         ('site-a', 'tenant-1', '甲站点'),
+                         ('site-b', 'tenant-1', '乙站点');
+                     INSERT INTO devices (id, tenant_id, name, last_seen_at)
+                         VALUES ('device-time', 'tenant-1', '时间测试设备', '2030-01-01 00:00:00');
+                     INSERT INTO site_links (id, tenant_id, left_site_id, right_site_id)
+                         VALUES ('link-time', 'tenant-1', 'site-a', 'site-b');
+                     INSERT INTO site_link_route_confirmations
+                         (site_link_id, site_id, confirmed_at)
+                         VALUES ('link-time', 'site-a', '2030-01-01 00:00:00');",
+                )
+                .expect("应创建 API 时间测试数据");
+        }
+
+        let devices = list_devices(State(state.clone()), admin_headers())
+            .await
+            .expect("应读取设备列表")
+            .0;
+        let device = devices
+            .iter()
+            .find(|device| device.id == "device-time")
+            .expect("应返回时间测试设备");
+        assert_eq!(device.last_seen_at, Some(1_893_456_000));
+        assert_eq!(
+            site_link_route_confirmation(
+                &state.db.lock().expect("数据库锁应可用"),
+                "link-time",
+                "site-a",
+            )
+            .expect("应读取静态路由确认时间"),
+            Some(1_893_456_000)
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_tunnel_data_session_downgrades_ready_entry() {
+        let state = test_state();
+        insert_test_tunnel(&state, true);
+        state
+            .db
+            .lock()
+            .expect("数据库锁应可用")
+            .execute(
+                "UPDATE devices SET status = 'online' WHERE id = 'tunnel-device'",
+                [],
+            )
+            .expect("应模拟在线控制连接");
+
+        refresh_tunnel_readiness(&state, "tunnel-device").await;
+        let (status, error): (String, Option<String>) = state
+            .db
+            .lock()
+            .expect("数据库锁应可用")
+            .query_row(
+                "SELECT apply_status, apply_error FROM tunnels WHERE id = 'tunnel-1'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("应读取断线后的 Tunnel 状态");
+        assert_eq!(status, "checking");
+        assert_eq!(error.as_deref(), Some("等待 Agent Tunnel 数据连接"));
     }
 
     #[tokio::test]
@@ -10136,7 +10386,7 @@ mod tests {
             .all(|network| network.health_status == GatewayHealthStatus::Degraded));
         assert!(networks.iter().all(|network| {
             network.health_error.as_deref()
-                == Some("公网 HTTPS 入口尚未就绪，新的组网加入和网关应用已暂停")
+                == Some("域名与 HTTPS 尚未就绪，新的组网加入和网关应用已暂停")
         }));
         assert_eq!(
             networks
@@ -10167,7 +10417,7 @@ mod tests {
         assert_eq!(link.health_status, GatewayHealthStatus::Degraded);
         assert_eq!(
             link.health_error.as_deref(),
-            Some("公网 HTTPS 入口尚未就绪，新的组网加入和网关应用已暂停")
+            Some("域名与 HTTPS 尚未就绪，新的组网加入和网关应用已暂停")
         );
         assert_eq!(link.left_site_name, "家庭");
         assert_eq!(link.right_site_name, "办公室");
@@ -10216,7 +10466,7 @@ mod tests {
         assert_eq!(degraded_link.health_status, GatewayHealthStatus::Degraded);
         assert_eq!(
             degraded_link.health_error.as_deref(),
-            Some("公网 HTTPS 入口尚未就绪，新的组网加入和网关应用已暂停")
+            Some("域名与 HTTPS 尚未就绪，新的组网加入和网关应用已暂停")
         );
         {
             let connection = state.db.lock().expect("数据库锁应可用");
