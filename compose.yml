@@ -1,10 +1,10 @@
 name: nexo
 
-# Nexo v0.1.2 Server 正式部署。内置组件只监听本机回环地址，公网入口、
+# Nexo v0.1.3 Server 正式部署。内置组件只监听本机回环地址，公网入口、
 # Agent 控制通道和 Tunnel 数据通道由宿主机网络直接提供。
 services:
   nexo-server:
-    image: ghcr.io/thelinyue/nexo-server:0.1.2
+    image: ghcr.io/thelinyue/nexo-server:0.1.3
     container_name: nexo-server
     network_mode: host
     volumes:
