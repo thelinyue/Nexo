@@ -31,6 +31,16 @@ export default defineConfig({
         ...devices["iPhone 13"],
         browserName: "chromium",
         colorScheme: "light",
+        viewport: { width: 375, height: 812 },
+      },
+    },
+    {
+      name: "mobile-landscape",
+      use: {
+        ...devices["iPhone 13"],
+        browserName: "chromium",
+        colorScheme: "light",
+        viewport: { width: 812, height: 375 },
       },
     },
   ],

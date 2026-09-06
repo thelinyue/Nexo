@@ -1416,14 +1416,15 @@ async fn update_tunnel(
     } else {
         None
     };
-    let (public_port, revision, old_origin_ca_path) = {
+    let (public_port, revision, old_origin_ca_path, was_enabled) = {
         let connection = state
             .db
             .lock()
             .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "数据库锁不可用"))?;
-        let old: (i64, String, String, Option<u16>, Option<String>) = connection
+        let old: (i64, String, String, Option<u16>, Option<String>, bool) = connection
             .query_row(
-                "SELECT apply_revision, tenant_id, protocol, public_port, origin_ca_secret_path
+                "SELECT apply_revision, tenant_id, protocol, public_port, origin_ca_secret_path,
+                        enabled
                  FROM tunnels WHERE id = ?1 AND deleted_at IS NULL",
                 [&id],
                 |row| {
@@ -1433,6 +1434,7 @@ async fn update_tunnel(
                         row.get(2)?,
                         row.get(3)?,
                         row.get(4)?,
+                        row.get(5)?,
                     ))
                 },
             )
@@ -1461,7 +1463,7 @@ async fn update_tunnel(
             current_listener_owned,
         )?;
         let revision = old.0.saturating_add(1).max(1);
-        (public_port, revision, old.4)
+        (public_port, revision, old.4, old.5)
     };
     let mut secret_rollbacks = Vec::new();
     let requested_origin_ca_path = normalized
@@ -1510,10 +1512,10 @@ async fn update_tunnel(
                   origin_protocol = ?8, origin_tls_server_name = ?9,
                   origin_tls_verification = ?10, service_name = ?11,
                    bridge_socket_path = ?12, origin_ca_secret_path = ?13,
-                   enabled = 1, deletion_requested = 0, deletion_revision = NULL,
-                   apply_status = 'checking', apply_error = NULL,
-                  apply_revision = ?14, updated_at = CURRENT_TIMESTAMP
-                  WHERE id = ?15 AND tenant_id = ?16 AND deleted_at IS NULL",
+                   enabled = ?14, deletion_requested = 0, deletion_revision = NULL,
+                   apply_status = ?15, apply_error = NULL,
+                  apply_revision = ?16, updated_at = CURRENT_TIMESTAMP
+                  WHERE id = ?17 AND tenant_id = ?18 AND deleted_at IS NULL",
                 rusqlite::params![
                     normalized.device_id,
                     normalized.name,
@@ -1532,6 +1534,8 @@ async fn update_tunnel(
                     origin_ca_path
                         .as_ref()
                         .map(|path| path.to_string_lossy().to_string()),
+                    i64::from(was_enabled),
+                    if was_enabled { "checking" } else { "disabled" },
                     revision,
                     id,
                     tenant_id,
@@ -1553,12 +1557,14 @@ async fn update_tunnel(
             }
         }
     }
-    if new_protocol == "tcp" {
-        if let Some(port) = public_port {
-            start_public_tunnel_listener(state.clone(), id.clone(), port).await;
+    if was_enabled {
+        if new_protocol == "tcp" {
+            if let Some(port) = public_port {
+                start_public_tunnel_listener(state.clone(), id.clone(), port).await;
+            }
+        } else if let Some(path) = bridge_socket_path {
+            start_public_web_listener(state.clone(), id.clone(), path).await;
         }
-    } else if let Some(path) = bridge_socket_path {
-        start_public_web_listener(state.clone(), id.clone(), path).await;
     }
     reconcile_caddy_config_best_effort(&state).await;
     let response = {
@@ -1793,25 +1799,16 @@ async fn set_tunnel_enabled(
             .db
             .lock()
             .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "数据库锁不可用"))?;
-        let protocol: String = connection
+        let (protocol, public_port): (String, Option<u16>) = connection
             .query_row(
-                "SELECT protocol FROM tunnels
+                "SELECT protocol, public_port FROM tunnels
                  WHERE id = ?1 AND tenant_id = ?2 AND deleted_at IS NULL",
                 rusqlite::params![id, tenant_id],
-                |row| row.get(0),
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .optional()
-            .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法读取公网访问模式"))?
+            .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法读取公网访问配置"))?
             .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "公网访问配置不存在"))?;
-        let public_port: Option<u16> = connection
-            .query_row(
-                "SELECT public_port FROM tunnels
-                 WHERE id = ?1 AND tenant_id = ?2 AND deleted_at IS NULL",
-                rusqlite::params![id, tenant_id],
-                |row| row.get(0),
-            )
-            .optional()
-            .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法读取公网端口"))?;
         let changed = connection
             .execute(
                 "UPDATE tunnels SET enabled = ?1, apply_status = ?2,
@@ -8965,6 +8962,38 @@ mod tests {
         }
     }
 
+    fn insert_test_tunnel(state: &AppState, enabled: bool) {
+        let connection = state.db.lock().expect("数据库锁应可用");
+        connection
+            .execute(
+                "INSERT INTO devices (id, tenant_id, name, capabilities_json)
+                 VALUES ('tunnel-device', 'tenant-1', 'Tunnel 测试设备', '[\"tunnel\"]')",
+                [],
+            )
+            .expect("应创建 Tunnel 测试设备");
+        connection
+            .execute(
+                "INSERT INTO tunnels
+                 (id, tenant_id, device_id, name, protocol, local_address, local_port,
+                  public_port, enabled, apply_status, apply_revision, applied_revision)
+                 VALUES ('tunnel-1', 'tenant-1', 'tunnel-device', '测试公网访问', 'tcp',
+                         '127.0.0.1', 8800, NULL, ?1, ?2, 3, 3)",
+                rusqlite::params![
+                    i64::from(enabled),
+                    if enabled { "ready" } else { "disabled" }
+                ],
+            )
+            .expect("应创建 Tunnel 测试记录");
+        connection
+            .execute(
+                "INSERT INTO tunnel_applied_states
+                 (tunnel_id, applied_revision, applied_config_json, apply_status)
+                 VALUES ('tunnel-1', 3, '{}', ?1)",
+                [if enabled { "ready" } else { "disabled" }],
+            )
+            .expect("应创建 Tunnel 应用状态");
+    }
+
     #[test]
     fn mesh_hostname_is_dns_safe_stable_and_unique_for_same_names() {
         let chinese = mesh_hostname(
@@ -9069,6 +9098,109 @@ mod tests {
             .contains_key("tunnel-1"));
         old.abort();
         replacement.abort();
+    }
+
+    #[tokio::test]
+    async fn disabling_tunnel_updates_state_and_publishes_disabled_desired_state() {
+        let state = test_state();
+        insert_test_tunnel(&state, true);
+
+        let disabled = disable_tunnel(
+            State(state.clone()),
+            admin_headers(),
+            Path("tunnel-1".to_owned()),
+        )
+        .await
+        .expect("管理员应能关闭公网访问")
+        .0;
+
+        assert!(!disabled.enabled);
+        assert_eq!(disabled.apply_status, "disabled");
+        assert_eq!(disabled.desired_revision, 4);
+        let desired = load_tunnel_desired_state(&state, "tunnel-device")
+            .expect("关闭后的 Tunnel Desired State 应可读取");
+        assert_eq!(desired.len(), 1);
+        assert!(!desired[0].enabled);
+        assert_eq!(desired[0].revision, 4);
+    }
+
+    #[tokio::test]
+    async fn updating_disabled_tunnel_keeps_it_disabled() {
+        let state = test_state();
+        insert_test_tunnel(&state, false);
+
+        let updated = update_tunnel(
+            State(state.clone()),
+            admin_headers(),
+            Path("tunnel-1".to_owned()),
+            Json(CreateTunnelRequest {
+                tenant_id: "tenant-1".to_owned(),
+                device_id: "tunnel-device".to_owned(),
+                name: "修改后的公网访问".to_owned(),
+                protocol: "tcp".to_owned(),
+                local_address: "127.0.0.1".to_owned(),
+                local_port: 9900,
+                public_port: None,
+                hostname: None,
+                origin_protocol: None,
+                origin_tls_server_name: None,
+                origin_tls_verification: Some("system".to_owned()),
+                origin_ca_pem: None,
+                service_name: None,
+            }),
+        )
+        .await
+        .expect("管理员应能编辑已关闭的公网访问")
+        .0;
+
+        assert_eq!(updated.name, "修改后的公网访问");
+        assert!(!updated.enabled);
+        assert_eq!(updated.apply_status, "disabled");
+        assert_eq!(updated.desired_revision, 4);
+        assert!(!state
+            .public_listener_tasks
+            .lock()
+            .expect("监听器登记应可读取")
+            .contains_key("tunnel-1"));
+    }
+
+    #[tokio::test]
+    async fn updating_enabled_tunnel_restarts_application() {
+        let state = test_state();
+        insert_test_tunnel(&state, true);
+
+        let updated = update_tunnel(
+            State(state.clone()),
+            admin_headers(),
+            Path("tunnel-1".to_owned()),
+            Json(CreateTunnelRequest {
+                tenant_id: "tenant-1".to_owned(),
+                device_id: "tunnel-device".to_owned(),
+                name: "继续启用的公网访问".to_owned(),
+                protocol: "tcp".to_owned(),
+                local_address: "127.0.0.1".to_owned(),
+                local_port: 9900,
+                public_port: None,
+                hostname: None,
+                origin_protocol: None,
+                origin_tls_server_name: None,
+                origin_tls_verification: Some("system".to_owned()),
+                origin_ca_pem: None,
+                service_name: None,
+            }),
+        )
+        .await
+        .expect("管理员应能编辑启用中的公网访问")
+        .0;
+
+        assert!(updated.enabled);
+        assert_eq!(updated.apply_status, "checking");
+        assert_eq!(updated.desired_revision, 4);
+        assert!(state
+            .public_listener_tasks
+            .lock()
+            .expect("监听器登记应可读取")
+            .contains_key("tunnel-1"));
     }
 
     #[tokio::test]
