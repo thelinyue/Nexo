@@ -6,7 +6,8 @@ mod network;
 
 pub use enrollment::{EnrollmentError, EnrollmentStatus, EnrollmentToken, PendingEnrollment};
 pub use gateway::{
-    CapabilityState, DetectedLocalNetwork, GatewayCapabilityReason, GatewayCapabilityReport,
+    forwarding_enabled_for_prefix, CapabilityState, DetectedLocalNetwork, GatewayCapabilityReason,
+    GatewayCapabilityReport,
 };
 pub use network::{validate_published_network, NetworkError};
 use serde::{Deserialize, Serialize};

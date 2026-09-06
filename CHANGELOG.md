@@ -2,6 +2,23 @@
 
 本项目使用 [Semantic Versioning](https://semver.org/) 记录公开版本。
 
+## [0.1.5] - 2026-09-06
+
+### Added
+
+- 增加站点、设备、共享网络、站点互联和穿透服务的依赖感知删除流程，并通过迁移保留旧数据库的升级兼容性。
+- 增加逐路由网关应用结果，分别校验 IPv4/IPv6 转发能力和 Headscale 路由收敛状态。
+
+### Changed
+
+- Headscale 对尚未发现的路由独立保持 Pending；可见路由仍可继续批准和撤销，避免单条路由阻塞整批收敛。
+- 设备删除完成后同步删除 Headscale Node，避免旧组网身份残留在拓扑中。
+- 正式镜像和 Compose 配置升级至 `0.1.5`，默认日志时区为 `Asia/Shanghai`。
+
+### Fixed
+
+- 修复资源删除完成前仍可重复修改或重新应用的问题，并确保删除操作按依赖顺序清理相关应用状态。
+
 ## [0.1.4] - 2026-09-06
 
 ### Added
@@ -67,6 +84,7 @@
 - 管理密码使用 Argon2id；LAN HTTP 与公网 HTTPS Session 相互隔离。
 - API Key、DNS Token、私钥和自定义 CA 保存为受限 Secret 文件。
 
+[0.1.5]: https://github.com/thelinyue/Nexo/releases/tag/v0.1.5
 [0.1.4]: https://github.com/thelinyue/Nexo/releases/tag/v0.1.4
 [0.1.3]: https://github.com/thelinyue/Nexo/releases/tag/v0.1.3
 [0.1.2]: https://github.com/thelinyue/Nexo/releases/tag/v0.1.2

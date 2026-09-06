@@ -1,3 +1,4 @@
+use ipnet::IpNet;
 use serde::{Deserialize, Serialize};
 
 /// 网关能力当前是否可以由 Agent 应用。
@@ -48,4 +49,35 @@ pub struct GatewayCapabilityReport {
     pub subnet_gateway_reason: Option<GatewayCapabilityReason>,
     pub site_gateway: CapabilityState,
     pub site_gateway_reason: Option<GatewayCapabilityReason>,
+}
+
+/// 判断指定网段所需的地址族是否已经开启内核转发。
+///
+/// Tailscale 按实际广告路由的地址族检查转发能力；IPv4 与 IPv6 互不构成
+/// 前置条件。调用方仍需单独校验 TUN、NET_ADMIN 和本地网段等基础能力。
+pub fn forwarding_enabled_for_prefix(
+    ipv4_forwarding: bool,
+    ipv6_forwarding: bool,
+    prefix: IpNet,
+) -> bool {
+    match prefix {
+        IpNet::V4(_) => ipv4_forwarding,
+        IpNet::V6(_) => ipv6_forwarding,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn forwarding_is_checked_per_address_family() {
+        let ipv4: IpNet = "192.168.10.0/24".parse().unwrap();
+        let ipv6: IpNet = "2001:db8:10::/64".parse().unwrap();
+
+        assert!(forwarding_enabled_for_prefix(true, false, ipv4));
+        assert!(!forwarding_enabled_for_prefix(true, false, ipv6));
+        assert!(!forwarding_enabled_for_prefix(false, true, ipv4));
+        assert!(forwarding_enabled_for_prefix(false, true, ipv6));
+    }
 }

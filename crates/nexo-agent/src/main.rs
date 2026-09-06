@@ -18,8 +18,8 @@ use clap::Parser;
 use get_if_addrs::{get_if_addrs, IfAddr};
 use ipnet::IpNet;
 use nexo_core::{
-    validate_published_network, ApplyStatus, CapabilityState, DetectedLocalNetwork,
-    DeviceCapability, GatewayCapabilityReason, GatewayCapabilityReport,
+    forwarding_enabled_for_prefix, validate_published_network, ApplyStatus, CapabilityState,
+    DetectedLocalNetwork, DeviceCapability, GatewayCapabilityReason, GatewayCapabilityReport,
 };
 use nexo_protocol::{
     AgentControlMessage, AgentEnrollmentPollRequest, AgentEnrollmentPollResponse,
@@ -764,7 +764,7 @@ async fn control_session(
                 &applier,
                 Some(&gateway_report),
             );
-            let GatewayApplyExecution { ack, local_applied } = execution;
+            let GatewayApplyExecution { ack, route_results } = execution;
             last_gateway_status = Some(ack.status);
             update_gateway_retry_state(
                 ack.status,
@@ -788,7 +788,7 @@ async fn control_session(
                 .iter()
                 .any(|feature| feature == "gateway_route_report")
             {
-                send_gateway_route_report(&mut reader, &gateway_state, &ack, local_applied).await?;
+                send_gateway_route_report(&mut reader, &gateway_state, route_results).await?;
             }
             if protocol_features
                 .iter()
@@ -872,7 +872,7 @@ async fn control_session(
                     &applier,
                     Some(&heartbeat_gateway_report),
                 );
-                let GatewayApplyExecution { ack, local_applied } = execution;
+                let GatewayApplyExecution { ack, route_results } = execution;
                 last_gateway_status = Some(ack.status);
                 update_gateway_retry_state(
                     ack.status,
@@ -896,8 +896,7 @@ async fn control_session(
                     .iter()
                     .any(|feature| feature == "gateway_route_report")
                 {
-                    send_gateway_route_report(&mut reader, &gateway_state, &ack, local_applied)
-                        .await?;
+                    send_gateway_route_report(&mut reader, &gateway_state, route_results).await?;
                 }
                 if protocol_features
                     .iter()
@@ -1163,34 +1162,11 @@ async fn handle_tunnel_stream(
 async fn send_gateway_route_report(
     reader: &mut AsyncBufReader<tokio_rustls::client::TlsStream<TcpStream>>,
     state: &GatewayDesiredState,
-    ack: &GatewayApplyAck,
-    local_apply_succeeded: bool,
+    routes: Vec<GatewayRouteApplyResult>,
 ) -> Result<()> {
     let report = GatewayRouteApplyReport {
         revision: state.revision,
-        routes: state
-            .routes
-            .iter()
-            .map(|route| GatewayRouteApplyResult {
-                network_id: route.network_id.clone(),
-                site_link_id: route.site_link_id.clone(),
-                prefix: route.prefix.clone(),
-                revision: route.revision,
-                enabled: route.enabled,
-                // 只有执行器明确报告本机命令成功，才允许报告本地成功；
-                // 演练模式、开关关闭或具体命令失败都必须保持 false。
-                local_applied: local_apply_succeeded
-                    && !matches!(ack.status, ApplyStatus::Failed | ApplyStatus::Retrying),
-                control_plane_status: None,
-                // Site Gateway 使用 --accept-routes=true 且关闭 SNAT；Tailscale
-                // set 成功后即可确认本地已接受远端路由，Headscale serving 仍由 Server
-                // 单独核对。
-                remote_applied: route.site_link_id.is_some()
-                    && local_apply_succeeded
-                    && !matches!(ack.status, ApplyStatus::Failed | ApplyStatus::Retrying),
-                error_message: ack.error_message.clone(),
-            })
-            .collect(),
+        routes,
         mesh_identity: None,
     };
     write_agent_message(
@@ -1874,7 +1850,7 @@ fn apply_gateway_desired_state_with_report(
 /// 成功执行，只有执行器返回 `Ok(true)` 时才允许后续逐路由报告触发 Headscale。
 struct GatewayApplyExecution {
     ack: GatewayApplyAck,
-    local_applied: bool,
+    route_results: Vec<GatewayRouteApplyResult>,
 }
 
 fn apply_gateway_desired_state_with_execution(
@@ -1887,8 +1863,8 @@ fn apply_gateway_desired_state_with_execution(
         .iter()
         .map(|route| route.network_id.clone())
         .collect();
-    let plan = match build_tailscale_route_plan(state) {
-        Ok(plan) => plan,
+    let prepared = match build_tailscale_route_plan_with_report(state, gateway_report) {
+        Ok(prepared) => prepared,
         Err(error) => {
             let error_message = format!("服务端下发的网关网络无效：{error}");
             tracing::error!("{}", error_message);
@@ -1898,28 +1874,13 @@ fn apply_gateway_desired_state_with_execution(
                     status: ApplyStatus::Failed,
                     network_ids,
                     applied_network_ids: Vec::new(),
-                    error_message: Some(error_message),
+                    error_message: Some(error_message.clone()),
                 },
-                local_applied: false,
+                route_results: failed_gateway_route_results(state, &error_message),
             };
         }
     };
-    if let Some(report) = gateway_report {
-        if let Some(error_message) = gateway_capability_error(state, report) {
-            tracing::error!("{}", error_message);
-            return GatewayApplyExecution {
-                ack: GatewayApplyAck {
-                    revision: state.revision,
-                    status: ApplyStatus::Failed,
-                    network_ids,
-                    applied_network_ids: Vec::new(),
-                    error_message: Some(error_message),
-                },
-                local_applied: false,
-            };
-        }
-    }
-    let local_applied = match applier.apply(&plan) {
+    let local_applied = match applier.apply(&prepared.plan) {
         Ok(applied) => applied,
         Err(error) => {
             let error_message = format!("Tailscale 网关应用失败：{error:#}");
@@ -1930,9 +1891,9 @@ fn apply_gateway_desired_state_with_execution(
                     status: ApplyStatus::Retrying,
                     network_ids,
                     applied_network_ids: Vec::new(),
-                    error_message: Some(error_message),
+                    error_message: Some(error_message.clone()),
                 },
-                local_applied: false,
+                route_results: prepared.route_results(false, Some(&error_message)),
             };
         }
     };
@@ -1950,15 +1911,31 @@ fn apply_gateway_desired_state_with_execution(
                 applied_network_ids: Vec::new(),
                 error_message: None,
             },
-            local_applied,
+            route_results: prepared.route_results(local_applied, None),
+        };
+    }
+    let blocked_error = prepared.first_blocked_error();
+    if !prepared.has_applicable_enabled_route() {
+        let error_message =
+            blocked_error.unwrap_or_else(|| "本机当前没有可应用的网关路由".to_owned());
+        tracing::error!("{}", error_message);
+        return GatewayApplyExecution {
+            ack: GatewayApplyAck {
+                revision: state.revision,
+                status: ApplyStatus::Failed,
+                network_ids,
+                applied_network_ids: Vec::new(),
+                error_message: Some(error_message),
+            },
+            route_results: prepared.route_results(local_applied, None),
         };
     }
     tracing::info!(
         revision = state.revision,
         route_count = state.routes.len(),
-        advertise_routes = ?plan.advertise_routes,
-        accept_routes = plan.accept_routes,
-        snat_subnet_routes = ?plan.snat_subnet_routes,
+        advertise_routes = ?prepared.plan.advertise_routes,
+        accept_routes = prepared.plan.accept_routes,
+        snat_subnet_routes = ?prepared.plan.snat_subnet_routes,
         "网关 Tailscale 参数已应用，等待 Headscale 路由批准"
     );
     GatewayApplyExecution {
@@ -1970,33 +1947,19 @@ fn apply_gateway_desired_state_with_execution(
             applied_network_ids: Vec::new(),
             error_message: None,
         },
-        local_applied,
+        route_results: prepared.route_results(local_applied, None),
     }
 }
 
-/// 在真实应用前再次核对能力，避免设备运行环境变化后仍执行高权限路由操作。
-fn gateway_capability_error(
+fn failed_gateway_route_results(
     state: &GatewayDesiredState,
-    report: &GatewayCapabilityReport,
-) -> Option<String> {
-    for route in state.routes.iter().filter(|route| route.enabled) {
-        let (capability, reason, label) = if route.site_link_id.is_some() {
-            (report.site_gateway, report.site_gateway_reason, "站点互联")
-        } else {
-            (
-                report.subnet_gateway,
-                report.subnet_gateway_reason,
-                "共享本地网络",
-            )
-        };
-        if capability != CapabilityState::Ready {
-            let reason = reason
-                .map(gateway_reason_message)
-                .unwrap_or("本机当前不满足网关运行条件");
-            return Some(format!("{label}无法应用：{reason}"));
-        }
-    }
-    None
+    error_message: &str,
+) -> Vec<GatewayRouteApplyResult> {
+    state
+        .routes
+        .iter()
+        .map(|route| gateway_route_result(route, false, Some(error_message.to_owned())))
+        .collect()
 }
 
 /// 将内部能力探测原因翻译为可直接展示给用户的中文说明。
@@ -2022,10 +1985,82 @@ struct TailscaleRoutePlan {
     snat_subnet_routes: Option<bool>,
 }
 
+/// 一批 Desired Route 的可执行计划及逐路由阻断原因。
+///
+/// Tailscale 的 `set` 仍按一次命令原子更新完整广告列表；这里仅把缺少对应
+/// 地址族转发的路由排除，并保留逐项结果供 Server 撤销其 Headscale 批准。
+struct PreparedGatewayRoutePlan<'a> {
+    plan: TailscaleRoutePlan,
+    routes: Vec<(&'a nexo_protocol::GatewayDesiredRoute, Option<String>)>,
+}
+
+impl PreparedGatewayRoutePlan<'_> {
+    fn has_applicable_enabled_route(&self) -> bool {
+        self.routes
+            .iter()
+            .any(|(route, error)| route.enabled && error.is_none())
+    }
+
+    fn first_blocked_error(&self) -> Option<String> {
+        self.routes.iter().find_map(|(_, error)| error.clone())
+    }
+
+    fn route_results(
+        &self,
+        local_apply_succeeded: bool,
+        apply_error: Option<&str>,
+    ) -> Vec<GatewayRouteApplyResult> {
+        self.routes
+            .iter()
+            .map(|(route, capability_error)| {
+                let error_message = capability_error.clone().or_else(|| {
+                    route
+                        .enabled
+                        .then_some(apply_error)
+                        .flatten()
+                        .map(str::to_owned)
+                });
+                let applied = route.enabled
+                    && capability_error.is_none()
+                    && apply_error.is_none()
+                    && local_apply_succeeded;
+                gateway_route_result(route, applied, error_message)
+            })
+            .collect()
+    }
+}
+
+fn gateway_route_result(
+    route: &nexo_protocol::GatewayDesiredRoute,
+    local_applied: bool,
+    error_message: Option<String>,
+) -> GatewayRouteApplyResult {
+    GatewayRouteApplyResult {
+        network_id: route.network_id.clone(),
+        site_link_id: route.site_link_id.clone(),
+        prefix: route.prefix.clone(),
+        revision: route.revision,
+        enabled: route.enabled,
+        local_applied,
+        control_plane_status: None,
+        remote_applied: route.site_link_id.is_some() && local_applied,
+        error_message: if route.enabled { error_message } else { None },
+    }
+}
+
 /// 将 Nexo 语义路由转换为 Tailscale 适配器所需的参数。
+#[cfg(test)]
 fn build_tailscale_route_plan(state: &GatewayDesiredState) -> Result<TailscaleRoutePlan> {
+    Ok(build_tailscale_route_plan_with_report(state, None)?.plan)
+}
+
+fn build_tailscale_route_plan_with_report<'a>(
+    state: &'a GatewayDesiredState,
+    report: Option<&GatewayCapabilityReport>,
+) -> Result<PreparedGatewayRoutePlan<'a>> {
     let mut advertise_routes = Vec::new();
     let mut accept_routes = false;
+    let mut routes = Vec::with_capacity(state.routes.len());
     for route in &state.routes {
         let prefix = route
             .prefix
@@ -2034,6 +2069,13 @@ fn build_tailscale_route_plan(state: &GatewayDesiredState) -> Result<TailscaleRo
         validate_published_network(prefix)
             .with_context(|| format!("前缀 {} 不允许发布", route.prefix))?;
         if !route.enabled {
+            routes.push((route, None));
+            continue;
+        }
+        let capability_error =
+            report.and_then(|report| gateway_route_capability_error(route, prefix, report));
+        if capability_error.is_some() {
+            routes.push((route, capability_error));
             continue;
         }
         if route.site_link_id.is_some() {
@@ -2041,14 +2083,52 @@ fn build_tailscale_route_plan(state: &GatewayDesiredState) -> Result<TailscaleRo
         } else {
             advertise_routes.push(route.prefix.clone());
         }
+        routes.push((route, None));
     }
     advertise_routes.sort();
     advertise_routes.dedup();
-    Ok(TailscaleRoutePlan {
-        advertise_routes,
-        accept_routes,
-        snat_subnet_routes: Some(!accept_routes),
+    Ok(PreparedGatewayRoutePlan {
+        plan: TailscaleRoutePlan {
+            advertise_routes,
+            accept_routes,
+            snat_subnet_routes: Some(!accept_routes),
+        },
+        routes,
     })
+}
+
+/// 在真实应用前按每条路由核对基础能力和对应地址族转发开关。
+fn gateway_route_capability_error(
+    route: &nexo_protocol::GatewayDesiredRoute,
+    prefix: IpNet,
+    report: &GatewayCapabilityReport,
+) -> Option<String> {
+    let (capability, reason, label) = if route.site_link_id.is_some() {
+        (report.site_gateway, report.site_gateway_reason, "站点互联")
+    } else {
+        (
+            report.subnet_gateway,
+            report.subnet_gateway_reason,
+            "共享本地网络",
+        )
+    };
+    if capability != CapabilityState::Ready
+        && reason != Some(GatewayCapabilityReason::IpForwardingDisabled)
+    {
+        let reason = reason
+            .map(gateway_reason_message)
+            .unwrap_or("本机当前不满足网关运行条件");
+        return Some(format!("{label}无法应用：{reason}"));
+    }
+    if !forwarding_enabled_for_prefix(report.ipv4_forwarding, report.ipv6_forwarding, prefix) {
+        let family = if matches!(prefix, IpNet::V4(_)) {
+            "IPv4"
+        } else {
+            "IPv6"
+        };
+        return Some(format!("{label}无法应用：设备未开启 {family} 转发"));
+    }
+    None
 }
 
 fn build_tls_connector(config: &AgentRuntimeConfig, key_pair: &KeyPair) -> Result<TlsConnector> {
@@ -2173,24 +2253,11 @@ fn gateway_unavailable_reason(
     if local_networks.is_empty() {
         return Some(GatewayCapabilityReason::NoLocalSubnet);
     }
-    if !ipv4_forwarding
-        && local_networks.iter().any(|network| {
-            network
-                .prefix
-                .parse::<IpNet>()
-                .is_ok_and(|prefix| matches!(prefix, IpNet::V4(_)))
+    if !local_networks.iter().any(|network| {
+        network.prefix.parse::<IpNet>().is_ok_and(|prefix| {
+            forwarding_enabled_for_prefix(ipv4_forwarding, ipv6_forwarding, prefix)
         })
-    {
-        return Some(GatewayCapabilityReason::IpForwardingDisabled);
-    }
-    if !ipv6_forwarding
-        && local_networks.iter().any(|network| {
-            network
-                .prefix
-                .parse::<IpNet>()
-                .is_ok_and(|prefix| matches!(prefix, IpNet::V6(_)))
-        })
-    {
+    }) {
         return Some(GatewayCapabilityReason::IpForwardingDisabled);
     }
     None
@@ -2253,6 +2320,35 @@ fn detect_net_admin() -> bool {
 mod tests {
     use super::*;
 
+    fn ready_gateway_report(
+        ipv4_forwarding: bool,
+        ipv6_forwarding: bool,
+    ) -> GatewayCapabilityReport {
+        GatewayCapabilityReport {
+            platform: "linux".to_owned(),
+            tun_available: true,
+            net_admin_available: true,
+            ipv4_forwarding,
+            ipv6_forwarding,
+            local_networks: vec![
+                DetectedLocalNetwork {
+                    interface_id: "eth0".to_owned(),
+                    prefix: "192.168.10.0/24".to_owned(),
+                    gateway_address: None,
+                },
+                DetectedLocalNetwork {
+                    interface_id: "eth1".to_owned(),
+                    prefix: "2001:db8:10::/64".to_owned(),
+                    gateway_address: None,
+                },
+            ],
+            subnet_gateway: CapabilityState::Ready,
+            subnet_gateway_reason: None,
+            site_gateway: CapabilityState::Ready,
+            site_gateway_reason: None,
+        }
+    }
+
     #[test]
     fn gateway_probe_reports_missing_tun_before_other_requirements() {
         let reason = gateway_unavailable_reason(false, false, false, false, &[]);
@@ -2271,6 +2367,39 @@ mod tests {
             gateway_address: None,
         }];
         let reason = gateway_unavailable_reason(true, true, false, true, &networks);
+        if cfg!(target_os = "linux") {
+            assert_eq!(reason, Some(GatewayCapabilityReason::IpForwardingDisabled));
+        } else {
+            assert_eq!(reason, Some(GatewayCapabilityReason::UnsupportedPlatform));
+        }
+    }
+
+    #[test]
+    fn gateway_probe_accepts_ipv4_only_when_ipv6_network_is_also_detected() {
+        let networks = ready_gateway_report(true, false).local_networks;
+        let reason = gateway_unavailable_reason(true, true, true, false, &networks);
+        if cfg!(target_os = "linux") {
+            assert_eq!(reason, None);
+        } else {
+            assert_eq!(reason, Some(GatewayCapabilityReason::UnsupportedPlatform));
+        }
+    }
+
+    #[test]
+    fn gateway_probe_accepts_ipv6_only_when_ipv4_network_is_also_detected() {
+        let networks = ready_gateway_report(false, true).local_networks;
+        let reason = gateway_unavailable_reason(true, true, false, true, &networks);
+        if cfg!(target_os = "linux") {
+            assert_eq!(reason, None);
+        } else {
+            assert_eq!(reason, Some(GatewayCapabilityReason::UnsupportedPlatform));
+        }
+    }
+
+    #[test]
+    fn gateway_probe_rejects_mixed_networks_when_both_families_are_disabled() {
+        let networks = ready_gateway_report(false, false).local_networks;
+        let reason = gateway_unavailable_reason(true, true, false, false, &networks);
         if cfg!(target_os = "linux") {
             assert_eq!(reason, Some(GatewayCapabilityReason::IpForwardingDisabled));
         } else {
@@ -2383,6 +2512,88 @@ mod tests {
         assert_eq!(plan.advertise_routes, vec!["192.168.10.0/24"]);
         assert!(plan.accept_routes);
         assert_eq!(plan.snat_subnet_routes, Some(false));
+    }
+
+    #[test]
+    fn gateway_apply_keeps_available_family_and_reports_blocked_family() {
+        let state = GatewayDesiredState {
+            revision: 7,
+            routes: vec![
+                nexo_protocol::GatewayDesiredRoute {
+                    network_id: "network-v4".to_owned(),
+                    site_link_id: None,
+                    prefix: "192.168.10.0/24".to_owned(),
+                    revision: 7,
+                    enabled: true,
+                },
+                nexo_protocol::GatewayDesiredRoute {
+                    network_id: "network-v6".to_owned(),
+                    site_link_id: None,
+                    prefix: "2001:db8:10::/64".to_owned(),
+                    revision: 7,
+                    enabled: true,
+                },
+            ],
+        };
+        let report = ready_gateway_report(true, false);
+        let prepared =
+            build_tailscale_route_plan_with_report(&state, Some(&report)).expect("应生成部分计划");
+        assert_eq!(prepared.plan.advertise_routes, vec!["192.168.10.0/24"]);
+
+        let execution = apply_gateway_desired_state_with_execution(
+            &state,
+            &NoopGatewayRouteApplier,
+            Some(&report),
+        );
+        assert_eq!(execution.ack.status, ApplyStatus::Checking);
+        assert!(execution.ack.error_message.is_none());
+        assert!(execution.route_results[0].local_applied);
+        assert!(execution.route_results[0].error_message.is_none());
+        assert!(!execution.route_results[1].local_applied);
+        assert_eq!(
+            execution.route_results[1].error_message.as_deref(),
+            Some("共享本地网络无法应用：设备未开启 IPv6 转发")
+        );
+    }
+
+    #[test]
+    fn disabling_one_family_withdraws_only_that_family_from_plan() {
+        let state = GatewayDesiredState {
+            revision: 8,
+            routes: vec![
+                nexo_protocol::GatewayDesiredRoute {
+                    network_id: "network-v4".to_owned(),
+                    site_link_id: None,
+                    prefix: "192.168.10.0/24".to_owned(),
+                    revision: 8,
+                    enabled: true,
+                },
+                nexo_protocol::GatewayDesiredRoute {
+                    network_id: "network-v6".to_owned(),
+                    site_link_id: None,
+                    prefix: "2001:db8:10::/64".to_owned(),
+                    revision: 8,
+                    enabled: true,
+                },
+            ],
+        };
+        let dual_stack =
+            build_tailscale_route_plan_with_report(&state, Some(&ready_gateway_report(true, true)))
+                .expect("双栈计划应有效");
+        assert_eq!(
+            dual_stack.plan.advertise_routes,
+            vec!["192.168.10.0/24", "2001:db8:10::/64"]
+        );
+
+        let ipv4_only = build_tailscale_route_plan_with_report(
+            &state,
+            Some(&ready_gateway_report(true, false)),
+        )
+        .expect("关闭 IPv6 后仍应生成 IPv4 计划");
+        assert_eq!(ipv4_only.plan.advertise_routes, vec!["192.168.10.0/24"]);
+        let results = ipv4_only.route_results(true, None);
+        assert!(results[0].local_applied);
+        assert!(!results[1].local_applied);
     }
 
     #[test]
@@ -2700,7 +2911,7 @@ mod tests {
         assert_eq!(ack.status, ApplyStatus::Failed);
         assert_eq!(
             ack.error_message.as_deref(),
-            Some("共享本地网络无法应用：系统未开启 IP 转发")
+            Some("共享本地网络无法应用：设备未开启 IPv4 转发")
         );
     }
 }

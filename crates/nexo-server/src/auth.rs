@@ -1188,6 +1188,9 @@ mod tests {
             public_listener_tasks: Arc::new(
                 std::sync::Mutex::new(std::collections::HashMap::new()),
             ),
+            active_tunnel_connections: Arc::new(std::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
             caddy: Arc::new(caddy::CaddySupervisor::new(
                 caddy::CaddyRuntimeConfig::from_env(data_dir.clone()),
             )),

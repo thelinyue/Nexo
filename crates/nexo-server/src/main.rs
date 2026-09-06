@@ -23,15 +23,16 @@ use axum::{
     http::{HeaderMap, StatusCode},
     middleware,
     response::{IntoResponse, Response},
-    routing::{get, post},
+    routing::{delete, get, post},
     serve::{IncomingStream, Listener},
     Json, Router,
 };
 use clap::{Parser, Subcommand};
 use ipnet::IpNet;
 use nexo_core::{
-    validate_published_network, ApplyStatus, CapabilityState, DeviceCapability, EnrollmentStatus,
-    EnrollmentToken, GatewayCapabilityReason, GatewayCapabilityReport,
+    forwarding_enabled_for_prefix, validate_published_network, ApplyStatus, CapabilityState,
+    DeviceCapability, EnrollmentStatus, EnrollmentToken, GatewayCapabilityReason,
+    GatewayCapabilityReport,
 };
 use nexo_headscale_adapter::{
     HeadscaleAdapter, HeadscaleControlPlane, HeadscaleHttpAdapter, HeadscaleNode,
@@ -108,6 +109,8 @@ const GATEWAY_ROUTE_APPLY_MIGRATION: &str =
 const PHASE2_MIGRATION: &str = include_str!("../../../migrations/0010_phase2_public_access.sql");
 const TIME_CONSISTENCY_MIGRATION: &str =
     include_str!("../../../migrations/0011_time_consistency.sql");
+const RESOURCE_DELETION_MIGRATION: &str =
+    include_str!("../../../migrations/0012_resource_deletion.sql");
 
 #[derive(Clone)]
 pub(crate) struct AppState {
@@ -133,6 +136,11 @@ pub(crate) struct AppState {
     /// 任务自然退出时会用令牌校验后再移除自己，避免旧任务结束时误删
     /// 同一 Tunnel 已经重新建立的新监听。
     public_listener_tasks: Arc<Mutex<HashMap<String, PublicListenerTask>>>,
+    /// 已经进入双向转发阶段的连接，按 Tunnel 分组保存取消令牌。
+    ///
+    /// 停止监听只能拒绝新连接；删除服务时还必须主动结束已经建立的连接，
+    /// 否则旧公网会话可能一直访问 Agent 本地服务，直到任一端自行断开。
+    active_tunnel_connections: Arc<Mutex<HashMap<String, HashMap<Uuid, CancellationToken>>>>,
     /// Caddy 故障只影响公网 Web Service，不影响 Nexo Core 或 TCP Tunnel。
     caddy: Arc<caddy::CaddySupervisor>,
     /// Headscale 的公网登录地址由公网入口设置驱动；Supervisor 自己负责重启
@@ -268,7 +276,17 @@ struct TunnelResponse {
     apply_error: Option<String>,
     desired_revision: i64,
     applied_revision: i64,
+    deletion_pending: bool,
     public_address: Option<String>,
+}
+
+/// 删除接口统一返回同步完成或等待外部撤销两种状态。
+#[derive(Debug, Serialize)]
+struct DeleteResponse {
+    deleted: bool,
+    pending: bool,
+    id: String,
+    message: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -481,6 +499,7 @@ struct SiteNetworkResponse {
     enabled: bool,
     apply_status: ApplyStatus,
     apply_error: Option<String>,
+    deletion_pending: bool,
     /// 独立于 Desired / Applied 的网关健康状态，避免“设备在线”被误认为路由已生效。
     health_status: GatewayHealthStatus,
     health_error: Option<String>,
@@ -516,6 +535,7 @@ struct SiteLinkResponse {
     enabled: bool,
     apply_status: ApplyStatus,
     apply_error: Option<String>,
+    deletion_pending: bool,
     /// 两端网关和站点互联路由的综合健康状态。
     health_status: GatewayHealthStatus,
     health_error: Option<String>,
@@ -641,7 +661,13 @@ async fn main() -> Result<()> {
         .execute_batch(PHASE2_MIGRATION)
         .context("无法初始化第二阶段公网访问数据表")?;
     apply_time_consistency_migration(&connection).context("无法统一数据库时间字段")?;
+    apply_resource_deletion_migration(&connection).context("无法初始化网络资源删除状态")?;
     ensure_phase2_tunnel_columns(&connection).context("无法初始化第二阶段 Tunnel 字段")?;
+    let legacy_tunnel_count = finalize_legacy_pending_tunnel_deletions(&connection)
+        .context("无法清理旧版本遗留的待删除穿透服务")?;
+    if legacy_tunnel_count > 0 {
+        tracing::info!(legacy_tunnel_count, "旧版本遗留的待删除穿透服务已永久清理");
+    }
     ensure_mesh_identity_online_column(&connection).context("无法初始化组网在线状态字段")?;
     ensure_server_ca(&connection).context("无法初始化服务端设备身份 CA")?;
     ensure_server_control_identity(&connection).context("无法初始化控制通道服务端证书")?;
@@ -714,6 +740,7 @@ async fn main() -> Result<()> {
         mesh_enrollment_lock: Arc::new(tokio::sync::Mutex::new(())),
         tunnel_sessions: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         public_listener_tasks: Arc::new(Mutex::new(HashMap::new())),
+        active_tunnel_connections: Arc::new(Mutex::new(HashMap::new())),
         caddy: Arc::new(caddy::CaddySupervisor::new(
             caddy::CaddyRuntimeConfig::from_env(data_dir.clone()),
         )),
@@ -815,7 +842,9 @@ async fn main() -> Result<()> {
         )
         .route("/api/v1/overview", get(overview))
         .route("/api/v1/devices", get(list_devices))
+        .route("/api/v1/devices/{id}", delete(delete_device))
         .route("/api/v1/sites", get(list_sites).post(create_site))
+        .route("/api/v1/sites/{id}", delete(delete_site))
         .route(
             "/api/v1/enrollments",
             get(list_enrollments).post(create_enrollment),
@@ -836,7 +865,10 @@ async fn main() -> Result<()> {
             "/api/v1/site-networks",
             get(list_site_networks).post(create_site_network),
         )
-        .route("/api/v1/site-networks/{id}", get(get_site_network))
+        .route(
+            "/api/v1/site-networks/{id}",
+            get(get_site_network).delete(delete_site_network),
+        )
         .route(
             "/api/v1/site-networks/{id}/disable",
             post(disable_site_network),
@@ -849,7 +881,10 @@ async fn main() -> Result<()> {
             "/api/v1/site-links",
             get(list_site_links).post(create_site_link),
         )
-        .route("/api/v1/site-links/{id}", get(get_site_link))
+        .route(
+            "/api/v1/site-links/{id}",
+            get(get_site_link).delete(delete_site_link),
+        )
         .route("/api/v1/site-links/{id}/disable", post(disable_site_link))
         .route("/api/v1/site-links/{id}/enable", post(enable_site_link))
         .route(
@@ -976,6 +1011,7 @@ fn run_cli_command(command: CliCommand) -> Result<()> {
     connection.execute_batch(GATEWAY_ROUTE_APPLY_MIGRATION)?;
     connection.execute_batch(PHASE2_MIGRATION)?;
     apply_time_consistency_migration(&connection)?;
+    apply_resource_deletion_migration(&connection)?;
     ensure_phase2_tunnel_columns(&connection)?;
     ensure_mesh_identity_online_column(&connection)?;
     let data_dir = db_path.parent().context("Nexo 数据库路径缺少父目录")?;
@@ -1069,6 +1105,41 @@ fn apply_time_consistency_migration(connection: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// 为共享网络和站点互联补充持久化删除意图。
+///
+/// 迁移必须在同一事务中完成；否则只增加一个字段就中断，会让后续启动误判
+/// schema 已经可用。版本记录同时保证重复启动和 CLI 路径保持幂等。
+fn apply_resource_deletion_migration(connection: &Connection) -> Result<()> {
+    let applied = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version = 12)",
+        [],
+        |row| row.get::<_, bool>(0),
+    )?;
+    if applied {
+        return Ok(());
+    }
+    let transaction = connection.unchecked_transaction()?;
+    for (table, column) in [
+        ("site_networks", "deletion_requested"),
+        ("site_links", "deletion_requested"),
+    ] {
+        let mut statement = transaction.prepare(&format!("PRAGMA table_info({table})"))?;
+        let columns = statement
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(statement);
+        if !columns.iter().any(|existing| existing == column) {
+            transaction.execute(
+                &format!("ALTER TABLE {table} ADD COLUMN {column} INTEGER NOT NULL DEFAULT 0"),
+                [],
+            )?;
+        }
+    }
+    transaction.execute_batch(RESOURCE_DELETION_MIGRATION)?;
+    transaction.commit()?;
+    Ok(())
+}
+
 /// SQLite 没有跨版本稳定的 `ADD COLUMN IF NOT EXISTS`；第二阶段字段单独做
 /// 幂等检查，保证旧数据库重启和 `nexo admin` CLI 都能安全复用迁移脚本。
 fn ensure_phase2_tunnel_columns(connection: &Connection) -> Result<()> {
@@ -1135,6 +1206,56 @@ fn ensure_phase2_tunnel_columns(connection: &Connection) -> Result<()> {
         [],
     )?;
     Ok(())
+}
+
+/// 启动时收敛旧版本遗留的 Tunnel 删除请求。
+///
+/// 新版本删除不再等待 Agent ACK；这里在单个事务中清理应用状态、保留最小审计
+/// 并物理删除业务记录。事务提交后再删除文件，文件失败只记录中文告警，不恢复
+/// 已经永久删除的数据库配置。
+fn finalize_legacy_pending_tunnel_deletions(connection: &Connection) -> Result<usize> {
+    let transaction = connection.unchecked_transaction()?;
+    let pending = {
+        let mut statement = transaction.prepare(
+            "SELECT id, tenant_id, origin_ca_secret_path, bridge_socket_path
+             FROM tunnels WHERE deletion_requested = 1",
+        )?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        rows
+    };
+    for (tunnel_id, tenant_id, _, _) in &pending {
+        transaction.execute(
+            "DELETE FROM tunnel_applied_states WHERE tunnel_id = ?1",
+            [tunnel_id],
+        )?;
+        transaction.execute(
+            "INSERT INTO audit_events (tenant_id, event_type, resource_type, resource_id)
+             VALUES (?1, 'TUNNEL_DELETED', 'tunnel', ?2)",
+            rusqlite::params![tenant_id, tunnel_id],
+        )?;
+        transaction.execute(
+            "DELETE FROM tunnels WHERE id = ?1 AND deletion_requested = 1",
+            [tunnel_id],
+        )?;
+    }
+    transaction.commit()?;
+    for (tunnel_id, _, origin_ca_path, bridge_socket_path) in &pending {
+        cleanup_tunnel_files(
+            tunnel_id,
+            origin_ca_path.clone(),
+            bridge_socket_path.clone(),
+        );
+    }
+    Ok(pending.len())
 }
 
 /// 在 Server 持续运行期间定期检查并轮换 Headscale API Key。
@@ -1238,7 +1359,7 @@ async fn list_tunnels(
                     t.origin_protocol, t.origin_tls_server_name,
                     COALESCE(t.origin_tls_verification, 'system'), t.service_name,
                     t.enabled, t.apply_status, t.apply_error, t.apply_revision,
-                    t.applied_revision, p.base_domain
+                    t.applied_revision, t.deletion_requested, p.base_domain
              FROM tunnels t JOIN devices d ON d.id = t.device_id
              LEFT JOIN public_entry_settings p ON p.id = 1
              WHERE t.deleted_at IS NULL AND t.tenant_id = ?1
@@ -1443,10 +1564,10 @@ async fn update_tunnel(
             .db
             .lock()
             .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "数据库锁不可用"))?;
-        let old: (i64, String, String, Option<u16>, Option<String>, bool) = connection
+        let old: (i64, String, String, Option<u16>, Option<String>, bool, i64) = connection
             .query_row(
                 "SELECT apply_revision, tenant_id, protocol, public_port, origin_ca_secret_path,
-                        enabled
+                        enabled, deletion_requested
                  FROM tunnels WHERE id = ?1 AND deleted_at IS NULL",
                 [&id],
                 |row| {
@@ -1457,6 +1578,7 @@ async fn update_tunnel(
                         row.get(3)?,
                         row.get(4)?,
                         row.get(5)?,
+                        row.get(6)?,
                     ))
                 },
             )
@@ -1465,6 +1587,12 @@ async fn update_tunnel(
             return Err(ApiError::new(
                 StatusCode::FORBIDDEN,
                 "穿透服务不属于当前租户",
+            ));
+        }
+        if old.6 != 0 {
+            return Err(ApiError::new(
+                StatusCode::CONFLICT,
+                "穿透服务正在等待删除，不能再编辑",
             ));
         }
         let requested_port = normalized.public_port.or_else(|| {
@@ -1635,6 +1763,7 @@ async fn upload_tunnel_origin_ca(
             .db
             .lock()
             .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "数据库锁不可用"))?;
+        ensure_tunnel_not_deleting(&connection, &id, &tenant_id)?;
         let exists: i64 = connection
             .query_row(
                 "SELECT COUNT(*) FROM tunnels
@@ -1701,54 +1830,77 @@ async fn delete_tunnel(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path(id): Path<String>,
-) -> Result<Json<serde_json::Value>, ApiError> {
+) -> Result<Json<DeleteResponse>, ApiError> {
     let tenant_id = auth::admin_tenant_id(&state, &headers)?;
-    let deletion_revision = {
+    let (origin_ca_path, bridge_socket_path) = {
         let mut connection = state
             .db
             .lock()
             .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "数据库锁不可用"))?;
         let transaction = connection.transaction().map_err(|_| {
-            ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法开始删除协调事务")
+            ApiError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "无法开始穿透服务删除事务",
+            )
         })?;
-        let current_revision: i64 = transaction
+        let paths = transaction
             .query_row(
-                "SELECT apply_revision FROM tunnels
+                "SELECT origin_ca_secret_path, bridge_socket_path FROM tunnels
                  WHERE id = ?1 AND tenant_id = ?2 AND deleted_at IS NULL",
                 rusqlite::params![id, tenant_id],
-                |row| row.get(0),
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .optional()
             .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法读取穿透服务"))?
             .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "穿透服务不存在"))?;
-        let revision = current_revision.saturating_add(1).max(1);
         transaction
             .execute(
-                "UPDATE tunnels SET enabled = 0, apply_status = 'applying',
-                 apply_error = '等待设备确认删除', apply_revision = ?1,
-                 deletion_requested = 1, deletion_revision = ?1,
-                 updated_at = CURRENT_TIMESTAMP
-                 WHERE id = ?2 AND tenant_id = ?3 AND deleted_at IS NULL",
-                rusqlite::params![revision, id, tenant_id],
+                "DELETE FROM tunnel_applied_states WHERE tunnel_id = ?1",
+                [&id],
             )
-            .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法更新删除状态"))?;
+            .map_err(|_| {
+                ApiError::new(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "无法删除穿透服务应用状态",
+                )
+            })?;
+        write_audit_event(&transaction, &tenant_id, "TUNNEL_DELETED", "tunnel", &id)?;
+        let deleted = transaction
+            .execute(
+                "DELETE FROM tunnels
+                 WHERE id = ?1 AND tenant_id = ?2 AND deleted_at IS NULL",
+                rusqlite::params![id, tenant_id],
+            )
+            .map_err(|_| {
+                ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法删除穿透服务记录")
+            })?;
+        if deleted != 1 {
+            return Err(ApiError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "穿透服务删除结果不一致",
+            ));
+        }
         transaction.commit().map_err(|_| {
-            ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法提交删除协调状态")
+            ApiError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "无法提交穿透服务删除事务",
+            )
         })?;
-        revision
+        paths
     };
-    // 入口先停，再让 Agent 收到完整的 disabled Desired State；在 ACK 到达前
-    // 保留数据库记录和 Origin CA，避免服务端已经删掉 Secret 但 Agent 仍持有
-    // 旧配置的半删除状态。
+    // 数据库提交后立即撤销公网数据面。Agent 下一次收到不含该项的完整快照时，
+    // 会清理内存中的旧配置，因此设备是否在线不影响服务端永久删除。
     stop_public_tunnel_listener(&state, &id);
+    stop_active_tunnel_connections(&state, &id);
+    cleanup_tunnel_files(&id, origin_ca_path, bridge_socket_path);
     reconcile_caddy_config_best_effort(&state).await;
-    Ok(Json(serde_json::json!({
-        "deleted": false,
-        "pending": true,
-        "id": id,
-        "revision": deletion_revision,
-        "message": "已关闭穿透服务，等待设备确认"
-    })))
+    tracing::info!(tunnel_id = %id, "穿透服务已永久删除");
+    Ok(Json(DeleteResponse {
+        deleted: true,
+        pending: false,
+        id,
+        message: "穿透服务已永久删除".to_owned(),
+    }))
 }
 
 async fn enable_tunnel(
@@ -1778,6 +1930,7 @@ async fn recheck_tunnel(
             .db
             .lock()
             .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "数据库锁不可用"))?;
+        ensure_tunnel_not_deleting(&connection, &id, &tenant_id)?;
         let changed = connection
             .execute(
                 "UPDATE tunnels SET apply_status = 'checking', apply_error = NULL,
@@ -1807,6 +1960,30 @@ async fn recheck_tunnel(
         .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法读取穿透服务状态"))
 }
 
+fn ensure_tunnel_not_deleting(
+    connection: &Connection,
+    id: &str,
+    tenant_id: &str,
+) -> Result<(), ApiError> {
+    let deletion_requested = connection
+        .query_row(
+            "SELECT deletion_requested FROM tunnels
+             WHERE id = ?1 AND tenant_id = ?2 AND deleted_at IS NULL",
+            rusqlite::params![id, tenant_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()
+        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法读取穿透服务"))?
+        .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "穿透服务不存在"))?;
+    if deletion_requested != 0 {
+        return Err(ApiError::new(
+            StatusCode::CONFLICT,
+            "穿透服务正在等待删除，不能重复操作",
+        ));
+    }
+    Ok(())
+}
+
 async fn set_tunnel_enabled(
     state: AppState,
     headers: HeaderMap,
@@ -1819,16 +1996,22 @@ async fn set_tunnel_enabled(
             .db
             .lock()
             .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "数据库锁不可用"))?;
-        let (protocol, public_port): (String, Option<u16>) = connection
+        let (protocol, public_port, deletion_requested): (String, Option<u16>, i64) = connection
             .query_row(
-                "SELECT protocol, public_port FROM tunnels
+                "SELECT protocol, public_port, deletion_requested FROM tunnels
                  WHERE id = ?1 AND tenant_id = ?2 AND deleted_at IS NULL",
                 rusqlite::params![id, tenant_id],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .optional()
             .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法读取穿透服务"))?
             .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "穿透服务不存在"))?;
+        if deletion_requested != 0 {
+            return Err(ApiError::new(
+                StatusCode::CONFLICT,
+                "穿透服务正在等待删除，不能再修改开关",
+            ));
+        }
         let changed = connection
             .execute(
                 "UPDATE tunnels SET enabled = ?1, apply_status = ?2,
@@ -2144,7 +2327,7 @@ fn tunnel_query(filter: &str) -> String {
                 t.origin_protocol, t.origin_tls_server_name,
                 COALESCE(t.origin_tls_verification, 'system'), t.service_name,
                 t.enabled, t.apply_status, t.apply_error, t.apply_revision,
-                t.applied_revision, p.base_domain
+                t.applied_revision, t.deletion_requested, p.base_domain
          FROM tunnels t JOIN devices d ON d.id = t.device_id
          LEFT JOIN public_entry_settings p ON p.id = 1 {filter}"
     )
@@ -2153,7 +2336,7 @@ fn tunnel_query(filter: &str) -> String {
 fn tunnel_response_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TunnelResponse> {
     let local_port: i64 = row.get(7)?;
     let public_port: Option<i64> = row.get(8)?;
-    let base_domain: Option<String> = row.get(19)?;
+    let base_domain: Option<String> = row.get(20)?;
     let protocol: String = row.get(5)?;
     let hostname: Option<String> = row.get(9)?;
     let public_address = match (
@@ -2187,6 +2370,7 @@ fn tunnel_response_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TunnelR
         apply_error: row.get(16)?,
         desired_revision: row.get(17)?,
         applied_revision: row.get(18)?,
+        deletion_pending: row.get::<_, i64>(19)? != 0,
         public_address,
     })
 }
@@ -3225,6 +3409,262 @@ async fn create_site(
     }))
 }
 
+/// 删除空站点；设备和网络拓扑属于显式业务资源，存在任一依赖时都拒绝级联。
+async fn delete_site(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<Json<DeleteResponse>, ApiError> {
+    let tenant_id = auth::admin_tenant_id(&state, &headers)?;
+    let mut connection = state
+        .db
+        .lock()
+        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "数据库锁不可用"))?;
+    let transaction = connection
+        .transaction()
+        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法开始站点删除事务"))?;
+    let (name, device_count, network_count, link_count): (String, i64, i64, i64) = transaction
+        .query_row(
+            "SELECT s.name,
+                        (SELECT COUNT(*) FROM devices d WHERE d.site_id = s.id),
+                        (SELECT COUNT(*) FROM site_networks n WHERE n.site_id = s.id),
+                        (SELECT COUNT(*) FROM site_links l
+                         WHERE l.left_site_id = s.id OR l.right_site_id = s.id)
+                 FROM sites s WHERE s.id = ?1 AND s.tenant_id = ?2",
+            rusqlite::params![id, tenant_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .optional()
+        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法检查站点依赖"))?
+        .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "站点不存在"))?;
+    if let Some(message) = delete_dependency_message(
+        "站点",
+        &[
+            ("台设备", device_count),
+            ("个共享网络", network_count),
+            ("个互联关系", link_count),
+        ],
+    ) {
+        tracing::warn!(site_id = %id, "拒绝删除站点：{message}");
+        return Err(ApiError::new(StatusCode::CONFLICT, message));
+    }
+    // 未完成的入网请求只是站点内部凭证，不应让一个已经没有业务资源的站点
+    // 永久无法删除；随站点删除一并作废，旧 token 此后无法再换取设备证书。
+    transaction
+        .execute("DELETE FROM pending_enrollments WHERE site_id = ?1", [&id])
+        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法作废站点入网请求"))?;
+    write_audit_event(&transaction, &tenant_id, "SITE_DELETED", "site", &id)?;
+    transaction
+        .execute(
+            "DELETE FROM sites WHERE id = ?1 AND tenant_id = ?2",
+            rusqlite::params![id, tenant_id],
+        )
+        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法删除站点"))?;
+    transaction
+        .commit()
+        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法提交站点删除事务"))?;
+    tracing::info!(site_id = %id, site_name = %name, "站点已删除");
+    Ok(Json(DeleteResponse {
+        deleted: true,
+        pending: false,
+        id,
+        message: "站点已删除".to_owned(),
+    }))
+}
+
+/// 删除设备前先撤销 Headscale 凭证和节点，再清理本地身份链。
+///
+/// 外部撤销失败时保留本地记录，避免管理界面声称设备已删除但旧节点仍可继续
+/// 参与组网。穿透服务和共享网络必须由各自的删除流程先行收敛。
+async fn delete_device(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<Json<DeleteResponse>, ApiError> {
+    let tenant_id = auth::admin_tenant_id(&state, &headers)?;
+    let (name, node_id, pre_auth_key_ids) = {
+        let connection = state
+            .db
+            .lock()
+            .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "数据库锁不可用"))?;
+        let (name, node_id, tunnel_count, network_count): (String, Option<String>, i64, i64) =
+            connection
+                .query_row(
+                    "SELECT d.name, m.headscale_node_id,
+                        (SELECT COUNT(*) FROM tunnels t
+                         WHERE t.device_id = d.id AND t.deleted_at IS NULL),
+                        (SELECT COUNT(*) FROM site_networks n
+                         WHERE n.publisher_device_id = d.id)
+                 FROM devices d
+                 LEFT JOIN mesh_identities m ON m.nexo_device_id = d.id
+                 WHERE d.id = ?1 AND d.tenant_id = ?2",
+                    rusqlite::params![id, tenant_id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                )
+                .optional()
+                .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法检查设备依赖"))?
+                .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "设备不存在"))?;
+        if let Some(message) = delete_dependency_message(
+            "设备",
+            &[("个穿透服务", tunnel_count), ("个共享网络", network_count)],
+        ) {
+            tracing::warn!(device_id = %id, "拒绝删除设备：{message}");
+            return Err(ApiError::new(StatusCode::CONFLICT, message));
+        }
+        let mut statement = connection
+            .prepare(
+                "SELECT headscale_pre_auth_key_id FROM mesh_enrollment_attempts
+                 WHERE nexo_device_id = ?1 AND state = 'issued'",
+            )
+            .map_err(|_| {
+                ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法读取设备入网密钥")
+            })?;
+        let pre_auth_key_ids = statement
+            .query_map([&id], |row| row.get::<_, String>(0))
+            .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法读取设备入网密钥"))?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(|_| {
+                ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "设备入网密钥数据无效")
+            })?;
+        (name, node_id, pre_auth_key_ids)
+    };
+
+    for key_id in &pre_auth_key_ids {
+        state.headscale.expire_pre_auth_key(key_id).await.map_err(|error| {
+            tracing::warn!(device_id = %id, key_id = %key_id, "无法吊销设备入网密钥：{error:#}");
+            ApiError::new(
+                StatusCode::BAD_GATEWAY,
+                "暂时无法吊销设备入网密钥，设备尚未删除，请稍后重试",
+            )
+        })?;
+    }
+    if let Some(node_id) = node_id.as_deref() {
+        state.headscale.delete_node(node_id).await.map_err(|error| {
+            tracing::warn!(device_id = %id, headscale_node_id = %node_id, "无法删除设备组网节点：{error:#}");
+            ApiError::new(
+                StatusCode::BAD_GATEWAY,
+                "暂时无法删除设备组网节点，设备尚未删除，请稍后重试",
+            )
+        })?;
+    }
+
+    {
+        let mut connection = state
+            .db
+            .lock()
+            .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "数据库锁不可用"))?;
+        let transaction = connection.transaction().map_err(|_| {
+            ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法开始设备删除事务")
+        })?;
+        let (tunnel_count, network_count): (i64, i64) = transaction
+            .query_row(
+                "SELECT
+                    (SELECT COUNT(*) FROM tunnels
+                     WHERE device_id = ?1 AND deleted_at IS NULL),
+                    (SELECT COUNT(*) FROM site_networks WHERE publisher_device_id = ?1)",
+                [&id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法复核设备依赖"))?;
+        if let Some(message) = delete_dependency_message(
+            "设备",
+            &[("个穿透服务", tunnel_count), ("个共享网络", network_count)],
+        ) {
+            tracing::warn!(device_id = %id, "复核时拒绝删除设备：{message}");
+            return Err(ApiError::new(StatusCode::CONFLICT, message));
+        }
+        let exists: i64 = transaction
+            .query_row(
+                "SELECT COUNT(*) FROM devices WHERE id = ?1 AND tenant_id = ?2",
+                rusqlite::params![id, tenant_id],
+                |row| row.get(0),
+            )
+            .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法复核设备"))?;
+        if exists == 0 {
+            return Err(ApiError::new(StatusCode::NOT_FOUND, "设备不存在"));
+        }
+        transaction
+            .execute(
+                "UPDATE sites SET active_site_gateway_device_id = NULL,
+                 updated_at = CURRENT_TIMESTAMP
+                 WHERE active_site_gateway_device_id = ?1",
+                [&id],
+            )
+            .map_err(|_| {
+                ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法清理站点网关引用")
+            })?;
+        for (sql, message) in [
+            (
+                "DELETE FROM gateway_route_applies WHERE device_id = ?1",
+                "无法清理设备路由状态",
+            ),
+            (
+                "DELETE FROM device_capability_reports WHERE device_id = ?1",
+                "无法清理设备能力报告",
+            ),
+            (
+                "DELETE FROM mesh_enrollment_attempts WHERE nexo_device_id = ?1",
+                "无法清理设备组网入网记录",
+            ),
+            (
+                "DELETE FROM mesh_identities WHERE nexo_device_id = ?1",
+                "无法清理设备组网身份",
+            ),
+            (
+                "DELETE FROM device_identities WHERE device_id = ?1",
+                "无法撤销设备证书",
+            ),
+            (
+                "DELETE FROM pending_enrollments WHERE device_id = ?1",
+                "无法清理设备入网请求",
+            ),
+        ] {
+            transaction
+                .execute(sql, [&id])
+                .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, message))?;
+        }
+        refresh_site_link_apply_status(&transaction).map_err(|error| {
+            tracing::error!(device_id = %id, "删除设备时刷新互联状态失败：{error:#}");
+            ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法刷新站点互联状态")
+        })?;
+        write_audit_event(&transaction, &tenant_id, "DEVICE_DELETED", "device", &id)?;
+        transaction
+            .execute(
+                "DELETE FROM devices WHERE id = ?1 AND tenant_id = ?2",
+                rusqlite::params![id, tenant_id],
+            )
+            .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法删除设备"))?;
+        transaction.commit().map_err(|_| {
+            ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法提交设备删除事务")
+        })?;
+    }
+    state.mesh_offers.lock().await.remove(&id);
+    if let Some(session) = state.tunnel_sessions.lock().await.remove(&id) {
+        session.cancel.cancel();
+    }
+    tracing::info!(device_id = %id, device_name = %name, "设备身份与本地记录已删除");
+    Ok(Json(DeleteResponse {
+        deleted: true,
+        pending: false,
+        id,
+        message: "设备已删除，原 Agent 需要重新入网才能连接".to_owned(),
+    }))
+}
+
+fn delete_dependency_message(subject: &str, dependencies: &[(&str, i64)]) -> Option<String> {
+    let details = dependencies
+        .iter()
+        .filter(|(_, count)| *count > 0)
+        .map(|(label, count)| format!("{count} {label}"))
+        .collect::<Vec<_>>();
+    (!details.is_empty()).then(|| {
+        format!(
+            "{subject}仍关联{}，请按互联关系、共享网络、穿透服务的顺序先完成删除",
+            details.join("、")
+        )
+    })
+}
+
 fn count_for_tenant(
     connection: &Connection,
     query: &str,
@@ -3762,10 +4202,9 @@ async fn serve_control_connection(
             }
             AgentControlMessage::GatewayRouteApplyReport { report } => {
                 apply_gateway_route_report(&state, &device_id, &report)?;
-                // 只有 Agent 明确确认启用路由已经在本机真实执行成功，才允许
-                // 触发 Headscale 批准。关闭路由是撤销操作，即使本地演练模式
-                // 没有执行命令，也不能借此批准任何新的前缀；含有失败/升级
-                // 路由的混合报告则等待下一次完整成功报告再收敛。
+                // 启用路由必须由 Agent 明确确认成功或失败；成功前缀可以独立
+                // 批准，失败前缀则从 Nexo 所有的批准列表撤销。没有结果的旧
+                // Agent 报告仍不能触发任何新的 Headscale 变更。
                 if report_allows_headscale_reconcile(&report) {
                     let reconcile_state = state.clone();
                     let reconcile_device_id = device_id.clone();
@@ -3782,7 +4221,7 @@ async fn serve_control_connection(
                 } else {
                     tracing::debug!(
                         device_id = %device_id,
-                        "逐路由报告尚未确认全部本地应用成功，暂不触发 Headscale 批准"
+                        "逐路由报告尚未给出可收敛的本地结果，暂不触发 Headscale 变更"
                     );
                 }
                 write_control_message(
@@ -3852,14 +4291,14 @@ async fn serve_control_connection(
 
 /// 判断逐路由报告是否足以授权 Headscale 路由收敛。
 ///
-/// 启用路由必须由 Agent 证明本地命令已经成功；关闭路由属于定向撤销，
-/// 即使 Agent 处于演练模式也可以继续清理控制平面的 Nexo 前缀。
+/// 启用路由必须由 Agent 给出本地成功或明确失败；成功前缀可独立批准，失败
+/// 前缀和关闭路由可独立撤销。没有错误也没有成功证据的结果仍需等待。
 fn report_allows_headscale_reconcile(report: &GatewayRouteApplyReport) -> bool {
     !report.routes.is_empty()
         && report
             .routes
             .iter()
-            .all(|route| !route.enabled || route.local_applied)
+            .all(|route| !route.enabled || route.local_applied || route.error_message.is_some())
 }
 
 async fn write_control_message(
@@ -4022,18 +4461,40 @@ where
                         continue;
                     }
                 };
+                let tunnel_id = command.tunnel_id.clone();
                 let header = LogicalStreamHeader::new(command.tunnel_id, command.connection_id)
                     .map_err(|error| anyhow::anyhow!("Tunnel 逻辑流首部无效：{error}"))?;
                 let mut stream_io = into_tokio_io(stream);
                 write_logical_header(&mut stream_io, &header)
                     .await
                     .map_err(|error| anyhow::anyhow!("无法发送 Tunnel 逻辑流首部：{error}"))?;
+                let connection_token = Uuid::new_v4();
+                let connection_cancel = CancellationToken::new();
+                register_active_tunnel_connection(
+                    state,
+                    &tunnel_id,
+                    connection_token,
+                    connection_cancel.clone(),
+                );
+                let connection_state = state.clone();
                 tokio::spawn(async move {
                     let _permit = command.permit;
                     let mut socket = command.socket;
-                    if let Err(error) = tokio::io::copy_bidirectional(&mut socket, &mut stream_io).await {
-                        tracing::debug!("Tunnel 连接转发结束：{error}");
+                    tokio::select! {
+                        _ = connection_cancel.cancelled() => {
+                            tracing::debug!(tunnel_id = %tunnel_id, "Tunnel 连接因服务删除而结束");
+                        }
+                        result = tokio::io::copy_bidirectional(&mut socket, &mut stream_io) => {
+                            if let Err(error) = result {
+                                tracing::debug!(tunnel_id = %tunnel_id, "Tunnel 连接转发结束：{error}");
+                            }
+                        }
                     }
+                    remove_active_tunnel_connection(
+                        &connection_state,
+                        &tunnel_id,
+                        connection_token,
+                    );
                 });
             }
             inbound = nexo_tunnel::next_inbound(connection) => {
@@ -4373,6 +4834,65 @@ fn stop_public_tunnel_listener(state: &AppState, tunnel_id: &str) {
     }
 }
 
+/// 登记一条正在转发的公网连接，使永久删除可以中止已有会话。
+fn register_active_tunnel_connection(
+    state: &AppState,
+    tunnel_id: &str,
+    token: Uuid,
+    cancel: CancellationToken,
+) {
+    if let Ok(mut connections) = state.active_tunnel_connections.lock() {
+        connections
+            .entry(tunnel_id.to_owned())
+            .or_default()
+            .insert(token, cancel);
+    }
+}
+
+/// 连接自然结束时只移除自身令牌，不能影响同一服务的其他并发连接。
+fn remove_active_tunnel_connection(state: &AppState, tunnel_id: &str, token: Uuid) {
+    if let Ok(mut connections) = state.active_tunnel_connections.lock() {
+        let remove_group = connections.get_mut(tunnel_id).is_some_and(|entries| {
+            entries.remove(&token);
+            entries.is_empty()
+        });
+        if remove_group {
+            connections.remove(tunnel_id);
+        }
+    }
+}
+
+/// 永久删除穿透服务时取消该服务的全部活动转发，不影响同设备其他服务。
+fn stop_active_tunnel_connections(state: &AppState, tunnel_id: &str) {
+    let entries = state
+        .active_tunnel_connections
+        .lock()
+        .ok()
+        .and_then(|mut connections| connections.remove(tunnel_id));
+    for cancel in entries
+        .into_iter()
+        .flat_map(|entries| entries.into_values())
+    {
+        cancel.cancel();
+    }
+}
+
+/// 删除穿透服务关联的 CA 与 Unix Socket；记录已经提交删除时不再回滚，
+/// 但保留明确中文日志，便于部署者定位数据目录权限或文件占用问题。
+fn cleanup_tunnel_files(
+    tunnel_id: &str,
+    origin_ca_path: Option<String>,
+    bridge_socket_path: Option<String>,
+) {
+    for path in [origin_ca_path, bridge_socket_path].into_iter().flatten() {
+        if let Err(error) = fs::remove_file(&path) {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                tracing::warn!(tunnel_id, path, "删除穿透服务 CA 或 Socket 失败：{error}");
+            }
+        }
+    }
+}
+
 /// 判断当前 Tunnel 是否仍登记着自己的公网监听器。只用于更新时识别
 /// “自占用”端口；真正的外部占用仍由 `TcpListener::bind` 负责检查。
 fn public_listener_is_active(state: &AppState, tunnel_id: &str) -> bool {
@@ -4496,8 +5016,8 @@ fn load_gateway_desired_state_with_mesh_allowed(
 
 /// 汇总一台设备当前全部公网访问 Desired State。
 ///
-/// 关闭项也会下发一次，便于 Agent 清理本地连接；已标记删除的记录不再进入
-/// 协议，删除协调器会在 ACK 后清理数据库和 Secret。
+/// 关闭项和待删除项仍会下发一次，便于 Agent 清理本地连接；删除协调器
+/// 只在当前 revision 的关闭 ACK 到达后清理数据库和 Secret。
 fn load_tunnel_desired_state(state: &AppState, device_id: &str) -> Result<Vec<TunnelDesiredState>> {
     let connection = state
         .db
@@ -4550,8 +5070,8 @@ fn load_tunnel_desired_state(state: &AppState, device_id: &str) -> Result<Vec<Tu
 /// Agent 对 Tunnel 的实际 ACK 只更新对应设备和 revision，旧 ACK 不能覆盖新配置。
 ///
 /// 成功 ACK 才能推进 Applied revision/config；失败 ACK 只更新错误状态，
-/// 保留上一份可用 Applied 配置。删除请求同样在这里完成最后一步：只有
-/// `disabled` Desired State 被 Agent 实际确认后，才删除数据库记录和 Secret。
+/// 保留上一份可用 Applied 配置。旧版本已经下发的删除 revision 仍可在这里
+/// 收敛；新版本的删除接口会直接移除记录，迟到 ACK 因查询不到记录而被忽略。
 fn apply_tunnel_results(
     state: &AppState,
     device_id: &str,
@@ -4580,13 +5100,14 @@ fn apply_tunnel_results(
             bridge_socket_path,
             row_applied_revision,
             current_apply_status,
+            tunnel_tenant_id,
         )) = transaction
             .query_row(
                 "SELECT apply_revision, enabled, protocol, local_address, local_port, hostname,
                         origin_protocol, origin_tls_server_name, origin_tls_verification,
                         deletion_requested, deletion_revision,
                         origin_ca_secret_path, bridge_socket_path,
-                        applied_revision, apply_status
+                        applied_revision, apply_status, tenant_id
                  FROM tunnels WHERE id = ?1 AND device_id = ?2 AND deleted_at IS NULL",
                 rusqlite::params![result.tunnel_id, device_id],
                 |row| {
@@ -4606,6 +5127,7 @@ fn apply_tunnel_results(
                         row.get::<_, Option<String>>(12)?,
                         row.get::<_, i64>(13)?,
                         row.get::<_, String>(14)?,
+                        row.get::<_, String>(15)?,
                     ))
                 },
             )
@@ -4689,6 +5211,11 @@ fn apply_tunnel_results(
                     "DELETE FROM tunnel_applied_states WHERE tunnel_id = ?1",
                     [&result.tunnel_id],
                 )?;
+                transaction.execute(
+                    "INSERT INTO audit_events (tenant_id, event_type, resource_type, resource_id)
+                     VALUES (?1, 'TUNNEL_DELETED', 'tunnel', ?2)",
+                    rusqlite::params![tunnel_tenant_id, result.tunnel_id],
+                )?;
                 let deleted = transaction.execute(
                     "DELETE FROM tunnels
                      WHERE id = ?1 AND device_id = ?2 AND deleted_at IS NULL
@@ -4724,13 +5251,8 @@ fn apply_tunnel_results(
     transaction.commit()?;
     for (tunnel_id, origin_ca_path, bridge_socket_path) in cleanups {
         stop_public_tunnel_listener(state, &tunnel_id);
-        for path in [origin_ca_path, bridge_socket_path].into_iter().flatten() {
-            if let Err(error) = fs::remove_file(&path) {
-                if error.kind() != std::io::ErrorKind::NotFound {
-                    tracing::warn!(tunnel_id = %tunnel_id, path = %path, "删除 Tunnel Secret 或 Socket 失败：{error}");
-                }
-            }
-        }
+        stop_active_tunnel_connections(state, &tunnel_id);
+        cleanup_tunnel_files(&tunnel_id, origin_ca_path, bridge_socket_path);
     }
     Ok(())
 }
@@ -5161,6 +5683,117 @@ fn refresh_site_link_apply_status(transaction: &rusqlite::Transaction<'_>) -> Re
          apply_error = CASE WHEN enabled = 0 THEN NULL ELSE apply_error END,
          updated_at = CURRENT_TIMESTAMP",
     )?;
+    finalize_requested_resource_deletions(transaction)?;
+    Ok(())
+}
+
+/// 在同一事务内检查网络资源的三段撤销证据并完成物理删除。
+///
+/// `local_status` 和 `remote_status` 来自 Agent 对当前 Desired revision 的 ACK，
+/// `control_plane_status` 只能由 Server 完成 Headscale 协调后写入。先清理 Link，
+/// 再清理 Network，保证映射和路由状态不会反向绕过固定的删除顺序。
+fn finalize_requested_resource_deletions(transaction: &rusqlite::Transaction<'_>) -> Result<()> {
+    let completed_links: Vec<(String, String)> = {
+        let mut statement = transaction.prepare(
+            "SELECT l.id, l.tenant_id
+             FROM site_links l
+             WHERE l.deletion_requested = 1 AND l.enabled = 0
+               AND (SELECT COUNT(*) FROM site_link_networks ln
+                    WHERE ln.site_link_id = l.id) = 2
+               AND NOT EXISTS (
+                 SELECT 1
+                 FROM site_link_networks local_link
+                 JOIN site_networks local_n ON local_n.id = local_link.site_network_id
+                 JOIN site_link_networks remote_link
+                   ON remote_link.site_link_id = local_link.site_link_id
+                  AND remote_link.side <> local_link.side
+                 JOIN site_networks remote_n ON remote_n.id = remote_link.site_network_id
+                 LEFT JOIN gateway_route_applies a
+                   ON a.device_id = local_n.publisher_device_id
+                  AND a.network_id = remote_n.id
+                  AND a.site_link_id = l.id
+                 WHERE local_link.site_link_id = l.id
+                   AND (a.desired_revision IS NULL OR a.desired_revision <> l.apply_revision
+                     OR a.local_status <> 'disabled'
+                     OR a.control_plane_status <> 'disabled'
+                     OR a.remote_status <> 'disabled')
+               )",
+        )?;
+        let rows = statement
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        rows
+    };
+    for (link_id, tenant_id) in completed_links {
+        transaction.execute(
+            "DELETE FROM gateway_route_applies WHERE site_link_id = ?1",
+            [&link_id],
+        )?;
+        transaction.execute(
+            "DELETE FROM site_link_route_confirmations WHERE site_link_id = ?1",
+            [&link_id],
+        )?;
+        transaction.execute(
+            "DELETE FROM site_link_networks WHERE site_link_id = ?1",
+            [&link_id],
+        )?;
+        transaction.execute(
+            "INSERT INTO audit_events (tenant_id, event_type, resource_type, resource_id)
+             VALUES (?1, 'SITE_LINK_DELETED', 'site_link', ?2)",
+            rusqlite::params![tenant_id, link_id],
+        )?;
+        transaction.execute(
+            "DELETE FROM site_links WHERE id = ?1 AND deletion_requested = 1",
+            [&link_id],
+        )?;
+    }
+
+    let completed_networks: Vec<(String, String)> = {
+        let mut statement = transaction.prepare(
+            "SELECT n.id, n.tenant_id
+             FROM site_networks n
+             JOIN gateway_network_states g ON g.site_network_id = n.id
+             WHERE n.deletion_requested = 1 AND n.enabled = 0
+               AND NOT EXISTS (SELECT 1 FROM site_link_networks ln
+                               WHERE ln.site_network_id = n.id)
+               AND EXISTS (
+                 SELECT 1 FROM gateway_route_applies a
+                 WHERE a.device_id = n.publisher_device_id
+                   AND a.network_id = n.id AND a.site_link_id = ''
+                   AND a.desired_revision = g.desired_revision
+                   AND a.local_status = 'disabled'
+                   AND a.control_plane_status = 'disabled'
+                   AND a.remote_status = 'disabled'
+               )",
+        )?;
+        let rows = statement
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        rows
+    };
+    for (network_id, tenant_id) in completed_networks {
+        transaction.execute(
+            "DELETE FROM subnet_access WHERE site_network_id = ?1",
+            [&network_id],
+        )?;
+        transaction.execute(
+            "DELETE FROM gateway_route_applies WHERE network_id = ?1",
+            [&network_id],
+        )?;
+        transaction.execute(
+            "DELETE FROM gateway_network_states WHERE site_network_id = ?1",
+            [&network_id],
+        )?;
+        transaction.execute(
+            "INSERT INTO audit_events (tenant_id, event_type, resource_type, resource_id)
+             VALUES (?1, 'SITE_NETWORK_DELETED', 'site_network', ?2)",
+            rusqlite::params![tenant_id, network_id],
+        )?;
+        transaction.execute(
+            "DELETE FROM site_networks WHERE id = ?1 AND deletion_requested = 1",
+            [&network_id],
+        )?;
+    }
     Ok(())
 }
 
@@ -5914,16 +6547,22 @@ fn apply_gateway_route_report(
         } else {
             "upgrade_required"
         };
-        let control_plane_status = route
-            .control_plane_status
-            .as_deref()
-            .filter(|status| {
-                matches!(
-                    *status,
-                    "pending" | "discovered" | "approved" | "serving" | "failed" | "disabled"
-                )
-            })
-            .unwrap_or("pending");
+        // Agent 无法证明 Headscale 已撤销路由。关闭 ACK 只确认本地状态，
+        // 控制平面的 disabled 必须等服务端实际调用 Headscale 后再写入。
+        let control_plane_status = if !route.enabled {
+            "pending"
+        } else {
+            route
+                .control_plane_status
+                .as_deref()
+                .filter(|status| {
+                    matches!(
+                        *status,
+                        "pending" | "discovered" | "approved" | "serving" | "failed" | "disabled"
+                    )
+                })
+                .unwrap_or("pending")
+        };
         let remote_status = if !route.enabled {
             "disabled"
         } else if route.remote_applied {
@@ -7459,6 +8098,125 @@ async fn get_site_network(
     Ok(Json(response))
 }
 
+/// 请求删除共享网络：先发布新的关闭 revision，待 Agent 与 Headscale 均确认
+/// 撤销后，由 `finalize_requested_resource_deletions` 在状态事务内物理删除。
+async fn delete_site_network(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<Json<DeleteResponse>, ApiError> {
+    let session_tenant = auth::admin_tenant_id(&state, &headers)?;
+    let (publisher_device_id, revision, already_pending) =
+        {
+            let mut connection = state
+                .db
+                .lock()
+                .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "数据库锁不可用"))?;
+            let transaction = connection.transaction().map_err(|_| {
+                ApiError::new(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "无法开始共享网络删除事务",
+                )
+            })?;
+            let (tenant_id, publisher_device_id, current_revision, deletion_requested, link_count):
+            (String, String, i64, i64, i64) = transaction
+            .query_row(
+                "SELECT n.tenant_id, n.publisher_device_id, g.desired_revision,
+                        n.deletion_requested,
+                        (SELECT COUNT(*) FROM site_link_networks ln
+                         WHERE ln.site_network_id = n.id)
+                 FROM site_networks n
+                 JOIN gateway_network_states g ON g.site_network_id = n.id
+                 WHERE n.id = ?1 AND n.tenant_id = ?2",
+                rusqlite::params![id, session_tenant],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法检查共享网络"))?
+            .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "共享网络不存在"))?;
+            if link_count > 0 {
+                let message = format!("共享网络仍被 {link_count} 个互联关系引用，请先删除互联关系");
+                tracing::warn!(network_id = %id, "拒绝删除共享网络：{message}");
+                return Err(ApiError::new(StatusCode::CONFLICT, message));
+            }
+            if deletion_requested != 0 {
+                transaction.commit().map_err(|_| {
+                    ApiError::new(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "无法提交共享网络删除状态",
+                    )
+                })?;
+                (publisher_device_id, current_revision, true)
+            } else {
+                let revision = current_revision.saturating_add(1).max(1);
+                transaction
+                    .execute(
+                        "UPDATE site_networks
+                     SET enabled = 0, deletion_requested = 1,
+                         apply_status = 'checking', apply_error = '等待路由撤销确认',
+                         updated_at = CURRENT_TIMESTAMP
+                     WHERE id = ?1 AND tenant_id = ?2",
+                        rusqlite::params![id, session_tenant],
+                    )
+                    .map_err(|_| {
+                        ApiError::new(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "无法保存共享网络删除请求",
+                        )
+                    })?;
+                transaction
+                    .execute(
+                        "UPDATE gateway_network_states
+                     SET desired_revision = ?1, apply_status = 'checking', applied_prefix = NULL,
+                         apply_error = '等待 Agent 与 Headscale 确认路由撤销',
+                         updated_at = CURRENT_TIMESTAMP
+                     WHERE site_network_id = ?2",
+                        rusqlite::params![revision, id],
+                    )
+                    .map_err(|_| {
+                        ApiError::new(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "无法生成共享网络关闭 revision",
+                        )
+                    })?;
+                write_audit_event(
+                    &transaction,
+                    &tenant_id,
+                    "SITE_NETWORK_DELETE_REQUESTED",
+                    "site_network",
+                    &id,
+                )?;
+                transaction.commit().map_err(|_| {
+                    ApiError::new(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "无法提交共享网络删除事务",
+                    )
+                })?;
+                (publisher_device_id, revision, false)
+            }
+        };
+    schedule_policy_reconcile(&state);
+    tracing::info!(network_id = %id, device_id = %publisher_device_id, revision, "共享网络已进入等待删除状态");
+    Ok(Json(DeleteResponse {
+        deleted: false,
+        pending: true,
+        id,
+        message: if already_pending {
+            "共享网络正在等待 Agent 与 Headscale 完成路由撤销".to_owned()
+        } else {
+            "已请求删除共享网络，等待 Agent 与 Headscale 完成路由撤销".to_owned()
+        },
+    }))
+}
+
 /// 关闭共享本地网络，使 Agent 收到撤销路由的最新 revision。
 async fn disable_site_network(
     State(state): State<AppState>,
@@ -7492,14 +8250,20 @@ async fn set_site_network_enabled(
     let transaction = connection
         .transaction()
         .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法开始共享网络事务"))?;
-    let (tenant_id, current_enabled): (String, i64) = transaction
+    let (tenant_id, current_enabled, deletion_requested): (String, i64, i64) = transaction
         .query_row(
-            "SELECT tenant_id, enabled FROM site_networks
+            "SELECT tenant_id, enabled, deletion_requested FROM site_networks
              WHERE id = ?1 AND tenant_id = ?2",
             rusqlite::params![id, session_tenant],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .map_err(|_| ApiError::new(StatusCode::NOT_FOUND, "共享网络不存在"))?;
+    if deletion_requested != 0 {
+        return Err(ApiError::new(
+            StatusCode::CONFLICT,
+            "共享网络正在等待删除，不能再修改开关",
+        ));
+    }
     if (current_enabled != 0) != enabled {
         transaction
             .execute(
@@ -7572,7 +8336,8 @@ fn read_site_network_response(
             "SELECT n.id, n.tenant_id, n.site_id, s.name, n.name,
                     n.publisher_device_id, d.name, n.interface_id,
                     g.desired_prefix, g.applied_prefix,
-                    g.desired_revision, n.enabled, g.apply_status, g.apply_error
+                    g.desired_revision, n.enabled, g.apply_status, g.apply_error,
+                    n.deletion_requested
              FROM site_networks n JOIN gateway_network_states g
              ON g.site_network_id = n.id
              JOIN sites s ON s.id = n.site_id
@@ -7596,6 +8361,7 @@ fn read_site_network_response(
                     enabled: row.get::<_, i64>(11)? != 0,
                     apply_status: parse_apply_status(&row.get::<_, String>(12)?),
                     apply_error: row.get(13)?,
+                    deletion_pending: row.get::<_, i64>(14)? != 0,
                     health_status: GatewayHealthStatus::Degraded,
                     health_error: None,
                 })
@@ -7728,6 +8494,15 @@ async fn create_site_link(
         .prefix
         .parse()
         .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "右侧共享网络数据无效"))?;
+    if !matches!(
+        (left_prefix, right_prefix),
+        (IpNet::V4(_), IpNet::V4(_)) | (IpNet::V6(_), IpNet::V6(_))
+    ) {
+        return Err(ApiError::new(
+            StatusCode::CONFLICT,
+            "站点互联两侧必须选择相同地址族的网络",
+        ));
+    }
     if networks_overlap(left_prefix, right_prefix) {
         return Err(ApiError::new(
             StatusCode::CONFLICT,
@@ -7815,6 +8590,104 @@ async fn get_site_link(
     Ok(Json(response))
 }
 
+/// 请求删除站点互联：生成高于两侧网络 revision 的关闭版本。两侧 Agent
+/// 和 Headscale 都确认当前版本已撤销后，状态事务会自动清理映射与确认记录。
+async fn delete_site_link(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<Json<DeleteResponse>, ApiError> {
+    let session_tenant = auth::admin_tenant_id(&state, &headers)?;
+    let (revision, already_pending) = {
+        let mut connection = state
+            .db
+            .lock()
+            .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "数据库锁不可用"))?;
+        let transaction = connection.transaction().map_err(|_| {
+            ApiError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "无法开始站点互联删除事务",
+            )
+        })?;
+        let (tenant_id, current_revision, network_revision, deletion_requested): (
+            String,
+            i64,
+            i64,
+            i64,
+        ) = transaction
+            .query_row(
+                "SELECT l.tenant_id, l.apply_revision,
+                        COALESCE((SELECT MAX(g.desired_revision)
+                                  FROM site_link_networks ln
+                                  JOIN gateway_network_states g
+                                    ON g.site_network_id = ln.site_network_id
+                                  WHERE ln.site_link_id = l.id), 0),
+                        l.deletion_requested
+                 FROM site_links l WHERE l.id = ?1 AND l.tenant_id = ?2",
+                rusqlite::params![id, session_tenant],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .optional()
+            .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法检查站点互联"))?
+            .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "站点互联不存在"))?;
+        if deletion_requested != 0 {
+            transaction.commit().map_err(|_| {
+                ApiError::new(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "无法提交站点互联删除状态",
+                )
+            })?;
+            (current_revision, true)
+        } else {
+            let revision = current_revision
+                .max(network_revision)
+                .saturating_add(1)
+                .max(1);
+            transaction
+                .execute(
+                    "UPDATE site_links
+                     SET enabled = 0, deletion_requested = 1, apply_revision = ?1,
+                         apply_status = 'checking', apply_error = '等待两侧路由撤销确认',
+                         updated_at = CURRENT_TIMESTAMP
+                     WHERE id = ?2 AND tenant_id = ?3",
+                    rusqlite::params![revision, id, session_tenant],
+                )
+                .map_err(|_| {
+                    ApiError::new(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "无法保存站点互联删除请求",
+                    )
+                })?;
+            write_audit_event(
+                &transaction,
+                &tenant_id,
+                "SITE_LINK_DELETE_REQUESTED",
+                "site_link",
+                &id,
+            )?;
+            transaction.commit().map_err(|_| {
+                ApiError::new(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "无法提交站点互联删除事务",
+                )
+            })?;
+            (revision, false)
+        }
+    };
+    schedule_policy_reconcile(&state);
+    tracing::info!(site_link_id = %id, revision, "站点互联已进入等待删除状态");
+    Ok(Json(DeleteResponse {
+        deleted: false,
+        pending: true,
+        id,
+        message: if already_pending {
+            "站点互联正在等待两侧 Agent 与 Headscale 完成路由撤销".to_owned()
+        } else {
+            "已请求删除站点互联，等待两侧 Agent 与 Headscale 完成路由撤销".to_owned()
+        },
+    }))
+}
+
 /// 关闭站点互联，使两侧 Agent 撤销对端网段路由。
 async fn disable_site_link(
     State(state): State<AppState>,
@@ -7848,14 +8721,20 @@ async fn set_site_link_enabled(
     let transaction = connection
         .transaction()
         .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法开始站点互联事务"))?;
-    let (tenant_id, current_enabled): (String, i64) = transaction
+    let (tenant_id, current_enabled, deletion_requested): (String, i64, i64) = transaction
         .query_row(
-            "SELECT tenant_id, enabled FROM site_links
+            "SELECT tenant_id, enabled, deletion_requested FROM site_links
              WHERE id = ?1 AND tenant_id = ?2",
             rusqlite::params![id, session_tenant],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .map_err(|_| ApiError::new(StatusCode::NOT_FOUND, "站点互联不存在"))?;
+    if deletion_requested != 0 {
+        return Err(ApiError::new(
+            StatusCode::CONFLICT,
+            "站点互联正在等待删除，不能再修改开关",
+        ));
+    }
     if (current_enabled != 0) != enabled {
         transaction
             .execute(
@@ -8111,15 +8990,21 @@ async fn confirm_site_link_router(
     let transaction = connection
         .transaction()
         .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法开始路由确认事务"))?;
-    let tenant_id: String = transaction
+    let (tenant_id, deletion_requested): (String, i64) = transaction
         .query_row(
-            "SELECT tenant_id FROM site_links
+            "SELECT tenant_id, deletion_requested FROM site_links
              WHERE id = ?1 AND tenant_id = ?3
                AND (left_site_id = ?2 OR right_site_id = ?2)",
             rusqlite::params![id, site_id, session_tenant],
-            |row| row.get(0),
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .map_err(|_| ApiError::new(StatusCode::NOT_FOUND, "站点互联或站点不存在"))?;
+    if deletion_requested != 0 {
+        return Err(ApiError::new(
+            StatusCode::CONFLICT,
+            "站点互联正在等待删除，不能再确认静态路由",
+        ));
+    }
     transaction
         .execute(
             "INSERT INTO site_link_route_confirmations (site_link_id, site_id, confirmed_at)
@@ -8153,6 +9038,22 @@ async fn recheck_site_link(
             .db
             .lock()
             .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "数据库锁不可用"))?;
+        let deletion_requested = connection
+            .query_row(
+                "SELECT deletion_requested FROM site_links
+                 WHERE id = ?1 AND tenant_id = ?2",
+                rusqlite::params![id, tenant_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+            .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法读取站点互联"))?
+            .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "站点互联不存在"))?;
+        if deletion_requested != 0 {
+            return Err(ApiError::new(
+                StatusCode::CONFLICT,
+                "站点互联正在等待删除，不能重复检测",
+            ));
+        }
         let mut statement = connection
             .prepare(
                 "SELECT n.publisher_device_id
@@ -8231,6 +9132,7 @@ fn read_site_link_response(
         enabled,
         apply_status,
         apply_error,
+        deletion_pending,
     ) = connection
         .query_row(
             "SELECT l.id, l.tenant_id, l.left_site_id, l.right_site_id,
@@ -8238,7 +9140,7 @@ fn read_site_link_response(
                     ln.site_network_id, rn.site_network_id,
                     lg.desired_prefix, rg.desired_prefix,
                     lg_network.publisher_device_id, rg_network.publisher_device_id,
-                    l.enabled, l.apply_status, l.apply_error
+                    l.enabled, l.apply_status, l.apply_error, l.deletion_requested
              FROM site_links l
              JOIN sites ls ON ls.id = l.left_site_id
              JOIN sites rs ON rs.id = l.right_site_id
@@ -8267,6 +9169,7 @@ fn read_site_link_response(
                     row.get::<_, i64>(12)? != 0,
                     parse_apply_status(&row.get::<_, String>(13)?),
                     row.get::<_, Option<String>>(14)?,
+                    row.get::<_, i64>(15)? != 0,
                 ))
             },
         )
@@ -8356,6 +9259,7 @@ fn read_site_link_response(
         enabled,
         apply_status,
         apply_error,
+        deletion_pending,
         health_status,
         health_error,
     })
@@ -8690,11 +9594,19 @@ fn inspect_gateway_device(
     } else {
         (report.subnet_gateway, report.subnet_gateway_reason)
     };
-    if capability == CapabilityState::Unavailable {
+    if capability == CapabilityState::Unavailable
+        && reason != Some(GatewayCapabilityReason::IpForwardingDisabled)
+    {
         return Ok((
             GatewayHealthStatus::Failed,
             Some(gateway_capability_message(reason)),
         ));
+    }
+    let parsed_prefix = prefix
+        .parse::<IpNet>()
+        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "共享网络前缀格式无效"))?;
+    if let Some(message) = gateway_forwarding_error(&report, parsed_prefix) {
+        return Ok((GatewayHealthStatus::Failed, Some(message)));
     }
     if !report
         .local_networks
@@ -8721,6 +9633,19 @@ fn gateway_capability_message(reason: Option<GatewayCapabilityReason>) -> String
     }
 }
 
+/// 按目标网段地址族返回精确的宿主机转发缺失原因。
+fn gateway_forwarding_error(report: &GatewayCapabilityReport, prefix: IpNet) -> Option<String> {
+    if forwarding_enabled_for_prefix(report.ipv4_forwarding, report.ipv6_forwarding, prefix) {
+        return None;
+    }
+    let family = if matches!(prefix, IpNet::V4(_)) {
+        "IPv4"
+    } else {
+        "IPv6"
+    };
+    Some(format!("设备未开启 {family} 转发"))
+}
+
 /// 站点互联两侧选中的共享网络及其网关设备。
 struct LinkNetwork {
     prefix: String,
@@ -8740,7 +9665,7 @@ fn load_network_for_link(
              FROM gateway_network_states g JOIN site_networks n
              ON n.id = g.site_network_id
              WHERE g.site_network_id = ?1 AND n.tenant_id = ?2 AND n.site_id = ?3
-             AND n.enabled = 1",
+             AND n.enabled = 1 AND n.deletion_requested = 0",
             rusqlite::params![network_id, tenant_id, site_id],
             |row| {
                 Ok(LinkNetwork {
@@ -8814,22 +9739,21 @@ fn ensure_gateway_device(
             "设备网关能力报告无效，请让 Agent 重新连接",
         )
     })?;
-    if report.subnet_gateway != CapabilityState::Ready {
+    if report.subnet_gateway != CapabilityState::Ready
+        && report.subnet_gateway_reason != Some(GatewayCapabilityReason::IpForwardingDisabled)
+    {
         return Err(ApiError::new(
             StatusCode::CONFLICT,
-            format!(
-                "设备不具备可用的共享本地网络能力：{:?}",
-                report.subnet_gateway_reason
-            ),
+            gateway_capability_message(report.subnet_gateway_reason),
         ));
     }
-    if require_online && report.site_gateway != CapabilityState::Ready {
+    if require_online
+        && report.site_gateway != CapabilityState::Ready
+        && report.site_gateway_reason != Some(GatewayCapabilityReason::IpForwardingDisabled)
+    {
         return Err(ApiError::new(
             StatusCode::CONFLICT,
-            format!(
-                "设备不具备可用的站点网关能力：{:?}",
-                report.site_gateway_reason
-            ),
+            gateway_capability_message(report.site_gateway_reason),
         ));
     }
     if !report.local_networks.iter().any(|network| {
@@ -8844,6 +9768,9 @@ fn ensure_gateway_device(
             StatusCode::CONFLICT,
             "设备最近探测到的本地网络与请求不一致",
         ));
+    }
+    if let Some(message) = gateway_forwarding_error(&report, prefix) {
+        return Err(ApiError::new(StatusCode::CONFLICT, message));
     }
     Ok(())
 }
@@ -8925,6 +9852,48 @@ mod tests {
         headers
     }
 
+    /// 删除测试专用的 Headscale 边界：记录外部撤销调用，并可精确模拟失败。
+    /// 这样可以验证“外部身份未撤销时本地记录不得删除”，而不连接真实服务。
+    #[derive(Default)]
+    struct DeletionHeadscale {
+        expired_keys: Mutex<Vec<String>>,
+        deleted_nodes: Mutex<Vec<String>>,
+        fail_key_expiration: bool,
+        fail_node_deletion: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl HeadscaleControlPlane for DeletionHeadscale {
+        async fn reconcile_routes(
+            &self,
+            routes: &[nexo_headscale_adapter::RouteAdvertisement],
+        ) -> Result<nexo_headscale_adapter::RouteApplyReport> {
+            HeadscaleAdapter.reconcile_routes(routes).await
+        }
+
+        async fn expire_pre_auth_key(&self, key_id: &str) -> Result<()> {
+            if self.fail_key_expiration {
+                anyhow::bail!("测试模拟 Pre-auth Key 吊销失败");
+            }
+            self.expired_keys
+                .lock()
+                .expect("Headscale Key 调用记录应可写")
+                .push(key_id.to_owned());
+            Ok(())
+        }
+
+        async fn delete_node(&self, node_id: &str) -> Result<()> {
+            if self.fail_node_deletion {
+                anyhow::bail!("测试模拟 Headscale Node 删除失败");
+            }
+            self.deleted_nodes
+                .lock()
+                .expect("Headscale Node 调用记录应可写")
+                .push(node_id.to_owned());
+            Ok(())
+        }
+    }
+
     #[test]
     fn public_https_probe_keeps_sni_and_targets_local_caddy() {
         let (host, url, address) = public_https_probe_target("nexo-test.example.com");
@@ -8934,6 +9903,10 @@ mod tests {
     }
 
     fn test_state() -> AppState {
+        test_state_with_headscale(Arc::new(HeadscaleAdapter))
+    }
+
+    fn test_state_with_headscale(headscale: Arc<dyn HeadscaleControlPlane>) -> AppState {
         let connection = Connection::open_in_memory().expect("应打开内存数据库");
         connection
             .execute_batch(INITIAL_MIGRATION)
@@ -8963,6 +9936,7 @@ mod tests {
             .execute_batch(PHASE2_MIGRATION)
             .expect("应初始化第二阶段公网访问表");
         apply_time_consistency_migration(&connection).expect("应统一测试数据库时间字段");
+        apply_resource_deletion_migration(&connection).expect("应初始化网络资源删除状态");
         ensure_phase2_tunnel_columns(&connection).expect("应初始化第二阶段 Tunnel 字段");
         ensure_mesh_identity_online_column(&connection).expect("应初始化组网在线状态字段");
         ensure_server_ca(&connection).expect("应初始化测试 CA");
@@ -9001,11 +9975,12 @@ mod tests {
         AppState {
             db: Arc::new(Mutex::new(connection)),
             data_dir: PathBuf::from("."),
-            headscale: Arc::new(HeadscaleAdapter),
+            headscale,
             mesh_offers: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             mesh_enrollment_lock: Arc::new(tokio::sync::Mutex::new(())),
             tunnel_sessions: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             public_listener_tasks: Arc::new(Mutex::new(HashMap::new())),
+            active_tunnel_connections: Arc::new(Mutex::new(HashMap::new())),
             caddy: Arc::new(caddy::CaddySupervisor::new(
                 caddy::CaddyRuntimeConfig::from_env(PathBuf::from(".")),
             )),
@@ -9045,6 +10020,54 @@ mod tests {
                 [if enabled { "ready" } else { "disabled" }],
             )
             .expect("应创建 Tunnel 应用状态");
+    }
+
+    fn insert_gateway_deletion_fixture(state: &AppState) {
+        state
+            .db
+            .lock()
+            .expect("数据库锁应可用")
+            .execute_batch(
+                "INSERT INTO sites (id, tenant_id, name) VALUES
+                    ('site-a', 'tenant-1', '家庭'),
+                    ('site-b', 'tenant-1', '办公室');
+                 INSERT INTO devices
+                    (id, tenant_id, site_id, name, status, capabilities_json)
+                    VALUES
+                    ('device-a', 'tenant-1', 'site-a', '家庭网关', 'online',
+                     '[\"subnet_gateway\",\"site_gateway\"]'),
+                    ('device-b', 'tenant-1', 'site-b', '办公室网关', 'online',
+                     '[\"subnet_gateway\",\"site_gateway\"]');
+                 INSERT INTO site_networks
+                    (id, tenant_id, site_id, name, publisher_device_id, interface_id,
+                     address_family, current_prefix)
+                    VALUES
+                    ('network-a', 'tenant-1', 'site-a', '家庭 LAN', 'device-a', 'eth0',
+                     'ipv4', '192.168.10.0/24'),
+                    ('network-b', 'tenant-1', 'site-b', '办公室 LAN', 'device-b', 'eth0',
+                     'ipv4', '192.168.20.0/24');
+                 INSERT INTO gateway_network_states
+                    (site_network_id, desired_prefix, desired_revision, apply_status)
+                    VALUES
+                    ('network-a', '192.168.10.0/24', 4, 'ready'),
+                    ('network-b', '192.168.20.0/24', 4, 'ready');
+                 INSERT INTO site_links
+                    (id, tenant_id, left_site_id, right_site_id, apply_revision, apply_status)
+                    VALUES ('link-a-b', 'tenant-1', 'site-a', 'site-b', 4, 'ready');
+                 INSERT INTO site_link_networks (site_link_id, site_network_id, side)
+                    VALUES ('link-a-b', 'network-a', 'left'),
+                           ('link-a-b', 'network-b', 'right');",
+            )
+            .expect("应创建网络资源删除测试数据");
+    }
+
+    fn finalize_resource_deletions_for_test(state: &AppState) {
+        let connection = state.db.lock().expect("数据库锁应可用");
+        let transaction = connection
+            .unchecked_transaction()
+            .expect("应开始删除收敛事务");
+        finalize_requested_resource_deletions(&transaction).expect("删除状态应能收敛");
+        transaction.commit().expect("应提交删除收敛事务");
     }
 
     #[test]
@@ -9351,6 +10374,253 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn deleting_tunnel_is_immediate_when_device_is_offline() {
+        let mut state = test_state();
+        let data_dir = std::env::temp_dir().join(format!("nexo-tunnel-delete-{}", Uuid::new_v4()));
+        fs::create_dir_all(&data_dir).expect("应创建穿透服务删除测试目录");
+        state.data_dir = data_dir.clone();
+        insert_test_tunnel(&state, true);
+
+        let ca_path = data_dir.join("origin.ca.pem");
+        let socket_path = data_dir.join("bridge.sock");
+        fs::write(&ca_path, "test-ca").expect("应创建测试 CA");
+        fs::write(&socket_path, "test-socket").expect("应创建测试 Socket");
+        state
+            .db
+            .lock()
+            .expect("数据库锁应可用")
+            .execute(
+                "UPDATE tunnels SET origin_ca_secret_path = ?1, bridge_socket_path = ?2
+                 WHERE id = 'tunnel-1'",
+                rusqlite::params![ca_path.to_string_lossy(), socket_path.to_string_lossy()],
+            )
+            .expect("应保存测试清理路径");
+
+        let listener = tokio::spawn(std::future::pending::<()>());
+        state.public_listener_tasks.lock().unwrap().insert(
+            "tunnel-1".to_owned(),
+            PublicListenerTask {
+                token: Uuid::new_v4(),
+                abort: listener.abort_handle(),
+            },
+        );
+        let connection_cancel = CancellationToken::new();
+        register_active_tunnel_connection(
+            &state,
+            "tunnel-1",
+            Uuid::new_v4(),
+            connection_cancel.clone(),
+        );
+
+        let response = delete_tunnel(
+            State(state.clone()),
+            admin_headers(),
+            Path("tunnel-1".to_owned()),
+        )
+        .await
+        .expect("离线设备上的穿透服务也应立即删除")
+        .0;
+
+        assert!(response.deleted);
+        assert!(!response.pending);
+        assert_eq!(response.message, "穿透服务已永久删除");
+        let connection = state.db.lock().expect("数据库锁应可用");
+        let tunnel_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM tunnels WHERE id = 'tunnel-1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let applied_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM tunnel_applied_states WHERE tunnel_id = 'tunnel-1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let audit_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM audit_events
+                 WHERE event_type = 'TUNNEL_DELETED' AND resource_id = 'tunnel-1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        drop(connection);
+        assert_eq!(tunnel_count, 0);
+        assert_eq!(applied_count, 0);
+        assert_eq!(audit_count, 1);
+        let desired = load_tunnel_desired_state(&state, "tunnel-device").unwrap();
+        assert!(desired.is_empty());
+        assert!(connection_cancel.is_cancelled());
+        assert!(!state
+            .public_listener_tasks
+            .lock()
+            .unwrap()
+            .contains_key("tunnel-1"));
+        assert!(!ca_path.exists());
+        assert!(!socket_path.exists());
+        let _ = fs::remove_dir_all(data_dir);
+    }
+
+    #[test]
+    fn startup_finalizes_legacy_pending_tunnel_deletion() {
+        let state = test_state();
+        let data_dir =
+            std::env::temp_dir().join(format!("nexo-legacy-tunnel-delete-{}", Uuid::new_v4()));
+        fs::create_dir_all(&data_dir).expect("应创建旧记录清理测试目录");
+        insert_test_tunnel(&state, false);
+        let ca_path = data_dir.join("legacy-origin.ca.pem");
+        let socket_path = data_dir.join("legacy-bridge.sock");
+        fs::write(&ca_path, "legacy-ca").expect("应创建旧版测试 CA");
+        fs::write(&socket_path, "legacy-socket").expect("应创建旧版测试 Socket");
+        let deleted = {
+            let connection = state.db.lock().expect("数据库锁应可用");
+            connection
+                .execute(
+                    "UPDATE tunnels SET deletion_requested = 1, deletion_revision = 4,
+                     origin_ca_secret_path = ?1, bridge_socket_path = ?2
+                     WHERE id = 'tunnel-1'",
+                    rusqlite::params![ca_path.to_string_lossy(), socket_path.to_string_lossy()],
+                )
+                .expect("应保存旧版待删除记录");
+            finalize_legacy_pending_tunnel_deletions(&connection)
+                .expect("启动时应清理旧版待删除记录")
+        };
+
+        assert_eq!(deleted, 1);
+        let connection = state.db.lock().expect("数据库锁应可用");
+        let tunnel_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM tunnels WHERE id = 'tunnel-1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let applied_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM tunnel_applied_states WHERE tunnel_id = 'tunnel-1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let audit_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM audit_events
+                 WHERE event_type = 'TUNNEL_DELETED' AND resource_id = 'tunnel-1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(tunnel_count, 0);
+        assert_eq!(applied_count, 0);
+        assert_eq!(audit_count, 1);
+        assert_eq!(
+            finalize_legacy_pending_tunnel_deletions(&connection).expect("重复启动应保持幂等"),
+            0
+        );
+        drop(connection);
+        assert!(!ca_path.exists());
+        assert!(!socket_path.exists());
+        let _ = fs::remove_dir_all(data_dir);
+    }
+
+    #[tokio::test]
+    async fn deleting_tunnel_from_another_tenant_returns_not_found() {
+        let state = test_state();
+        insert_test_tunnel(&state, true);
+        {
+            let connection = state.db.lock().expect("数据库锁应可用");
+            connection
+                .execute(
+                    "INSERT INTO tenants (id, name) VALUES ('tenant-2', '其他租户')",
+                    [],
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "UPDATE users SET tenant_id = 'tenant-2' WHERE id = 'user-1'",
+                    [],
+                )
+                .unwrap();
+            connection
+                .execute("UPDATE auth_sessions SET tenant_id = 'tenant-2'", [])
+                .unwrap();
+        }
+
+        let error = delete_tunnel(
+            State(state.clone()),
+            admin_headers(),
+            Path("tunnel-1".to_owned()),
+        )
+        .await
+        .expect_err("其他租户不能删除穿透服务");
+        assert_eq!(error.status, StatusCode::NOT_FOUND);
+        let missing = delete_tunnel(
+            State(state.clone()),
+            admin_headers(),
+            Path("missing-tunnel".to_owned()),
+        )
+        .await
+        .expect_err("不存在的穿透服务应返回未找到");
+        assert_eq!(missing.status, StatusCode::NOT_FOUND);
+        let count: i64 = state
+            .db
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM tunnels WHERE id = 'tunnel-1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn stopping_active_connections_only_affects_selected_tunnel() {
+        let state = test_state();
+        let first = CancellationToken::new();
+        let second = CancellationToken::new();
+        let other = CancellationToken::new();
+        let first_token = Uuid::new_v4();
+        let second_token = Uuid::new_v4();
+        register_active_tunnel_connection(&state, "tunnel-1", first_token, first.clone());
+        register_active_tunnel_connection(&state, "tunnel-1", second_token, second.clone());
+        register_active_tunnel_connection(&state, "tunnel-2", Uuid::new_v4(), other.clone());
+
+        remove_active_tunnel_connection(&state, "tunnel-1", first_token);
+        stop_active_tunnel_connections(&state, "tunnel-1");
+
+        let replacement = CancellationToken::new();
+        let replacement_token = Uuid::new_v4();
+        register_active_tunnel_connection(
+            &state,
+            "tunnel-1",
+            replacement_token,
+            replacement.clone(),
+        );
+        remove_active_tunnel_connection(&state, "tunnel-1", second_token);
+
+        assert!(!first.is_cancelled());
+        assert!(second.is_cancelled());
+        assert!(!other.is_cancelled());
+        assert!(!replacement.is_cancelled());
+        assert!(state
+            .active_tunnel_connections
+            .lock()
+            .unwrap()
+            .get("tunnel-1")
+            .is_some_and(|connections| connections.contains_key(&replacement_token)));
+        assert!(state
+            .active_tunnel_connections
+            .lock()
+            .unwrap()
+            .contains_key("tunnel-2"));
+    }
+
+    #[tokio::test]
     async fn disabling_tunnel_updates_state_and_publishes_disabled_desired_state() {
         let state = test_state();
         insert_test_tunnel(&state, true);
@@ -9451,6 +10721,477 @@ mod tests {
             .lock()
             .expect("监听器登记应可读取")
             .contains_key("tunnel-1"));
+    }
+
+    #[tokio::test]
+    async fn deleted_tunnel_no_longer_blocks_device_deletion() {
+        let state = test_state();
+        insert_test_tunnel(&state, true);
+
+        let _ = delete_tunnel(
+            State(state.clone()),
+            admin_headers(),
+            Path("tunnel-1".to_owned()),
+        )
+        .await
+        .expect("穿透服务应立即永久删除");
+        let repeated = delete_tunnel(
+            State(state.clone()),
+            admin_headers(),
+            Path("tunnel-1".to_owned()),
+        )
+        .await
+        .expect_err("永久删除后重复请求应返回未找到");
+        assert_eq!(repeated.status, StatusCode::NOT_FOUND);
+
+        let _ = delete_device(
+            State(state),
+            admin_headers(),
+            Path("tunnel-device".to_owned()),
+        )
+        .await
+        .expect("穿透服务删除完成后应立即允许删除设备");
+    }
+
+    #[tokio::test]
+    async fn site_deletion_enforces_tenant_scope_and_reports_all_dependencies() {
+        let state = test_state();
+        insert_gateway_deletion_fixture(&state);
+        state
+            .db
+            .lock()
+            .expect("数据库锁应可用")
+            .execute_batch(
+                "INSERT INTO tenants (id, name) VALUES ('tenant-2', '其他租户');
+                 INSERT INTO sites (id, tenant_id, name)
+                    VALUES ('site-other', 'tenant-2', '其他租户站点');",
+            )
+            .expect("应创建其他租户站点");
+
+        let hidden = delete_site(
+            State(state.clone()),
+            admin_headers(),
+            Path("site-other".to_owned()),
+        )
+        .await
+        .expect_err("当前租户不应删除其他租户站点");
+        assert_eq!(hidden.status, StatusCode::NOT_FOUND);
+
+        let dependency = delete_site(
+            State(state.clone()),
+            admin_headers(),
+            Path("site-a".to_owned()),
+        )
+        .await
+        .expect_err("仍有业务依赖的站点不应删除");
+        assert_eq!(dependency.status, StatusCode::CONFLICT);
+        assert!(dependency.message.contains("1 台设备"));
+        assert!(dependency.message.contains("1 个共享网络"));
+        assert!(dependency.message.contains("1 个互联关系"));
+    }
+
+    #[tokio::test]
+    async fn empty_site_deletion_revokes_unfinished_enrollments() {
+        let state = test_state();
+        state
+            .db
+            .lock()
+            .expect("数据库锁应可用")
+            .execute_batch(
+                "INSERT INTO sites (id, tenant_id, name)
+                    VALUES ('site-empty', 'tenant-1', '空站点');
+                 INSERT INTO pending_enrollments
+                    (id, tenant_id, site_id, token_digest, status, expires_at)
+                    VALUES ('enrollment-empty', 'tenant-1', 'site-empty',
+                            'empty-token-digest', 'pending', 1893456000);",
+            )
+            .expect("应创建空站点与未完成入网请求");
+
+        let response = delete_site(
+            State(state.clone()),
+            admin_headers(),
+            Path("site-empty".to_owned()),
+        )
+        .await
+        .expect("空站点应可删除")
+        .0;
+        assert!(response.deleted);
+        assert!(!response.pending);
+        let remaining: (i64, i64) = state
+            .db
+            .lock()
+            .expect("数据库锁应可用")
+            .query_row(
+                "SELECT
+                    (SELECT COUNT(*) FROM sites WHERE id = 'site-empty'),
+                    (SELECT COUNT(*) FROM pending_enrollments
+                     WHERE id = 'enrollment-empty')",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("应检查站点和入网请求已清理");
+        assert_eq!(remaining, (0, 0));
+    }
+
+    #[tokio::test]
+    async fn online_device_deletion_revokes_headscale_and_local_identity_state() {
+        let headscale = Arc::new(DeletionHeadscale::default());
+        let state = test_state_with_headscale(headscale.clone());
+        state
+            .db
+            .lock()
+            .expect("数据库锁应可用")
+            .execute_batch(
+                "INSERT INTO sites (id, tenant_id, name)
+                    VALUES ('site-device', 'tenant-1', '设备站点');
+                 INSERT INTO devices
+                    (id, tenant_id, site_id, name, status, capabilities_json)
+                    VALUES ('device-delete', 'tenant-1', 'site-device', '在线设备',
+                            'online', '[\"tunnel\"]');
+                 INSERT INTO device_identities
+                    (device_id, certificate_pem, certificate_fingerprint, expires_at)
+                    VALUES ('device-delete', 'certificate', 'fingerprint', 1893456000);
+                 INSERT INTO mesh_identities
+                    (nexo_device_id, tenant_id, headscale_node_id, state, online)
+                    VALUES ('device-delete', 'tenant-1', 'node-17', 'ready', 1);
+                 INSERT INTO mesh_enrollment_attempts
+                    (id, nexo_device_id, tenant_id, headscale_pre_auth_key_id,
+                     expires_at, state)
+                    VALUES ('attempt-delete', 'device-delete', 'tenant-1', 'key-17',
+                            1893456000, 'issued');
+                 INSERT INTO device_capability_reports (device_id, report_json)
+                    VALUES ('device-delete', '{}');
+                 INSERT INTO pending_enrollments
+                    (id, tenant_id, token_digest, status, expires_at, device_id)
+                    VALUES ('pending-delete', 'tenant-1', 'pending-delete-digest',
+                            'approved', 1893456000, 'device-delete');",
+            )
+            .expect("应创建设备身份清理测试数据");
+        state.mesh_offers.lock().await.insert(
+            "device-delete".to_owned(),
+            MeshEnrollmentOffer {
+                auth_key: "test-key".to_owned(),
+                auth_key_id: "key-17".to_owned(),
+                endpoint: "https://mesh.example.com".to_owned(),
+                hostname: "device-delete".to_owned(),
+                reset: false,
+                tenant_id: Some("tenant-1".to_owned()),
+            },
+        );
+        let (sender, _receiver) = tokio::sync::mpsc::channel(1);
+        let session_cancel = CancellationToken::new();
+        state.tunnel_sessions.lock().await.insert(
+            "device-delete".to_owned(),
+            TunnelSessionHandle {
+                sender,
+                cancel: session_cancel.clone(),
+                connection_permits: Arc::new(tokio::sync::Semaphore::new(1)),
+            },
+        );
+
+        let response = delete_device(
+            State(state.clone()),
+            admin_headers(),
+            Path("device-delete".to_owned()),
+        )
+        .await
+        .expect("在线设备应在撤销外部身份后删除")
+        .0;
+        assert!(response.deleted);
+        assert!(session_cancel.is_cancelled());
+        assert_eq!(
+            *headscale.expired_keys.lock().expect("应读取 Key 撤销调用"),
+            vec!["key-17".to_owned()]
+        );
+        assert_eq!(
+            *headscale
+                .deleted_nodes
+                .lock()
+                .expect("应读取 Node 删除调用"),
+            vec!["node-17".to_owned()]
+        );
+        assert!(!state.mesh_offers.lock().await.contains_key("device-delete"));
+
+        let remaining: (i64, i64, i64, i64, i64, i64) = state
+            .db
+            .lock()
+            .expect("数据库锁应可用")
+            .query_row(
+                "SELECT
+                    (SELECT COUNT(*) FROM devices WHERE id = 'device-delete'),
+                    (SELECT COUNT(*) FROM device_identities WHERE device_id = 'device-delete'),
+                    (SELECT COUNT(*) FROM mesh_identities
+                     WHERE nexo_device_id = 'device-delete'),
+                    (SELECT COUNT(*) FROM mesh_enrollment_attempts
+                     WHERE nexo_device_id = 'device-delete'),
+                    (SELECT COUNT(*) FROM device_capability_reports
+                     WHERE device_id = 'device-delete'),
+                    (SELECT COUNT(*) FROM pending_enrollments
+                     WHERE device_id = 'device-delete')",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                },
+            )
+            .expect("应检查本地设备身份链已清理");
+        assert_eq!(remaining, (0, 0, 0, 0, 0, 0));
+    }
+
+    #[tokio::test]
+    async fn headscale_failure_keeps_local_device_record() {
+        let headscale = Arc::new(DeletionHeadscale {
+            fail_node_deletion: true,
+            ..DeletionHeadscale::default()
+        });
+        let state = test_state_with_headscale(headscale);
+        state
+            .db
+            .lock()
+            .expect("数据库锁应可用")
+            .execute_batch(
+                "INSERT INTO devices (id, tenant_id, name, status)
+                    VALUES ('device-failed', 'tenant-1', '撤销失败设备', 'online');
+                 INSERT INTO mesh_identities
+                    (nexo_device_id, tenant_id, headscale_node_id, state)
+                    VALUES ('device-failed', 'tenant-1', 'node-failed', 'ready');",
+            )
+            .expect("应创建 Headscale 失败测试设备");
+
+        let error = delete_device(
+            State(state.clone()),
+            admin_headers(),
+            Path("device-failed".to_owned()),
+        )
+        .await
+        .expect_err("Headscale 停用失败时不得删除本地记录");
+        assert_eq!(error.status, StatusCode::BAD_GATEWAY);
+        let remaining: (i64, i64) = state
+            .db
+            .lock()
+            .expect("数据库锁应可用")
+            .query_row(
+                "SELECT
+                    (SELECT COUNT(*) FROM devices WHERE id = 'device-failed'),
+                    (SELECT COUNT(*) FROM mesh_identities
+                     WHERE nexo_device_id = 'device-failed')",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("应检查失败后本地数据仍保留");
+        assert_eq!(remaining, (1, 1));
+    }
+
+    #[tokio::test]
+    async fn network_deletion_obeys_order_and_waits_for_exact_revision() {
+        let state = test_state();
+        insert_gateway_deletion_fixture(&state);
+
+        let device_dependency = delete_device(
+            State(state.clone()),
+            admin_headers(),
+            Path("device-a".to_owned()),
+        )
+        .await
+        .expect_err("共享网络仍存在时不得删除发布设备");
+        assert_eq!(device_dependency.status, StatusCode::CONFLICT);
+        assert!(device_dependency.message.contains("1 个共享网络"));
+
+        let network_dependency = delete_site_network(
+            State(state.clone()),
+            admin_headers(),
+            Path("network-a".to_owned()),
+        )
+        .await
+        .expect_err("互联关系仍存在时不得删除共享网络");
+        assert_eq!(network_dependency.status, StatusCode::CONFLICT);
+        assert!(network_dependency.message.contains("1 个互联关系"));
+
+        let first_link = delete_site_link(
+            State(state.clone()),
+            admin_headers(),
+            Path("link-a-b".to_owned()),
+        )
+        .await
+        .expect("站点互联应进入等待删除")
+        .0;
+        let repeated_link = delete_site_link(
+            State(state.clone()),
+            admin_headers(),
+            Path("link-a-b".to_owned()),
+        )
+        .await
+        .expect("重复删除站点互联应保持幂等")
+        .0;
+        assert!(first_link.pending && repeated_link.pending);
+        let link_revision: i64 = state
+            .db
+            .lock()
+            .expect("数据库锁应可用")
+            .query_row(
+                "SELECT apply_revision FROM site_links WHERE id = 'link-a-b'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("应读取 Link 删除 revision");
+        assert_eq!(link_revision, 5);
+
+        state
+            .db
+            .lock()
+            .expect("数据库锁应可用")
+            .execute_batch(
+                "INSERT INTO gateway_route_applies
+                    (device_id, network_id, site_link_id, desired_revision,
+                     local_status, control_plane_status, remote_status)
+                 VALUES
+                    ('device-a', 'network-b', 'link-a-b', 4,
+                     'disabled', 'disabled', 'disabled'),
+                    ('device-b', 'network-a', 'link-a-b', 4,
+                     'disabled', 'disabled', 'disabled');",
+            )
+            .expect("应写入旧 Link revision 的撤销状态");
+        finalize_resource_deletions_for_test(&state);
+        let old_link_remaining: i64 = state
+            .db
+            .lock()
+            .expect("数据库锁应可用")
+            .query_row(
+                "SELECT COUNT(*) FROM site_links WHERE id = 'link-a-b'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("应检查旧 revision 未提前删除 Link");
+        assert_eq!(old_link_remaining, 1);
+
+        state
+            .db
+            .lock()
+            .expect("数据库锁应可用")
+            .execute(
+                "UPDATE gateway_route_applies SET desired_revision = 5
+                 WHERE site_link_id = 'link-a-b'",
+                [],
+            )
+            .expect("应推进 Link 到当前删除 revision");
+        finalize_resource_deletions_for_test(&state);
+        let link_remaining: i64 = state
+            .db
+            .lock()
+            .expect("数据库锁应可用")
+            .query_row(
+                "SELECT COUNT(*) FROM site_links WHERE id = 'link-a-b'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("应检查 Link 已完成删除");
+        assert_eq!(link_remaining, 0);
+
+        let first_network = delete_site_network(
+            State(state.clone()),
+            admin_headers(),
+            Path("network-a".to_owned()),
+        )
+        .await
+        .expect("共享网络应进入等待删除")
+        .0;
+        let repeated_network = delete_site_network(
+            State(state.clone()),
+            admin_headers(),
+            Path("network-a".to_owned()),
+        )
+        .await
+        .expect("重复删除共享网络应保持幂等")
+        .0;
+        assert!(first_network.pending && repeated_network.pending);
+        let network_revision: i64 = state
+            .db
+            .lock()
+            .expect("数据库锁应可用")
+            .query_row(
+                "SELECT desired_revision FROM gateway_network_states
+                 WHERE site_network_id = 'network-a'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("应读取共享网络删除 revision");
+        assert_eq!(network_revision, 5);
+
+        state
+            .db
+            .lock()
+            .expect("数据库锁应可用")
+            .execute(
+                "INSERT INTO gateway_route_applies
+                    (device_id, network_id, site_link_id, desired_revision,
+                     local_status, control_plane_status, remote_status)
+                 VALUES ('device-a', 'network-a', '', 4,
+                         'disabled', 'disabled', 'disabled')",
+                [],
+            )
+            .expect("应写入旧 Network revision 的撤销状态");
+        finalize_resource_deletions_for_test(&state);
+        let old_network_remaining: i64 = state
+            .db
+            .lock()
+            .expect("数据库锁应可用")
+            .query_row(
+                "SELECT COUNT(*) FROM site_networks WHERE id = 'network-a'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("应检查旧 revision 未提前删除共享网络");
+        assert_eq!(old_network_remaining, 1);
+
+        state
+            .db
+            .lock()
+            .expect("数据库锁应可用")
+            .execute(
+                "UPDATE gateway_route_applies SET desired_revision = 5
+                 WHERE device_id = 'device-a' AND network_id = 'network-a'
+                   AND site_link_id = ''",
+                [],
+            )
+            .expect("应推进 Network 到当前删除 revision");
+        finalize_resource_deletions_for_test(&state);
+        let network_remaining: i64 = state
+            .db
+            .lock()
+            .expect("数据库锁应可用")
+            .query_row(
+                "SELECT COUNT(*) FROM site_networks WHERE id = 'network-a'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("应检查共享网络已完成删除");
+        assert_eq!(network_remaining, 0);
+
+        let audit_counts: (i64, i64, i64, i64) = state
+            .db
+            .lock()
+            .expect("数据库锁应可用")
+            .query_row(
+                "SELECT
+                    (SELECT COUNT(*) FROM audit_events
+                     WHERE event_type = 'SITE_LINK_DELETE_REQUESTED'),
+                    (SELECT COUNT(*) FROM audit_events
+                     WHERE event_type = 'SITE_LINK_DELETED'),
+                    (SELECT COUNT(*) FROM audit_events
+                     WHERE event_type = 'SITE_NETWORK_DELETE_REQUESTED'),
+                    (SELECT COUNT(*) FROM audit_events
+                     WHERE event_type = 'SITE_NETWORK_DELETED')",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .expect("应读取网络资源删除审计");
+        assert_eq!(audit_counts, (1, 1, 1, 1));
     }
 
     #[tokio::test]
@@ -9569,6 +11310,205 @@ mod tests {
                 mesh_identity: None,
             }
         ));
+        assert!(report_allows_headscale_reconcile(
+            &GatewayRouteApplyReport {
+                revision: 3,
+                routes: vec![
+                    GatewayRouteApplyResult {
+                        network_id: "network-v4".to_owned(),
+                        site_link_id: None,
+                        prefix: "192.168.10.0/24".to_owned(),
+                        revision: 3,
+                        enabled: true,
+                        local_applied: true,
+                        control_plane_status: None,
+                        remote_applied: false,
+                        error_message: None,
+                    },
+                    GatewayRouteApplyResult {
+                        network_id: "network-v6".to_owned(),
+                        site_link_id: None,
+                        prefix: "2001:db8:10::/64".to_owned(),
+                        revision: 3,
+                        enabled: true,
+                        local_applied: false,
+                        control_plane_status: None,
+                        remote_applied: false,
+                        error_message: Some("设备未开启 IPv6 转发".to_owned()),
+                    },
+                ],
+                mesh_identity: None,
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn shared_network_admission_and_health_are_checked_per_address_family() {
+        env::set_var("NEXO_ADMIN_TOKEN", "test-admin");
+        let state = test_state();
+        let mut report = GatewayCapabilityReport {
+            platform: "linux".to_owned(),
+            tun_available: true,
+            net_admin_available: true,
+            ipv4_forwarding: true,
+            ipv6_forwarding: false,
+            local_networks: vec![
+                DetectedLocalNetwork {
+                    interface_id: "eth0".to_owned(),
+                    prefix: "192.168.10.0/24".to_owned(),
+                    gateway_address: Some("192.168.10.2".to_owned()),
+                },
+                DetectedLocalNetwork {
+                    interface_id: "eth1".to_owned(),
+                    prefix: "2001:db8:10::/64".to_owned(),
+                    gateway_address: Some("2001:db8:10::2".to_owned()),
+                },
+            ],
+            subnet_gateway: CapabilityState::Ready,
+            subnet_gateway_reason: None,
+            site_gateway: CapabilityState::Ready,
+            site_gateway_reason: None,
+        };
+        {
+            let connection = state.db.lock().expect("数据库锁应可用");
+            connection
+                .execute_batch(
+                    "INSERT INTO sites (id, tenant_id, name)
+                        VALUES ('site-family', 'tenant-1', '双栈站点');
+                     INSERT INTO devices
+                        (id, tenant_id, site_id, name, status, capabilities_json)
+                        VALUES ('device-family', 'tenant-1', 'site-family', '双栈网关',
+                                'online', '[\"subnet_gateway\",\"site_gateway\"]');
+                     INSERT INTO mesh_identities
+                        (nexo_device_id, tenant_id, headscale_node_id, state, online)
+                        VALUES ('device-family', 'tenant-1', '42', 'ready', 1);",
+                )
+                .expect("应创建地址族测试设备");
+            connection
+                .execute(
+                    "INSERT INTO device_capability_reports (device_id, report_json)
+                     VALUES ('device-family', ?1)",
+                    [serde_json::to_string(&report).unwrap()],
+                )
+                .expect("应保存 IPv4-only 能力报告");
+        }
+
+        let _ = create_site_network(
+            State(state.clone()),
+            admin_headers(),
+            Json(CreateSiteNetworkRequest {
+                tenant_id: "tenant-1".to_owned(),
+                site_id: "site-family".to_owned(),
+                name: "IPv4 LAN".to_owned(),
+                publisher_device_id: "device-family".to_owned(),
+                interface_id: "eth0".to_owned(),
+                prefix: "192.168.10.0/24".to_owned(),
+            }),
+        )
+        .await
+        .expect("IPv4-only 设备应能共享 IPv4 网络");
+        let error = create_site_network(
+            State(state.clone()),
+            admin_headers(),
+            Json(CreateSiteNetworkRequest {
+                tenant_id: "tenant-1".to_owned(),
+                site_id: "site-family".to_owned(),
+                name: "IPv6 LAN".to_owned(),
+                publisher_device_id: "device-family".to_owned(),
+                interface_id: "eth1".to_owned(),
+                prefix: "2001:db8:10::/64".to_owned(),
+            }),
+        )
+        .await
+        .expect_err("IPv4-only 设备不应共享 IPv6 网络");
+        assert_eq!(error.message, "设备未开启 IPv6 转发");
+
+        report.ipv4_forwarding = false;
+        report.ipv6_forwarding = true;
+        state
+            .db
+            .lock()
+            .expect("数据库锁应可用")
+            .execute(
+                "UPDATE device_capability_reports SET report_json = ?1
+                 WHERE device_id = 'device-family'",
+                [serde_json::to_string(&report).unwrap()],
+            )
+            .expect("应切换为 IPv6-only 能力报告");
+        let _ = create_site_network(
+            State(state.clone()),
+            admin_headers(),
+            Json(CreateSiteNetworkRequest {
+                tenant_id: "tenant-1".to_owned(),
+                site_id: "site-family".to_owned(),
+                name: "IPv6 LAN".to_owned(),
+                publisher_device_id: "device-family".to_owned(),
+                interface_id: "eth1".to_owned(),
+                prefix: "2001:db8:10::/64".to_owned(),
+            }),
+        )
+        .await
+        .expect("IPv6-only 设备应能共享 IPv6 网络");
+
+        let (health, message) = inspect_gateway_device(
+            &state.db.lock().expect("数据库锁应可用"),
+            "device-family",
+            "eth0",
+            "192.168.10.0/24",
+            false,
+        )
+        .expect("应计算现有 IPv4 网络健康状态");
+        assert_eq!(health, GatewayHealthStatus::Failed);
+        assert_eq!(message.as_deref(), Some("设备未开启 IPv4 转发"));
+    }
+
+    #[tokio::test]
+    async fn site_link_rejects_networks_from_different_address_families() {
+        env::set_var("NEXO_ADMIN_TOKEN", "test-admin");
+        let state = test_state();
+        state
+            .db
+            .lock()
+            .expect("数据库锁应可用")
+            .execute_batch(
+                "INSERT INTO sites (id, tenant_id, name) VALUES
+                    ('site-v4', 'tenant-1', 'IPv4 站点'),
+                    ('site-v6', 'tenant-1', 'IPv6 站点');
+                 INSERT INTO devices
+                    (id, tenant_id, site_id, name, status, capabilities_json) VALUES
+                    ('device-v4', 'tenant-1', 'site-v4', 'IPv4 网关', 'online',
+                     '[\"subnet_gateway\",\"site_gateway\"]'),
+                    ('device-v6', 'tenant-1', 'site-v6', 'IPv6 网关', 'online',
+                     '[\"subnet_gateway\",\"site_gateway\"]');
+                 INSERT INTO site_networks
+                    (id, tenant_id, site_id, name, publisher_device_id, interface_id,
+                     address_family, current_prefix) VALUES
+                    ('network-v4', 'tenant-1', 'site-v4', 'IPv4 LAN', 'device-v4', 'eth0',
+                     'ipv4', '192.168.10.0/24'),
+                    ('network-v6', 'tenant-1', 'site-v6', 'IPv6 LAN', 'device-v6', 'eth0',
+                     'ipv6', '2001:db8:20::/64');
+                 INSERT INTO gateway_network_states
+                    (site_network_id, desired_prefix, desired_revision) VALUES
+                    ('network-v4', '192.168.10.0/24', 1),
+                    ('network-v6', '2001:db8:20::/64', 1);",
+            )
+            .expect("应创建异族站点网络");
+
+        let error = create_site_link(
+            State(state),
+            admin_headers(),
+            Json(CreateSiteLinkRequest {
+                tenant_id: "tenant-1".to_owned(),
+                left_site_id: "site-v4".to_owned(),
+                left_network_id: "network-v4".to_owned(),
+                right_site_id: "site-v6".to_owned(),
+                right_network_id: "network-v6".to_owned(),
+            }),
+        )
+        .await
+        .expect_err("跨地址族站点互联必须被拒绝");
+        assert_eq!(error.status, StatusCode::CONFLICT);
+        assert_eq!(error.message, "站点互联两侧必须选择相同地址族的网络");
     }
 
     #[tokio::test]

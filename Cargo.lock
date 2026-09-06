@@ -1040,7 +1040,7 @@ dependencies = [
 
 [[package]]
 name = "nexo-agent"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "anyhow",
  "clap",
@@ -1065,7 +1065,7 @@ dependencies = [
 
 [[package]]
 name = "nexo-core"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "base64 0.22.1",
  "hex",
@@ -1078,7 +1078,7 @@ dependencies = [
 
 [[package]]
 name = "nexo-headscale-adapter"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1090,7 +1090,7 @@ dependencies = [
 
 [[package]]
 name = "nexo-protocol"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "bytes",
  "nexo-core",
@@ -1100,7 +1100,7 @@ dependencies = [
 
 [[package]]
 name = "nexo-server"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "anyhow",
  "argon2",
@@ -1137,7 +1137,7 @@ dependencies = [
 
 [[package]]
 name = "nexo-tunnel"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "bytes",
  "futures-io",

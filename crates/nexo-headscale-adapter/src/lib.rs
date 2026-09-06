@@ -443,6 +443,13 @@ impl HeadscaleHttpAdapter {
         .await
     }
 
+    /// 永久删除已经撤销的设备组网节点，避免旧身份继续留在 Headscale 拓扑中。
+    pub async fn delete_node(&self, node_id: &str) -> Result<()> {
+        let path = format!("/api/v1/node/{}", urlencoding(node_id));
+        self.send_empty(self.request(Method::DELETE, &path), "删除设备组网节点")
+            .await
+    }
+
     pub async fn set_policy(&self, policy: &str) -> Result<()> {
         self.send_empty(
             self.request(Method::PUT, "/api/v1/policy")
@@ -482,47 +489,45 @@ impl HeadscaleHttpAdapter {
             .await?
             .ok_or_else(|| anyhow!("Headscale 节点 {node_id} 不存在"))?;
         let desired: BTreeSet<&str> = desired_prefixes.iter().map(String::as_str).collect();
-        // Headscale 的批准接口会替换完整列表；在节点尚未发布某个 Desired
-        // 前缀时先返回 Pending，避免把尚未发现的路由误当成已批准，或让控制
-        // 平面因为未知前缀直接返回错误。已经批准/提供服务的前缀可继续收敛。
-        let unavailable = desired.iter().find(|prefix| {
-            !node.available_routes.iter().any(|value| value == **prefix)
-                && !node.approved_routes.iter().any(|value| value == **prefix)
-                && !node.subnet_routes.iter().any(|value| value == **prefix)
-        });
-        if let Some(prefix) = unavailable {
-            return Ok(NodeRouteReport {
-                node_id: node_id.to_owned(),
-                available_routes: node.available_routes,
-                approved_routes: node.approved_routes,
-                subnet_routes: node.subnet_routes,
-                approved: false,
-                serving: false,
-                error_message: Some(format!("Headscale 尚未发现路由 {prefix}")),
-            });
+        // Headscale 的批准接口会替换完整列表。只批准节点已经广告或正在提供的
+        // Desired 前缀；尚未发现的前缀独立保持 Pending，不能阻塞同节点上其他
+        // 前缀的批准，也不能阻止失效 Nexo 前缀从完整批准列表中撤销。
+        let mut visible = Vec::new();
+        let mut pending = Vec::new();
+        for prefix in &desired {
+            if node.available_routes.iter().any(|value| value == *prefix)
+                || node.approved_routes.iter().any(|value| value == *prefix)
+                || node.subnet_routes.iter().any(|value| value == *prefix)
+            {
+                visible.push((*prefix).to_owned());
+            } else {
+                pending.push(*prefix);
+            }
         }
-        let merged = Self::merge_approved_routes(
-            &node.approved_routes,
-            desired_prefixes,
-            nexo_owned_prefixes,
-        );
+        let merged =
+            Self::merge_approved_routes(&node.approved_routes, &visible, nexo_owned_prefixes);
         let approved_node = self.approve_routes(node_id, &merged).await?;
-        let serving = desired.iter().all(|prefix| {
-            approved_node
-                .subnet_routes
+        let approved = pending.is_empty()
+            && desired
                 .iter()
-                .any(|candidate| candidate == prefix)
-        });
+                .all(|prefix| approved_node.approved_routes.iter().any(|v| v == *prefix));
+        let serving = pending.is_empty()
+            && desired.iter().all(|prefix| {
+                approved_node
+                    .subnet_routes
+                    .iter()
+                    .any(|candidate| candidate == *prefix)
+            });
         Ok(NodeRouteReport {
             node_id: node_id.to_owned(),
             available_routes: approved_node.available_routes.clone(),
             approved_routes: approved_node.approved_routes.clone(),
             subnet_routes: approved_node.subnet_routes.clone(),
-            approved: desired
-                .iter()
-                .all(|prefix| approved_node.approved_routes.iter().any(|v| v == prefix)),
+            approved,
             serving,
-            error_message: None,
+            error_message: pending
+                .first()
+                .map(|prefix| format!("Headscale 尚未发现路由 {prefix}")),
         })
     }
 }
@@ -578,6 +583,10 @@ pub trait HeadscaleControlPlane: Send + Sync {
 
     async fn expire_node(&self, _node_id: &str, _expiry: &str) -> Result<()> {
         Err(anyhow!("Headscale 节点停用 API 尚未配置"))
+    }
+
+    async fn delete_node(&self, _node_id: &str) -> Result<()> {
+        Err(anyhow!("Headscale 节点删除 API 尚未配置"))
     }
 
     async fn set_policy(&self, _policy: &str) -> Result<()> {
@@ -689,6 +698,10 @@ impl HeadscaleControlPlane for HeadscaleHttpAdapter {
         HeadscaleHttpAdapter::expire_node(self, node_id, expiry).await
     }
 
+    async fn delete_node(&self, node_id: &str) -> Result<()> {
+        HeadscaleHttpAdapter::delete_node(self, node_id).await
+    }
+
     async fn set_policy(&self, policy: &str) -> Result<()> {
         HeadscaleHttpAdapter::set_policy(self, policy).await
     }
@@ -746,6 +759,47 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
+    async fn read_http_request(stream: &mut tokio::net::TcpStream) -> String {
+        let mut request = Vec::new();
+        let mut buffer = [0_u8; 1024];
+        loop {
+            let count = stream.read(&mut buffer).await.expect("应能读取测试请求");
+            if count == 0 {
+                break;
+            }
+            request.extend_from_slice(&buffer[..count]);
+            let Some(header_end) = request.windows(4).position(|window| window == b"\r\n\r\n")
+            else {
+                continue;
+            };
+            let headers = String::from_utf8_lossy(&request[..header_end]);
+            let content_length = headers
+                .lines()
+                .find_map(|line| {
+                    line.to_ascii_lowercase()
+                        .strip_prefix("content-length:")
+                        .and_then(|value| value.trim().parse::<usize>().ok())
+                })
+                .unwrap_or_default();
+            if request.len() >= header_end + 4 + content_length {
+                break;
+            }
+        }
+        String::from_utf8(request).expect("测试请求应是 UTF-8")
+    }
+
+    async fn write_json_response(stream: &mut tokio::net::TcpStream, body: &str) {
+        let response = format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\nconnection: close\r\ncontent-length: {}\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        stream
+            .write_all(response.as_bytes())
+            .await
+            .expect("应返回测试响应");
+    }
+
     #[test]
     fn merge_keeps_non_nexo_routes_and_replaces_owned_routes() {
         let merged = HeadscaleHttpAdapter::merge_approved_routes(
@@ -754,6 +808,91 @@ mod tests {
             &["192.168.10.0/24".to_owned()],
         );
         assert_eq!(merged, vec!["10.0.0.0/24", "192.168.20.0/24"]);
+    }
+
+    #[tokio::test]
+    async fn pending_prefix_does_not_block_visible_approval_or_failed_withdrawal() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("测试 HTTP 监听器应能启动");
+        let address = listener.local_addr().expect("测试监听器应有地址");
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("应接受节点查询");
+            let request = read_http_request(&mut stream).await;
+            assert!(request.starts_with("GET /api/v1/node/7 "));
+            write_json_response(
+                &mut stream,
+                r#"{"node":{"id":"7","availableRoutes":["192.168.10.0/24"],"approvedRoutes":["10.0.0.0/24","2001:db8:dead::/64"],"subnetRoutes":[]}}"#,
+            )
+            .await;
+
+            let (mut stream, _) = listener.accept().await.expect("应接受路由批准请求");
+            let request = read_http_request(&mut stream).await;
+            assert!(request.starts_with("POST /api/v1/node/7/approve_routes "));
+            let body = request.split_once("\r\n\r\n").expect("请求应包含正文").1;
+            let payload: serde_json::Value = serde_json::from_str(body).expect("正文应为 JSON");
+            assert_eq!(
+                payload["routes"],
+                serde_json::json!(["10.0.0.0/24", "192.168.10.0/24"])
+            );
+            write_json_response(
+                &mut stream,
+                r#"{"node":{"id":"7","availableRoutes":["192.168.10.0/24"],"approvedRoutes":["10.0.0.0/24","192.168.10.0/24"],"subnetRoutes":["192.168.10.0/24"]}}"#,
+            )
+            .await;
+        });
+        let adapter = HeadscaleHttpAdapter::new(format!("http://{address}"), "test-secret")
+            .expect("测试适配器应能创建");
+        let report = adapter
+            .reconcile_node_routes(
+                "7",
+                &["192.168.10.0/24".to_owned(), "2001:db8:20::/64".to_owned()],
+                &[
+                    "192.168.10.0/24".to_owned(),
+                    "2001:db8:20::/64".to_owned(),
+                    "2001:db8:dead::/64".to_owned(),
+                ],
+            )
+            .await
+            .expect("可见前缀应独立收敛");
+        assert!(!report.approved);
+        assert!(!report.serving);
+        assert_eq!(
+            report.error_message.as_deref(),
+            Some("Headscale 尚未发现路由 2001:db8:20::/64")
+        );
+        assert!(report
+            .approved_routes
+            .contains(&"192.168.10.0/24".to_owned()));
+        assert!(report.subnet_routes.contains(&"192.168.10.0/24".to_owned()));
+        assert!(!report
+            .approved_routes
+            .contains(&"2001:db8:dead::/64".to_owned()));
+        server.await.expect("测试 HTTP 服务应完成");
+    }
+
+    #[tokio::test]
+    async fn delete_node_uses_official_delete_endpoint() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("测试 HTTP 监听器应能启动");
+        let address = listener.local_addr().expect("测试监听器应有地址");
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("应接受节点删除请求");
+            let request = read_http_request(&mut stream).await;
+            assert!(request.starts_with("DELETE /api/v1/node/42 "));
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nconnection: close\r\ncontent-length: 0\r\n\r\n")
+                .await
+                .expect("应返回节点删除响应");
+        });
+        let adapter = HeadscaleHttpAdapter::new(format!("http://{address}"), "test-secret")
+            .expect("测试适配器应能创建");
+        adapter
+            .delete_node("42")
+            .await
+            .expect("官方节点删除接口应成功");
+        server.await.expect("测试 HTTP 服务应完成");
     }
 
     #[test]

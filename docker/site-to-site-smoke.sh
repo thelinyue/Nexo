@@ -96,6 +96,7 @@ request_json() {
 
 post_json() { request_json POST "$1" "$2"; }
 put_json() { request_json PUT "$1" "$2"; }
+delete_json() { request_json DELETE "$1" '{}'; }
 
 expect_status() {
   local expected="$1"
@@ -600,4 +601,70 @@ if dc exec -T outside-probe curl --silent --show-error --noproxy '*' \
   exit 1
 fi
 echo "✓ 内部管理端口隔离通过"
+
+echo "按依赖顺序删除 Tunnel、Site Link、共享网络、设备和站点"
+for tunnel_id in "$http_tunnel" "$https_tunnel" "$tcp_tunnel"; do
+  delete_json "$HTTP_URL/api/v1/tunnels/$tunnel_id" \
+    | jq -e --arg id "$tunnel_id" '.id == $id and .deleted == true and .pending == false' \
+    >/dev/null
+done
+api "$HTTP_URL/api/v1/tunnels" | jq -e --arg http "$http_tunnel" --arg https "$https_tunnel" --arg tcp "$tcp_tunnel" \
+  '[.[] | select(.id == $http or .id == $https or .id == $tcp)] | length == 0' \
+  >/dev/null
+
+delete_json "$HTTP_URL/api/v1/site-links/$link" \
+  | jq -e --arg id "$link" '.id == $id and .deleted == false and .pending == true' \
+  >/dev/null
+wait_for "Site Link 已完成删除" \
+  "api '$HTTP_URL/api/v1/site-links' | jq -e --arg id '$link' '[.[] | select(.id == \$id)] | length == 0'" 180
+
+for network_id in "$home_network" "$office_network"; do
+  delete_json "$HTTP_URL/api/v1/site-networks/$network_id" \
+    | jq -e --arg id "$network_id" '.id == $id and .deleted == false and .pending == true' \
+    >/dev/null
+done
+wait_for "两侧共享网络已完成删除" \
+  "api '$HTTP_URL/api/v1/site-networks' | jq -e --arg home '$home_network' --arg office '$office_network' \
+    '[.[] | select(.id == \$home or .id == \$office)] | length == 0'" 180
+
+echo "确认删除互联和共享网络后双向 LAN 路由均已失效"
+if dc exec -T office-terminal curl --fail --silent --show-error --noproxy '*' \
+  --connect-timeout 3 --max-time 8 http://192.168.10.100:8800/source >/dev/null 2>&1; then
+  echo "删除 Site Link 和共享网络后仍可访问家庭 LAN" >&2
+  exit 1
+fi
+if dc exec -T home-terminal curl --fail --silent --show-error --noproxy '*' \
+  --connect-timeout 3 --max-time 8 http://192.168.20.100:8800/source >/dev/null 2>&1; then
+  echo "删除 Site Link 和共享网络后仍可访问办公室 LAN" >&2
+  exit 1
+fi
+echo "✓ 删除后双向 LAN 路由均已失效"
+
+delete_json "$HTTP_URL/api/v1/devices/$home_device" \
+  | jq -e --arg id "$home_device" '.id == $id and .deleted == true and .pending == false' \
+  >/dev/null
+delete_json "$HTTP_URL/api/v1/devices/$office_device" \
+  | jq -e --arg id "$office_device" '.id == $id and .deleted == true and .pending == false' \
+  >/dev/null
+wait_for "两台设备及 Headscale Node 已完成删除" \
+  "api '$HTTP_URL/api/v1/devices' | jq -e --arg home '$home_device' --arg office '$office_device' \
+    '[.[] | select(.id == \$home or .id == \$office)] | length == 0' && test \"\$(headscale_node_count)\" -eq 0" 120
+
+delete_json "$HTTP_URL/api/v1/sites/$home_site" \
+  | jq -e --arg id "$home_site" '.id == $id and .deleted == true and .pending == false' \
+  >/dev/null
+delete_json "$HTTP_URL/api/v1/sites/$office_site" \
+  | jq -e --arg id "$office_site" '.id == $id and .deleted == true and .pending == false' \
+  >/dev/null
+api "$HTTP_URL/api/v1/sites" | jq -e --arg home "$home_site" --arg office "$office_site" \
+  '[.[] | select(.id == $home or .id == $office)] | length == 0' >/dev/null
+api "$HTTP_URL/api/v1/devices" | jq -e --arg home "$home_device" --arg office "$office_device" \
+  '[.[] | select(.id == $home or .id == $office)] | length == 0' >/dev/null
+api "$HTTP_URL/api/v1/site-networks" | jq -e --arg home "$home_network" --arg office "$office_network" \
+  '[.[] | select(.id == $home or .id == $office)] | length == 0' >/dev/null
+api "$HTTP_URL/api/v1/site-links" | jq -e --arg id "$link" \
+  '[.[] | select(.id == $id)] | length == 0' >/dev/null
+api "$HTTP_URL/api/v1/tunnels" | jq -e --arg http "$http_tunnel" --arg https "$https_tunnel" --arg tcp "$tcp_tunnel" \
+  '[.[] | select(.id == $http or .id == $https or .id == $tcp)] | length == 0' >/dev/null
+echo "✓ 删除资源已从相关 API 列表中移除"
 echo "第二阶段 Linux Docker 公网访问和 Site-to-Site 完整验收通过"

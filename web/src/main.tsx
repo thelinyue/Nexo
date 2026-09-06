@@ -9,6 +9,7 @@ import {
   CheckCircle2,
   ChevronDown,
   CircleAlert,
+  Copy,
   Eye,
   EyeOff,
   Globe2,
@@ -24,6 +25,7 @@ import {
   Settings,
   Share2,
   ShieldCheck,
+  Trash2,
   UserPlus,
   WifiOff,
   X,
@@ -150,7 +152,15 @@ type Tunnel = {
   apply_error: string | null;
   desired_revision: number;
   applied_revision: number;
+  deletion_pending: boolean;
   public_address: string | null;
+};
+
+type DeleteResponse = {
+  deleted: boolean;
+  pending: boolean;
+  id: string;
+  message: string;
 };
 
 type PublicEntry = {
@@ -172,6 +182,8 @@ type PublicEntry = {
 };
 
 type GatewayReport = {
+  ipv4_forwarding: boolean;
+  ipv6_forwarding: boolean;
   subnet_gateway: "ready" | "unavailable";
   site_gateway: "ready" | "unavailable";
   local_networks?: LocalNetwork[];
@@ -255,6 +267,7 @@ type SiteLink = {
   health_status: "ready" | "degraded" | "failed" | "disabled";
   health_error: string | null;
   route_confirmations?: { site_id: string; confirmed_at: number }[];
+  deletion_pending: boolean;
 };
 
 type SiteNetwork = {
@@ -274,6 +287,7 @@ type SiteNetwork = {
   apply_error: string | null;
   health_status: SiteLink["health_status"];
   health_error: string | null;
+  deletion_pending: boolean;
 };
 
 const emptyOverview: Overview = {
@@ -314,8 +328,13 @@ function Dashboard({
   const [showSiteForm, setShowSiteForm] = useState(false);
   const [editingTunnel, setEditingTunnel] = useState<Tunnel | null>(null);
   const [editTrigger, setEditTrigger] = useState<HTMLButtonElement | null>(null);
+  const [deletingTunnel, setDeletingTunnel] = useState<Tunnel | null>(null);
+  const [deleteTunnelTrigger, setDeleteTunnelTrigger] = useState<HTMLButtonElement | null>(null);
   const [showEnrollmentForm, setShowEnrollmentForm] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [statusMessage, setStatusMessage] = useState<string | null>(null);
+  const [deletingResource, setDeletingResource] = useState<string | null>(null);
+  const previousPendingDeletionIds = useRef<Set<string>>(new Set());
 
   useEffect(() => {
     const updateRoute = () => setRoute(readRoute());
@@ -398,6 +417,29 @@ function Dashboard({
       await refreshCurrentPage();
     } catch (requestError) {
       setError(requestError instanceof Error ? requestError.message : "暂时无法批准设备");
+    }
+  }, [request, refreshCurrentPage]);
+
+  const deleteResource = useCallback(async (
+    resourceKey: string,
+    path: string,
+    confirmation: string,
+    fallback: string,
+  ) => {
+    if (!window.confirm(confirmation)) return;
+    setDeletingResource(resourceKey);
+    setError(null);
+    setStatusMessage(null);
+    try {
+      const response = await request(path, { method: "DELETE" });
+      const body: unknown = await response.json().catch(() => null);
+      if (!response.ok) throw new Error(readApiError(body, fallback));
+      setStatusMessage((body as DeleteResponse).message);
+      await refreshCurrentPage();
+    } catch (requestError) {
+      setError(requestError instanceof Error ? requestError.message : fallback);
+    } finally {
+      setDeletingResource(null);
     }
   }, [request, refreshCurrentPage]);
 
@@ -496,8 +538,40 @@ function Dashboard({
     return () => window.clearInterval(timer);
   }, [hasPendingGatewayChanges, refreshCurrentPage, route]);
 
+  const pendingDeletionIds = [
+    ...siteNetworks.filter((item) => item.deletion_pending).map((item) => `network:${item.id}`),
+    ...siteLinks.filter((item) => item.deletion_pending).map((item) => `link:${item.id}`),
+  ];
+  const hasVisiblePendingDeletion = pendingDeletionIds.length > 0
+    && (route === "#/overview" || route === "#/networks" || route === "#/public-access/tunnels");
+  useEffect(() => {
+    if (!hasVisiblePendingDeletion) return;
+    const timer = window.setInterval(() => void refreshCurrentPage(), 4000);
+    return () => window.clearInterval(timer);
+  }, [hasVisiblePendingDeletion, refreshCurrentPage]);
+
+  useEffect(() => {
+    const current = new Set(pendingDeletionIds);
+    if ([...previousPendingDeletionIds.current].some((id) => !current.has(id))) {
+      setStatusMessage("资源删除已完成");
+    }
+    previousPendingDeletionIds.current = current;
+  }, [pendingDeletionIds.join("|")]);
+
   const applyTunnelUpdate = useCallback((updated: Tunnel) => {
     setTunnels((current) => current.map((tunnel) => tunnel.id === updated.id ? updated : tunnel));
+    void refreshCurrentPage();
+  }, [refreshCurrentPage]);
+
+  const applyTunnelDeletion = useCallback((response: DeleteResponse) => {
+    setTunnels((current) => current.filter((tunnel) => tunnel.id !== response.id));
+    setStatusMessage(response.message);
+    setDeletingTunnel(null);
+    setDeleteTunnelTrigger(null);
+    // 等待 dialog 卸载时的焦点恢复完成，再把焦点送到更新后的列表标题。
+    window.requestAnimationFrame(() => window.requestAnimationFrame(() => {
+      document.querySelector<HTMLElement>("#tunnel-list-heading")?.focus();
+    }));
     void refreshCurrentPage();
   }, [refreshCurrentPage]);
 
@@ -509,6 +583,7 @@ function Dashboard({
       {mobileNavigationOpen && <MobileNavigation route={route} onClose={() => setMobileNavigationOpen(false)} />}
 
       <main className="content" id="main-content" aria-busy={loading}>
+        {statusMessage && <p className="action-status" role="status">{statusMessage}</p>}
         <div className="page-transition" key={route}>
           {route === "#/overview" && (
             <OverviewPage
@@ -536,6 +611,13 @@ function Dashboard({
               onApprove={approveEnrollment}
               request={request}
               onRefresh={refreshCurrentPage}
+              deletingResource={deletingResource}
+              onDeleteDevice={(device) => void deleteResource(
+                `device:${device.id}`,
+                `/api/v1/devices/${encodeURIComponent(device.id)}`,
+                `确定删除设备“${device.name}”吗？设备身份和组网节点会立即撤销，原 Agent 必须重新入网。`,
+                "暂时无法删除设备",
+              )}
             />
           )}
           {route.startsWith("#/public-access/") && (
@@ -552,6 +634,10 @@ function Dashboard({
               onRefresh={refreshCurrentPage}
               onTunnelChanged={applyTunnelUpdate}
               onEdit={(tunnel, trigger) => { setEditingTunnel(tunnel); setEditTrigger(trigger); }}
+              onDeleteTunnel={(tunnel, trigger) => {
+                setDeletingTunnel(tunnel);
+                setDeleteTunnelTrigger(trigger);
+              }}
             />
           )}
           {route === "#/networks" && (
@@ -576,6 +662,25 @@ function Dashboard({
               onConfirmRoute={confirmRoute}
               actionNetworkId={actionNetworkId}
               actionLinkId={actionLinkId}
+              deletingResource={deletingResource}
+              onDeleteSite={(site) => void deleteResource(
+                `site:${site.id}`,
+                `/api/v1/sites/${encodeURIComponent(site.id)}`,
+                `确定删除站点“${site.name}”吗？仅空站点可以删除，此操作无法撤销。`,
+                "暂时无法删除站点",
+              )}
+              onDeleteNetwork={(network) => void deleteResource(
+                `network:${network.id}`,
+                `/api/v1/site-networks/${encodeURIComponent(network.id)}`,
+                `确定删除共享网络“${network.name}”吗？路由会先撤销，确认完成后永久删除。`,
+                "暂时无法删除共享网络",
+              )}
+              onDeleteLink={(link) => void deleteResource(
+                `link:${link.id}`,
+                `/api/v1/site-links/${encodeURIComponent(link.id)}`,
+                `确定删除“${link.left_site_name} ↔ ${link.right_site_name}”的互联关系吗？两侧路由撤销后将永久删除。`,
+                "暂时无法删除站点互联",
+              )}
               onRefresh={refreshCurrentPage}
             />
           )}
@@ -593,6 +698,15 @@ function Dashboard({
           returnFocus={editTrigger}
           onUpdated={applyTunnelUpdate}
           onClose={() => { setEditingTunnel(null); setEditTrigger(null); }}
+        />
+      )}
+      {deletingTunnel && (
+        <DeleteTunnelDialog
+          tunnel={deletingTunnel}
+          request={request}
+          returnFocus={deleteTunnelTrigger}
+          onDeleted={applyTunnelDeletion}
+          onClose={() => { setDeletingTunnel(null); setDeleteTunnelTrigger(null); }}
         />
       )}
     </div>
@@ -847,6 +961,8 @@ function DevicesPage({
   onApprove,
   request,
   onRefresh,
+  deletingResource,
+  onDeleteDevice,
 }: {
   route: AppRoute;
   devices: Device[];
@@ -860,6 +976,8 @@ function DevicesPage({
   onApprove: (enrollment: Enrollment) => Promise<void>;
   request: ApiRequest;
   onRefresh: () => Promise<void>;
+  deletingResource: string | null;
+  onDeleteDevice: (device: Device) => void;
 }) {
   const pending = enrollments.filter((item) => item.status === "awaiting_approval");
   const enrollmentView = route === "#/devices/enrollments";
@@ -903,7 +1021,7 @@ function DevicesPage({
       ) : (
         <section className="panel page-panel">
           <div className="panel-heading"><div><p className="eyebrow">设备状态</p><h2>{devices.length} 台设备</h2></div><span className="status-pill ready"><i />当前状态</span></div>
-          {devices.length === 0 ? <EmptyState icon={Server} title="还没有加入设备" detail="请从入网请求页面添加第一台设备。" /> : <div className="device-list">{devices.map((device) => <DeviceRow key={device.id} device={device} />)}</div>}
+          {devices.length === 0 ? <EmptyState icon={Server} title="还没有加入设备" detail="请从入网请求页面添加第一台设备。" /> : <div className="device-list">{devices.map((device) => <DeviceRow key={device.id} device={device} deleting={deletingResource === `device:${device.id}`} onDelete={() => onDeleteDevice(device)} />)}</div>}
         </section>
       )}
     </>
@@ -923,6 +1041,7 @@ function PublicAccessPage({
   onRefresh,
   onTunnelChanged,
   onEdit,
+  onDeleteTunnel,
 }: {
   route: AppRoute;
   publicEntry: PublicEntry | null;
@@ -936,6 +1055,7 @@ function PublicAccessPage({
   onRefresh: () => Promise<void>;
   onTunnelChanged: (updated: Tunnel) => void;
   onEdit: (tunnel: Tunnel, trigger: HTMLButtonElement) => void;
+  onDeleteTunnel: (tunnel: Tunnel, trigger: HTMLButtonElement) => void;
 }) {
   const tunnelsView = route === "#/public-access/tunnels";
   const [showEntrySettings, setShowEntrySettings] = useState(false);
@@ -1007,7 +1127,7 @@ function PublicAccessPage({
         {publicEntry?.apply_error && <p className="network-error">{publicEntry.apply_error}</p>}
       </section>}
       {tunnelsView && <section className="panel page-panel">
-        <div className="panel-heading"><div><p className="eyebrow">穿透服务</p><h2>{tunnels.length} 个穿透服务</h2></div></div>
+        <div className="panel-heading"><div><p className="eyebrow">穿透服务</p><h2 id="tunnel-list-heading" tabIndex={-1}>{tunnels.length} 个穿透服务</h2></div></div>
         {tunnels.length === 0 ? (
           <EmptyState icon={Globe2} title="还没有穿透服务" detail="添加 Web 服务或 TCP 端口后，配置生效状态会显示在这里。" />
         ) : (
@@ -1019,6 +1139,7 @@ function PublicAccessPage({
                 request={request}
                 onChanged={onTunnelChanged}
                 onEdit={(trigger) => onEdit(tunnel, trigger)}
+                onDelete={(trigger) => onDeleteTunnel(tunnel, trigger)}
               />
             ))}
           </div>
@@ -1069,6 +1190,10 @@ function NetworksPage({
   onConfirmRoute,
   actionNetworkId,
   actionLinkId,
+  deletingResource,
+  onDeleteSite,
+  onDeleteNetwork,
+  onDeleteLink,
   onRefresh,
 }: {
   sites: Site[];
@@ -1091,6 +1216,10 @@ function NetworksPage({
   onConfirmRoute: (link: SiteLink, siteId: string) => Promise<void>;
   actionNetworkId: string | null;
   actionLinkId: string | null;
+  deletingResource: string | null;
+  onDeleteSite: (site: Site) => void;
+  onDeleteNetwork: (network: SiteNetwork) => void;
+  onDeleteLink: (link: SiteLink) => void;
   onRefresh: () => Promise<void>;
 }) {
   const [expandedSiteIds, setExpandedSiteIds] = useState<Set<string>>(() => new Set());
@@ -1143,25 +1272,30 @@ function NetworksPage({
               return (
                 <article className={`network-site${expanded ? " expanded" : ""}`} key={site.id}>
                   <div className="network-site-summary">
-                    <div className="network-site-identity"><span className="site-icon"><Building2 size={18} aria-hidden="true" /></span><div><strong>{site.name}</strong><span>{siteDevices.length} 台设备</span></div></div>
+                    <div className="network-site-identity"><span className="site-icon"><Building2 size={18} aria-hidden="true" /></span><div className="network-site-identity-text"><strong>{site.name}</strong><span>{siteDevices.length} 台设备</span></div></div>
                     <div className="network-site-fact"><span className="network-site-label">网关设备</span><strong>{gatewayDevices.length ? gatewayDevices.map((device) => device.name).join("、") : "尚未就绪"}</strong></div>
                     <div className="network-site-fact"><span className="network-site-label">共享网络</span><strong>{networks.length} 个{networkIssues ? ` · ${networkIssues} 个异常` : " · 无异常"}</strong></div>
                     <div className="network-site-fact"><span className="network-site-label">互联关系</span><strong>{connectedSites.size} 个站点{linkIssues ? ` · ${linkIssues} 个异常` : " · 无异常"}</strong></div>
-                    <button className="network-site-toggle" type="button" aria-expanded={expanded} aria-controls={detailsId} aria-label={`${expanded ? "收起" : "展开"}${site.name}`} onClick={() => toggleSite(site.id)}>
-                      <ChevronDown size={18} aria-hidden="true" />
-                    </button>
+                    <div className="network-site-controls">
+                      <button className="delete-icon-button" type="button" aria-label={`删除站点${site.name}`} title="删除站点" disabled={deletingResource === `site:${site.id}`} onClick={() => onDeleteSite(site)}>
+                        <Trash2 size={17} aria-hidden="true" />
+                      </button>
+                      <button className="network-site-toggle" type="button" aria-expanded={expanded} aria-controls={detailsId} aria-label={`${expanded ? "收起" : "展开"}${site.name}`} onClick={() => toggleSite(site.id)}>
+                        <ChevronDown size={18} aria-hidden="true" />
+                      </button>
+                    </div>
                   </div>
                   {expanded && (
                     <div className="network-site-details" id={detailsId}>
                       <section className="network-inline-section" aria-labelledby={`${detailsId}-networks`}>
                         <div className="network-inline-heading"><div><h2 id={`${detailsId}-networks`}>共享网络</h2><p>本站向已连接站点开放的局域网网段。</p></div><button className="secondary-button compact-button" type="button" onClick={() => onOpenNetworkForm(site.id)} disabled={!canAddNetwork}><Plus size={15} aria-hidden="true" />添加共享网络</button></div>
                         {!canAddNetwork && <p className="network-prerequisite">需要本站有一台共享网络能力就绪、且已探测到本地网段的设备。</p>}
-                        {networks.length === 0 ? <p className="network-inline-empty">本站还没有共享网络。</p> : <div className="network-list">{networks.map((network) => <SiteNetworkRow key={network.id} network={network} actionPending={actionNetworkId === network.id} onToggle={() => void onToggleNetwork(network)} />)}</div>}
+                        {networks.length === 0 ? <p className="network-inline-empty">本站还没有共享网络。</p> : <div className="network-list">{networks.map((network) => <SiteNetworkRow key={network.id} network={network} actionPending={actionNetworkId === network.id || deletingResource === `network:${network.id}`} onToggle={() => void onToggleNetwork(network)} onDelete={() => onDeleteNetwork(network)} />)}</div>}
                       </section>
                       <section className="network-inline-section" aria-labelledby={`${detailsId}-links`}>
                         <div className="network-inline-heading"><div><h2 id={`${detailsId}-links`}>互联关系</h2><p>本站与其他站点的连接，以及本站需要配置的静态路由。</p></div><button className="secondary-button compact-button" type="button" onClick={() => onOpenLinkForm(site.id)} disabled={!canConnect}><Plus size={15} aria-hidden="true" />连接站点</button></div>
                         {!canConnect && <p className="network-prerequisite">{enabledNetworks.length === 0 ? "请先为本站添加并启用一个共享网络。" : "需要另一个站点具备已启用的共享网络。"}</p>}
-                        {links.length === 0 ? <p className="network-inline-empty">本站还没有连接其他站点。</p> : <div className="link-list">{links.map((link) => <SiteLinkCard key={link.id} link={link} currentSiteId={site.id} actionPending={actionLinkId === link.id} onToggle={() => void onToggleLink(link)} onRecheck={() => void onRecheckLink(link)} onConfirmRoute={(siteId) => void onConfirmRoute(link, siteId)} />)}</div>}
+                        {links.length === 0 ? <p className="network-inline-empty">本站还没有连接其他站点。</p> : <div className="link-list">{links.map((link) => <SiteLinkCard key={link.id} link={link} currentSiteId={site.id} actionPending={actionLinkId === link.id || deletingResource === `link:${link.id}`} onToggle={() => void onToggleLink(link)} onRecheck={() => void onRecheckLink(link)} onConfirmRoute={(siteId) => void onConfirmRoute(link, siteId)} onDelete={() => onDeleteLink(link)} />)}</div>}
                       </section>
                     </div>
                   )}
@@ -1190,7 +1324,7 @@ function hasGatewayIssue(item: SiteNetwork | SiteLink): boolean {
 }
 
 /**
- * 网络创建流程共用的模态外壳。原生 dialog 负责焦点约束；关闭时把焦点
+ * 表单与危险确认共用的模态外壳。原生 dialog 负责焦点约束；关闭时把焦点
  * 送回触发按钮，提交中的表单则拒绝 Esc 和遮罩关闭，避免请求状态丢失。
  */
 function FormDialog({
@@ -1200,6 +1334,9 @@ function FormDialog({
   onClose,
   children,
   returnFocus: explicitReturnFocus,
+  role,
+  compact = false,
+  initialFocusSelector,
 }: {
   eyebrow: string;
   title: string;
@@ -1207,6 +1344,9 @@ function FormDialog({
   onClose: () => void;
   children: ReactNode;
   returnFocus?: HTMLElement | null;
+  role?: "dialog" | "alertdialog";
+  compact?: boolean;
+  initialFocusSelector?: string;
 }) {
   const dialogRef = useRef<HTMLDialogElement>(null);
   const returnFocus = useRef<HTMLElement | null>(explicitReturnFocus ?? document.activeElement as HTMLElement | null);
@@ -1214,21 +1354,25 @@ function FormDialog({
   const submitting = () => dialogRef.current?.querySelector('[aria-busy="true"]') !== null;
   useEffect(() => {
     const dialog = dialogRef.current;
-    if (dialog && !dialog.open) dialog.showModal();
+    if (dialog && !dialog.open) {
+      dialog.showModal();
+      if (initialFocusSelector) dialog.querySelector<HTMLElement>(initialFocusSelector)?.focus();
+    }
     return () => {
       if (dialog?.open) dialog.close();
       returnFocus.current?.focus();
     };
-  }, []);
+  }, [initialFocusSelector]);
   return (
     <dialog
       ref={dialogRef}
       className="form-dialog"
+      role={role}
       aria-labelledby={titleId.current}
       onCancel={(event) => { event.preventDefault(); if (!submitting()) onClose(); }}
       onClick={(event) => { if (event.target === event.currentTarget && !submitting()) onClose(); }}
     >
-      <div className="form-dialog-surface" onClick={(event) => event.stopPropagation()}>
+      <div className={`form-dialog-surface${compact ? " compact" : ""}`} onClick={(event) => event.stopPropagation()}>
         <header className="form-dialog-header">
           <div><p className="eyebrow">{eyebrow}</p><h2 id={titleId.current}>{title}</h2><p>{description}</p></div>
           <button className="icon-button" type="button" aria-label={`关闭${title}窗口`} onClick={() => { if (!submitting()) onClose(); }}>
@@ -1400,10 +1544,11 @@ function Metric({ label, value, hint }: { label: string; value: number; hint: st
   );
 }
 
-function DeviceRow({ device }: { device: Device }) {
+function DeviceRow({ device, deleting, onDelete }: { device: Device; deleting: boolean; onDelete: () => void }) {
   const online = device.status === "online";
   const subnetReady = device.gateway_report?.subnet_gateway === "ready";
   const siteReady = device.gateway_report?.site_gateway === "ready";
+  const familyAvailability = device.gateway_report ? gatewayFamilyAvailability(device.gateway_report) : null;
   return (
     <div className="device-row">
       <span className={`device-avatar ${online ? "online" : ""}`}>{device.name.slice(0, 1).toUpperCase()}</span>
@@ -1416,14 +1561,35 @@ function DeviceRow({ device }: { device: Device }) {
         <span className={`capability ${device.mesh_status === "connected" ? "ready" : ""}`}>网络互联：{meshStatusLabel(device.mesh_status)}</span>
         {device.mesh_address && <span className="capability">{device.mesh_address}</span>}
         {device.gateway_report && (
-          <span className={`capability ${subnetReady ? "ready" : ""}`}>共享网络 {subnetReady ? "可用" : "待检查"}</span>
+          <span className={`capability ${subnetReady ? "ready" : ""}`}>共享网络 {subnetReady && familyAvailability ? familyAvailability : "待检查"}</span>
         )}
         {device.gateway_report && (
-          <span className={`capability ${siteReady ? "ready" : ""}`}>站点互联 {siteReady ? "可用" : "待检查"}</span>
+          <span className={`capability ${siteReady ? "ready" : ""}`}>站点互联 {siteReady && familyAvailability ? familyAvailability : "待检查"}</span>
         )}
       </div>
+      <button className="delete-icon-button" type="button" aria-label={deleting ? `正在删除设备${device.name}` : `删除设备${device.name}`} aria-busy={deleting} title="删除设备" disabled={deleting} onClick={onDelete}>
+        <Trash2 size={17} aria-hidden="true" />
+      </button>
     </div>
   );
+}
+
+function networkAddressFamily(prefix: string): "ipv4" | "ipv6" {
+  return prefix.includes(":") ? "ipv6" : "ipv4";
+}
+
+function forwardingRequirement(report: GatewayReport, prefix: string): string | null {
+  if (networkAddressFamily(prefix) === "ipv6") {
+    return report.ipv6_forwarding ? null : "需开启 IPv6 转发";
+  }
+  return report.ipv4_forwarding ? null : "需开启 IPv4 转发";
+}
+
+function gatewayFamilyAvailability(report: GatewayReport): string | null {
+  if (report.ipv4_forwarding && report.ipv6_forwarding) return "IPv4/IPv6 可用";
+  if (report.ipv4_forwarding) return "IPv4 可用";
+  if (report.ipv6_forwarding) return "IPv6 可用";
+  return null;
 }
 
 /**
@@ -1457,7 +1623,12 @@ function CreateSiteNetworkForm({
   );
   const selectedDevice = eligibleDevices.find((device) => device.id === deviceId);
   const localNetworks = selectedDevice?.gateway_report?.local_networks ?? [];
-  const selectedNetwork = localNetworks.find((network) => `${network.interface_id}|${network.prefix}` === networkKey);
+  const selectedNetworkCandidate = localNetworks.find((network) => `${network.interface_id}|${network.prefix}` === networkKey);
+  const selectedNetwork = selectedNetworkCandidate
+    && selectedDevice?.gateway_report
+    && !forwardingRequirement(selectedDevice.gateway_report, selectedNetworkCandidate.prefix)
+    ? selectedNetworkCandidate
+    : undefined;
 
   /** Agent 能力更新后清空失效选择，避免提交已经不存在的设备状态。 */
   useEffect(() => {
@@ -1468,10 +1639,14 @@ function CreateSiteNetworkForm({
   }, [deviceId, eligibleDevices]);
 
   useEffect(() => {
-    if (networkKey && !localNetworks.some((network) => `${network.interface_id}|${network.prefix}` === networkKey)) {
+    if (networkKey && !localNetworks.some((network) => {
+      const matches = `${network.interface_id}|${network.prefix}` === networkKey;
+      return matches && selectedDevice?.gateway_report
+        && !forwardingRequirement(selectedDevice.gateway_report, network.prefix);
+    })) {
       setNetworkKey("");
     }
-  }, [localNetworks, networkKey]);
+  }, [localNetworks, networkKey, selectedDevice]);
 
   return (
     <form
@@ -1549,7 +1724,10 @@ function CreateSiteNetworkForm({
             <option value="">{deviceId ? "选择已探测网段" : "先选择设备"}</option>
             {localNetworks.map((network) => {
               const value = `${network.interface_id}|${network.prefix}`;
-              return <option key={value} value={value}>{network.prefix} · {network.interface_id}</option>;
+              const requirement = selectedDevice?.gateway_report
+                ? forwardingRequirement(selectedDevice.gateway_report, network.prefix)
+                : null;
+              return <option key={value} value={value} disabled={Boolean(requirement)}>{network.prefix} · {network.interface_id}{requirement ? ` · ${requirement}` : ""}</option>;
             })}
           </select>
         </label>
@@ -1570,7 +1748,7 @@ function CreateSiteNetworkForm({
   );
 }
 
-/** 站点互联创建表单：两侧只允许选择已启用的共享网络，冲突由服务端最终裁决。 */
+/** 站点互联创建表单：两侧只允许选择已启用且地址族相同的共享网络。 */
 function CreateSiteLinkForm({
   sourceSiteId,
   sites,
@@ -1589,18 +1767,28 @@ function CreateSiteLinkForm({
   const availableNetworks = siteNetworks.filter((network) => network.enabled);
   const leftSiteId = sourceSiteId;
   const leftSite = sites.find((site) => site.id === leftSiteId);
-  const targetSites = sites.filter((site) =>
+  const candidateTargetSites = sites.filter((site) =>
     site.id !== leftSiteId
     && site.tenant_id === leftSite?.tenant_id
     && availableNetworks.some((network) => network.site_id === site.id),
   );
-  const [rightSiteId, setRightSiteId] = useState(targetSites[0]?.id ?? "");
+  const [rightSiteId, setRightSiteId] = useState(candidateTargetSites[0]?.id ?? "");
   const [leftNetworkId, setLeftNetworkId] = useState("");
   const [rightNetworkId, setRightNetworkId] = useState("");
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const leftNetworks = availableNetworks.filter((network) => network.site_id === leftSiteId);
-  const rightNetworks = availableNetworks.filter((network) => network.site_id === rightSiteId);
+  const selectedLeftNetwork = leftNetworks.find((network) => network.id === leftNetworkId);
+  const targetSites = candidateTargetSites.filter((site) => !selectedLeftNetwork || availableNetworks.some(
+    (network) => network.site_id === site.id
+      && networkAddressFamily(network.desired_prefix) === networkAddressFamily(selectedLeftNetwork.desired_prefix),
+  ));
+  const rightNetworks = availableNetworks.filter((network) =>
+    network.site_id === rightSiteId
+    && (!selectedLeftNetwork
+      || networkAddressFamily(network.desired_prefix) === networkAddressFamily(selectedLeftNetwork.desired_prefix)),
+  );
+  const selectedRightNetwork = rightNetworks.find((network) => network.id === rightNetworkId);
   const rightSite = sites.find((site) => site.id === rightSiteId);
 
   /**
@@ -1633,7 +1821,7 @@ function CreateSiteLinkForm({
       aria-busy={submitting}
       onSubmit={async (event) => {
         event.preventDefault();
-        if (!leftSite || !rightSite || !leftNetworkId || !rightNetworkId) {
+        if (!leftSite || !rightSite || !selectedLeftNetwork || !selectedRightNetwork) {
           setError("请先选择两侧站点和共享网络");
           return;
         }
@@ -1643,6 +1831,10 @@ function CreateSiteLinkForm({
         }
         if (leftSite.tenant_id !== rightSite.tenant_id) {
           setError("暂不支持跨租户建立站点互联");
+          return;
+        }
+        if (networkAddressFamily(selectedLeftNetwork.desired_prefix) !== networkAddressFamily(selectedRightNetwork.desired_prefix)) {
+          setError("站点互联两侧必须选择相同地址族的网络");
           return;
         }
         setSubmitting(true);
@@ -1707,7 +1899,7 @@ function CreateSiteLinkForm({
       </fieldset>
       {error && <p className="form-error" role="alert">{error}</p>}
       <div className="form-footer">
-        <span className="form-hint">相同或重叠网段会被服务端阻止，并显示冲突原因。</span>
+        <span className="form-hint">仅可连接相同地址族的网络；相同或重叠网段会被服务端阻止。</span>
         <div className="form-actions">
           <button className="secondary-button" type="button" onClick={onCancel} disabled={submitting}>取消</button>
           <button className="primary-button" type="submit" disabled={submitting || !leftNetworkId || !rightNetworkId}>
@@ -1719,7 +1911,7 @@ function CreateSiteLinkForm({
   );
 }
 
-const RELEASE_AGENT_IMAGE = "ghcr.io/thelinyue/nexo-agent:0.1.4";
+const RELEASE_AGENT_IMAGE = "ghcr.io/thelinyue/nexo-agent:0.1.5";
 
 function buildAgentCompose(serverUrl: string, token: string): string {
   return `name: nexo-agent
@@ -2282,28 +2474,142 @@ function EditTunnelDialog({
   );
 }
 
+/** 仅把浏览器能够安全导航的 HTTP/HTTPS 地址暴露为链接。 */
+function navigableWebAddress(publicAddress: string | null): string | null {
+  if (!publicAddress) return null;
+  try {
+    const protocol = new URL(publicAddress).protocol;
+    return protocol === "http:" || protocol === "https:" ? publicAddress : null;
+  } catch {
+    return null;
+  }
+}
+
+/** 穿透服务永久删除使用独立确认窗，避免与可恢复的开关操作混淆。 */
+function DeleteTunnelDialog({
+  tunnel,
+  request,
+  returnFocus,
+  onDeleted,
+  onClose,
+}: {
+  tunnel: Tunnel;
+  request: ApiRequest;
+  returnFocus: HTMLButtonElement | null;
+  onDeleted: (response: DeleteResponse) => void;
+  onClose: () => void;
+}) {
+  const [submitting, setSubmitting] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  return (
+    <FormDialog
+      eyebrow="危险操作"
+      title="删除穿透服务"
+      description={`“${tunnel.name}”的公网入口和服务端配置将立即永久删除。`}
+      role="alertdialog"
+      compact
+      initialFocusSelector="[data-delete-cancel]"
+      returnFocus={returnFocus}
+      onClose={onClose}
+    >
+      <form className="delete-confirmation-form" aria-busy={submitting} onSubmit={async (event) => {
+        event.preventDefault();
+        setSubmitting(true);
+        setError(null);
+        try {
+          const response = await request(`/api/v1/tunnels/${encodeURIComponent(tunnel.id)}`, { method: "DELETE" });
+          const body: unknown = await response.json().catch(() => null);
+          if (!response.ok) throw new Error(readApiError(body, "暂时无法删除穿透服务"));
+          const deletion = body as DeleteResponse | null;
+          if (!deletion || deletion.deleted !== true || deletion.pending !== false || deletion.id !== tunnel.id) {
+            throw new Error("服务端未确认穿透服务已永久删除");
+          }
+          onDeleted(deletion);
+        } catch (requestError) {
+          setError(requestError instanceof Error ? requestError.message : "暂时无法删除穿透服务");
+          setSubmitting(false);
+        }
+      }}>
+        <div className="delete-confirmation-copy">
+          <AlertTriangle size={20} aria-hidden="true" />
+          <p>此操作无法恢复。设备离线不影响删除；设备下次连接时会自动清理旧配置。</p>
+        </div>
+        {error && <p className="form-error" role="alert">{error}</p>}
+        <div className="dialog-actions">
+          <button className="secondary-button" type="button" data-delete-cancel disabled={submitting} onClick={onClose}>取消</button>
+          <button className="danger-button" type="submit" disabled={submitting}>
+            <Trash2 size={16} aria-hidden="true" />{submitting ? "删除中…" : "永久删除"}
+          </button>
+        </div>
+      </form>
+    </FormDialog>
+  );
+}
+
 function TunnelRow({
   tunnel,
   request,
   onChanged,
   onEdit,
+  onDelete,
 }: {
   tunnel: Tunnel;
   request: ApiRequest;
   onChanged: (updated: Tunnel) => void;
   onEdit: (trigger: HTMLButtonElement) => void;
+  onDelete: (trigger: HTMLButtonElement) => void;
 }) {
   const [pending, setPending] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const statusKind = !tunnel.enabled ? "disabled" : tunnel.apply_status === "ready" ? "ready" : tunnel.apply_status === "failed" ? "failed" : "working";
+  const [copyState, setCopyState] = useState<"idle" | "copied" | "failed">("idle");
+  const actionDisabled = pending || tunnel.deletion_pending;
+  const statusKind = tunnel.deletion_pending ? "working" : !tunnel.enabled ? "disabled" : tunnel.apply_status === "ready" ? "ready" : tunnel.apply_status === "failed" ? "failed" : "working";
+  const webAddress = navigableWebAddress(tunnel.public_address);
+
+  useEffect(() => {
+    if (copyState !== "copied") return;
+    const timeout = window.setTimeout(() => setCopyState("idle"), 2000);
+    return () => window.clearTimeout(timeout);
+  }, [copyState]);
+
   return (
     <div className="tunnel-row">
       <div className="tunnel-identity"><strong>{tunnel.name}</strong><span>{tunnel.device_name} · {tunnel.local_address}:{tunnel.local_port}</span></div>
-      <div className="tunnel-address"><span>{tunnel.protocol.toUpperCase()}</span><code>{tunnel.public_address ?? "等待配置生效"}</code></div>
+      <div className="tunnel-address">
+        <span>访问地址</span>
+        <div className="tunnel-address-value">
+          {webAddress ? (
+            <a className="tunnel-address-link" href={webAddress} target="_blank" rel="noopener noreferrer"><code>{webAddress}</code></a>
+          ) : (
+            <code>{tunnel.public_address ?? "等待配置生效"}</code>
+          )}
+          {tunnel.public_address && (
+            <button
+              className="tunnel-copy-button"
+              type="button"
+              data-copied={copyState === "copied" || undefined}
+              aria-label={copyState === "copied" ? `${tunnel.name}的访问地址已复制` : `复制${tunnel.name}的访问地址`}
+              title={copyState === "copied" ? "已复制" : "复制访问地址"}
+              onClick={async () => {
+                try {
+                  await navigator.clipboard.writeText(tunnel.public_address!);
+                  setCopyState("copied");
+                } catch {
+                  setCopyState("failed");
+                }
+              }}
+            >
+              {copyState === "copied" ? <CheckCircle2 size={15} aria-hidden="true" /> : <Copy size={15} aria-hidden="true" />}
+            </button>
+          )}
+          <span className="sr-only" role="status" aria-live="polite">{copyState === "copied" ? "访问地址已复制" : ""}</span>
+        </div>
+      </div>
       <div className="network-actions">
-        <span className={`link-status ${statusKind}`}><i />{tunnel.enabled ? (tunnel.apply_status === "ready" ? "已生效" : tunnel.apply_status === "failed" ? "配置失败" : "配置生效中") : "已关闭"}</span>
-        <button className="link-action" type="button" disabled={pending} onClick={(event) => onEdit(event.currentTarget)}>编辑</button>
-        <button className="link-action" type="button" disabled={pending} onClick={async () => {
+        <span className={`link-status ${statusKind}`}><i />{tunnel.deletion_pending ? "等待删除" : tunnel.enabled ? (tunnel.apply_status === "ready" ? "已生效" : tunnel.apply_status === "failed" ? "配置失败" : "配置生效中") : "已关闭"}</span>
+        <button className="link-action" type="button" disabled={actionDisabled} onClick={(event) => onEdit(event.currentTarget)}>编辑</button>
+        <button className="link-action" type="button" disabled={actionDisabled} onClick={async () => {
           setPending(true);
           setError(null);
           try {
@@ -2316,8 +2622,12 @@ function TunnelRow({
           } finally {
             setPending(false);
           }
-        }}>{pending ? "处理中…" : tunnel.enabled ? "关闭" : "启用"}</button>
+        }}>{pending ? "处理中…" : tunnel.deletion_pending ? "等待删除" : tunnel.enabled ? "关闭" : "启用"}</button>
+        <button className="delete-icon-button" type="button" aria-label={`删除穿透服务${tunnel.name}`} title={tunnel.deletion_pending ? "等待删除" : "删除穿透服务"} disabled={actionDisabled} onClick={(event) => onDelete(event.currentTarget)}>
+          <Trash2 size={17} aria-hidden="true" />
+        </button>
       </div>
+      {copyState === "failed" && <p className="network-error" role="alert">浏览器无法访问剪贴板，请手动选择访问地址复制。</p>}
       {error && <p className="network-error" role="alert">{error}</p>}
       {tunnel.apply_error && <p className="network-error">{tunnel.apply_error}</p>}
     </div>
@@ -2332,6 +2642,7 @@ function SiteLinkCard({
   onToggle,
   onRecheck,
   onConfirmRoute,
+  onDelete,
 }: {
   link: SiteLink;
   currentSiteId: string;
@@ -2339,8 +2650,10 @@ function SiteLinkCard({
   onToggle: () => void;
   onRecheck: () => void;
   onConfirmRoute: (siteId: string) => void;
+  onDelete: () => void;
 }) {
-  const status = siteLinkStatus(link.apply_status);
+  const status = link.deletion_pending ? { label: "等待删除", kind: "working" } : siteLinkStatus(link.apply_status);
+  const actionsDisabled = actionPending || link.deletion_pending;
   const health = gatewayHealthStatus(link.health_status);
   const currentSiteName = link.left_site_id === currentSiteId ? link.left_site_name : link.right_site_name;
   const otherSiteName = link.left_site_id === currentSiteId ? link.right_site_name : link.left_site_name;
@@ -2360,12 +2673,15 @@ function SiteLinkCard({
             className="link-action"
             type="button"
             onClick={onToggle}
-            disabled={actionPending}
+            disabled={actionsDisabled}
             aria-label={link.enabled ? "关闭站点互联" : "重新启用站点互联"}
           >
-            {actionPending ? "处理中…" : link.enabled ? "关闭" : "启用"}
+            {actionPending ? "处理中…" : link.deletion_pending ? "等待删除" : link.enabled ? "关闭" : "启用"}
           </button>
-          <button className="link-action" type="button" onClick={onRecheck} disabled={actionPending}>重新检测</button>
+          <button className="link-action" type="button" onClick={onRecheck} disabled={actionsDisabled}>重新检测</button>
+          <button className="delete-icon-button" type="button" aria-label={`删除${link.left_site_name}到${link.right_site_name}的站点互联`} title={link.deletion_pending ? "等待删除" : "删除站点互联"} disabled={actionsDisabled} onClick={onDelete}>
+            <Trash2 size={17} aria-hidden="true" />
+          </button>
         </div>
       </div>
       {link.apply_error && <p className="link-error">{link.apply_error}</p>}
@@ -2380,7 +2696,7 @@ function SiteLinkCard({
             {route.router_confirmed ? (
               <span className="route-confirmed">路由已配置</span>
             ) : (
-              <button className="route-confirm-button" type="button" onClick={() => onConfirmRoute(route.router_site_id)}>
+              <button className="route-confirm-button" type="button" disabled={actionsDisabled} onClick={() => onConfirmRoute(route.router_site_id)}>
                 确认路由已配置
               </button>
             )}
@@ -2397,12 +2713,15 @@ function SiteNetworkRow({
   network,
   actionPending,
   onToggle,
+  onDelete,
 }: {
   network: SiteNetwork;
   actionPending: boolean;
   onToggle: () => void;
+  onDelete: () => void;
 }) {
-  const status = siteLinkStatus(network.apply_status);
+  const status = network.deletion_pending ? { label: "等待删除", kind: "working" } : siteLinkStatus(network.apply_status);
+  const actionsDisabled = actionPending || network.deletion_pending;
   const health = gatewayHealthStatus(network.health_status);
   return (
     <div className="network-row">
@@ -2430,10 +2749,13 @@ function SiteNetworkRow({
           className="link-action"
           type="button"
           onClick={onToggle}
-          disabled={actionPending}
+          disabled={actionsDisabled}
           aria-label={network.enabled ? "停止共享本地网络" : "重新共享本地网络"}
         >
-          {actionPending ? "处理中…" : network.enabled ? "停止共享" : "重新启用"}
+          {actionPending ? "处理中…" : network.deletion_pending ? "等待删除" : network.enabled ? "停止共享" : "重新启用"}
+        </button>
+        <button className="delete-icon-button" type="button" aria-label={`删除共享网络${network.name}`} title={network.deletion_pending ? "等待删除" : "删除共享网络"} disabled={actionsDisabled} onClick={onDelete}>
+          <Trash2 size={17} aria-hidden="true" />
         </button>
       </div>
       {network.health_error && network.health_error !== network.apply_error && <p className="network-health-error">网关状态：{network.health_error}</p>}
