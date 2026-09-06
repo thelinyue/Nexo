@@ -2,6 +2,12 @@
 
 本项目使用 [Semantic Versioning](https://semver.org/) 记录公开版本。
 
+## [0.1.1] - 2026-09-06
+
+### Fixed
+
+- 修正 Server 与 Agent 运行时 Debian 基础镜像的固定摘要，确保 GitHub 发布构建可从官方镜像仓库复现。
+
 ## [0.1.0] - 2026-09-06
 
 ### Added
@@ -19,4 +25,5 @@
 - 管理密码使用 Argon2id；LAN HTTP 与公网 HTTPS Session 相互隔离。
 - API Key、DNS Token、私钥和自定义 CA 保存为受限 Secret 文件。
 
+[0.1.1]: https://github.com/thelinyue/Nexo/releases/tag/v0.1.1
 [0.1.0]: https://github.com/thelinyue/Nexo/releases/tag/v0.1.0
