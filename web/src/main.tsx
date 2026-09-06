@@ -103,6 +103,12 @@ type Enrollment = {
   device_id: string | null;
 };
 
+type CreatedEnrollment = {
+  enrollment_id: string;
+  token: string;
+  expires_at: number;
+};
+
 type MeshStatus = {
   status: "normal" | "starting" | "abnormal" | "restricted" | "version_incompatible";
   message: string;
@@ -175,6 +181,7 @@ function Dashboard({ request, auth, onLogout }: { request: ApiRequest; auth: Aut
   const [showNetworkForm, setShowNetworkForm] = useState(false);
   const [showLinkForm, setShowLinkForm] = useState(false);
   const [showTunnelForm, setShowTunnelForm] = useState(false);
+  const [showEnrollmentForm, setShowEnrollmentForm] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
   const refreshOverview = useCallback(async () => {
@@ -434,8 +441,21 @@ function Dashboard({ request, auth, onLogout }: { request: ApiRequest; auth: Aut
               <p className="eyebrow">添加设备</p>
               <h2>批准后自动加入组网</h2>
             </div>
-            <span className={`status-pill ${meshStatus?.status === "normal" ? "ready" : ""}`}><i />{meshStatus?.message ?? "组网状态检查中"}</span>
+            <div className="panel-heading-actions">
+              <span className={`status-pill ${meshStatus?.status === "normal" ? "ready" : ""}`}><i />{meshStatus?.message ?? "组网状态检查中"}</span>
+              <button className="secondary-button" type="button" onClick={() => setShowEnrollmentForm((visible) => !visible)}>
+                {showEnrollmentForm ? "收起" : "添加设备"}
+              </button>
+            </div>
           </div>
+          {showEnrollmentForm && (
+            <CreateEnrollmentForm
+              sites={sites}
+              request={request}
+              onCreated={refreshOverview}
+              onDone={() => setShowEnrollmentForm(false)}
+            />
+          )}
           {enrollments.filter((item) => item.status === "awaiting_approval").length === 0 ? (
             <div className="empty-state compact-empty">
               <div className="empty-icon">＋</div>
@@ -906,6 +926,167 @@ function CreateSiteLinkForm({
         <span className="form-hint">相同或重叠网段会被服务端阻止，并显示冲突原因。</span>
         <button className="primary-button" type="submit" disabled={submitting || !leftNetworkId || !rightNetworkId}>
           {submitting ? "创建中…" : "建立站点互联"}
+        </button>
+      </div>
+      {error && <p className="form-error" role="alert">{error}</p>}
+    </form>
+  );
+}
+
+const RELEASE_AGENT_IMAGE = "ghcr.io/thelinyue/nexo-agent:0.1.2";
+
+function buildAgentCompose(serverUrl: string, token: string): string {
+  return `name: nexo-agent
+
+services:
+  nexo-agent:
+    image: ${RELEASE_AGENT_IMAGE}
+    container_name: nexo-agent
+    network_mode: host
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    sysctls:
+      net.ipv4.ip_forward: "1"
+      net.ipv6.conf.all.forwarding: "1"
+    environment:
+      NEXO_SERVER_URL: ${JSON.stringify(serverUrl)}
+      NEXO_ENROLLMENT_TOKEN: ${JSON.stringify(token)}
+    volumes:
+      - ./data/nexo-agent:/data/nexo-agent
+    restart: unless-stopped
+`;
+}
+
+/**
+ * 设备加入向导只收集无法自动获知的信息，并立即生成可运行的 Compose。
+ * 一次性 Token 不写入浏览器存储；用户离开当前结果后只能重新生成。
+ */
+function CreateEnrollmentForm({
+  sites,
+  request,
+  onCreated,
+  onDone,
+}: {
+  sites: Site[];
+  request: ApiRequest;
+  onCreated: () => Promise<void>;
+  onDone: () => void;
+}) {
+  const [deviceName, setDeviceName] = useState("");
+  const [siteId, setSiteId] = useState("");
+  const [serverUrl, setServerUrl] = useState(() => window.location.origin);
+  const [created, setCreated] = useState<CreatedEnrollment | null>(null);
+  const [submitting, setSubmitting] = useState(false);
+  const [copyState, setCopyState] = useState<"idle" | "copied" | "failed">("idle");
+  const [error, setError] = useState<string | null>(null);
+
+  const normalizedServerUrl = serverUrl.trim().replace(/\/+$/, "");
+  const compose = created ? buildAgentCompose(normalizedServerUrl, created.token) : "";
+
+  if (created) {
+    return (
+      <div className="enrollment-setup" aria-live="polite">
+        <div className="enrollment-result-heading">
+          <div>
+            <strong>Agent 配置已生成</strong>
+            <span>凭证将在 {new Date(created.expires_at * 1000).toLocaleTimeString()} 前有效，且只能使用一次。</span>
+          </div>
+          <span className="entry-state ready"><i />等待设备连接</span>
+        </div>
+        <textarea className="enrollment-compose" aria-label="Agent Compose" value={compose} readOnly spellCheck={false} />
+        <div className="form-footer enrollment-result-actions">
+          <span className="form-hint">复制到设备后运行 <code>docker compose up -d</code>。设备领取身份后可以删除 Token。</span>
+          <div className="panel-heading-actions">
+            <button className="secondary-button" type="button" onClick={onDone}>完成</button>
+            <button
+              className="primary-button"
+              type="button"
+              onClick={async () => {
+                try {
+                  await navigator.clipboard.writeText(compose);
+                  setCopyState("copied");
+                } catch {
+                  setCopyState("failed");
+                }
+              }}
+            >
+              {copyState === "copied" ? "已复制" : "复制 Compose"}
+            </button>
+          </div>
+        </div>
+        {copyState === "failed" && <p className="form-error" role="alert">浏览器无法访问剪贴板，请手动选择上方内容。</p>}
+      </div>
+    );
+  }
+
+  return (
+    <form
+      className="enrollment-setup"
+      onSubmit={async (event) => {
+        event.preventDefault();
+        setError(null);
+        let parsed: URL;
+        try {
+          parsed = new URL(normalizedServerUrl);
+        } catch {
+          setError("Nexo Server 地址格式无效");
+          return;
+        }
+        if (!['http:', 'https:'].includes(parsed.protocol) || !parsed.hostname) {
+          setError("Nexo Server 地址必须使用 http:// 或 https://");
+          return;
+        }
+        if (parsed.pathname !== "/" || parsed.search || parsed.hash) {
+          setError("Nexo Server 地址不能包含路径、查询参数或锚点");
+          return;
+        }
+        const selectedSite = sites.find((site) => site.id === siteId);
+        setSubmitting(true);
+        try {
+          const response = await request("/api/v1/enrollments", {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({
+              tenant_id: selectedSite?.tenant_id ?? sites[0]?.tenant_id ?? "default",
+              site_id: siteId || null,
+              ttl_seconds: 900,
+              device_name: deviceName.trim(),
+            }),
+          });
+          const body = await response.json().catch(() => null) as CreatedEnrollment | { error?: string } | null;
+          if (!response.ok) throw new Error(readApiError(body, "暂时无法创建设备入网凭证"));
+          setCreated(body as CreatedEnrollment);
+          await onCreated();
+        } catch (requestError) {
+          setError(requestError instanceof Error ? requestError.message : "暂时无法创建设备入网凭证");
+        } finally {
+          setSubmitting(false);
+        }
+      }}
+    >
+      <div className="form-grid enrollment-form-grid">
+        <label>
+          <span>设备名称</span>
+          <input value={deviceName} onChange={(event) => setDeviceName(event.target.value)} placeholder="家庭 NAS" required autoFocus />
+        </label>
+        <label>
+          <span>所属站点（可选）</span>
+          <select value={siteId} onChange={(event) => setSiteId(event.target.value)}>
+            <option value="">暂不指定</option>
+            {sites.map((site) => <option key={site.id} value={site.id}>{site.name}</option>)}
+          </select>
+        </label>
+        <label>
+          <span>Nexo Server 地址</span>
+          <input value={serverUrl} onChange={(event) => setServerUrl(event.target.value)} inputMode="url" placeholder="http://192.168.1.10:8280" required />
+        </label>
+      </div>
+      <div className="form-footer">
+        <span className="form-hint">系统会自动使用同一主机的 9890 和 9891 端口，不需要分别配置。</span>
+        <button className="primary-button" type="submit" disabled={submitting || !deviceName.trim() || !serverUrl.trim()}>
+          {submitting ? "正在生成…" : "生成 Agent 配置"}
         </button>
       </div>
       {error && <p className="form-error" role="alert">{error}</p>}

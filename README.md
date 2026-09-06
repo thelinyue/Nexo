@@ -3,17 +3,35 @@
 Nexo 是面向个人自托管、NAS/HomeLab 和小型网络环境的设备、异地组网与公网访问管理服务。
 它把设备、共享网络、站点互联、Web 服务和 TCP 端口集中到一个 Web 界面中，正常使用不需要编辑配置文件。
 
-## v0.1.1 快速开始
+## v0.1.2 快速开始
 
-首个正式版本仅支持 `linux/amd64` Docker。Server 与 Agent 使用独立镜像，
+当前版本仅支持 `linux/amd64` Docker。Server 与 Agent 使用独立镜像，
 Agent 可以安装在其他家庭、办公室或 VPS 上并加入任意 Nexo Server。
 
-从 [v0.1.1 Release](https://github.com/thelinyue/Nexo/releases/tag/v0.1.1)
-下载 `nexo-v0.1.1-docker.tar.gz` 并解压，然后：
+### 部署 Server
+
+新建一个空目录，将下面内容保存为 `compose.yml`。该配置不需要 `.env`，可以
+直接复制并启动：
+
+```yaml
+name: nexo
+
+services:
+  nexo-server:
+    image: ghcr.io/thelinyue/nexo-server:0.1.2
+    container_name: nexo-server
+    network_mode: host
+    volumes:
+      - ./data/nexo:/data/nexo
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "curl --fail --silent http://127.0.0.1:8280/health >/dev/null"]
+      interval: 10s
+      timeout: 3s
+      retries: 6
+```
 
 ```bash
-cp .env.example .env
-# 编辑 .env 中的公网或 LAN 可达地址
 docker compose up -d
 docker compose exec nexo-server nexo bootstrap-code
 ```
@@ -22,16 +40,48 @@ docker compose exec nexo-server nexo bootstrap-code
 证书继续在 Web 中配置；未配置 HTTPS 时，LAN 管理入口仍可使用，但新的组网
 应用会保持受限状态。
 
-在其他站点部署 Agent：
+### 添加 Agent
+
+在 Web 的“添加设备”中填写设备名称和站点，Nexo 会生成一份已经包含 Server
+地址和一次性 Token 的完整 Compose。复制到目标设备并运行：
 
 ```bash
-# 在该站点准备相同的 .env，并将地址指向目标 Nexo Server
-docker compose -f compose.agent.yml up -d
+docker compose up -d
 ```
 
-首次启动前，将 Web 中创建的一次性入网 Token 填入 `NEXO_ENROLLMENT_TOKEN`。
-设备成功加入后立即从 `.env` 中删除 Token，再次执行 Compose 应用配置。Agent
-身份保存在 `./data/nexo-agent`，不会绑定到生成 Token 的那台 Server 镜像。
+需要手动准备时，也可以直接使用下面的完整模板，只替换两个值：
+
+```yaml
+name: nexo-agent
+
+services:
+  nexo-agent:
+    image: ghcr.io/thelinyue/nexo-agent:0.1.2
+    container_name: nexo-agent
+    network_mode: host
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    sysctls:
+      net.ipv4.ip_forward: "1"
+      net.ipv6.conf.all.forwarding: "1"
+    environment:
+      NEXO_SERVER_URL: "http://192.168.1.10:8280"
+      NEXO_ENROLLMENT_TOKEN: "请替换为 Web 生成的一次性 Token"
+    volumes:
+      - ./data/nexo-agent:/data/nexo-agent
+    restart: unless-stopped
+```
+
+| 环境变量 | 用途 | 格式与示例 | 要求 |
+| --- | --- | --- | --- |
+| `NEXO_SERVER_URL` | Agent 首次联系的 Nexo 管理地址，并用于自动推导同一主机的 `9890/9891` | `http://192.168.1.10:8280` 或 `https://nexo.example.com` | 必填；必须能从 Agent 所在网络访问 |
+| `NEXO_ENROLLMENT_TOKEN` | 授权一台设备提交入网请求 | Web 生成的短时字符串 | 首次入网必填且属于敏感信息；领取设备身份后失效，可从 Compose 或 `.env` 删除 |
+
+设备名称、所属站点、公网域名、证书、共享网络和公网访问都在 Web 中管理。
+官方镜像内的组件路径、监听地址、能力开关和数据目录不需要用户设置。Agent
+身份保存在 `./data/nexo-agent`，容器重启后不会再次使用已经失效的 Token。
 
 ## 第二阶段能力
 
@@ -94,10 +144,14 @@ docker compose -f docker/compose.phase2.yml exec nexo-server nexo admin recover
 ## Docker 部署
 
 正式发布使用仓库根目录的 [`compose.yml`](compose.yml) 和
-[`compose.agent.yml`](compose.agent.yml)，镜像标签固定为 `0.1.1`，不会隐式
+[`compose.agent.yml`](compose.agent.yml)，镜像标签固定为 `0.1.2`，不会隐式
 升级。开发环境的源码构建示例仍保留在 [`docker/compose.phase2.yml`](docker/compose.phase2.yml)。
 它们使用 host network，保留真实 LAN 转发所需的最小权限：Agent 只授予
 `/dev/net/tun` 和 `NET_ADMIN`，不使用 `privileged` 或 Docker Socket。
+
+`8280`、`9890`、`9891`、`80` 和 `443` 是进程启动前就必须建立的固定网络
+边界，因此不能依赖 Web 启动后修改。本版本不支持为控制和 Tunnel 数据通道
+自定义 NAT 映射端口。
 
 在原生 Linux 或具备 Docker Engine 的 WSL2 发行版中运行：
 

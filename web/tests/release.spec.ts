@@ -70,6 +70,19 @@ async function installApiMocks(page: Page, options: MockOptions) {
       });
       return;
     }
+    if (path === "/api/v1/enrollments" && route.request().method() === "POST") {
+      const request = route.request().postDataJSON() as { device_name?: string; tenant_id?: string };
+      if (request.device_name !== "家庭 NAS" || request.tenant_id !== "default") {
+        await route.fulfill({ status: 400, contentType: "application/json", body: '{"error":"入网参数不完整"}' });
+        return;
+      }
+      await fulfillJson(route, {
+        enrollment_id: "enrollment-release",
+        token: "release-one-time-token",
+        expires_at: 1893456000,
+      });
+      return;
+    }
     if (path in dashboardResponses) {
       await fulfillJson(route, dashboardResponses[path]);
       return;
@@ -109,6 +122,26 @@ test("已登录管理界面在桌面和移动视口保持完整", async ({ page 
   await expect(page.getByRole("heading", { name: "概览" })).toBeVisible();
   await expect(page.getByRole("heading", { name: "Web 服务与 TCP 端口" })).toBeVisible();
   await expect(page.getByRole("heading", { name: "让网络归于一处" })).toBeVisible();
+  await expectNoHorizontalOverflow(page);
+});
+
+test("添加设备只生成两个必要环境变量", async ({ page, context }) => {
+  await context.grantPermissions(["clipboard-read", "clipboard-write"]);
+  await installApiMocks(page, { initialized: true, authenticated: true });
+  await page.goto("/");
+
+  await page.getByRole("button", { name: "添加设备" }).click();
+  await page.getByLabel("设备名称").fill("家庭 NAS");
+  await page.getByRole("button", { name: "生成 Agent 配置" }).click();
+
+  const compose = await page.getByLabel("Agent Compose").inputValue();
+  expect(compose).toContain("ghcr.io/thelinyue/nexo-agent:0.1.2");
+  expect(compose.match(/NEXO_[A-Z_]+:/g)).toEqual([
+    "NEXO_SERVER_URL:",
+    "NEXO_ENROLLMENT_TOKEN:",
+  ]);
+  await page.getByRole("button", { name: "复制 Compose" }).click();
+  await expect(page.getByRole("button", { name: "已复制" })).toBeVisible();
   await expectNoHorizontalOverflow(page);
 });
 

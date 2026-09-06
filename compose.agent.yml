@@ -4,7 +4,7 @@ name: nexo-agent
 # 任意 Nexo Server，不要求与 Server 位于同一台主机。
 services:
   nexo-agent:
-    image: ghcr.io/thelinyue/nexo-agent:0.1.1
+    image: ghcr.io/thelinyue/nexo-agent:0.1.2
     container_name: nexo-agent
     network_mode: host
     cap_add:
@@ -16,16 +16,7 @@ services:
       net.ipv6.conf.all.forwarding: "1"
     environment:
       NEXO_SERVER_URL: ${NEXO_SERVER_URL:?请在 .env 中填写 NEXO_SERVER_URL}
-      NEXO_CONTROL_ADDR: ${NEXO_CONTROL_ADDR:?请在 .env 中填写 NEXO_CONTROL_ADDR}
-      NEXO_CONTROL_SERVER_NAME: ${NEXO_CONTROL_SERVER_NAME:-nexo-server}
-      NEXO_TUNNEL_ADDR: ${NEXO_AGENT_TUNNEL_ADDR:?请在 .env 中填写 NEXO_AGENT_TUNNEL_ADDR}
-      NEXO_TUNNEL_SERVER_NAME: ${NEXO_TUNNEL_SERVER_NAME:-nexo-server}
       NEXO_ENROLLMENT_TOKEN: ${NEXO_ENROLLMENT_TOKEN:-}
-      NEXO_DEVICE_NAME: ${NEXO_DEVICE_NAME:-Nexo Gateway}
-      NEXO_AGENT_CAPABILITIES: ${NEXO_AGENT_CAPABILITIES:-mesh,subnet_gateway,site_gateway,tunnel}
-      NEXO_TAILSCALE_APPLY: "true"
-      NEXO_TAILSCALED_ENABLED: "true"
-      NEXO_STATE_DIR: /data/nexo-agent
     volumes:
       - ./data/nexo-agent:/data/nexo-agent
     restart: unless-stopped

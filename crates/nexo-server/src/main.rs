@@ -367,6 +367,8 @@ struct CreateEnrollmentRequest {
     tenant_id: String,
     site_id: Option<String>,
     ttl_seconds: Option<i64>,
+    /// Web 预先指定的展示名称；旧客户端省略时继续使用 Agent 上报的主机名。
+    device_name: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -4901,11 +4903,7 @@ async fn refresh_all_tunnel_readiness(state: &AppState) {
 
 /// Agent 只拿到数据通道地址和证书名称，不接触 Caddy/Admin/Headscale 内部端口。
 fn tunnel_endpoint_from_env() -> Option<TunnelDataEndpoint> {
-    let address = env::var("NEXO_TUNNEL_ENDPOINT")
-        .or_else(|_| env::var("NEXO_TUNNEL_ADDR"))
-        .unwrap_or_else(|_| "127.0.0.1:9891".to_owned())
-        .trim()
-        .to_owned();
+    let address = env::var("NEXO_TUNNEL_ENDPOINT").ok()?.trim().to_owned();
     if address.is_empty() {
         return None;
     }
@@ -6533,6 +6531,15 @@ async fn create_enrollment(
         return Err(ApiError::new(StatusCode::BAD_REQUEST, "tenant_id 不能为空"));
     }
     ensure_tenant_scope(request.tenant_id.trim(), &session_tenant)?;
+    let device_name = request
+        .device_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned);
+    if request.device_name.is_some() && device_name.is_none() {
+        return Err(ApiError::new(StatusCode::BAD_REQUEST, "设备名称不能为空"));
+    }
     let ttl_seconds = request.ttl_seconds.unwrap_or(900);
     let now = unix_now();
     let token = EnrollmentToken::generate(now, ttl_seconds)
@@ -6570,14 +6577,15 @@ async fn create_enrollment(
     connection
         .execute(
             "INSERT INTO pending_enrollments
-             (id, tenant_id, site_id, token_digest, expires_at)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
+             (id, tenant_id, site_id, token_digest, expires_at, requested_name)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             rusqlite::params![
                 enrollment_id,
                 request.tenant_id,
                 request.site_id,
                 token.digest,
-                token.expires_at
+                token.expires_at,
+                device_name,
             ],
         )
         .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法保存入网凭证"))?;
@@ -7084,7 +7092,7 @@ async fn enroll_agent(
     let changed = connection
         .execute(
             "UPDATE pending_enrollments SET
-             status = 'awaiting_approval', requested_name = ?2,
+             status = 'awaiting_approval', requested_name = COALESCE(requested_name, ?2),
              requested_os = ?3, requested_architecture = ?4,
              requested_agent_version = ?5, requested_capabilities_json = ?6,
              requested_csr_pem = ?7
@@ -8846,6 +8854,14 @@ fn parse_enrollment_status(status: &str) -> EnrollmentStatus {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn legacy_enrollment_request_without_web_name_remains_compatible() {
+        let request: CreateEnrollmentRequest =
+            serde_json::from_str(r#"{"tenant_id":"default","site_id":null,"ttl_seconds":900}"#)
+                .expect("旧版创建入网请求应继续解析");
+        assert!(request.device_name.is_none());
+    }
     use axum::http::HeaderValue;
     use nexo_core::{DetectedLocalNetwork, DeviceCapability};
     use tokio::net::TcpStream;
@@ -9184,6 +9200,7 @@ mod tests {
                 tenant_id: "tenant-1".to_owned(),
                 site_id: None,
                 ttl_seconds: Some(900),
+                device_name: Some("Web 指定 NAS".to_owned()),
             }),
         )
         .await
@@ -9207,7 +9224,7 @@ mod tests {
             State(state.clone()),
             Json(AgentEnrollmentRequest {
                 token,
-                device_name: "测试 NAS".to_owned(),
+                device_name: "容器主机名".to_owned(),
                 os: Some("linux".to_owned()),
                 architecture: Some("amd64".to_owned()),
                 agent_version: "0.1.0".to_owned(),
@@ -9245,7 +9262,18 @@ mod tests {
         .expect("管理员应能批准入网请求")
         .0;
         assert_eq!(approved.status, EnrollmentStatus::Approved);
-        assert!(approved.device_id.is_some());
+        let approved_device_id = approved.device_id.clone().expect("审批应返回设备 ID");
+        let approved_name: String = state
+            .db
+            .lock()
+            .expect("数据库锁应可用")
+            .query_row(
+                "SELECT name FROM devices WHERE id = ?1",
+                [&approved_device_id],
+                |row| row.get(0),
+            )
+            .expect("应能读取设备名称");
+        assert_eq!(approved_name, "Web 指定 NAS");
 
         let delivered = poll_agent_enrollment(
             State(state.clone()),
@@ -9700,6 +9728,7 @@ mod tests {
                 tenant_id: "tenant-1".to_owned(),
                 site_id: None,
                 ttl_seconds: Some(900),
+                device_name: None,
             }),
         )
         .await
@@ -9740,6 +9769,17 @@ mod tests {
         .expect("管理员应能批准设备")
         .0;
         let device_id = approved.device_id.expect("审批应返回设备 ID");
+        let fallback_name: String = state
+            .db
+            .lock()
+            .expect("数据库锁应可用")
+            .query_row(
+                "SELECT name FROM devices WHERE id = ?1",
+                [&device_id],
+                |row| row.get(0),
+            )
+            .expect("应能读取使用 Agent 主机名的设备");
+        assert_eq!(fallback_name, "控制通道设备");
         let (device_certificate_pem, ca_certificate_pem) = {
             let connection = state.db.lock().expect("数据库锁应可用");
             connection

@@ -1,7 +1,9 @@
 # Nexo Server/Agent 容器
 
-`compose.phase1.yml` 提供 Server 与 Agent 的最小部署示例。Server 容器内的
-Headscale 使用 `8281`，只允许本机/容器内部访问，不作为公网入口。第二阶段的
+正式部署直接使用仓库根目录的 `compose.yml` 和 `compose.agent.yml`。Server
+不需要环境变量，Agent 只需要 `NEXO_SERVER_URL` 和首次入网的一次性
+`NEXO_ENROLLMENT_TOKEN`。Server 容器内的组网服务使用 `8281`，只允许
+本机访问，不作为公网入口。内置
 Caddy 公网入口使用 `80/443`，管理入口使用 `8280`，Agent 控制通道使用 `9890`，
 Tunnel 数据通道使用 `9891`。
 
@@ -32,9 +34,8 @@ bash docker/site-to-site-smoke.sh
 验证双向 HTTP/HTTPS、8 MiB TCP 传输、真实 LAN 源地址、关闭互联和重启恢复。
 验收终端镜像只包含测试用的 Python/OpenSSL/curl，不包含 Nexo 或 Tailscale。
 
-Server 内置 Headscale 默认开启 MagicDNS，组网名称后缀为 `mesh.nexo.internal`；
-生产部署可通过 `NEXO_MESH_DNS_BASE_DOMAIN` 指定其他内部域名。公网 Caddy、公开域名
-和泛域名证书仍属于第二阶段。
+Server 默认开启“使用设备名称访问”，内部名称后缀由官方镜像管理。公网域名、
+证书、设备名称、共享网络和公网访问统一在 Web 中配置。
 
 如果 Windows 侧没有 Docker CLI，请从已安装 Docker Engine 的 WSL2 发行版中执行上述命令。
 

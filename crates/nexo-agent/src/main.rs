@@ -42,8 +42,10 @@ use tokio_rustls::{rustls, TlsConnector};
 #[command(name = "nexo-agent", version, about = "Nexo 联巢设备代理")]
 struct Cli {}
 
-/// Agent 运行时所需的最小配置，避免把服务端地址写死在二进制中。
-/// Agent 的启动配置；服务端地址和控制通道地址均可在容器环境变量中指定。
+/// Agent 运行时所需的最小配置。
+///
+/// 普通部署只需要提供管理地址和一次性入网凭证。控制与数据通道使用固定
+/// 端口从管理地址推导；旧环境变量仍作为测试和高级部署的显式覆盖保留。
 #[derive(Clone)]
 struct AgentRuntimeConfig {
     server_url: String,
@@ -74,17 +76,21 @@ impl AgentRuntimeConfig {
         if server_url.is_empty() {
             anyhow::bail!("NEXO_SERVER_URL 不能为空");
         }
+        let default_control_addr = service_address_from_server_url(&server_url, 9890)?;
+        let default_tunnel_addr = service_address_from_server_url(&server_url, 9891)?;
         let device_name = env::var("NEXO_DEVICE_NAME")
             .unwrap_or_else(|_| env::var("HOSTNAME").unwrap_or_else(|_| "Nexo Agent".to_owned()));
         let capabilities = parse_capabilities(
-            &env::var("NEXO_AGENT_CAPABILITIES").unwrap_or_else(|_| "tunnel".to_owned()),
+            &env::var("NEXO_AGENT_CAPABILITIES")
+                .unwrap_or_else(|_| "mesh,subnet_gateway,site_gateway,tunnel".to_owned()),
         )?;
         let state_dir = PathBuf::from(
             env::var("NEXO_STATE_DIR").unwrap_or_else(|_| "./data/nexo-agent".to_owned()),
         );
-        let control_addr = env::var("NEXO_CONTROL_ADDR")
-            .ok()
-            .filter(|value| !value.trim().is_empty());
+        let control_addr = Some(select_service_address(
+            env::var("NEXO_CONTROL_ADDR").ok(),
+            default_control_addr,
+        ));
         let control_server_name =
             env::var("NEXO_CONTROL_SERVER_NAME").unwrap_or_else(|_| "nexo-server".to_owned());
         let tailscale_apply_enabled = env::var("NEXO_TAILSCALE_APPLY")
@@ -109,9 +115,10 @@ impl AgentRuntimeConfig {
             .ok()
             .map(|value| parse_bool_env(&value))
             .unwrap_or(tailscale_apply_enabled);
-        let tunnel_addr = env::var("NEXO_TUNNEL_ADDR")
-            .ok()
-            .filter(|value| !value.trim().is_empty());
+        let tunnel_addr = Some(select_service_address(
+            env::var("NEXO_TUNNEL_ADDR").ok(),
+            default_tunnel_addr,
+        ));
         let tunnel_server_name =
             env::var("NEXO_TUNNEL_SERVER_NAME").unwrap_or_else(|_| control_server_name.clone());
         Ok(Self {
@@ -132,6 +139,28 @@ impl AgentRuntimeConfig {
             tunnel_server_name,
         })
     }
+}
+
+/// 从用户唯一需要提供的 Server URL 推导固定服务端口。
+///
+/// URL 的路径和管理端口不会传播到设备通道；这两个通道是 Nexo 的固定网络
+/// 边界。IPv6 地址必须保留方括号，避免生成无法连接的 `::1:9890`。
+fn service_address_from_server_url(server_url: &str, port: u16) -> Result<String> {
+    let parsed = reqwest::Url::parse(server_url)
+        .with_context(|| format!("NEXO_SERVER_URL 不是有效的 HTTP 地址：{server_url}"))?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        anyhow::bail!("NEXO_SERVER_URL 只支持 http:// 或 https:// 地址");
+    }
+    let host = parsed
+        .host_str()
+        .context("NEXO_SERVER_URL 缺少可连接的主机名或 IP 地址")?;
+    Ok(format_tcp_target(host, port))
+}
+
+fn select_service_address(explicit: Option<String>, derived: String) -> String {
+    explicit
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or(derived)
 }
 
 /// 读取布尔型环境变量；无法识别的值按关闭处理，避免误启用系统命令。
@@ -288,7 +317,7 @@ async fn main() -> Result<()> {
             }
         }
     } else {
-        tracing::info!("未提供 NEXO_ENROLLMENT_TOKEN，Agent 等待后续配置");
+        anyhow::bail!("尚未保存设备身份，请先在 Web 添加设备并设置 NEXO_ENROLLMENT_TOKEN");
     }
     tracing::info!("Nexo Agent 已启动，目标服务端：{}", config.server_url);
     let run_result = if stop_after_enrollment {
@@ -2368,6 +2397,47 @@ mod tests {
         assert!(parse_bool_env("1"));
         assert!(!parse_bool_env("false"));
         assert!(!parse_bool_env("enabled"));
+    }
+
+    #[test]
+    fn service_addresses_are_derived_from_dns_and_ignore_management_port() {
+        assert_eq!(
+            service_address_from_server_url("https://nexo.example.com:8443", 9890).unwrap(),
+            "nexo.example.com:9890"
+        );
+        assert_eq!(
+            service_address_from_server_url("http://192.0.2.10:8280", 9891).unwrap(),
+            "192.0.2.10:9891"
+        );
+    }
+
+    #[test]
+    fn service_addresses_preserve_ipv6_literal_format() {
+        assert_eq!(
+            service_address_from_server_url("http://[2001:db8::10]:8280", 9890).unwrap(),
+            "[2001:db8::10]:9890"
+        );
+    }
+
+    #[test]
+    fn service_address_rejects_invalid_or_unsupported_server_url() {
+        assert!(service_address_from_server_url("nexo.example.com", 9890).is_err());
+        assert!(service_address_from_server_url("ftp://nexo.example.com", 9890).is_err());
+    }
+
+    #[test]
+    fn explicit_legacy_service_address_keeps_priority() {
+        assert_eq!(
+            select_service_address(
+                Some("gateway.example.com:19990".to_owned()),
+                "nexo.example.com:9890".to_owned(),
+            ),
+            "gateway.example.com:19990"
+        );
+        assert_eq!(
+            select_service_address(Some("".to_owned()), "nexo.example.com:9890".to_owned()),
+            "nexo.example.com:9890"
+        );
     }
 
     #[test]
