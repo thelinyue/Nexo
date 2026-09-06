@@ -1542,7 +1542,7 @@ async fn update_tunnel(
     if let Some(old_path) = old_origin_ca_path.as_deref() {
         let keep_old_path = origin_ca_path
             .as_deref()
-            .is_some_and(|path| path == old_path);
+            .is_some_and(|path| path == std::path::Path::new(old_path));
         if !keep_old_path {
             if let Err(error) = fs::remove_file(old_path) {
                 if error.kind() != std::io::ErrorKind::NotFound {

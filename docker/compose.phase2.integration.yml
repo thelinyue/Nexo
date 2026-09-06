@@ -21,9 +21,13 @@ services:
       # Headscale 只绑定 Server loopback；正式 HTTPS 就绪前，Supervisor
       # 使用这个仅供 Nexo 自身访问的地址，启用公网入口后会自动切换为
       # https://mesh.phase2.test。
-      NEXO_HEADSCALE_URL: http://127.0.0.1:8281
-      NEXO_MESH_INTERNAL_URL: http://127.0.0.1:8281
+      # 内置 DERP 要求 server_url 使用 HTTPS；Agent 只会在 Caddy 和证书
+      # 已就绪后入网，mesh.phase2.test 在测试网络内解析到本容器。
+      NEXO_HEADSCALE_URL: https://mesh.phase2.test
+      NEXO_MESH_INTERNAL_URL: https://mesh.phase2.test
       NEXO_MESH_DNS_BASE_DOMAIN: mesh.nexo.internal
+      # 只在验收环境启用真实中继；生产默认关闭并使用官方 DERP Map。
+      NEXO_HEADSCALE_EMBEDDED_DERP_ENABLED: "true"
       NEXO_CADDY_ENABLED: "true"
       NEXO_CADDY_BIN: /usr/local/bin/caddy
       NEXO_CADDY_ADMIN_URL: http://127.0.0.1:8290
@@ -39,6 +43,8 @@ services:
       - "127.0.0.1:28080:80"
       - "127.0.0.1:28443:443"
       - "127.0.0.1:22000:20000"
+    expose:
+      - "3478/udp"
     networks:
       control:
         ipv4_address: 172.29.0.2

@@ -5,8 +5,26 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 COPY integration-terminal.py /usr/local/bin/integration-terminal.py
 RUN openssl req -x509 -newkey rsa:2048 -nodes -days 2 \
+      -subj "/CN=Nexo Integration Test CA" \
+      -addext "basicConstraints=critical,CA:TRUE" \
+      -addext "keyUsage=critical,keyCertSign,cRLSign" \
+      -keyout /tmp/nexo-terminal-ca.key \
+      -out /etc/ssl/certs/nexo-terminal-ca.crt \
+    && openssl req -new -newkey rsa:2048 -nodes \
       -subj "/CN=nexo-integration-terminal" \
+      -addext "basicConstraints=critical,CA:FALSE" \
+      -addext "keyUsage=critical,digitalSignature,keyEncipherment" \
+      -addext "extendedKeyUsage=serverAuth" \
+      -addext "subjectAltName=DNS:nexo-integration-terminal" \
       -keyout /etc/ssl/private/nexo-terminal.key \
+      -out /tmp/nexo-terminal.csr \
+    && openssl x509 -req -days 2 \
+      -in /tmp/nexo-terminal.csr \
+      -CA /etc/ssl/certs/nexo-terminal-ca.crt \
+      -CAkey /tmp/nexo-terminal-ca.key \
+      -CAcreateserial -copy_extensions copy \
       -out /etc/ssl/certs/nexo-terminal.crt \
+    && rm -f /tmp/nexo-terminal-ca.key /tmp/nexo-terminal.csr \
+      /etc/ssl/certs/nexo-terminal-ca.srl \
     && chmod 0600 /etc/ssl/private/nexo-terminal.key
 ENTRYPOINT ["python3", "/usr/local/bin/integration-terminal.py"]

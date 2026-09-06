@@ -53,6 +53,9 @@ pub struct HeadscaleRuntimeConfig {
     pub server_url: String,
     /// MagicDNS 为节点生成的内部后缀；不向 Web 暴露 Headscale 配置细节。
     pub dns_base_domain: String,
+    /// 集成测试可启用内置 DERP，验证无法直连时的真实数据面。
+    /// 生产环境默认关闭，继续使用官方 DERP Map。
+    pub embedded_derp_enabled: bool,
     pub enabled: bool,
 }
 
@@ -76,6 +79,9 @@ impl HeadscaleRuntimeConfig {
                 .unwrap_or_else(|_| "http://nexo-server:8281".to_owned()),
             dns_base_domain: env::var("NEXO_MESH_DNS_BASE_DOMAIN")
                 .unwrap_or_else(|_| "mesh.nexo.internal".to_owned()),
+            embedded_derp_enabled: env::var("NEXO_HEADSCALE_EMBEDDED_DERP_ENABLED")
+                .map(|value| value.eq_ignore_ascii_case("true"))
+                .unwrap_or(false),
             enabled,
         }
     }
@@ -334,15 +340,18 @@ impl HeadscaleSupervisor {
         let database_path = headscale_dir.join("headscale.db");
         let noise_key_path = headscale_dir.join("noise_private.key");
         let unix_socket_path = headscale_dir.join("headscale.sock");
+        let derp_config = render_derp_config(
+            self.config.embedded_derp_enabled,
+            &headscale_dir.join("derp_server_private.key"),
+        );
         let content = format!(
-            "server_url: {server_url}\nlisten_addr: {listen}\nmetrics_listen_addr: 127.0.0.1:9090\nnoise:\n  private_key_path: {noise}\nprefixes:\n  v4: 100.64.0.0/10\n  v6: fd7a:115c:a1e0::/48\nderp:\n  server:\n    enabled: false\n  # Headscale 0.29.x 即使不运行内置 DERP Server，也要求初始 DERPMap 非空。\n  # 使用官方默认地图提供 NAT 穿透回退；可达节点优先走 WireGuard 直连。\n  urls:\n    - {derp_url}\n  paths: []\n  auto_update_enabled: true\n  update_frequency: 3h\ndatabase:\n  type: sqlite\n  sqlite:\n    path: {database}\npolicy:\n  # Headscale 0.29.x 只有 database 模式支持通过官方 API 更新策略。\n  mode: database\ndns:\n  magic_dns: true\n  base_domain: {dns_domain}\n  override_local_dns: true\n  nameservers:\n    # Headscale 0.29.x 在 override_local_dns 开启时要求至少一个上游 DNS。\n    # MagicDNS 仍负责 mesh.nexo.internal，其他名称交给这些公共解析器。\n    global:\n      - 1.1.1.1\n      - 1.0.0.1\n      - 2606:4700:4700::1111\n      - 2606:4700:4700::1001\n    split: {{}}\n  search_domains: []\n  extra_records: []\nunix_socket: {unix_socket}\nunix_socket_permission: \"0600\"\nlog:\n  level: info\n",
+            "server_url: {server_url}\nlisten_addr: {listen}\nmetrics_listen_addr: 127.0.0.1:9090\nnoise:\n  private_key_path: {noise}\nprefixes:\n  v4: 100.64.0.0/10\n  v6: fd7a:115c:a1e0::/48\nderp:\n{derp_config}\n  update_frequency: 3h\ndatabase:\n  type: sqlite\n  sqlite:\n    path: {database}\npolicy:\n  # Headscale 0.29.x 只有 database 模式支持通过官方 API 更新策略。\n  mode: database\ndns:\n  magic_dns: true\n  base_domain: {dns_domain}\n  override_local_dns: true\n  nameservers:\n    # Headscale 0.29.x 在 override_local_dns 开启时要求至少一个上游 DNS。\n    # MagicDNS 仍负责 mesh.nexo.internal，其他名称交给这些公共解析器。\n    global:\n      - 1.1.1.1\n      - 1.0.0.1\n      - 2606:4700:4700::1111\n      - 2606:4700:4700::1001\n    split: {{}}\n  search_domains: []\n  extra_records: []\nunix_socket: {unix_socket}\nunix_socket_permission: \"0600\"\nlog:\n  level: info\n",
             server_url = yaml_quote(server_url),
             listen = yaml_quote(&self.config.listen_addr),
             noise = yaml_quote(&noise_key_path.to_string_lossy()),
             database = yaml_quote(&database_path.to_string_lossy()),
             dns_domain = yaml_quote(&self.config.dns_base_domain),
             unix_socket = yaml_quote(&unix_socket_path.to_string_lossy()),
-            derp_url = yaml_quote(DEFAULT_DERP_MAP_URL),
         );
         let temporary = self.config.config_path().with_extension("yaml.tmp");
         fs::write(&temporary, content)?;
@@ -601,6 +610,20 @@ fn yaml_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "''"))
 }
 
+fn render_derp_config(embedded_enabled: bool, private_key_path: &Path) -> String {
+    if embedded_enabled {
+        format!(
+            "  # 仅供集成测试使用：DERP 通过现有 HTTPS 入口提供，STUN 监听测试网络。\n  server:\n    enabled: true\n    region_id: 900\n    region_code: nexo-integration\n    region_name: Nexo Integration\n    verify_clients: true\n    stun_listen_addr: 0.0.0.0:3478\n    private_key_path: {}\n    automatically_add_embedded_derp_region: true\n  urls: []\n  paths: []\n  auto_update_enabled: false",
+            yaml_quote(&private_key_path.to_string_lossy())
+        )
+    } else {
+        format!(
+            "  server:\n    enabled: false\n  # 使用官方默认地图提供 NAT 穿透回退；可达节点优先走 WireGuard 直连。\n  urls:\n    - {}\n  paths: []\n  auto_update_enabled: true",
+            yaml_quote(DEFAULT_DERP_MAP_URL)
+        )
+    }
+}
+
 fn set_private_permissions(path: &Path) -> Result<()> {
     #[cfg(unix)]
     {
@@ -647,5 +670,25 @@ mod tests {
             parse_cli_secret(b"hskey-abc\n"),
             Some("hskey-abc".to_owned())
         );
+    }
+
+    #[test]
+    fn production_derp_config_uses_official_map_and_auto_update() {
+        let sources = render_derp_config(false, Path::new("/unused"));
+        assert!(sources.contains("enabled: false"));
+        assert!(sources.contains(DEFAULT_DERP_MAP_URL));
+        assert!(sources.contains("paths: []"));
+        assert!(sources.contains("auto_update_enabled: true"));
+    }
+
+    #[test]
+    fn integration_derp_config_enables_embedded_server_without_external_map() {
+        let sources = render_derp_config(true, Path::new("/data/nexo/headscale/derp.key"));
+        assert!(sources.contains("enabled: true"));
+        assert!(sources.contains("stun_listen_addr: 0.0.0.0:3478"));
+        assert!(sources.contains("private_key_path: '/data/nexo/headscale/derp.key'"));
+        assert!(sources.contains("urls: []"));
+        assert!(sources.contains("auto_update_enabled: false"));
+        assert!(!sources.contains(DEFAULT_DERP_MAP_URL));
     }
 }

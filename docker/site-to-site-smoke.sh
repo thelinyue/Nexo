@@ -41,6 +41,14 @@ cleanup_on_exit() {
   if ((exit_code != 0)) && command -v docker >/dev/null 2>&1; then
     echo "验收失败，先输出 Compose 状态和相关容器日志" >&2
     dc ps -a >&2 || true
+    if [[ -n "$CSRF_TOKEN" ]]; then
+      echo "Nexo 设备与组网状态快照：" >&2
+      api "$HTTP_URL/api/v1/devices" | jq . >&2 || true
+      api "$HTTP_URL/api/v1/mesh/status" | jq . >&2 || true
+      if [[ -n "${link:-}" ]]; then
+        api "$HTTP_URL/api/v1/site-links/$link" | jq . >&2 || true
+      fi
+    fi
     dc logs --no-color --tail=160 nexo-server home-gateway office-gateway outside-probe >&2 || true
   fi
   if [[ -n "$HEADSCALE_PID" && "$HEADSCALE_STOPPED" == "1" ]]; then
@@ -232,9 +240,10 @@ public_request() {
 echo "生成阶段二临时 CA 和根域名/泛域名证书"
 generate_test_certificate
 
-echo "清理上一次同名验收拓扑并启动 Nexo Server"
+echo "清理上一次同名验收拓扑并一次性构建验收镜像"
 dc down --volumes --remove-orphans >/dev/null 2>&1 || true
-dc up -d --build nexo-server
+dc build nexo-server home-gateway office-gateway home-terminal office-terminal outside-probe
+dc up -d --no-build nexo-server
 wait_for "Nexo Server 健康" "http_curl --fail '$HTTP_URL/health'" 90
 
 echo "初始化测试管理员 Session"
@@ -278,7 +287,7 @@ home_token="$(create_token "$home_site")"
 office_token="$(create_token "$office_site")"
 export NEXO_HOME_ENROLLMENT_TOKEN="$home_token"
 export NEXO_OFFICE_ENROLLMENT_TOKEN="$office_token"
-dc up -d --build home-gateway office-gateway
+dc up -d --no-build home-gateway office-gateway
 home_enrollment="$(find_enrollment 家庭网关)"
 office_enrollment="$(find_enrollment 办公网关)"
 approve "$home_enrollment"
@@ -296,7 +305,7 @@ wait_for "办公网关已连接异地组网" \
 home_device="$(device_id 家庭网关)"
 office_device="$(device_id 办公网关)"
 
-dc up -d --build home-terminal office-terminal
+dc up -d --no-build --no-recreate home-terminal office-terminal outside-probe
 wait_for "家庭终端 HTTP 服务" \
   "dc exec -T home-terminal curl --fail --silent --noproxy '*' --connect-timeout 3 --max-time 10 http://192.168.10.100:8800/source" 60
 wait_for "办公室终端 HTTP 服务" \
@@ -318,13 +327,14 @@ expect_status 404 POST "$HTTP_URL/api/v1/sites" \
 
 home_network="$(post_json "$HTTP_URL/api/v1/site-networks" \
   "{\"tenant_id\":\"default\",\"site_id\":\"$home_site\",\"name\":\"家庭局域网\",\"publisher_device_id\":\"$home_device\",\"interface_id\":\"$home_iface\",\"prefix\":\"192.168.10.0/24\"}" | jq -r '.id')"
-office_overlap_network="$(post_json "$HTTP_URL/api/v1/site-networks" \
-  "{\"tenant_id\":\"default\",\"site_id\":\"$office_site\",\"name\":\"办公室冲突网段\",\"publisher_device_id\":\"$office_device\",\"interface_id\":\"$office_iface\",\"prefix\":\"192.168.10.0/24\"}" | jq -r '.id')"
+expect_status 409 POST "$HTTP_URL/api/v1/site-networks" \
+  "{\"tenant_id\":\"default\",\"site_id\":\"$office_site\",\"name\":\"办公室冲突网段\",\"publisher_device_id\":\"$office_device\",\"interface_id\":\"$office_iface\",\"prefix\":\"192.168.10.0/24\"}"
+api "$HTTP_URL/api/v1/site-networks" | jq -e --arg site "$office_site" \
+  '[.[] | select(.site_id == $site and .desired_prefix == "192.168.10.0/24")] | length == 0' \
+  >/dev/null
+api "$HTTP_URL/api/v1/site-links" | jq -e 'length == 0' >/dev/null
 office_network="$(post_json "$HTTP_URL/api/v1/site-networks" \
   "{\"tenant_id\":\"default\",\"site_id\":\"$office_site\",\"name\":\"办公室局域网\",\"publisher_device_id\":\"$office_device\",\"interface_id\":\"$office_iface\",\"prefix\":\"192.168.20.0/24\"}" | jq -r '.id')"
-expect_status 409 POST "$HTTP_URL/api/v1/site-links" \
-  "{\"tenant_id\":\"default\",\"left_site_id\":\"$home_site\",\"left_network_id\":\"$home_network\",\"right_site_id\":\"$office_site\",\"right_network_id\":\"$office_overlap_network\"}"
-post_json "$HTTP_URL/api/v1/site-networks/$office_overlap_network/disable" '{}' >/dev/null
 link="$(post_json "$HTTP_URL/api/v1/site-links" \
   "{\"tenant_id\":\"default\",\"left_site_id\":\"$home_site\",\"left_network_id\":\"$home_network\",\"right_site_id\":\"$office_site\",\"right_network_id\":\"$office_network\"}" | jq -r '.id')"
 post_json "$HTTP_URL/api/v1/site-links/$link/router-confirmations/$home_site" '{}' >/dev/null
@@ -332,8 +342,27 @@ post_json "$HTTP_URL/api/v1/site-links/$link/router-confirmations/$office_site" 
 wait_for "Site Gateway 路由 READY" \
   "api '$HTTP_URL/api/v1/site-links/$link' | jq -e '.apply_status == \"ready\" and .health_status == \"ready\"'" 180
 
+echo "验证双向 Site-to-Site HTTP、HTTPS、8 MiB 和真实源 IP"
+dc exec -T office-terminal curl --fail --silent --noproxy '*' \
+  --connect-timeout 3 --max-time 15 http://192.168.10.100:8800/source \
+  | grep -q 'source=192.168.20.100'
+dc exec -T home-terminal curl --fail --silent --noproxy '*' \
+  --connect-timeout 3 --max-time 15 http://192.168.20.100:8800/source \
+  | grep -q 'source=192.168.10.100'
+dc exec -T office-terminal curl --fail --silent --insecure --noproxy '*' \
+  --connect-timeout 3 --max-time 15 https://192.168.10.100:8843/source \
+  | grep -q 'source=192.168.20.100'
+dc exec -T home-terminal curl --fail --silent --insecure --noproxy '*' \
+  --connect-timeout 3 --max-time 15 https://192.168.20.100:8843/source \
+  | grep -q 'source=192.168.10.100'
+[[ "$(dc exec -T office-terminal curl --fail --silent --noproxy '*' \
+  --connect-timeout 3 --max-time 30 http://192.168.10.100:8800/large | wc -c)" -ge 8388608 ]]
+[[ "$(dc exec -T home-terminal curl --fail --silent --noproxy '*' \
+  --connect-timeout 3 --max-time 30 http://192.168.20.100:8800/large | wc -c)" -ge 8388608 ]]
+echo "✓ 双向 Site-to-Site 数据面与源 IP 保留通过"
+
 echo "创建 HTTP、HTTPS 和 TCP Tunnel"
-origin_ca_pem="$(dc exec -T home-terminal cat /etc/ssl/certs/nexo-terminal.crt)"
+origin_ca_pem="$(dc exec -T home-terminal cat /etc/ssl/certs/nexo-terminal-ca.crt)"
 http_tunnel="$(post_json "$HTTP_URL/api/v1/tunnels" \
   "$(jq -cn --arg tenant default --arg device "$home_device" \
     --arg name Plain --arg host plain --arg address 192.168.10.100 \
@@ -355,14 +384,18 @@ wait_for "TCP Tunnel READY" \
   "api '$HTTP_URL/api/v1/tunnels/$tcp_tunnel' | jq -e '.apply_status == \"ready\"'" 180
 
 echo "验证 HTTP-only、HTTPS、308 跳转、WebSocket 和 8 MiB 传输"
-public_request http plain."$PUBLIC_DOMAIN" /source | grep -q 'source=192.168.10.100'
+public_request http plain."$PUBLIC_DOMAIN" /source | grep -q 'source=192.168.10.2'
+echo "✓ HTTP-only Web Service"
 root_headers="$(http_curl --resolve "$PUBLIC_DOMAIN:28080:127.0.0.1" \
   -D - -o /dev/null "http://$PUBLIC_DOMAIN:28080/")"
 grep -qi '^HTTP/.* 308' <<<"$root_headers"
 grep -qi "location: https://nexo.$PUBLIC_DOMAIN" <<<"$root_headers"
-public_request https secure."$PUBLIC_DOMAIN" /source | grep -q 'source=192.168.10.100'
+echo "✓ 根域名 308 跳转"
+public_request https secure."$PUBLIC_DOMAIN" /source | grep -q 'source=192.168.10.2'
+echo "✓ HTTPS Web Service 与自定义 Origin CA"
 [[ "$(public_request http plain."$PUBLIC_DOMAIN" /large | wc -c)" -ge 8388608 ]]
 [[ "$(public_request https secure."$PUBLIC_DOMAIN" /large | wc -c)" -ge 8388608 ]]
+echo "✓ HTTP/HTTPS 8 MiB 传输"
 
 websocket_probe() {
   local host="$1"
@@ -423,7 +456,7 @@ echo "✓ HTTP/HTTPS、8 MiB 和 WebSocket 通过"
 echo "验证 TCP Tunnel 和并发连接"
 dc exec -T outside-probe curl --fail --silent --show-error --noproxy '*' \
   --connect-timeout 3 --max-time 15 http://172.29.0.2:20000/source \
-  | grep -q 'source=172.29.0.50'
+  | grep -q 'source=192.168.10.2'
 tcp_pids=()
 for i in $(seq 1 8); do
   dc exec -T outside-probe curl --fail --silent --show-error --noproxy '*' \

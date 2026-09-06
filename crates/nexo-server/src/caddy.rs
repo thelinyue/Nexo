@@ -152,13 +152,12 @@ impl CaddySupervisor {
         } else {
             None
         };
+        // JSON 是 Caddy 原生配置格式；只有非原生格式才需要指定适配器。
         let child = command
             .args([
                 "run",
                 "--config",
                 self.config.config_path.to_string_lossy().as_ref(),
-                "--adapter",
-                "json",
             ])
             .stdin(Stdio::null())
             .stdout(Stdio::inherit())

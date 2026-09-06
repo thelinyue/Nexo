@@ -699,8 +699,9 @@ async fn control_session(
     .await?;
     let response = read_control_response(&mut reader).await?;
     apply_server_tunnel_endpoint(tunnel_endpoint, &response).await;
-    let mut last_gateway_revision = None;
+    let mut last_gateway_state = None;
     let mut last_gateway_status = None;
+    let mut gateway_confirmation_pending = false;
     let mut gateway_retry_attempt = 0;
     let mut gateway_retry_at = None;
     let mut last_gateway_report = Some(gateway_report.clone());
@@ -723,7 +724,6 @@ async fn control_session(
                 Some(&gateway_report),
             );
             let GatewayApplyExecution { ack, local_applied } = execution;
-            last_gateway_revision = Some(ack.revision);
             last_gateway_status = Some(ack.status);
             update_gateway_retry_state(
                 ack.status,
@@ -755,6 +755,9 @@ async fn control_session(
             {
                 send_tunnel_apply_report(&mut reader, &tunnels, config).await?;
             }
+            gateway_confirmation_pending =
+                !matches!(ack.status, ApplyStatus::Failed | ApplyStatus::Retrying);
+            last_gateway_state = Some(gateway_state);
         }
         ServerControlMessage::HelloAccepted {
             gateway_state: None,
@@ -810,12 +813,14 @@ async fn control_session(
                 ..
             } if should_apply_gateway_state(
                 &gateway_state,
-                last_gateway_revision,
+                last_gateway_state.as_ref(),
                 last_gateway_status,
                 gateway_retry_at,
+                gateway_confirmation_pending,
                 last_gateway_report.as_ref() != Some(&heartbeat_gateway_report),
             ) =>
             {
+                let confirms_same_state = last_gateway_state.as_ref() == Some(&gateway_state);
                 replace_desired_tunnels(desired_tunnels, &tunnels).await;
                 if let Some(offer) = mesh_enrollment {
                     apply_mesh_enrollment_offer(&mut reader, config, &offer).await?;
@@ -827,7 +832,6 @@ async fn control_session(
                     Some(&heartbeat_gateway_report),
                 );
                 let GatewayApplyExecution { ack, local_applied } = execution;
-                last_gateway_revision = Some(ack.revision);
                 last_gateway_status = Some(ack.status);
                 update_gateway_retry_state(
                     ack.status,
@@ -860,6 +864,9 @@ async fn control_session(
                 {
                     send_tunnel_apply_report(&mut reader, &tunnels, config).await?;
                 }
+                gateway_confirmation_pending = !confirms_same_state
+                    && !matches!(ack.status, ApplyStatus::Failed | ApplyStatus::Retrying);
+                last_gateway_state = Some(gateway_state);
             }
             ServerControlMessage::HeartbeatAck {
                 gateway_state: None,
@@ -1625,16 +1632,23 @@ async fn query_tailscale_value(
 
 /// 判断本次心跳是否需要重新应用网关状态。
 ///
-/// 新 revision 必须立即应用；相同 revision 只有在退避时间到达后才重试，
-/// 避免 Tailscale 或宿主机暂时故障时每个心跳都重复执行系统命令。
+/// Desired State 内容变化必须立即应用；相同内容只有在退避时间到达后才重试，
+/// 避免 Tailscale 或宿主机暂时故障时每个心跳都重复执行系统命令。运行时健康
+/// 门控可能在不修改数据库 revision 的情况下暂停再恢复路由，因此不能只比较 revision。
+/// 成功应用后的下一次心跳会再确认一次，覆盖 Server 重启时并发状态投影可能
+/// 覆盖单次逐路由 ACK 的窗口；确认成功后不会继续重复执行系统命令。
 fn should_apply_gateway_state(
     state: &GatewayDesiredState,
-    last_revision: Option<i64>,
+    last_state: Option<&GatewayDesiredState>,
     last_status: Option<ApplyStatus>,
     retry_at: Option<Instant>,
+    confirmation_pending: bool,
     capabilities_changed: bool,
 ) -> bool {
-    if last_revision != Some(state.revision) {
+    if last_state != Some(state) {
+        return true;
+    }
+    if confirmation_pending {
         return true;
     }
     if capabilities_changed && last_status == Some(ApplyStatus::Failed) {
@@ -2483,31 +2497,84 @@ mod tests {
         };
         assert!(!should_apply_gateway_state(
             &state,
-            Some(8),
+            Some(&state),
             Some(ApplyStatus::Retrying),
             Some(Instant::now() + Duration::from_secs(60)),
             false,
+            false,
         ));
         assert!(should_apply_gateway_state(
             &state,
-            Some(8),
+            Some(&state),
             Some(ApplyStatus::Retrying),
             Some(Instant::now() - Duration::from_secs(1)),
             false,
-        ));
-        assert!(should_apply_gateway_state(
-            &state,
-            Some(7),
-            Some(ApplyStatus::Checking),
-            None,
             false,
         ));
         assert!(should_apply_gateway_state(
             &state,
-            Some(8),
+            None,
+            Some(ApplyStatus::Checking),
+            None,
+            false,
+            false,
+        ));
+        assert!(should_apply_gateway_state(
+            &state,
+            Some(&state),
             Some(ApplyStatus::Failed),
             None,
+            false,
             true,
+        ));
+    }
+
+    #[test]
+    fn gateway_reapplies_when_runtime_gate_changes_same_revision() {
+        let disabled = GatewayDesiredState {
+            revision: 8,
+            routes: vec![nexo_protocol::GatewayDesiredRoute {
+                network_id: "network-a".to_owned(),
+                site_link_id: None,
+                prefix: "192.168.10.0/24".to_owned(),
+                revision: 8,
+                enabled: false,
+            }],
+        };
+        let mut enabled = disabled.clone();
+        enabled.routes[0].enabled = true;
+
+        assert!(should_apply_gateway_state(
+            &enabled,
+            Some(&disabled),
+            Some(ApplyStatus::Disabled),
+            None,
+            false,
+            false,
+        ));
+    }
+
+    #[test]
+    fn gateway_reapplies_once_when_confirmation_is_pending() {
+        let state = GatewayDesiredState {
+            revision: 8,
+            routes: Vec::new(),
+        };
+        assert!(should_apply_gateway_state(
+            &state,
+            Some(&state),
+            Some(ApplyStatus::Checking),
+            None,
+            true,
+            false,
+        ));
+        assert!(!should_apply_gateway_state(
+            &state,
+            Some(&state),
+            Some(ApplyStatus::Checking),
+            None,
+            false,
+            false,
         ));
     }
 
