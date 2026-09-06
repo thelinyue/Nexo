@@ -421,6 +421,17 @@ pub fn build_caddy_config_with_environment_and_readiness(
         .iter()
         .filter(|tunnel| tunnel.enabled && tunnel.protocol == "https")
         .filter_map(|tunnel| tunnel_route(tunnel, domain));
+    let wildcard_hosts = tunnels
+        .iter()
+        .filter(|tunnel| tunnel.enabled && tunnel.protocol == "https")
+        .filter_map(|tunnel| {
+            tunnel
+                .hostname
+                .as_deref()
+                .map(|hostname| format!("{hostname}.{domain}"))
+        })
+        .chain([format!("nexo.{domain}"), format!("mesh.{domain}")])
+        .collect::<Vec<_>>();
 
     let mut http_routes = Vec::new();
     let mut https_routes = Vec::new();
@@ -455,6 +466,14 @@ pub fn build_caddy_config_with_environment_and_readiness(
         https_routes.push(system_route(domain, "mesh", "127.0.0.1:8281", false, false));
         https_routes.push(redirect_route(domain, &format!("https://nexo.{domain}")));
         https_routes.extend(https_tunnels);
+        if certificate_mode == "cloudflare" {
+            // 显式的泛域名路由让 Caddy 实际管理 `*.domain` 证书；精确服务
+            // 路由仍排在前面，未知子域名只返回 404，不会暴露内部服务。
+            https_routes.push(json!({
+                "match": [{"host": [format!("*.{domain}")]}],
+                "handle": [{"handler": "static_response", "status_code": 404}]
+            }));
+        }
     } else {
         http_routes.push(system_route(domain, "nexo", "127.0.0.1:9888", true, true));
         // Headscale 的正式组网入口只允许 HTTPS；没有证书时不向公网暴露
@@ -476,6 +495,12 @@ pub fn build_caddy_config_with_environment_and_readiness(
                 "certificate_selection": { "any_tag": ["nexo-manual"] }
             }]);
             https_server["automatic_https"] = json!({ "disable": true });
+        } else if certificate_mode == "cloudflare" {
+            // `nexo`、`mesh` 和各 Web Service 都由同一张泛域名证书覆盖，
+            // 避免为每个子域名分别创建 ACME 订单。
+            https_server["automatic_https"] = json!({
+                "skip_certificates": wildcard_hosts
+            });
         }
         servers.insert("https".to_owned(), https_server);
     }
@@ -666,6 +691,18 @@ mod tests {
         let text = config.to_string();
         assert!(text.contains("*.example.com"));
         assert!(text.contains("{env.NEXO_CLOUDFLARE_API_TOKEN}"));
+        assert_eq!(
+            config["apps"]["http"]["servers"]["https"]["automatic_https"]["skip_certificates"],
+            json!(["nexo.example.com", "mesh.example.com"])
+        );
+        let routes = config["apps"]["http"]["servers"]["https"]["routes"]
+            .as_array()
+            .expect("HTTPS 路由应为数组");
+        let wildcard = routes
+            .iter()
+            .find(|route| route["match"][0]["host"][0] == "*.example.com")
+            .expect("应生成泛域名兜底路由");
+        assert_eq!(wildcard["handle"][0]["status_code"], 404);
     }
 
     #[test]

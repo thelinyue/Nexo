@@ -38,6 +38,36 @@ Server 内置 Headscale 默认开启 MagicDNS，组网名称后缀为 `mesh.nexo
 
 如果 Windows 侧没有 Docker CLI，请从已安装 Docker Engine 的 WSL2 发行版中执行上述命令。
 
+## 真实 Cloudflare ACME 验收
+
+`cloudflare-acme-smoke.sh` 只用于发布前的人工验收，不进入普通 CI。请使用
+Cloudflare 管理的独立测试域名，Token 仅授予对应 Zone 的 `Zone:Read` 和
+`DNS:Edit`，并保存到仓库外的文本文件。脚本不会修改 A/AAAA；Caddy 只会在
+签发期间创建并清理 `_acme-challenge` TXT 记录。
+
+先执行 Staging，确认 DNS-01 和本机 Caddy TLS 闭环：
+
+```bash
+NEXO_REAL_ACME_DOMAIN=nexo-test.example.com \
+NEXO_CLOUDFLARE_TOKEN_FILE=/run/secrets/cloudflare-token \
+NEXO_ACME_KEEP_IMAGE=true \
+bash docker/cloudflare-acme-smoke.sh staging
+```
+
+Staging 通过后，使用同一构建镜像执行一次 Production。Production 必须显式
+确认，避免误用正式签发额度：
+
+```bash
+NEXO_REAL_ACME_DOMAIN=nexo-test.example.com \
+NEXO_CLOUDFLARE_TOKEN_FILE=/run/secrets/cloudflare-token \
+NEXO_ACME_SKIP_BUILD=true \
+NEXO_CONFIRM_PRODUCTION_ACME=yes \
+bash docker/cloudflare-acme-smoke.sh production
+```
+
+每次运行都使用并清理固定前缀的独立容器和数据卷。不要使用承载真实业务的
+生产根域名反复运行该脚本，也不要把 Token 内容写入命令行、仓库或日志。
+
 管理员恢复需要本地 Docker 权限，可执行 `docker compose -f docker/compose.phase2.yml
 exec nexo-server nexo admin recover` 获取一次性 Recovery Code；恢复码不会写入
 SQLite 或普通日志，输入恢复页面后会立即吊销全部旧 Session。

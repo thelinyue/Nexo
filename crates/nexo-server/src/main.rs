@@ -2811,23 +2811,36 @@ async fn public_certificate_material_ready(state: &AppState, entry: &PublicEntry
     }
 }
 
-/// 仅用于判断 Caddy 是否已经实际提供 HTTPS 证书；请求不会携带管理凭据。
+/// 生成本机 Caddy 证书探测目标。
+///
+/// 公网域名可能经过 Cloudflare 代理，直接按公网 DNS 访问只能证明边缘节点
+/// 提供了证书，不能证明当前 Nexo 实例已经完成签发。因此连接地址必须固定为
+/// Server 回环地址，同时保留公网主机名用于 HTTP Host 和 TLS SNI。
+fn public_https_probe_target(domain: &str) -> (String, String, SocketAddr) {
+    let host = format!("nexo.{domain}");
+    let url = format!("https://{host}/api/v1/auth/status");
+    (host, url, SocketAddr::from(([127, 0, 0, 1], 443)))
+}
+
+/// 仅用于判断本机 Caddy 是否已经实际提供 HTTPS 证书；请求不会携带管理凭据。
 /// Staging 证书可能不受系统 CA 信任，因此这里允许无效证书，但不改变
 /// Caddy 对外的证书校验策略。
 async fn probe_public_https(domain: &str) -> bool {
+    let (host, url, address) = public_https_probe_target(domain);
     let Ok(client) = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(5))
         .danger_accept_invalid_certs(true)
         .redirect(reqwest::redirect::Policy::none())
+        .resolve(&host, address)
         .build()
     else {
         return false;
     };
     client
-        .get(format!("https://nexo.{domain}/api/v1/auth/status"))
+        .get(url)
         .send()
         .await
-        .is_ok_and(|response| response.status().as_u16() < 600)
+        .is_ok_and(|response| response.status().is_success())
 }
 
 fn truncate_error_message(message: &str) -> String {
@@ -8847,6 +8860,14 @@ mod tests {
             HeaderValue::from_static("nexo_local_session=test-session"),
         );
         headers
+    }
+
+    #[test]
+    fn public_https_probe_keeps_sni_and_targets_local_caddy() {
+        let (host, url, address) = public_https_probe_target("nexo-test.example.com");
+        assert_eq!(host, "nexo.nexo-test.example.com");
+        assert_eq!(url, "https://nexo.nexo-test.example.com/api/v1/auth/status");
+        assert_eq!(address, SocketAddr::from(([127, 0, 0, 1], 443)));
     }
 
     fn test_state() -> AppState {
