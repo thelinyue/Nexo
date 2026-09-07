@@ -19,7 +19,7 @@ mod policy;
 
 use anyhow::{Context, Result};
 use axum::{
-    extract::{connect_info::Connected, Path, State},
+    extract::{connect_info::Connected, Path, Query, State},
     http::{HeaderMap, StatusCode},
     middleware,
     response::{IntoResponse, Response},
@@ -123,6 +123,8 @@ const TAILSCALE_CLIENT_MIGRATION: &str =
 const ACCESS_CONTROL_MIGRATION: &str = include_str!("../../../migrations/0017_access_control.sql");
 const PUBLIC_DOMAIN_OPERATIONS_MIGRATION: &str =
     include_str!("../../../migrations/0018_public_domain_operations.sql");
+const PUBLIC_DOMAIN_RUNTIME_EVENTS_MIGRATION: &str =
+    include_str!("../../../migrations/0019_public_domain_runtime_events.sql");
 
 #[derive(Clone)]
 pub(crate) struct AppState {
@@ -415,6 +417,20 @@ struct PublicDomainResponse {
     attempt_count: i64,
     next_retry_at: Option<i64>,
     dns_management: DnsManagementResponse,
+    management_entry: Option<String>,
+    mesh_entry: Option<String>,
+    readiness_summary: PublicDomainReadinessSummary,
+}
+
+/// 聚合列表所需的入口就绪状态，避免不同客户端各自推导出不一致结论。
+#[derive(Debug, Serialize, Clone)]
+struct PublicDomainReadinessSummary {
+    status: String,
+    root_dns: String,
+    wildcard_dns: String,
+    https: String,
+    management_entry: String,
+    mesh_entry: String,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -526,6 +542,167 @@ struct PublicDomainSecretRequest {
     certificate_pem: Option<String>,
     #[serde(default)]
     private_key_pem: Option<String>,
+    /// 上传证书校验成功后原子切换为手动模式；失败时继续保留自动证书。
+    #[serde(default)]
+    activate_manual_certificate: bool,
+}
+
+#[derive(Debug, Deserialize, Default, Clone)]
+struct RuntimeEventQuery {
+    public_domain_id: Option<String>,
+    level: Option<String>,
+    category: Option<String>,
+    since: Option<i64>,
+    cursor: Option<i64>,
+    limit: Option<usize>,
+    search: Option<String>,
+}
+
+#[derive(Debug, Serialize, Clone)]
+struct RuntimeEventResponse {
+    id: i64,
+    public_domain_id: Option<String>,
+    domain: Option<String>,
+    level: String,
+    category: String,
+    stage: Option<String>,
+    summary: String,
+    error_code: Option<String>,
+    retry_at: Option<i64>,
+    technical_detail: Option<String>,
+    occurred_at: i64,
+}
+
+#[derive(Debug, Serialize)]
+struct RuntimeEventPage {
+    events: Vec<RuntimeEventResponse>,
+    next_cursor: Option<i64>,
+}
+
+fn read_public_domain_runtime_events(
+    connection: &Connection,
+    tenant_id: &str,
+    query: &RuntimeEventQuery,
+    maximum: usize,
+) -> Result<RuntimeEventPage, ApiError> {
+    let limit = query.limit.unwrap_or(50).clamp(1, maximum);
+    let domain_id = query
+        .public_domain_id
+        .as_deref()
+        .filter(|value| !value.is_empty());
+    let level = query.level.as_deref().filter(|value| !value.is_empty());
+    let category = query.category.as_deref().filter(|value| !value.is_empty());
+    let search = query
+        .search
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let mut statement = connection
+        .prepare(
+            "SELECT id, public_domain_id, domain, level, category, stage, summary,
+                    error_code, retry_at, technical_detail, occurred_at
+             FROM public_domain_runtime_events
+             WHERE tenant_id = ?1
+               AND (?2 IS NULL OR public_domain_id = ?2)
+               AND (?3 IS NULL OR level = ?3)
+               AND (?4 IS NULL OR category = ?4)
+               AND (?5 IS NULL OR occurred_at >= ?5)
+               AND (?6 IS NULL OR id < ?6)
+               AND (?7 IS NULL OR lower(summary) LIKE '%' || lower(?7) || '%'
+                    OR lower(COALESCE(domain, '')) LIKE '%' || lower(?7) || '%'
+                    OR lower(COALESCE(technical_detail, '')) LIKE '%' || lower(?7) || '%')
+             ORDER BY id DESC LIMIT ?8",
+        )
+        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法读取域名服务日志"))?;
+    let mut events = statement
+        .query_map(
+            rusqlite::params![
+                tenant_id,
+                domain_id,
+                level,
+                category,
+                query.since,
+                query.cursor,
+                search,
+                i64::try_from(limit + 1).unwrap_or(101),
+            ],
+            |row| {
+                Ok(RuntimeEventResponse {
+                    id: row.get(0)?,
+                    public_domain_id: row.get(1)?,
+                    domain: row.get(2)?,
+                    level: row.get(3)?,
+                    category: row.get(4)?,
+                    stage: row.get(5)?,
+                    summary: row.get(6)?,
+                    error_code: row.get(7)?,
+                    retry_at: row.get(8)?,
+                    technical_detail: row.get(9)?,
+                    occurred_at: row.get(10)?,
+                })
+            },
+        )
+        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法查询域名服务日志"))?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法解析域名服务日志"))?;
+    let next_cursor = (events.len() > limit)
+        .then(|| events.get(limit - 1).map(|event| event.id))
+        .flatten();
+    events.truncate(limit);
+    Ok(RuntimeEventPage {
+        events,
+        next_cursor,
+    })
+}
+
+async fn list_public_domain_runtime_events(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<RuntimeEventQuery>,
+) -> Result<Json<RuntimeEventPage>, ApiError> {
+    let tenant_id = auth::admin_tenant_id(&state, &headers)?;
+    let connection = state
+        .db
+        .lock()
+        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "数据库锁不可用"))?;
+    Ok(Json(read_public_domain_runtime_events(
+        &connection,
+        &tenant_id,
+        &query,
+        100,
+    )?))
+}
+
+async fn export_public_domain_runtime_events(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(mut query): Query<RuntimeEventQuery>,
+) -> Result<Response, ApiError> {
+    let tenant_id = auth::admin_tenant_id(&state, &headers)?;
+    query.limit = Some(1_000);
+    let page = {
+        let connection = state
+            .db
+            .lock()
+            .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "数据库锁不可用"))?;
+        read_public_domain_runtime_events(&connection, &tenant_id, &query, 1_000)?
+    };
+    let body = serde_json::to_vec_pretty(&page.events)
+        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法导出域名服务日志"))?;
+    Ok((
+        [
+            (
+                axum::http::header::CONTENT_TYPE,
+                "application/json; charset=utf-8",
+            ),
+            (
+                axum::http::header::CONTENT_DISPOSITION,
+                "attachment; filename=domain-runtime-events.json",
+            ),
+        ],
+        body,
+    )
+        .into_response())
 }
 
 #[derive(Debug, Deserialize)]
@@ -1148,6 +1325,8 @@ async fn main() -> Result<()> {
     apply_access_control_migration(&connection).context("无法初始化可视化访问控制数据结构")?;
     apply_public_domain_operations_migration(&connection)
         .context("无法初始化域名 DNS 托管和证书进度数据结构")?;
+    apply_public_domain_runtime_events_migration(&connection)
+        .context("无法初始化域名服务运行日志")?;
     let legacy_tunnel_count = finalize_legacy_pending_tunnel_deletions(&connection)
         .context("无法清理旧版本遗留的待删除穿透服务")?;
     if legacy_tunnel_count > 0 {
@@ -1332,6 +1511,10 @@ async fn main() -> Result<()> {
             post(upload_public_domain_credentials),
         )
         .route(
+            "/api/v1/public-domains/{id}/manual-certificate",
+            delete(delete_public_domain_manual_certificate),
+        )
+        .route(
             "/api/v1/public-domains/{id}/recheck",
             post(recheck_public_domain),
         )
@@ -1370,6 +1553,14 @@ async fn main() -> Result<()> {
         .route(
             "/api/v1/public-domain-migrations/{id}",
             get(get_public_domain_migration),
+        )
+        .route(
+            "/api/v1/public-domain-runtime-events",
+            get(list_public_domain_runtime_events),
+        )
+        .route(
+            "/api/v1/public-domain-runtime-events/export",
+            get(export_public_domain_runtime_events),
         )
         .route("/api/v1/tunnels", get(list_tunnels).post(create_tunnel))
         .route(
@@ -1607,6 +1798,7 @@ fn run_cli_command(command: CliCommand) -> Result<()> {
     apply_tailscale_client_migration(&connection)?;
     apply_access_control_migration(&connection)?;
     apply_public_domain_operations_migration(&connection)?;
+    apply_public_domain_runtime_events_migration(&connection)?;
     ensure_mesh_identity_online_column(&connection)?;
     let data_dir = db_path.parent().context("Nexo 数据库路径缺少父目录")?;
     migrate_legacy_public_domain_secrets(data_dir, &connection)
@@ -1733,6 +1925,23 @@ fn apply_public_domain_operations_migration(connection: &Connection) -> Result<(
     }
     let transaction = connection.unchecked_transaction()?;
     transaction.execute_batch(PUBLIC_DOMAIN_OPERATIONS_MIGRATION)?;
+    transaction.commit()?;
+    Ok(())
+}
+
+/// 初始化域名服务运行事件表。运行日志与安全审计职责不同，独立存储便于
+/// 执行短周期清理，也避免诊断事件淹没登录、授权等安全记录。
+fn apply_public_domain_runtime_events_migration(connection: &Connection) -> Result<()> {
+    let applied = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version = 19)",
+        [],
+        |row| row.get::<_, bool>(0),
+    )?;
+    if applied {
+        return Ok(());
+    }
+    let transaction = connection.unchecked_transaction()?;
+    transaction.execute_batch(PUBLIC_DOMAIN_RUNTIME_EVENTS_MIGRATION)?;
     transaction.commit()?;
     Ok(())
 }
@@ -4541,21 +4750,55 @@ fn public_domain_response_from_row(
     let root_not_after = row.get(14)?;
     let wildcard_not_before = row.get(17)?;
     let wildcard_not_after = row.get(18)?;
+    let id = row.get(0)?;
+    let tenant_id = row.get(1)?;
+    let domain: String = row.get(2)?;
+    let is_primary = row.get::<_, i64>(3)? != 0;
+    let dns_check: serde_json::Value =
+        serde_json::from_str(&row.get::<_, String>(10)?).unwrap_or_else(|_| serde_json::json!({}));
+    let root_certificate_status: String = row.get(11)?;
+    let wildcard_certificate_status: String = row.get(15)?;
+    let dns_part_status = |part: &str| {
+        let value = dns_check.get(part);
+        if value
+            .and_then(|item| item.get("resolved"))
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|records| !records.is_empty())
+            && value
+                .and_then(|item| item.get("error"))
+                .is_none_or(serde_json::Value::is_null)
+        {
+            "ready"
+        } else if value.and_then(|item| item.get("error")).is_some() {
+            "error"
+        } else {
+            "pending"
+        }
+    };
+    let root_dns = dns_part_status("root").to_owned();
+    let wildcard_dns = dns_part_status("wildcard").to_owned();
+    let https_ready = public_domain_ready_from_row(
+        &apply_status,
+        https_enabled,
+        &root_certificate_status,
+        &wildcard_certificate_status,
+    );
+    let management_entry = (is_primary && https_enabled).then(|| format!("https://nexo.{domain}"));
+    let mesh_entry = (is_primary && https_enabled).then(|| format!("https://mesh.{domain}"));
     Ok(PublicDomainResponse {
-        id: row.get(0)?,
-        tenant_id: row.get(1)?,
-        domain: row.get(2)?,
-        is_primary: row.get::<_, i64>(3)? != 0,
+        id,
+        tenant_id,
+        domain,
+        is_primary,
         https_enabled,
         certificate_mode: row.get(5)?,
         acme_environment: row.get(6)?,
-        apply_status,
+        apply_status: apply_status.clone(),
         apply_error: row.get(8)?,
         error_code: row.get(9)?,
-        dns_check: serde_json::from_str(&row.get::<_, String>(10)?)
-            .unwrap_or_else(|_| serde_json::json!({})),
+        dns_check,
         root_certificate: CertificateStatusResponse {
-            status: row.get(11)?,
+            status: root_certificate_status,
             not_before: root_not_before,
             not_after: root_not_after,
             renewal_at: automatic_renewal
@@ -4572,7 +4815,7 @@ fn public_domain_response_from_row(
             },
         },
         wildcard_certificate: CertificateStatusResponse {
-            status: row.get(15)?,
+            status: wildcard_certificate_status,
             not_before: wildcard_not_before,
             not_after: wildcard_not_after,
             renewal_at: automatic_renewal
@@ -4601,6 +4844,30 @@ fn public_domain_response_from_row(
             status: row.get(28)?,
             error: row.get(29)?,
             version: row.get(30)?,
+        },
+        management_entry: management_entry.clone(),
+        mesh_entry: mesh_entry.clone(),
+        readiness_summary: PublicDomainReadinessSummary {
+            status: apply_status,
+            root_dns: root_dns.clone(),
+            wildcard_dns: wildcard_dns.clone(),
+            https: if https_ready { "ready" } else { "pending" }.to_owned(),
+            management_entry: if !is_primary {
+                "not_applicable"
+            } else if https_ready && root_dns == "ready" {
+                "ready"
+            } else {
+                "pending"
+            }
+            .to_owned(),
+            mesh_entry: if !is_primary {
+                "not_applicable"
+            } else if https_ready && wildcard_dns == "ready" {
+                "ready"
+            } else {
+                "pending"
+            }
+            .to_owned(),
         },
     })
 }
@@ -5570,6 +5837,8 @@ async fn update_public_domain(
 #[derive(Debug, Deserialize, Default)]
 struct DeletePublicDomainRequest {
     replacement_domain_id: Option<String>,
+    #[serde(default)]
+    disable_public_access: bool,
 }
 
 async fn delete_public_domain(
@@ -5579,8 +5848,9 @@ async fn delete_public_domain(
     body: Option<Json<DeletePublicDomainRequest>>,
 ) -> Result<Json<DeleteResponse>, ApiError> {
     let tenant_id = auth::admin_tenant_id(&state, &headers)?;
-    let replacement = body.and_then(|Json(value)| value.replacement_domain_id);
-    let (secret_dir, usage, _is_primary) = {
+    let request = body.map(|Json(value)| value).unwrap_or_default();
+    let replacement = request.replacement_domain_id.as_deref();
+    let (secret_dir, usage, is_primary) = {
         let mut connection = state
             .db
             .lock()
@@ -5598,10 +5868,23 @@ async fn delete_public_domain(
                 |row| Ok((row.get(0)?, row.get(1)?, row.get::<_, i64>(2)? != 0)),
             )
             .map_err(|_| ApiError::new(StatusCode::NOT_FOUND, "域名不存在"))?;
-        if row.2 {
+        let domain_count: i64 = transaction
+            .query_row(
+                "SELECT COUNT(*) FROM public_domains WHERE tenant_id = ?1",
+                [&tenant_id],
+                |count_row| count_row.get(0),
+            )
+            .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法检查域名数量"))?;
+        if row.2 && domain_count > 1 {
             return Err(ApiError::new(
                 StatusCode::CONFLICT,
                 "主域名不能直接删除，请先切换主域名",
+            ));
+        }
+        if row.2 && !request.disable_public_access {
+            return Err(ApiError::new(
+                StatusCode::CONFLICT,
+                "删除唯一主域名会停用公网入口，请确认后重试",
             ));
         }
         let active_migration: i64 = transaction
@@ -5621,8 +5904,8 @@ async fn delete_public_domain(
                 "域名仍被未完成的主域名迁移依赖，所有设备确认前不能删除",
             ));
         }
-        if row.1 > 0 {
-            let Some(target) = replacement.as_deref() else {
+        if row.1 > 0 && !row.2 {
+            let Some(target) = replacement else {
                 return Err(ApiError::new(
                     StatusCode::CONFLICT,
                     "域名仍被服务使用，请选择替代域名",
@@ -5703,6 +5986,45 @@ async fn delete_public_domain(
                     ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法迁移域名服务")
                 })?;
         }
+        if row.2 {
+            transaction
+                .execute(
+                    "UPDATE tunnels SET public_domain_id = NULL, updated_at = CURRENT_TIMESTAMP
+                     WHERE public_domain_id = ?1 AND deleted_at IS NULL
+                       AND protocol IN ('http', 'https')",
+                    [&id],
+                )
+                .map_err(|_| {
+                    ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法解除服务域名绑定")
+                })?;
+            transaction
+                .execute(
+                    "UPDATE public_entry_settings SET base_domain = NULL, https_enabled = 0,
+                     certificate_mode = 'none', apply_status = 'not_configured', apply_error = NULL,
+                     certificate_not_before = NULL, certificate_not_after = NULL,
+                     certificate_subjects_json = '[]', dns_check_json = '{}',
+                     desired_revision = desired_revision + 1, updated_at = unixepoch()
+                     WHERE tenant_id = ?1",
+                    [&tenant_id],
+                )
+                .map_err(|_| {
+                    ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法停用公网入口")
+                })?;
+        }
+        // 已完成迁移只是历史记录，不应继续通过外键阻止旧域名删除；进行中的
+        // 迁移已在上方拒绝，删除任务会级联清理逐设备状态。
+        transaction
+            .execute(
+                "DELETE FROM public_domain_migrations
+                 WHERE (from_domain_id = ?1 OR to_domain_id = ?1) AND status = 'completed'",
+                [&id],
+            )
+            .map_err(|_| {
+                ApiError::new(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "无法清理已完成的域名迁移记录",
+                )
+            })?;
         transaction
             .execute(
                 "DELETE FROM public_domains WHERE id = ?1 AND tenant_id = ?2",
@@ -5714,12 +6036,23 @@ async fn delete_public_domain(
         })?;
         (row.0, row.1, row.2)
     };
+    let secret_dir = {
+        let path = PathBuf::from(secret_dir);
+        if path.is_absolute() {
+            path
+        } else {
+            state.data_dir.join(path)
+        }
+    };
     if let Err(error) = fs::remove_dir_all(&secret_dir) {
         if error.kind() != std::io::ErrorKind::NotFound {
             tracing::warn!(domain_id = %id, "域名 Secret 目录清理失败：{error}");
         }
     }
     reconcile_caddy_config_best_effort(&state).await;
+    if is_primary {
+        sync_headscale_server_url(&state).await;
+    }
     tracing::info!(domain_id = %id, usage, "公网域名已删除");
     Ok(Json(DeleteResponse {
         deleted: true,
@@ -5754,12 +6087,33 @@ async fn upload_public_domain_credentials(
     let certificate_metadata = match mode.as_str() {
         "cloudflare" => {
             if request.certificate_pem.is_some() || request.private_key_pem.is_some() {
-                return Err(ApiError::new(
-                    StatusCode::BAD_REQUEST,
-                    "Cloudflare DNS-01 模式不能上传手动证书",
-                ));
+                if !request.activate_manual_certificate {
+                    return Err(ApiError::new(
+                        StatusCode::BAD_REQUEST,
+                        "上传手动证书时必须明确启用手动证书模式",
+                    ));
+                }
+                match (
+                    request.certificate_pem.as_deref(),
+                    request.private_key_pem.as_deref(),
+                ) {
+                    (Some(certificate), Some(private_key)) => {
+                        Some(validate_certificate_pair_for_domain(
+                            certificate,
+                            private_key,
+                            Some(&domain),
+                        )?)
+                    }
+                    _ => {
+                        return Err(ApiError::new(
+                            StatusCode::BAD_REQUEST,
+                            "证书和私钥必须同时提供",
+                        ))
+                    }
+                }
+            } else {
+                None
             }
-            None
         }
         "manual" => {
             match (
@@ -5785,6 +6139,12 @@ async fn upload_public_domain_credentials(
             ));
         }
     };
+    if request.activate_manual_certificate && certificate_metadata.is_none() {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "启用手动证书时必须同时提供证书和私钥",
+        ));
+    }
     if request
         .cloudflare_token
         .as_deref()
@@ -5805,7 +6165,7 @@ async fn upload_public_domain_credentials(
         capture_secret_rollback(&mut secret_rollbacks, &path);
         write_secret_file(&path, token)?;
     }
-    if let (Some(certificate), Some(private_key), Some(metadata)) = (
+    let uploaded_certificate = if let (Some(certificate), Some(private_key), Some(metadata)) = (
         request.certificate_pem.as_deref(),
         request.private_key_pem.as_deref(),
         certificate_metadata.as_ref(),
@@ -5816,49 +6176,70 @@ async fn upload_public_domain_credentials(
         capture_secret_rollback(&mut secret_rollbacks, &private_key_path);
         write_secret_file(&certificate_path, certificate)?;
         write_secret_file(&private_key_path, private_key)?;
-        let subjects =
-            serde_json::to_string(&metadata.subjects).unwrap_or_else(|_| "[]".to_owned());
-        let connection = state
-            .db
-            .lock()
-            .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "数据库锁不可用"))?;
-        connection
-                    .execute(
-                        "UPDATE public_domains SET root_certificate_status = 'ready',
-                         wildcard_certificate_status = 'ready', root_certificate_not_before = ?1,
-                         root_certificate_not_after = ?2, wildcard_certificate_not_before = ?1,
-                         wildcard_certificate_not_after = ?2, root_certificate_subjects_json = ?3,
-                         wildcard_certificate_subjects_json = ?3, apply_status = 'checking',
-                         apply_error = NULL, error_code = NULL, desired_revision = desired_revision + 1,
-                         updated_at = unixepoch() WHERE id = ?4 AND tenant_id = ?5",
-                        rusqlite::params![
-                            metadata.not_before,
-                            metadata.not_after,
-                            subjects,
-                            id,
-                            tenant_id
-                        ],
-                    )
-                    .map_err(|_| {
-                        ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法保存证书元数据")
-                    })?;
-        connection
-            .execute(
-                "UPDATE public_domain_certificate_progress
-                         SET stage = 'active', last_event_at = unixepoch(),
-                             next_retry_at = NULL, error_code = NULL,
-                             error_message = NULL, updated_at = unixepoch()
-                         WHERE public_domain_id = ?1",
-                [&id],
-            )
-            .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法保存证书进度"))?;
-    }
+        Some((
+            metadata.not_before,
+            metadata.not_after,
+            serde_json::to_string(&metadata.subjects).unwrap_or_else(|_| "[]".to_owned()),
+        ))
+    } else {
+        None
+    };
     {
-        let connection = state
+        let mut connection = state
             .db
             .lock()
             .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "数据库锁不可用"))?;
-        connection
+        let transaction = connection.transaction().map_err(|_| {
+            ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法开始凭据状态事务")
+        })?;
+        if let Some((not_before, not_after, subjects)) = uploaded_certificate.as_ref() {
+            transaction
+                .execute(
+                    "UPDATE public_domains SET certificate_mode = CASE WHEN ?1 = 1 THEN 'manual' ELSE certificate_mode END,
+                     root_certificate_status = 'ready', wildcard_certificate_status = 'ready',
+                     root_certificate_not_before = ?2, root_certificate_not_after = ?3,
+                     wildcard_certificate_not_before = ?2, wildcard_certificate_not_after = ?3,
+                     root_certificate_subjects_json = ?4, wildcard_certificate_subjects_json = ?4,
+                     apply_status = 'checking', apply_error = NULL, error_code = NULL,
+                     desired_revision = desired_revision + 1, updated_at = unixepoch()
+                     WHERE id = ?5 AND tenant_id = ?6",
+                    rusqlite::params![
+                        i64::from(request.activate_manual_certificate),
+                        not_before,
+                        not_after,
+                        subjects,
+                        id,
+                        tenant_id
+                    ],
+                )
+                .map_err(|_| {
+                    ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法保存证书元数据")
+                })?;
+            transaction
+                .execute(
+                    "UPDATE public_domain_certificate_progress
+                     SET stage = 'active', last_event_at = unixepoch(), next_retry_at = NULL,
+                         error_code = NULL, error_message = NULL, updated_at = unixepoch()
+                     WHERE public_domain_id = ?1",
+                    [&id],
+                )
+                .map_err(|_| {
+                    ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法保存证书进度")
+                })?;
+        }
+        if request.activate_manual_certificate {
+            transaction
+                .execute(
+                    "UPDATE public_entry_settings SET certificate_mode = 'manual',
+                     desired_revision = desired_revision + 1, updated_at = unixepoch()
+                     WHERE tenant_id = ?1 AND base_domain = ?2",
+                    rusqlite::params![tenant_id, domain],
+                )
+                .map_err(|_| {
+                    ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法更新主域名证书模式")
+                })?;
+        }
+        transaction
             .execute(
                 "UPDATE public_domains SET apply_status = 'checking', apply_error = NULL,
                  error_code = NULL, desired_revision = desired_revision + 1,
@@ -5868,6 +6249,9 @@ async fn upload_public_domain_credentials(
             .map_err(|_| {
                 ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法更新证书应用状态")
             })?;
+        transaction.commit().map_err(|_| {
+            ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法提交凭据状态事务")
+        })?;
     }
     reconcile_caddy_config_best_effort(&state).await;
     let connection = state
@@ -5888,6 +6272,115 @@ async fn upload_public_domain_credentials(
         }
     }
     response
+}
+
+async fn delete_public_domain_manual_certificate(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<Json<PublicDomainResponse>, ApiError> {
+    let tenant_id = auth::admin_tenant_id(&state, &headers)?;
+    let domain = {
+        let connection = state
+            .db
+            .lock()
+            .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "数据库锁不可用"))?;
+        connection
+            .query_row(
+                "SELECT domain FROM public_domains WHERE id = ?1 AND tenant_id = ?2",
+                rusqlite::params![id, tenant_id],
+                |row| row.get::<_, String>(0),
+            )
+            .map_err(|_| ApiError::new(StatusCode::NOT_FOUND, "域名不存在"))?
+    };
+    let directory = domain_secret_dir(&state, &id);
+    let certificate_path = directory.join("certificate.pem");
+    let private_key_path = directory.join("private-key.pem");
+    let mut rollbacks = vec![
+        SecretFileRollback::capture(&certificate_path),
+        SecretFileRollback::capture(&private_key_path),
+    ];
+    for path in [&certificate_path, &private_key_path] {
+        if let Err(error) = fs::remove_file(path) {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                return Err(ApiError::new(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "无法删除手动证书文件",
+                ));
+            }
+        }
+    }
+    {
+        let mut connection = state
+            .db
+            .lock()
+            .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "数据库锁不可用"))?;
+        let transaction = connection.transaction().map_err(|_| {
+            ApiError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "无法开始手动证书删除事务",
+            )
+        })?;
+        transaction
+            .execute(
+                "UPDATE public_domains SET root_certificate_status = 'pending',
+                 wildcard_certificate_status = 'pending', root_certificate_not_before = NULL,
+                 root_certificate_not_after = NULL, wildcard_certificate_not_before = NULL,
+                 wildcard_certificate_not_after = NULL, root_certificate_subjects_json = '[]',
+                 wildcard_certificate_subjects_json = '[]', apply_status = 'error',
+                 apply_error = '手动证书已删除，请上传新证书或明确切换到自动证书',
+                 error_code = 'manual_certificate_missing', desired_revision = desired_revision + 1,
+                 updated_at = unixepoch() WHERE id = ?1 AND tenant_id = ?2",
+                rusqlite::params![id, tenant_id],
+            )
+            .map_err(|_| {
+                ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法更新手动证书状态")
+            })?;
+        transaction
+            .execute(
+                "UPDATE public_domain_certificate_progress SET stage = 'waiting_configuration',
+                 last_event_at = unixepoch(), next_retry_at = NULL,
+                 error_code = 'manual_certificate_missing',
+                 error_message = '手动证书已删除，自动申请保持关闭', updated_at = unixepoch()
+                 WHERE public_domain_id = ?1",
+                [&id],
+            )
+            .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法更新证书进度"))?;
+        transaction
+            .execute(
+                "UPDATE public_entry_settings SET certificate_not_before = NULL,
+                 certificate_not_after = NULL, certificate_subjects_json = '[]',
+                 apply_status = 'error', apply_error = '手动证书已删除，请重新配置证书',
+                 desired_revision = desired_revision + 1, updated_at = unixepoch()
+                 WHERE tenant_id = ?1 AND base_domain = ?2",
+                rusqlite::params![tenant_id, domain],
+            )
+            .map_err(|_| {
+                ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法更新主域名证书状态")
+            })?;
+        transaction.commit().map_err(|_| {
+            ApiError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "无法提交手动证书删除事务",
+            )
+        })?;
+    }
+    for rollback in &mut rollbacks {
+        rollback.commit();
+    }
+    reconcile_caddy_config_best_effort(&state).await;
+    let connection = state
+        .db
+        .lock()
+        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "数据库锁不可用"))?;
+    connection
+        .query_row(
+            &public_domain_query_ordered("WHERE p.id = ?1 AND p.tenant_id = ?2"),
+            rusqlite::params![id, tenant_id],
+            public_domain_response_from_row,
+        )
+        .map(Json)
+        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法读取域名证书状态"))
 }
 
 async fn recheck_public_domain(
@@ -6018,11 +6511,11 @@ async fn recheck_public_domain(
     let apply_error = if apply_status == "ready" {
         None
     } else if rate_limited {
-        Some("CA 限流窗口尚未结束，Caddy 将按官方退避自动重试")
+        Some("CA 限流窗口尚未结束，自动证书服务将按官方退避重试")
     } else if certificate_expired {
-        Some("证书已过期，Caddy 将按 Automatic HTTPS 规则自动续期")
+        Some("证书已过期，自动证书服务将按既定规则续期")
     } else {
-        Some("根域名或泛域名证书尚未签发，Caddy 将自动重试")
+        Some("根域名或泛域名证书尚未签发，系统将自动重试")
     };
     let error_code = if apply_status == "ready" {
         None
@@ -6256,7 +6749,7 @@ async fn renew_public_domains(
             if retry_after.is_some_and(|retry| retry > now) {
                 skipped.push(BatchSkippedItem {
                     id: id.clone(),
-                    reason: "CA 限流窗口尚未结束，Caddy 会自动重试".to_owned(),
+                    reason: "CA 限流窗口尚未结束，系统会自动重试".to_owned(),
                 });
                 continue;
             }
@@ -6305,7 +6798,7 @@ async fn renew_public_domains(
     }
     Ok(PublicDomainBatchResponse {
         message: format!(
-            "已请求 Caddy 处理 {} 个域名，限流项将按官方退避自动重试",
+            "已请求自动证书服务处理 {} 个域名，限流项将按官方退避自动重试",
             updated.len()
         ),
         updated,
@@ -6586,9 +7079,17 @@ fn load_caddy_desired_config_with_readiness(
                 certificate_mode: row.get(4)?,
                 acme_environment: row.get(5)?,
                 secret_dir: if PathBuf::from(&secret_dir).is_absolute() {
-                    PathBuf::from(secret_dir)
+                    PathBuf::from(&secret_dir)
                 } else {
-                    state.data_dir.join(secret_dir)
+                    state.data_dir.join(&secret_dir)
+                },
+                manual_certificate_available: {
+                    let path = if PathBuf::from(&secret_dir).is_absolute() {
+                        PathBuf::from(&secret_dir)
+                    } else {
+                        state.data_dir.join(&secret_dir)
+                    };
+                    path.join("certificate.pem").is_file() && path.join("private-key.pem").is_file()
                 },
                 token_env,
                 https_ready: ready,
@@ -6800,21 +7301,31 @@ fn apply_caddy_log_events(state: &AppState, events: &[caddy::CaddyLogEvent]) -> 
             |row| row.get(0),
         )
         .context("无法读取公网域名租户")?;
-    let domains = connection
+    let mut domains = connection
         .prepare("SELECT id, domain FROM public_domains WHERE tenant_id = ?1")?
         .query_map([&tenant_id], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
+    // 优先匹配较长的域名，避免 `app.example.com` 被错误归到 `example.com`。
+    domains.sort_by_key(|(_, domain)| std::cmp::Reverse(domain.len()));
     for event in events {
-        let Some(stage) = event.certificate_stage() else {
-            continue;
-        };
         let normalized_identifier = event
             .identifier
             .as_deref()
             .map(|identifier| identifier.trim().trim_end_matches('.').to_ascii_lowercase());
         let lower_message = event.message.to_ascii_lowercase();
+        let related_domain = domains.iter().find(|(_, domain)| {
+            normalized_identifier.as_ref().is_some_and(|identifier| {
+                identifier == domain
+                    || identifier == &format!("*.{domain}")
+                    || identifier.ends_with(&format!(".{domain}"))
+            }) || lower_message.contains(domain.as_str())
+        });
+        persist_public_domain_runtime_event(state, &connection, &tenant_id, related_domain, event)?;
+        let Some(stage) = event.certificate_stage() else {
+            continue;
+        };
         let retry_at = event
             .retry_after_secs
             .map(|seconds| unix_now().saturating_add(i64::try_from(seconds).unwrap_or(i64::MAX)));
@@ -6885,6 +7396,206 @@ fn apply_caddy_log_events(state: &AppState, events: &[caddy::CaddyLogEvent]) -> 
             )?;
         }
     }
+    prune_public_domain_runtime_events(&connection, &tenant_id)?;
+    Ok(())
+}
+
+/// 把底层组件事件翻译为产品可理解的运行日志。原文仅作为脱敏后的技术详情
+/// 保存，界面无需理解底层 logger 或组件名称也能判断下一步。
+fn persist_public_domain_runtime_event(
+    state: &AppState,
+    connection: &Connection,
+    tenant_id: &str,
+    related_domain: Option<&(String, String)>,
+    event: &caddy::CaddyLogEvent,
+) -> Result<()> {
+    let logger = event
+        .logger
+        .as_deref()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let message = event.message.to_ascii_lowercase();
+    let level = match event
+        .level
+        .as_deref()
+        .unwrap_or("info")
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "error" => "error",
+        "warn" | "warning" => "warning",
+        "debug" => "debug",
+        _ => "info",
+    };
+    let category = if logger.contains("reverse_proxy") || message.contains("upstream") {
+        "reverse_proxy"
+    } else if logger.contains("dns")
+        || message.contains("cloudflare")
+        || message.contains("propagation")
+    {
+        "dns_validation"
+    } else if logger.contains("acme")
+        || logger.contains("tls.obtain")
+        || message.contains("certificate")
+    {
+        "automatic_certificate"
+    } else if logger.contains("tls") || message.contains("handshake") {
+        "https"
+    } else if logger.contains("admin") || logger.contains("config") || message.contains("config") {
+        "configuration"
+    } else if logger.contains("storage") {
+        "certificate_storage"
+    } else {
+        "service_runtime"
+    };
+    let stage = event.certificate_stage();
+    let summary = match (category, stage) {
+        (_, Some("retry_wait")) => "证书申请暂未完成，系统将按计划自动重试",
+        (_, Some("presenting_dns")) => "正在创建证书校验所需的 DNS 记录",
+        (_, Some("waiting_dns")) => "正在等待证书校验记录完成传播",
+        (_, Some("validating")) => "证书颁发机构正在验证域名",
+        (_, Some("issued")) => "证书已经签发",
+        (_, Some("active")) => "证书已经加载并启用",
+        ("reverse_proxy", _) => "反向代理暂时无法连接内部服务",
+        ("configuration", _) if level == "error" => "域名服务配置应用失败",
+        ("configuration", _) => "域名服务配置已经更新",
+        ("certificate_storage", _) => "证书存储发生异常",
+        ("https", _) => "HTTPS 连接发生异常",
+        _ if level == "error" => "域名服务运行异常",
+        _ => "域名服务运行状态已更新",
+    };
+    let retry_at = event
+        .retry_after_secs
+        .map(|seconds| unix_now().saturating_add(i64::try_from(seconds).unwrap_or(i64::MAX)));
+    let technical_detail = redact_runtime_detail(state, &event.message);
+    connection.execute(
+        "INSERT INTO public_domain_runtime_events
+         (tenant_id, public_domain_id, domain, level, category, stage, summary,
+          error_code, retry_at, technical_detail)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+        rusqlite::params![
+            tenant_id,
+            related_domain.map(|item| item.0.as_str()),
+            related_domain.map(|item| item.1.as_str()),
+            level,
+            category,
+            stage,
+            summary,
+            event.status_code.map(|code| format!("http_{code}")),
+            retry_at,
+            technical_detail,
+        ],
+    )?;
+    Ok(())
+}
+
+fn redact_runtime_detail(state: &AppState, value: &str) -> String {
+    let mut redacted = value.to_owned();
+    let mut token_paths = vec![state
+        .data_dir
+        .join("secrets")
+        .join("public-entry")
+        .join("cloudflare.token")];
+    let domain_root = state.data_dir.join("secrets").join("public-domains");
+    if let Ok(entries) = fs::read_dir(domain_root) {
+        token_paths.extend(
+            entries
+                .flatten()
+                .map(|entry| entry.path().join("cloudflare.token")),
+        );
+    }
+    for token in token_paths
+        .into_iter()
+        .filter_map(|path| fs::read_to_string(path).ok())
+        .map(|token| token.trim().to_owned())
+        .filter(|token| !token.is_empty())
+    {
+        redacted = redacted.replace(&token, "[敏感信息已隐藏]");
+    }
+    let lower = redacted.to_ascii_lowercase();
+    if [
+        "authorization",
+        "cookie",
+        "api_token",
+        "api token",
+        "bearer ",
+        "headscale key",
+        "preauthkey",
+        "begin certificate",
+        "private key-----",
+        "begin private key",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker))
+    {
+        return "[敏感信息已隐藏]".to_owned();
+    }
+    // 技术详情仍面向最终用户，因此隐藏部署目录与底层实现名称。中文摘要和
+    // 产品化分类已经保留了排障所需的上下文。
+    for path in [
+        state.data_dir.display().to_string(),
+        state.data_dir.display().to_string().replace('\\', "/"),
+    ] {
+        if path.len() > 2 && path != "." {
+            redacted = redacted.replace(&path, "[内部路径]");
+        }
+    }
+    redacted = replace_ascii_case_insensitive(&redacted, "caddy", "域名服务");
+    redacted = redacted
+        .split_whitespace()
+        .map(|part| {
+            let unquoted = part.trim_matches(['\"', '\'', '(', ')', '[', ']', '{', '}', ',']);
+            let bytes = unquoted.as_bytes();
+            let windows_path =
+                bytes.len() > 2 && bytes[1] == b':' && matches!(bytes[2], b'\\' | b'/');
+            if unquoted.starts_with('/') || unquoted.starts_with("file://") || windows_path {
+                "[内部路径]"
+            } else {
+                part
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    truncate_error_message(&redacted)
+}
+
+fn replace_ascii_case_insensitive(value: &str, needle: &str, replacement: &str) -> String {
+    let mut result = value.to_owned();
+    loop {
+        let lower = result.to_ascii_lowercase();
+        let Some(index) = lower.find(needle) else {
+            break;
+        };
+        result.replace_range(index..index + needle.len(), replacement);
+    }
+    result
+}
+
+fn prune_public_domain_runtime_events(connection: &Connection, tenant_id: &str) -> Result<()> {
+    connection.execute(
+        "DELETE FROM public_domain_runtime_events
+         WHERE tenant_id = ?1 AND occurred_at < unixepoch() - 604800",
+        [tenant_id],
+    )?;
+    let domain_ids = connection
+        .prepare("SELECT id FROM public_domains WHERE tenant_id = ?1")?
+        .query_map([tenant_id], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    for domain_id in domain_ids {
+        connection.execute(
+            "DELETE FROM public_domain_runtime_events WHERE public_domain_id = ?1
+             AND id NOT IN (SELECT id FROM public_domain_runtime_events
+                 WHERE public_domain_id = ?1 ORDER BY occurred_at DESC, id DESC LIMIT 500)",
+            [&domain_id],
+        )?;
+    }
+    connection.execute(
+        "DELETE FROM public_domain_runtime_events WHERE tenant_id = ?1 AND public_domain_id IS NULL
+         AND id NOT IN (SELECT id FROM public_domain_runtime_events
+             WHERE tenant_id = ?1 AND public_domain_id IS NULL
+             ORDER BY occurred_at DESC, id DESC LIMIT 500)",
+        [tenant_id],
+    )?;
     Ok(())
 }
 
@@ -7171,20 +7882,30 @@ fn validate_certificate_pair_for_domain(
     expected_domain: Option<&str>,
 ) -> Result<CertificateMetadata, ApiError> {
     let metadata = parse_certificate_metadata(certificate, true)?;
-    let key = KeyPair::from_pem(private_key)
-        .map_err(|_| ApiError::new(StatusCode::BAD_REQUEST, "证书私钥格式无效或无法解析"))?;
-    let (_, pem) = parse_x509_pem(certificate.as_bytes()).map_err(|_| {
+    if private_key.contains("BEGIN ENCRYPTED PRIVATE KEY") {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "暂不支持带密码的私钥，请提供未加密的 PEM 私钥",
+        ));
+    }
+    let certificate_chain = pem_certificates(certificate).map_err(|_| {
         ApiError::new(
             StatusCode::BAD_REQUEST,
-            "证书格式无效，请提供 PEM X.509 证书",
+            "证书格式无效，请提供完整的 PEM 证书链",
         )
     })?;
-    let parsed = pem
-        .parse_x509()
-        .map_err(|_| ApiError::new(StatusCode::BAD_REQUEST, "证书内容无法解析"))?;
-    if parsed.subject_pki.subject_public_key.data != key.public_key_raw() {
-        return Err(ApiError::new(StatusCode::BAD_REQUEST, "证书与私钥不匹配"));
-    }
+    let private_key = pem_private_key(private_key).map_err(|_| {
+        ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "私钥格式无效，支持未加密的 PKCS#1、PKCS#8 或 SEC1 PEM 私钥",
+        )
+    })?;
+    // Rustls 与实际 HTTPS 服务使用同一套密钥解析和匹配校验，可接受 Caddy
+    // 支持的常见 PEM 私钥格式，也避免只靠算法特定公钥字节比较造成误判。
+    rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(certificate_chain, private_key)
+        .map_err(|_| ApiError::new(StatusCode::BAD_REQUEST, "证书与私钥不匹配"))?;
     if let Some(domain) = expected_domain {
         let domain = domain.trim().trim_end_matches('.').to_ascii_lowercase();
         let wildcard = format!("*.{domain}");
@@ -17348,6 +18069,225 @@ mod tests {
         assert!(public_domain_dns_ready(&legacy.to_string()));
     }
 
+    fn manual_certificate_fixture(
+        subjects: &[&str],
+        not_before: OffsetDateTime,
+        not_after: OffsetDateTime,
+    ) -> (String, String) {
+        let key = KeyPair::generate().expect("应生成测试私钥");
+        let mut params = CertificateParams::new(
+            subjects
+                .iter()
+                .map(|item| (*item).to_owned())
+                .collect::<Vec<_>>(),
+        )
+        .expect("应创建测试证书参数");
+        params.not_before = not_before;
+        params.not_after = not_after;
+        let certificate = params.self_signed(&key).expect("应签发测试证书");
+        (certificate.pem(), key.serialize_pem())
+    }
+
+    #[test]
+    fn rustls_private_key_parser_accepts_pkcs1_pkcs8_and_sec1_containers() {
+        let cases = [
+            (
+                "-----BEGIN RSA PRIVATE KEY-----\nMAECAQ==\n-----END RSA PRIVATE KEY-----\n",
+                "pkcs1",
+            ),
+            (
+                "-----BEGIN PRIVATE KEY-----\nMAECAQ==\n-----END PRIVATE KEY-----\n",
+                "pkcs8",
+            ),
+            (
+                "-----BEGIN EC PRIVATE KEY-----\nMAECAQ==\n-----END EC PRIVATE KEY-----\n",
+                "sec1",
+            ),
+        ];
+        for (pem, expected) in cases {
+            let parsed = pem_private_key(pem).expect("应识别受支持的 PEM 私钥容器");
+            let actual = match parsed {
+                rustls::pki_types::PrivateKeyDer::Pkcs1(_) => "pkcs1",
+                rustls::pki_types::PrivateKeyDer::Pkcs8(_) => "pkcs8",
+                rustls::pki_types::PrivateKeyDer::Sec1(_) => "sec1",
+                _ => "unknown",
+            };
+            assert_eq!(actual, expected);
+        }
+    }
+
+    #[test]
+    fn manual_certificate_validation_reports_key_san_and_validity_errors() {
+        let now = OffsetDateTime::now_utc();
+        let (certificate, private_key) = manual_certificate_fixture(
+            &["example.com", "*.example.com"],
+            now - Duration::days(1),
+            now + Duration::days(30),
+        );
+        validate_certificate_pair_for_domain(&certificate, &private_key, Some("example.com"))
+            .expect("有效的 PKCS#8 测试证书应通过校验");
+
+        let (_, other_key) = manual_certificate_fixture(
+            &["example.com", "*.example.com"],
+            now - Duration::days(1),
+            now + Duration::days(30),
+        );
+        assert_eq!(
+            validate_certificate_pair_for_domain(&certificate, &other_key, Some("example.com"))
+                .expect_err("不匹配私钥必须被拒绝")
+                .message,
+            "证书与私钥不匹配"
+        );
+        assert_eq!(
+            validate_certificate_pair_for_domain(
+                &certificate,
+                "-----BEGIN ENCRYPTED PRIVATE KEY-----\ntest\n-----END ENCRYPTED PRIVATE KEY-----",
+                Some("example.com"),
+            )
+            .expect_err("加密私钥必须被拒绝")
+            .message,
+            "暂不支持带密码的私钥，请提供未加密的 PEM 私钥"
+        );
+
+        let (wrong_san, wrong_san_key) = manual_certificate_fixture(
+            &["other.example.com", "*.other.example.com"],
+            now - Duration::days(1),
+            now + Duration::days(30),
+        );
+        assert_eq!(
+            validate_certificate_pair_for_domain(&wrong_san, &wrong_san_key, Some("example.com"))
+                .expect_err("错误 SAN 必须被拒绝")
+                .message,
+            "证书必须同时覆盖根域名和泛域名"
+        );
+
+        let (expired, expired_key) = manual_certificate_fixture(
+            &["example.com", "*.example.com"],
+            now - Duration::days(30),
+            now - Duration::days(1),
+        );
+        assert_eq!(
+            validate_certificate_pair_for_domain(&expired, &expired_key, Some("example.com"))
+                .expect_err("过期证书必须被拒绝")
+                .message,
+            "证书已经过期或尚未生效"
+        );
+    }
+
+    #[test]
+    fn secret_file_rollback_restores_previous_content_and_removes_new_file() {
+        let root = std::env::temp_dir().join(format!("nexo-secret-rollback-{}", Uuid::new_v4()));
+        let existing = root.join("existing.pem");
+        let created = root.join("created.pem");
+        write_secret_file(&existing, "previous").expect("应写入旧 Secret");
+        {
+            let mut rollbacks = Vec::new();
+            capture_secret_rollback(&mut rollbacks, &existing);
+            capture_secret_rollback(&mut rollbacks, &created);
+            write_secret_file(&existing, "replacement").expect("应替换 Secret");
+            write_secret_file(&created, "temporary").expect("应创建 Secret");
+        }
+        assert_eq!(
+            fs::read_to_string(&existing).expect("应读取回滚内容"),
+            "previous"
+        );
+        assert!(!created.exists(), "失败请求新建的 Secret 应被删除");
+        fs::remove_dir_all(root).expect("应清理测试目录");
+    }
+
+    #[tokio::test]
+    async fn deleting_only_primary_domain_requires_confirmation_and_preserves_tunnel() {
+        let root = std::env::temp_dir().join(format!("nexo-domain-delete-{}", Uuid::new_v4()));
+        let mut state = test_state();
+        state.data_dir = root.clone();
+        state.caddy = Arc::new(caddy::CaddySupervisor::new(
+            caddy::CaddyRuntimeConfig::from_env(root.clone()),
+        ));
+        state.headscale_runtime = Arc::new(HeadscaleSupervisor::new(
+            HeadscaleRuntimeConfig::from_env(root.clone()),
+        ));
+        insert_test_tunnel(&state, true);
+        {
+            let connection = state.db.lock().expect("数据库锁应可用");
+            connection
+                .execute(
+                    "UPDATE public_entry_settings SET tenant_id = 'tenant-1', base_domain = 'example.com',
+                     https_enabled = 1, certificate_mode = 'manual' WHERE id = 1",
+                    [],
+                )
+                .expect("应创建主域名兼容投影");
+            connection
+                .execute(
+                    "INSERT INTO public_domains
+                     (id, tenant_id, domain, is_primary, certificate_mode, secret_dir, apply_status)
+                     VALUES ('domain-primary', 'tenant-1', 'example.com', 1, 'manual',
+                             'secrets/public-domains/domain-primary', 'ready')",
+                    [],
+                )
+                .expect("应创建唯一主域名");
+            connection
+                .execute(
+                    "UPDATE tunnels SET protocol = 'http', hostname = 'media',
+                     public_domain_id = 'domain-primary' WHERE id = 'tunnel-1'",
+                    [],
+                )
+                .expect("应绑定 Web 穿透服务");
+        }
+        let secret_dir = root.join("secrets/public-domains/domain-primary");
+        write_secret_file(&secret_dir.join("certificate.pem"), "certificate")
+            .expect("应创建测试凭据");
+
+        let error = delete_public_domain(
+            State(state.clone()),
+            admin_headers(),
+            Path("domain-primary".to_owned()),
+            Some(Json(DeletePublicDomainRequest::default())),
+        )
+        .await
+        .expect_err("未确认关闭公网入口时必须拒绝删除");
+        assert_eq!(error.status, StatusCode::CONFLICT);
+
+        let _ = delete_public_domain(
+            State(state.clone()),
+            admin_headers(),
+            Path("domain-primary".to_owned()),
+            Some(Json(DeletePublicDomainRequest {
+                replacement_domain_id: None,
+                disable_public_access: true,
+            })),
+        )
+        .await
+        .expect("明确确认后应删除唯一主域名");
+
+        let connection = state.db.lock().expect("数据库锁应可用");
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT enabled, public_domain_id FROM tunnels WHERE id = 'tunnel-1'",
+                    [],
+                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Option<String>>(1)?)),
+                )
+                .expect("Web 穿透服务应保留"),
+            (1, None)
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT base_domain FROM public_entry_settings WHERE id = 1",
+                    [],
+                    |row| row.get::<_, Option<String>>(0),
+                )
+                .expect("应读取兼容投影"),
+            None
+        );
+        drop(connection);
+        assert!(
+            !secret_dir.exists(),
+            "相对 Secret 目录应按数据目录解析并清理"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
     #[test]
     fn tunnel_list_query_keeps_public_domain_columns_aligned() {
         let state = test_state();
@@ -17382,6 +18322,93 @@ mod tests {
             .prepare("SELECT stage FROM public_domain_certificate_progress")
             .is_ok());
         apply_public_domain_operations_migration(&connection).expect("重复执行版本 18 应保持幂等");
+    }
+
+    #[test]
+    fn public_domain_runtime_events_migration_is_present_and_idempotent() {
+        let state = test_state();
+        let connection = state.db.lock().expect("数据库锁应可用");
+        assert!(connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version = 19)",
+                [],
+                |row| row.get::<_, bool>(0),
+            )
+            .expect("应读取运行日志迁移版本"));
+        assert!(connection
+            .prepare("SELECT category, technical_detail FROM public_domain_runtime_events")
+            .is_ok());
+        apply_public_domain_runtime_events_migration(&connection)
+            .expect("重复执行版本 19 应保持幂等");
+    }
+
+    #[test]
+    fn runtime_event_detail_hides_sensitive_and_internal_values() {
+        let state = test_state();
+        let detail = redact_runtime_detail(
+            &state,
+            "Caddy failed while loading /data/nexo/caddy-storage/certificates/site.pem",
+        );
+        assert!(!detail.to_ascii_lowercase().contains("caddy"));
+        assert!(!detail.contains("/data/nexo"));
+        assert!(detail.contains("[内部路径]"));
+        assert_eq!(
+            redact_runtime_detail(&state, "Authorization: Bearer should-not-leak"),
+            "[敏感信息已隐藏]"
+        );
+        assert_eq!(
+            redact_runtime_detail(&state, "-----BEGIN CERTIFICATE-----"),
+            "[敏感信息已隐藏]"
+        );
+    }
+
+    #[test]
+    fn runtime_event_query_uses_stable_cursor_and_tenant_scope() {
+        let state = test_state();
+        let connection = state.db.lock().expect("数据库锁应可用");
+        connection
+            .execute_batch(
+                "INSERT INTO public_domain_runtime_events
+                    (tenant_id, level, category, summary, occurred_at)
+                 VALUES
+                    ('tenant-1', 'info', 'configuration', '较早事件', 100),
+                    ('tenant-1', 'warning', 'dns_validation', 'DNS 等待', 200),
+                    ('tenant-1', 'error', 'https', '最新错误', 300);",
+            )
+            .expect("应创建运行日志夹具");
+        let first = read_public_domain_runtime_events(
+            &connection,
+            "tenant-1",
+            &RuntimeEventQuery {
+                limit: Some(1),
+                ..RuntimeEventQuery::default()
+            },
+            100,
+        )
+        .expect("应读取第一页");
+        assert_eq!(first.events.len(), 1);
+        assert_eq!(first.events[0].summary, "最新错误");
+        let second = read_public_domain_runtime_events(
+            &connection,
+            "tenant-1",
+            &RuntimeEventQuery {
+                cursor: first.next_cursor,
+                limit: Some(1),
+                ..RuntimeEventQuery::default()
+            },
+            100,
+        )
+        .expect("应读取第二页");
+        assert_eq!(second.events[0].summary, "DNS 等待");
+        assert!(read_public_domain_runtime_events(
+            &connection,
+            "tenant-2",
+            &RuntimeEventQuery::default(),
+            100,
+        )
+        .expect("跨租户查询应返回空集合")
+        .events
+        .is_empty());
     }
 
     #[test]
@@ -17480,6 +18507,8 @@ mod tests {
         apply_access_control_migration(&connection).expect("应初始化可视化访问控制结构");
         apply_public_domain_operations_migration(&connection)
             .expect("应初始化域名 DNS 托管和证书进度结构");
+        apply_public_domain_runtime_events_migration(&connection)
+            .expect("应初始化域名服务运行日志结构");
         ensure_mesh_identity_online_column(&connection).expect("应初始化组网在线状态字段");
         ensure_server_ca(&connection).expect("应初始化测试 CA");
         ensure_server_control_identity(&connection).expect("应初始化测试控制证书");

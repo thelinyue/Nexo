@@ -60,6 +60,9 @@ const seedPublicDomain = {
   attempt_count: 0,
   next_retry_at: null as number | null,
   dns_management: { enabled: true, target_ipv4: "203.0.113.10", target_ipv6: null, status: "ready", error: null, version: 1 },
+  management_entry: "https://nexo.example.com",
+  mesh_entry: "https://mesh.example.com",
+  readiness_summary: { status: "ready", root_dns: "ready", wildcard_dns: "ready", https: "ready", management_entry: "ready", mesh_entry: "ready" },
 };
 
 const seedSites = [
@@ -250,7 +253,7 @@ async function installApiMocks(page: Page, options: MockOptions) {
     const path = new URL(request.url()).pathname;
     const method = request.method();
     if (path === "/api/v1/auth/status") {
-      await fulfillJson(route, { initialized, authenticated, username: authenticated ? "admin" : null, channel: authenticated ? "local_http" : null, csrf_token: authenticated ? "release-csrf" : null, local_http_warning: true });
+      await fulfillJson(route, { initialized, authenticated, username: authenticated ? "admin" : null, role: authenticated ? "system_admin" : null, channel: authenticated ? "local_http" : null, csrf_token: authenticated ? "release-csrf" : null, local_http_warning: true });
       return;
     }
     if (path === "/api/v1/auth/initialize" && method === "POST") {
@@ -290,6 +293,63 @@ async function installApiMocks(page: Page, options: MockOptions) {
       await fulfillJson(route, state.publicDomains);
       return;
     }
+    if (supportsPublicDomains && path === "/api/v1/public-domains" && method === "POST") {
+      const body = request.postDataJSON() as Record<string, unknown>;
+      const created = {
+        ...structuredClone(seedPublicDomain),
+        ...body,
+        id: `domain-${state.publicDomains.length + 1}`,
+        domain: String(body.domain),
+        is_primary: state.publicDomains.length === 0,
+        usage_count: 0,
+        dns_management: {
+          enabled: Boolean(body.dns_management_enabled),
+          target_ipv4: body.dns_target_ipv4 || null,
+          target_ipv6: body.dns_target_ipv6 || null,
+          status: "pending",
+          error: null,
+          version: 0,
+        },
+      } as typeof seedPublicDomain;
+      state.publicDomains.push(created);
+      await fulfillJson(route, created, 201);
+      return;
+    }
+    const publicDomainMatch = path.match(/^\/api\/v1\/public-domains\/([^/]+)$/);
+    if (supportsPublicDomains && publicDomainMatch && method === "PUT") {
+      if (failPublicEntryUpdate) { failPublicEntryUpdate = false; await fulfillJson(route, { error: "模拟域名与 HTTPS 设置失败" }, 422); return; }
+      const domain = state.publicDomains.find((item) => item.id === decodeURIComponent(publicDomainMatch[1]));
+      if (!domain) { await fulfillJson(route, { error: "域名不存在" }, 404); return; }
+      const body = request.postDataJSON() as Record<string, unknown>;
+      Object.assign(domain, body, {
+        dns_management: {
+          ...domain.dns_management,
+          enabled: Boolean(body.dns_management_enabled),
+          target_ipv4: body.dns_target_ipv4 || null,
+          target_ipv6: body.dns_target_ipv6 || null,
+        },
+      });
+      await fulfillJson(route, domain);
+      return;
+    }
+    if (supportsPublicDomains && publicDomainMatch && method === "DELETE") {
+      state.publicDomains = state.publicDomains.filter((item) => item.id !== decodeURIComponent(publicDomainMatch[1]));
+      await fulfillJson(route, { deleted: true, pending: false, id: decodeURIComponent(publicDomainMatch[1]), message: "公网域名已删除" });
+      return;
+    }
+    if (supportsPublicDomains && path === "/api/v1/public-domain-runtime-events" && method === "GET") {
+      const selectedDomain = new URL(request.url()).searchParams.get("public_domain_id");
+      const events = [
+        { id: 3, public_domain_id: "domain-primary", domain: "example.com", level: "error", category: "automatic_certificate", stage: "retry_wait", summary: "证书申请暂未完成，系统将按计划自动重试", error_code: "acme_rate_limited", retry_at: 1893000000, technical_detail: "服务返回 HTTP 429，敏感信息已隐藏", occurred_at: 1892000000 },
+        { id: 2, public_domain_id: null, domain: null, level: "info", category: "configuration", stage: null, summary: "域名服务配置已经更新", error_code: null, retry_at: null, technical_detail: null, occurred_at: 1891000000 },
+      ].filter((event) => !selectedDomain || event.public_domain_id === selectedDomain);
+      await fulfillJson(route, { events, next_cursor: null });
+      return;
+    }
+    if (supportsPublicDomains && path === "/api/v1/public-domain-runtime-events/export" && method === "GET") {
+      await route.fulfill({ status: 200, contentType: "application/json", body: "[]" });
+      return;
+    }
     const dnsPreviewMatch = path.match(/^\/api\/v1\/public-domains\/([^/]+)\/dns\/preview$/);
     if (supportsPublicDomains && dnsPreviewMatch && method === "GET") {
       const domain = state.publicDomains.find((item) => item.id === dnsPreviewMatch[1]);
@@ -318,8 +378,8 @@ async function installApiMocks(page: Page, options: MockOptions) {
       const updated = state.publicDomains.filter((domain) => body.ids.includes(domain.id) && domain.apply_status !== "rate_limited");
       const skipped = state.publicDomains
         .filter((domain) => body.ids.includes(domain.id) && domain.apply_status === "rate_limited")
-        .map((domain) => ({ id: domain.id, reason: "CA 限流窗口尚未结束，Caddy 会自动重试" }));
-      await fulfillJson(route, { updated, skipped, message: "已请求 Caddy 处理 " + updated.length + " 个域名，限流项将按官方退避自动重试" });
+        .map((domain) => ({ id: domain.id, reason: "CA 限流窗口尚未结束，系统会自动重试" }));
+      await fulfillJson(route, { updated, skipped, message: "已请求自动证书服务处理 " + updated.length + " 个域名，限流项将按官方退避自动重试" });
       return;
     }
     if (supportsPublicDomains && /^\/api\/v1\/public-domains\/[^/]+\/(recheck|renew)$/.test(path) && method === "POST") {
@@ -327,7 +387,7 @@ async function installApiMocks(page: Page, options: MockOptions) {
       const domain = state.publicDomains.find((item) => item.id === decodeURIComponent(parts.at(-2) ?? ""));
       if (!domain) { await fulfillJson(route, { error: "域名不存在" }, 404); return; }
       if (parts.at(-1) === "renew" && domain.apply_status === "rate_limited") {
-        await fulfillJson(route, { error: "CA 限流窗口尚未结束，Caddy 会自动重试" }, 429);
+        await fulfillJson(route, { error: "CA 限流窗口尚未结束，系统会自动重试" }, 429);
         return;
       }
       await fulfillJson(route, domain);
@@ -336,6 +396,14 @@ async function installApiMocks(page: Page, options: MockOptions) {
     if (supportsPublicDomains && /^\/api\/v1\/public-domains\/[^/]+\/credentials$/.test(path) && method === "POST") {
       const domain = state.publicDomains.find((item) => item.id === decodeURIComponent(path.split("/").at(-2) ?? ""));
       if (!domain) { await fulfillJson(route, { error: "域名不存在" }, 404); return; }
+      await fulfillJson(route, domain);
+      return;
+    }
+    if (supportsPublicDomains && /^\/api\/v1\/public-domains\/[^/]+\/manual-certificate$/.test(path) && method === "DELETE") {
+      const domain = state.publicDomains.find((item) => item.id === decodeURIComponent(path.split("/").at(-2) ?? ""));
+      if (!domain) { await fulfillJson(route, { error: "域名不存在" }, 404); return; }
+      domain.apply_status = "error";
+      domain.apply_error = "手动证书已删除，请上传新证书或明确切换到自动证书";
       await fulfillJson(route, domain);
       return;
     }
@@ -638,8 +706,8 @@ test("首次初始化后进入独立概览页", async ({ page }) => {
   await expectNoHorizontalOverflow(page);
 });
 
-test("五个一级页面、二级路由与浏览器历史可用", async ({ page }) => {
-  await installApiMocks(page, { initialized: true, authenticated: true });
+test("六个一级页面、独立域名页与浏览器历史可用", async ({ page }) => {
+  await installApiMocks(page, { initialized: true, authenticated: true, publicDomains: [seedPublicDomain] });
   await page.goto("/#/overview");
   await expect(page.locator("main h1")).toHaveText("概览");
   await expectNoGenericRefresh(page);
@@ -663,8 +731,8 @@ test("五个一级页面、二级路由与浏览器历史可用", async ({ page 
   } else {
     await expect(page.locator(".sidebar").getByRole("link", { name: "公网访问" })).toHaveAttribute("aria-current", "page");
   }
-  await page.getByRole("link", { name: "域名与 HTTPS", exact: true }).click();
-  await expect(page).toHaveURL(/#\/public-access\/domain$/);
+  await navigatePrimary(page, "域名与 HTTPS");
+  await expect(page).toHaveURL(/#\/domains$/);
   await expect(page.locator("main h1")).toHaveText("域名与 HTTPS");
   await expectNoGenericRefresh(page);
   await expect(page.getByRole("button", { name: "重新检测", exact: true })).toBeVisible();
@@ -693,7 +761,12 @@ test("旧公网访问地址无历史污染地跳转到内网穿透", async ({ pa
   await page.goto("/#/public-access");
   await expect(page).toHaveURL(/#\/public-access\/tunnels$/);
   await expect(page.locator("main h1")).toHaveText("内网穿透");
-  await expect(page.getByRole("link", { name: "内网穿透", exact: true })).toHaveAttribute("aria-current", "page");
+  if ((page.viewportSize()?.width ?? 1440) <= 900) {
+    await page.getByRole("button", { name: "打开导航" }).click();
+    await expect(page.getByRole("dialog", { name: "移动导航" }).getByRole("link", { name: "公网访问" })).toHaveAttribute("aria-current", "page");
+  } else {
+    await expect(page.locator(".sidebar").getByRole("link", { name: "公网访问" })).toHaveAttribute("aria-current", "page");
+  }
   await page.goBack();
   await expect(page).toHaveURL(/#\/overview$/);
 });
@@ -782,7 +855,7 @@ test("添加设备生成最小 Compose 配置", async ({ page, context }) => {
   await page.getByLabel("设备名称").fill("家庭 NAS");
   await page.getByRole("button", { name: "生成设备配置" }).click();
   const compose = await page.getByLabel("Docker Compose 配置").inputValue();
-  expect(compose).toContain("ghcr.io/thelinyue/nexo-agent:0.1.10");
+  expect(compose).toContain("ghcr.io/thelinyue/nexo-agent:0.1.11");
   expect(compose).toContain("TZ: ${TZ:-Asia/Shanghai}");
   expect(compose.match(/NEXO_[A-Z_]+:/g)).toEqual(["NEXO_SERVER_URL:", "NEXO_ENROLLMENT_TOKEN:"]);
   await page.getByRole("button", { name: "复制 Compose 配置" }).click();
@@ -955,23 +1028,28 @@ test("已添加设备支持编辑名称与所属站点", async ({ page }) => {
   await expectNoHorizontalOverflow(page);
 });
 
-test("域名与 HTTPS 设置使用弹窗并安全提交 Cloudflare Token", async ({ page }) => {
-  await installApiMocks(page, { initialized: true, authenticated: true, failFirstPublicEntryUpdate: true });
+test("域名编辑 Sheet 在失败后保留表单并安全提交 Cloudflare Token", async ({ page }) => {
+  await installApiMocks(page, { initialized: true, authenticated: true, failFirstPublicEntryUpdate: true, publicDomains: [seedPublicDomain] });
   let secretRequestCount = 0;
   page.on("request", (request) => {
-    if (new URL(request.url()).pathname === "/api/v1/settings/public-entry/certificate") secretRequestCount += 1;
+    if (new URL(request.url()).pathname === "/api/v1/public-domains/domain-primary/credentials") secretRequestCount += 1;
   });
-  await page.goto("/#/public-access/domain");
+  await page.goto("/#/domains");
 
   await expect(page.getByLabel("Cloudflare API Token")).toHaveCount(0);
-  const editTrigger = page.getByRole("button", { name: "编辑域名与 HTTPS" });
+  const row = page.locator(".domain-table-item").filter({ hasText: "example.com" });
+  const menuTrigger = row.locator('summary[aria-label="更多 example.com 操作"]');
+  await menuTrigger.click();
+  const editTrigger = row.getByRole("button", { name: "编辑设置" });
   await editTrigger.click();
-  let dialog = page.getByRole("dialog", { name: "编辑域名与 HTTPS" });
+  let dialog = page.getByRole("dialog", { name: "编辑 example.com" });
+  await expect(dialog).toHaveClass(/form-sheet/);
   await page.keyboard.press("Escape");
   await expect(dialog).toBeHidden();
-  await expect(editTrigger).toBeFocused();
+  await expect(menuTrigger).toBeFocused();
+  await menuTrigger.click();
   await editTrigger.click();
-  dialog = page.getByRole("dialog", { name: "编辑域名与 HTTPS" });
+  dialog = page.getByRole("dialog", { name: "编辑 example.com" });
   const tokenInput = dialog.getByLabel("Cloudflare API Token", { exact: true });
   await expect(tokenInput).toHaveAttribute("type", "password");
   await tokenInput.fill("  release-cloudflare-token  ");
@@ -979,50 +1057,52 @@ test("域名与 HTTPS 设置使用弹窗并安全提交 Cloudflare Token", async
   await expect(tokenInput).toHaveAttribute("type", "text");
   await dialog.getByRole("button", { name: "隐藏 Cloudflare API Token" }).click();
 
-  await dialog.getByRole("button", { name: "保存设置" }).click();
+  await dialog.getByRole("button", { name: "保存修改" }).click();
   await expect(dialog.getByRole("alert")).toHaveText("模拟域名与 HTTPS 设置失败");
   await expect(tokenInput).toHaveValue("  release-cloudflare-token  ");
   expect(secretRequestCount).toBe(0);
 
-  const secretRequest = page.waitForRequest((request) => new URL(request.url()).pathname === "/api/v1/settings/public-entry/certificate");
-  await dialog.getByRole("button", { name: "保存设置" }).click();
+  const secretRequest = page.waitForRequest((request) => new URL(request.url()).pathname === "/api/v1/public-domains/domain-primary/credentials");
+  await dialog.getByRole("button", { name: "保存修改" }).click();
   expect((await secretRequest).postDataJSON()).toMatchObject({ cloudflare_token: "release-cloudflare-token" });
   await expect(dialog).toBeHidden();
-  await expect(editTrigger).toBeFocused();
+  await expect(menuTrigger).toBeFocused();
   expect(secretRequestCount).toBe(1);
 
+  await menuTrigger.click();
   await editTrigger.click();
-  dialog = page.getByRole("dialog", { name: "编辑域名与 HTTPS" });
+  dialog = page.getByRole("dialog", { name: "编辑 example.com" });
   await expect(dialog.getByLabel("Cloudflare API Token", { exact: true })).toHaveValue("");
-  await dialog.getByRole("button", { name: "保存设置" }).click();
+  await dialog.getByRole("button", { name: "保存修改" }).click();
   await expect(dialog).toBeHidden();
   expect(secretRequestCount).toBe(1);
   await expectNoHorizontalOverflow(page);
 });
 
-test("未配置域名与 HTTPS 时通过配置弹窗完成设置", async ({ page }) => {
+test("空域名列表可通过添加 Sheet 完成配置", async ({ page }) => {
   await installApiMocks(page, {
     initialized: true,
     authenticated: true,
-    publicEntry: { base_domain: null, https_enabled: false, certificate_mode: "none", apply_status: "not_configured", certificate_not_after: null },
+    publicDomains: [],
   });
   await page.goto("/#/public-access/domain");
-  await expect(page.getByText("尚未配置", { exact: true })).toBeVisible();
+  await expect(page).toHaveURL(/#\/domains$/);
+  await expect(page.getByText("还没有公网域名", { exact: true })).toBeVisible();
   await expect(page.getByLabel("根域名")).toHaveCount(0);
-  const configureTrigger = page.getByRole("button", { name: "配置域名与 HTTPS" });
+  const configureTrigger = page.getByRole("button", { name: "添加域名" });
   await configureTrigger.click();
-  const dialog = page.getByRole("dialog", { name: "配置域名与 HTTPS" });
+  const dialog = page.getByRole("dialog", { name: "添加公网域名" });
   await dialog.getByLabel("根域名").fill("edge.example.com");
   await dialog.getByRole("button", { name: "取消" }).click();
   await expect(dialog).toBeHidden();
   await expect(configureTrigger).toBeFocused();
 
   await configureTrigger.click();
-  const reopened = page.getByRole("dialog", { name: "配置域名与 HTTPS" });
+  const reopened = page.getByRole("dialog", { name: "添加公网域名" });
   await reopened.getByLabel("根域名").fill("edge.example.com");
-  await reopened.getByRole("button", { name: "保存设置" }).click();
+  await reopened.getByRole("button", { name: "添加域名" }).click();
   await expect(reopened).toBeHidden();
-  await expect(page.getByRole("button", { name: "编辑域名与 HTTPS" })).toBeVisible();
+  await expect(page.locator(".domain-table-item").filter({ hasText: "edge.example.com" })).toBeVisible();
   await expectNoHorizontalOverflow(page);
 });
 
@@ -1057,30 +1137,37 @@ test("多域名列表展示证书生命周期并支持批量与手动申请", as
     authenticated: true,
     publicDomains: [seedPublicDomain, rateLimitedDomain, manualDomain],
   });
-  await page.goto("/#/public-access/domain");
+  await page.goto("/#/domains");
 
-  const primaryRow = page.locator(".domain-row").filter({ hasText: "example.com" }).first();
+  const primaryRow = page.locator(".domain-table-item").filter({ hasText: "example.com" }).first();
   await expect(primaryRow).toContainText("主域名");
-  await expect(primaryRow).toContainText("到期时间");
-  await expect(primaryRow).toContainText("预计进入 Caddy 续期窗口");
-  const limitedRow = page.locator(".domain-row").filter({ hasText: "rate.example.com" });
-  await expect(limitedRow.getByRole("button", { name: "手动申请证书" })).toBeDisabled();
-  await limitedRow.getByText("查看 CA 限流与自动重试").click();
-  await expect(limitedRow).toContainText("Caddy 正在自动重试");
-  await expect(limitedRow).toContainText("下一次尝试");
+  await expect(primaryRow).toContainText("预计续期");
+  const limitedRow = page.locator(".domain-table-item").filter({ hasText: "rate.example.com" });
+  await expect(limitedRow).toContainText("CA 限流");
+  await limitedRow.getByRole("button", { name: /展开 rate.example.com/ }).click();
+  await expect(limitedRow).toContainText("系统将在");
+  await limitedRow.locator('summary[aria-label="更多 rate.example.com 操作"]').click();
+  await expect(limitedRow.getByRole("button", { name: "申请自动证书" })).toBeDisabled();
 
-  await page.getByRole("checkbox", { name: "全选公网域名" }).check();
+  if ((page.viewportSize()?.width ?? 1440) > 900) {
+    await page.getByRole("checkbox", { name: "全选公网域名" }).check();
+  } else {
+    await page.getByRole("checkbox", { name: "选择 example.com" }).check();
+    await page.getByRole("checkbox", { name: "选择 rate.example.com" }).check();
+    await page.getByRole("checkbox", { name: "选择 manual.example.net" }).check();
+  }
   const batchRecheck = page.waitForRequest((request) => new URL(request.url()).pathname === "/api/v1/public-domains/batch/recheck");
-  await page.getByRole("button", { name: "批量重新检测" }).click();
+  await page.locator(".batch-toolbar").getByRole("button", { name: "重新检测" }).click();
   expect((await batchRecheck).postDataJSON()).toEqual({ ids: ["domain-primary", "domain-rate-limited", "domain-manual"] });
   await expect(page.getByRole("status")).toContainText("已重新检测 3 个域名");
 
   const singleRenew = page.waitForRequest((request) => new URL(request.url()).pathname === "/api/v1/public-domains/domain-primary/renew");
-  await primaryRow.getByRole("button", { name: "手动申请证书" }).click();
+  await primaryRow.locator('summary[aria-label="更多 example.com 操作"]').click();
+  await primaryRow.getByRole("button", { name: "申请自动证书" }).click();
   await singleRenew;
-  await expect(page.getByRole("status")).toContainText("已请求 Caddy 处理 example.com 的证书");
+  await expect(page.getByRole("status")).toContainText("已提交 example.com 的自动证书申请");
 
-  const manualRow = page.locator(".domain-row").filter({ hasText: "manual.example.net" });
+  const manualRow = page.locator(".domain-table-item").filter({ hasText: "manual.example.net" });
   await manualRow.getByRole("button", { name: "更新证书" }).click();
   const dialog = page.getByRole("dialog", { name: "编辑 manual.example.net" });
   await expect(dialog.getByLabel("证书文件")).toBeVisible();
@@ -1096,21 +1183,26 @@ test("DNS 托管先预览再同步并展示真实证书阶段", async ({ page })
     authenticated: true,
     publicDomains: [seedPublicDomain],
   });
-  await page.goto("/#/public-access/domain");
+  await page.goto("/#/domains");
 
-  const row = page.locator(".domain-row").filter({ hasText: "example.com" });
+  const row = page.locator(".domain-table-item").filter({ hasText: "example.com" });
+  await row.getByRole("button", { name: /展开 example.com/ }).click();
   await expect(row).toContainText("CA 校验");
   await expect(row).toContainText("已签发");
   await expect(row).toContainText("已启用");
   await expect(row).toContainText("SAN");
+  await expect(row).toContainText("管理入口：https://nexo.example.com");
+  await expect(row).toContainText("Mesh 入口：https://mesh.example.com");
 
-  await row.getByRole("button", { name: "编辑" }).click();
+  await row.locator('summary[aria-label="更多 example.com 操作"]').click();
+  await row.getByRole("button", { name: "编辑设置" }).click();
   const editor = page.getByRole("dialog", { name: "编辑 example.com" });
   await expect(editor.getByText("ACME 环境")).toHaveCount(0);
   await expect(editor.getByRole("checkbox", { name: "由 Nexo 自动管理 Cloudflare DNS" })).toBeChecked();
   await expect(editor.getByLabel("公网 IPv4")).toHaveValue("203.0.113.10");
   await editor.getByRole("button", { name: "取消" }).click();
 
+  await row.locator('summary[aria-label="更多 example.com 操作"]').click();
   await row.getByRole("button", { name: "同步 DNS" }).click();
   const preview = page.getByRole("dialog", { name: "同步 example.com" });
   await expect(preview).toContainText("接管同值记录");
@@ -1121,6 +1213,90 @@ test("DNS 托管先预览再同步并展示真实证书阶段", async ({ page })
   expect((await applyRequest).postDataJSON()).toEqual({ confirm_conflicts: false });
   await expect(preview).toBeHidden();
   await expectNoHorizontalOverflow(page);
+});
+
+test("运行日志使用产品化居中弹窗并支持域名筛选", async ({ page }) => {
+  await installApiMocks(page, { initialized: true, authenticated: true, publicDomains: [seedPublicDomain] });
+  await page.goto("/#/domains");
+
+  const topTrigger = page.getByRole("button", { name: "运行日志", exact: true });
+  await topTrigger.click();
+  let dialog = page.getByRole("dialog", { name: "域名服务运行日志" });
+  await expect(dialog).not.toHaveClass(/form-sheet/);
+  await expect(dialog.locator(".form-dialog-surface")).toHaveClass(/wide/);
+  await expect(dialog.getByLabel("域名", { exact: true })).toHaveValue("all");
+  await expect(dialog).toContainText("自动证书");
+  await expect(dialog).toContainText("配置应用");
+  await expect(dialog).not.toContainText(/caddy|logger|secret_dir/i);
+  await dialog.getByRole("button", { name: "关闭域名服务运行日志窗口" }).click();
+  await expect(topTrigger).toBeFocused();
+
+  const row = page.locator(".domain-table-item").filter({ hasText: "example.com" });
+  const filteredRequest = page.waitForRequest((request) => {
+    const url = new URL(request.url());
+    return url.pathname === "/api/v1/public-domain-runtime-events" && url.searchParams.get("public_domain_id") === "domain-primary";
+  });
+  await row.getByRole("button", { name: "查看 example.com 运行日志" }).click();
+  await filteredRequest;
+  dialog = page.getByRole("dialog", { name: "域名服务运行日志" });
+  await expect(dialog.getByLabel("域名", { exact: true })).toHaveValue("domain-primary");
+  await expect(dialog).not.toContainText("域名服务配置已经更新");
+});
+
+test("自动域名上传手动证书时请求原子启用", async ({ page }) => {
+  await installApiMocks(page, { initialized: true, authenticated: true, publicDomains: [seedPublicDomain] });
+  await page.goto("/#/domains");
+  const row = page.locator(".domain-table-item").filter({ hasText: "example.com" });
+  await row.locator('summary[aria-label="更多 example.com 操作"]').click();
+  await row.getByRole("button", { name: "编辑设置" }).click();
+  const editor = page.getByRole("dialog", { name: "编辑 example.com" });
+  await editor.getByLabel("签发方式").selectOption("manual");
+  await editor.getByLabel("证书文件").setInputFiles({ name: "example.com.pem", mimeType: "text/plain", buffer: Buffer.from("-----BEGIN CERTIFICATE-----\ntest\n-----END CERTIFICATE-----") });
+  await editor.getByLabel("私钥文件").setInputFiles({ name: "example.com.key", mimeType: "text/plain", buffer: Buffer.from("-----BEGIN RSA PRIVATE KEY-----\ntest\n-----END RSA PRIVATE KEY-----") });
+  const credentialsRequest = page.waitForRequest((request) => new URL(request.url()).pathname === "/api/v1/public-domains/domain-primary/credentials");
+  await editor.getByRole("button", { name: "保存修改" }).click();
+  expect((await credentialsRequest).postDataJSON()).toMatchObject({
+    activate_manual_certificate: true,
+    certificate_pem: expect.stringContaining("BEGIN CERTIFICATE"),
+    private_key_pem: expect.stringContaining("BEGIN RSA PRIVATE KEY"),
+  });
+  await expect(editor).toBeHidden();
+  await expect(row).toContainText("手动证书");
+  await expect(row).toContainText("自动申请已停止");
+});
+
+test("删除手动证书后保持手动模式", async ({ page }) => {
+  const manualDomain = { ...structuredClone(seedPublicDomain), certificate_mode: "manual" };
+  await installApiMocks(page, { initialized: true, authenticated: true, publicDomains: [manualDomain] });
+  await page.goto("/#/domains");
+  const row = page.locator(".domain-table-item").filter({ hasText: "example.com" });
+  await row.getByRole("button", { name: "更新证书" }).click();
+  const editor = page.getByRole("dialog", { name: "编辑 example.com" });
+  page.once("dialog", (confirmation) => void confirmation.accept());
+  const deleteRequest = page.waitForRequest((request) => request.method() === "DELETE" && new URL(request.url()).pathname === "/api/v1/public-domains/domain-primary/manual-certificate");
+  await editor.getByRole("button", { name: "删除当前手动证书" }).click();
+  await deleteRequest;
+  await expect(editor).toBeHidden();
+  await expect(row).toContainText("手动证书");
+  await expect(row).toContainText("自动申请已停止");
+  await row.locator('summary[aria-label="更多 example.com 操作"]').click();
+  await expect(row.getByRole("button", { name: "申请自动证书" })).toHaveCount(0);
+});
+
+test("删除唯一主域名明确关闭公网入口", async ({ page }) => {
+  await installApiMocks(page, { initialized: true, authenticated: true, publicDomains: [seedPublicDomain] });
+  await page.goto("/#/domains");
+  const row = page.locator(".domain-table-item").filter({ hasText: "example.com" });
+  await row.locator('summary[aria-label="更多 example.com 操作"]').click();
+  await row.getByRole("button", { name: "删除域名" }).click();
+  const dialog = page.getByRole("alertdialog", { name: "删除 example.com" });
+  await expect(dialog).toContainText("Web 穿透服务会保留并解除域名绑定");
+  await dialog.getByRole("checkbox").check();
+  const deleteRequest = page.waitForRequest((request) => request.method() === "DELETE" && new URL(request.url()).pathname === "/api/v1/public-domains/domain-primary");
+  await dialog.getByRole("button", { name: "确认删除" }).click();
+  expect((await deleteRequest).postDataJSON()).toEqual({ disable_public_access: true });
+  await expect(dialog).toBeHidden();
+  await expect(page.getByText("还没有公网域名", { exact: true })).toBeVisible();
 });
 
 test("网关能力按地址族展示并禁用不可转发网段", async ({ page }) => {

@@ -10,13 +10,16 @@ import {
   ChevronDown,
   CircleAlert,
   Copy,
+  Download,
   Eye,
   EyeOff,
   Globe2,
   KeyRound,
   LayoutDashboard,
+  LockKeyhole,
   LogOut,
   Menu,
+  MoreHorizontal,
   MonitorSmartphone,
   Network,
   Pencil,
@@ -24,6 +27,8 @@ import {
   Power,
   PowerOff,
   RefreshCw,
+  ScrollText,
+  Search,
   Server,
   Settings,
   Share2,
@@ -43,24 +48,27 @@ type AppRoute =
   | "#/devices/enrollments"
   | "#/devices/official"
   | "#/access-control"
+  | "#/domains"
   | "#/public-access/tunnels"
   | "#/public-access/domain"
   | "#/networks"
   | "#/settings";
 
-type PrimaryRoute = "overview" | "devices" | "access-control" | "public-access" | "networks" | "settings";
+type PrimaryRoute = "overview" | "devices" | "access-control" | "domains" | "public-access" | "networks" | "settings";
 
 type NavigationItem = {
   id: PrimaryRoute;
   label: string;
   href: AppRoute;
   icon: LucideIcon;
+  systemOnly?: boolean;
 };
 
 const navigationItems: NavigationItem[] = [
   { id: "overview", label: "概览", href: "#/overview", icon: LayoutDashboard },
   { id: "devices", label: "设备", href: "#/devices/list", icon: MonitorSmartphone },
   { id: "access-control", label: "访问控制", href: "#/access-control", icon: ShieldCheck },
+  { id: "domains", label: "域名与 HTTPS", href: "#/domains", icon: LockKeyhole, systemOnly: true },
   { id: "public-access", label: "公网访问", href: "#/public-access/tunnels", icon: Globe2 },
   { id: "networks", label: "网络互联", href: "#/networks", icon: Network },
   { id: "settings", label: "设置", href: "#/settings", icon: Settings },
@@ -72,6 +80,7 @@ const validRoutes = new Set<AppRoute>([
   "#/devices/enrollments",
   "#/devices/official",
   "#/access-control",
+  "#/domains",
   "#/public-access/tunnels",
   "#/public-access/domain",
   "#/networks",
@@ -81,6 +90,10 @@ const validRoutes = new Set<AppRoute>([
 /** Hash 路由避免改变服务端静态托管，同时让每个管理页面可以刷新和前进后退。 */
 function readRoute(): AppRoute {
   const hash = window.location.hash;
+  if (hash === "#/public-access/domain") {
+    window.history.replaceState(null, "", `${window.location.pathname}${window.location.search}#/domains`);
+    return "#/domains";
+  }
   if (hash === "#/public-access") {
     window.history.replaceState(null, "", `${window.location.pathname}${window.location.search}#/public-access/tunnels`);
     return "#/public-access/tunnels";
@@ -98,6 +111,7 @@ function readRoute(): AppRoute {
 function primaryRoute(route: AppRoute): PrimaryRoute {
   if (route.startsWith("#/devices/")) return "devices";
   if (route === "#/access-control") return "access-control";
+  if (route === "#/domains") return "domains";
   if (route.startsWith("#/public-access/")) return "public-access";
   if (route === "#/networks") return "networks";
   if (route === "#/settings") return "settings";
@@ -110,6 +124,7 @@ function routeTitle(route: AppRoute): string {
   if (route === "#/devices/enrollments") return "入网请求";
   if (route === "#/devices/official") return "官方客户端";
   if (route === "#/access-control") return "访问控制";
+  if (route === "#/domains") return "域名与 HTTPS";
   if (route === "#/public-access/tunnels") return "内网穿透";
   if (route === "#/public-access/domain") return "域名与 HTTPS";
   if (route === "#/networks") return "网络互联";
@@ -267,6 +282,16 @@ type PublicDomain = {
   attempt_count: number;
   next_retry_at: number | null;
   dns_management: DnsManagement;
+  management_entry?: string | null;
+  mesh_entry?: string | null;
+  readiness_summary?: {
+    status: string;
+    root_dns: string;
+    wildcard_dns: string;
+    https: string;
+    management_entry: string;
+    mesh_entry: string;
+  };
 };
 
 type ManagedDnsChange = {
@@ -295,6 +320,25 @@ type PublicDomainMigration = {
   last_error: string | null;
   created_at: number;
   updated_at: number;
+};
+
+type RuntimeEvent = {
+  id: number;
+  public_domain_id: string | null;
+  domain: string | null;
+  level: "error" | "warning" | "info" | "debug" | string;
+  category: string;
+  stage: string | null;
+  summary: string;
+  error_code: string | null;
+  retry_at: number | null;
+  technical_detail: string | null;
+  occurred_at: number;
+};
+
+type RuntimeEventPage = {
+  events: RuntimeEvent[];
+  next_cursor: number | null;
 };
 
 type GatewayReport = {
@@ -587,7 +631,7 @@ function Dashboard({
   // 公网域名是实例级设置，只对系统管理员开放；普通用户直接打开旧链接时
   // 回到自己的穿透列表，避免先渲染一个必然 403 的空页面。
   useEffect(() => {
-    if (auth.role === "tenant" && route === "#/public-access/domain") {
+    if (auth.role === "tenant" && route === "#/domains") {
       window.history.replaceState(null, "", `${window.location.pathname}${window.location.search}#/public-access/tunnels`);
       setRoute("#/public-access/tunnels");
     }
@@ -667,29 +711,25 @@ function Dashboard({
         });
         const previewBody: unknown = await previewResponse.json().catch(() => null);
         if (previewResponse.ok) setAccessPolicyPreview(previewBody as AccessPolicyPreview);
-      } else if (page === "public-access") {
-        if (route === "#/public-access/domain") {
-          // v0.1.7 使用多域名 API；旧单例接口只作为一个发布周期的兼容回退，
-          // 这样升级中的旧 Server 仍能打开设置页面，但新配置不会写回旧投影。
-          const domainsResponse = await request("/api/v1/public-domains");
-          const domainsBody: unknown = await domainsResponse.json().catch(() => null);
-          if (domainsResponse.ok) {
-            setPublicDomains(Array.isArray(domainsBody) ? domainsBody as PublicDomain[] : []);
-            setPublicEntry(null);
-          } else {
-            setPublicDomains([]);
-            setPublicEntry(await read<PublicEntry>("/api/v1/settings/public-entry", "暂时无法读取域名与 HTTPS 配置"));
-          }
+      } else if (page === "domains") {
+        const domainsResponse = await request("/api/v1/public-domains");
+        const domainsBody: unknown = await domainsResponse.json().catch(() => null);
+        if (domainsResponse.ok) {
+          setPublicDomains(Array.isArray(domainsBody) ? domainsBody as PublicDomain[] : []);
+          setPublicEntry(null);
         } else {
-          const [nextTunnels, nextDevices] = await Promise.all([
-            read<Tunnel[]>("/api/v1/tunnels", "暂时无法读取穿透服务"),
-            read<Device[]>("/api/v1/devices", "暂时无法读取设备"),
-          ]);
-          setTunnels(nextTunnels); setDevices(nextDevices);
-          const domainsResponse = await request("/api/v1/public-domains");
-          const domainsBody: unknown = await domainsResponse.json().catch(() => null);
-          if (domainsResponse.ok) setPublicDomains(Array.isArray(domainsBody) ? domainsBody as PublicDomain[] : []);
+          setPublicDomains([]);
+          setPublicEntry(await read<PublicEntry>("/api/v1/settings/public-entry", "暂时无法读取域名与 HTTPS 配置"));
         }
+      } else if (page === "public-access") {
+        const [nextTunnels, nextDevices] = await Promise.all([
+          read<Tunnel[]>("/api/v1/tunnels", "暂时无法读取穿透服务"),
+          read<Device[]>("/api/v1/devices", "暂时无法读取设备"),
+        ]);
+        setTunnels(nextTunnels); setDevices(nextDevices);
+        const domainsResponse = await request("/api/v1/public-domains");
+        const domainsBody: unknown = await domainsResponse.json().catch(() => null);
+        if (domainsResponse.ok) setPublicDomains(Array.isArray(domainsBody) ? domainsBody as PublicDomain[] : []);
       } else if (page === "networks") {
         const [nextSites, nextDevices, nextNetworks, nextLinks] = await Promise.all([
           read<Site[]>("/api/v1/sites", "暂时无法读取站点"),
@@ -844,7 +884,7 @@ function Dashboard({
     ["pending", "checking", "configuring", "retrying", "rate_limited"].includes(domain.apply_status.toLowerCase()),
   );
   useEffect(() => {
-    if (!hasPendingPublicDomainChanges || route !== "#/public-access/domain") {
+    if (!hasPendingPublicDomainChanges || route !== "#/domains") {
       return;
     }
     const timer = window.setInterval(() => void refreshCurrentPage(), 5000);
@@ -910,9 +950,9 @@ function Dashboard({
   return (
     <div className="app-shell">
       <a className="skip-link" href="#main-content">跳到主要内容</a>
-      <Sidebar route={route} />
+      <Sidebar route={route} role={auth.role} />
       <MobileHeader onOpen={() => setMobileNavigationOpen(true)} />
-      {mobileNavigationOpen && <MobileNavigation route={route} onClose={() => setMobileNavigationOpen(false)} />}
+      {mobileNavigationOpen && <MobileNavigation route={route} role={auth.role} onClose={() => setMobileNavigationOpen(false)} />}
 
       <main className="content" id="main-content" aria-busy={loading}>
         {statusMessage && <p className="action-status" role="status">{statusMessage}</p>}
@@ -964,12 +1004,18 @@ function Dashboard({
               onRefresh={refreshCurrentPage}
             />
           )}
+          {route === "#/domains" && (
+            <DomainsPage
+              domains={publicDomains}
+              legacyEntry={publicEntry}
+              error={error}
+              request={request}
+              onRefresh={refreshCurrentPage}
+            />
+          )}
           {route.startsWith("#/public-access/") && (
             <PublicAccessPage
-              auth={auth}
-              route={route}
               publicDomains={publicDomains}
-              publicEntry={publicEntry}
               tunnels={tunnels}
               devices={devices}
               error={error}
@@ -990,6 +1036,7 @@ function Dashboard({
             <NetworksPage
               sites={sites}
               devices={devices}
+              publicDomains={publicDomains}
               siteNetworks={siteNetworks}
               siteLinks={siteLinks}
               error={error}
@@ -1090,11 +1137,11 @@ function BrandMark() {
   );
 }
 
-function NavigationLinks({ route, onNavigate }: { route: AppRoute; onNavigate?: () => void }) {
+function NavigationLinks({ route, role, onNavigate }: { route: AppRoute; role: string; onNavigate?: () => void }) {
   const active = primaryRoute(route);
   return (
     <nav className="primary-navigation" aria-label="主导航">
-      {navigationItems.map((item) => {
+      {navigationItems.filter((item) => !item.systemOnly || role === "system_admin").map((item) => {
         const Icon = item.icon;
         return (
           <a
@@ -1113,11 +1160,11 @@ function NavigationLinks({ route, onNavigate }: { route: AppRoute; onNavigate?: 
   );
 }
 
-function Sidebar({ route }: { route: AppRoute }) {
+function Sidebar({ route, role }: { route: AppRoute; role: string }) {
   return (
     <aside className="sidebar">
       <BrandMark />
-      <NavigationLinks route={route} />
+      <NavigationLinks route={route} role={role} />
       <p className="sidebar-footer">设备、服务与网络，都有清晰的归处。</p>
     </aside>
   );
@@ -1136,7 +1183,7 @@ function MobileHeader({ onOpen }: { onOpen: () => void }) {
 }
 
 /** 移动导航使用原生 dialog 获得焦点约束，并从左侧沿同一路径进入和离开。 */
-function MobileNavigation({ route, onClose }: { route: AppRoute; onClose: () => void }) {
+function MobileNavigation({ route, role, onClose }: { route: AppRoute; role: string; onClose: () => void }) {
   const dialogRef = useRef<HTMLDialogElement>(null);
   useEffect(() => {
     const dialog = dialogRef.current;
@@ -1158,7 +1205,7 @@ function MobileNavigation({ route, onClose }: { route: AppRoute; onClose: () => 
             <X size={20} aria-hidden="true" />
           </button>
         </div>
-        <NavigationLinks route={route} onNavigate={onClose} />
+        <NavigationLinks route={route} role={role} onNavigate={onClose} />
       </div>
     </dialog>
   );
@@ -1694,11 +1741,22 @@ function AccessControlPage({
   );
 }
 
+function DomainsPage({ domains, legacyEntry, error, request, onRefresh }: {
+  domains: PublicDomain[];
+  legacyEntry: PublicEntry | null;
+  error: string | null;
+  request: ApiRequest;
+  onRefresh: () => Promise<void>;
+}) {
+  return <>
+    <PageHeader eyebrow="公网基础设施" title="域名与 HTTPS" subtitle="统一管理公网入口、网络互联地址和 Web 服务使用的域名。" />
+    <PageError error={error} onRetry={onRefresh} />
+    {legacyEntry ? <section className="panel page-panel"><EmptyState icon={Globe2} title="域名资源接口暂不可用" detail="当前服务仍返回旧版入口设置，请升级服务端后再管理多域名。" /></section> : <PublicDomainsPanel domains={domains} request={request} onRefresh={onRefresh} />}
+  </>;
+}
+
 function PublicAccessPage({
-  auth,
-  route,
   publicDomains,
-  publicEntry,
   tunnels,
   devices,
   error,
@@ -1711,10 +1769,7 @@ function PublicAccessPage({
   onEdit,
   onDeleteTunnel,
 }: {
-  auth: AuthStatus;
-  route: AppRoute;
   publicDomains: PublicDomain[];
-  publicEntry: PublicEntry | null;
   tunnels: Tunnel[];
   devices: Device[];
   error: string | null;
@@ -1727,7 +1782,6 @@ function PublicAccessPage({
   onEdit: (tunnel: Tunnel, trigger: HTMLButtonElement) => void;
   onDeleteTunnel: (tunnel: Tunnel, trigger: HTMLButtonElement) => void;
 }) {
-  const tunnelsView = route === "#/public-access/tunnels";
   const [selectedTunnelIds, setSelectedTunnelIds] = useState<string[]>([]);
   const [batchBusy, setBatchBusy] = useState(false);
   const [batchMessage, setBatchMessage] = useState<string | null>(null);
@@ -1753,10 +1807,6 @@ function PublicAccessPage({
       return next.length === current.length ? current : next;
     });
   }, [tunnels]);
-
-  useEffect(() => {
-    if (!tunnelsView) setSelectedTunnelIds([]);
-  }, [tunnelsView]);
 
   const toggleTunnelSelection = (tunnel: Tunnel, checked: boolean) => {
     if (tunnel.deletion_pending) return;
@@ -1814,80 +1864,23 @@ function PublicAccessPage({
     await onRefresh();
   };
 
-  const [showEntrySettings, setShowEntrySettings] = useState(false);
-  const [entryChecking, setEntryChecking] = useState(false);
-  const [entryActionError, setEntryActionError] = useState<string | null>(null);
-  const entryConfigured = Boolean(publicEntry?.base_domain);
-  const entryStatusKind = publicEntry?.apply_status === "ready"
-    ? "ready"
-    : publicEntry?.apply_status === "error"
-      ? "error"
-      : "working";
-  const certificateLabel = publicEntry?.https_enabled
-    ? publicEntry.certificate_not_after
-      ? `有效期至 ${new Date(publicEntry.certificate_not_after * 1000).toLocaleDateString()}`
-      : "等待证书签发"
-    : "未启用";
-
-  const recheckEntry = async () => {
-    setEntryChecking(true);
-    setEntryActionError(null);
-    try {
-      const response = await request("/api/v1/settings/public-entry/recheck", { method: "POST" });
-      const body: unknown = await response.json().catch(() => null);
-      if (!response.ok) throw new Error(readApiError(body, "暂时无法重新检测域名与 HTTPS"));
-      await onRefresh();
-    } catch (requestError) {
-      setEntryActionError(requestError instanceof Error ? requestError.message : "暂时无法重新检测域名与 HTTPS");
-    } finally {
-      setEntryChecking(false);
-    }
-  };
+  const primaryDomain = publicDomains.find((domain) => domain.is_primary);
+  const publicDomainReady = Boolean(primaryDomain && publicDomainStatus(primaryDomain.apply_status).kind === "ready");
 
   return (
     <>
       <PageHeader
         eyebrow="公网访问"
-        title={tunnelsView ? "内网穿透" : "域名与 HTTPS"}
-        subtitle={tunnelsView ? "将设备上的 Web 服务或 TCP 端口安全开放到公网。" : "配置公网根域名、HTTPS 和证书来源。"}
-        action={tunnelsView ? <button className="primary-button" type="button" onClick={onOpenCreate}><Plus size={16} aria-hidden="true" />添加穿透服务</button> : undefined}
+        title="内网穿透"
+        subtitle="将设备上的 Web 服务或 TCP 端口安全开放到公网。"
+        action={<button className="primary-button" type="button" onClick={onOpenCreate}><Plus size={16} aria-hidden="true" />添加穿透服务</button>}
       />
-      <SectionTabs label="公网访问页面" route={route} items={[
-        { href: "#/public-access/tunnels", label: "内网穿透", icon: Globe2 },
-        ...(auth.role !== "tenant" ? [{ href: "#/public-access/domain" as AppRoute, label: "域名与 HTTPS", icon: ShieldCheck }] : []),
-      ]} />
       <PageError error={error} onRetry={onRefresh} />
-      {!tunnelsView && publicEntry === null && <PublicDomainsPanel
-        domains={publicDomains}
-        request={request}
-        onRefresh={onRefresh}
-      />}
-      {!tunnelsView && publicEntry !== null && <section className="panel page-panel public-entry-panel">
-        <div className="public-entry-summary">
-          <div className="public-entry-copy">
-            <p className="eyebrow">访问基础配置</p>
-            <h2>域名与证书状态</h2>
-            <p>根域名同时用于 Web 服务地址和 Nexo 的公网服务地址。</p>
-          </div>
-          <div className="public-entry-actions">
-            <span className={`status-pill ${entryStatusKind}`}><i />{publicEntryLabel(publicEntry)}</span>
-            <button className="secondary-button" type="button" onClick={() => void recheckEntry()} disabled={!publicEntry || entryChecking}>
-              <RefreshCw size={16} aria-hidden="true" />{entryChecking ? "检测中…" : "重新检测"}
-            </button>
-            <button className="secondary-button" type="button" onClick={() => setShowEntrySettings(true)} disabled={!publicEntry}>
-              <Settings size={16} aria-hidden="true" />{entryConfigured ? "编辑域名与 HTTPS" : "配置域名与 HTTPS"}
-            </button>
-          </div>
-        </div>
-        <dl className="public-entry-facts" aria-label="域名与 HTTPS 配置摘要">
-          <div><dt>根域名</dt><dd>{publicEntry?.base_domain ?? "尚未配置"}</dd></div>
-          <div><dt>访问协议</dt><dd>{publicEntry?.https_enabled ? "HTTPS" : "HTTP"}</dd></div>
-          <div><dt>证书</dt><dd>{certificateLabel}</dd></div>
-        </dl>
-        {entryActionError && <p className="network-error" role="alert">{entryActionError}</p>}
-        {publicEntry?.apply_error && <p className="network-error">{publicEntry.apply_error}</p>}
-      </section>}
-      {tunnelsView && <section className="panel page-panel">
+      <section className={`domain-dependency-notice ${publicDomainReady ? "ready" : "warning"}`}>
+        <div><strong>{publicDomainReady ? `Web 服务默认使用 ${primaryDomain?.domain}` : "Web 服务域名尚未就绪"}</strong><span>{publicDomainReady ? "域名证书与路由由系统统一管理。" : "TCP 穿透不受影响；创建或启用 Web 穿透前需要可用的主域名。"}</span></div>
+        <a className="secondary-button compact-button" href="#/domains">管理域名</a>
+      </section>
+      <section className="panel page-panel">
         <div className="panel-heading tunnel-panel-heading">
           <div><p className="eyebrow">穿透服务</p><h2 id="tunnel-list-heading" tabIndex={-1}>{tunnels.length} 个穿透服务</h2></div>
           {selectedTunnelIds.length > 0 && <div className="batch-toolbar" role="toolbar" aria-label="穿透服务批量操作">
@@ -1921,13 +1914,13 @@ function PublicAccessPage({
             ))}
           </div>
         )}
-      </section>}
-      {tunnelsView && showCreate && (
+      </section>
+      {showCreate && (
         <FormDialog eyebrow="内网穿透" title="添加穿透服务" description="选择设备和本地服务，将 Web 服务或 TCP 端口开放到公网。" onClose={onCloseCreate}>
           <CreateTunnelForm devices={devices} publicDomains={publicDomains} request={request} onCancel={onCloseCreate} onCreated={async () => { onCloseCreate(); await onRefresh(); }} />
         </FormDialog>
       )}
-      {tunnelsView && batchDeviceDialog && (
+      {batchDeviceDialog && (
         <BatchTunnelDeviceDialog
           tunnels={selectedTunnels}
           devices={devices}
@@ -1937,7 +1930,7 @@ function PublicAccessPage({
           onClose={() => { setBatchDeviceDialog(false); setBatchDeviceTrigger(null); }}
         />
       )}
-      {tunnelsView && batchDeleteDialog && (
+      {batchDeleteDialog && (
         <BatchTunnelDeleteDialog
           tunnels={selectedTunnels}
           request={request}
@@ -1945,21 +1938,6 @@ function PublicAccessPage({
           onDeleted={(result) => void handleBatchDeleted(result)}
           onClose={() => { setBatchDeleteDialog(false); setBatchDeleteTrigger(null); }}
         />
-      )}
-      {!tunnelsView && showEntrySettings && publicEntry && (
-        <FormDialog
-          eyebrow="域名与 HTTPS"
-          title={entryConfigured ? "编辑域名与 HTTPS" : "配置域名与 HTTPS"}
-          description="配置公网根域名、HTTPS 和证书来源。"
-          onClose={() => setShowEntrySettings(false)}
-        >
-          <PublicEntrySettings
-            entry={publicEntry}
-            request={request}
-            onCancel={() => setShowEntrySettings(false)}
-            onSaved={async () => { await onRefresh(); setEntryActionError(null); setShowEntrySettings(false); }}
-          />
-        </FormDialog>
       )}
     </>
   );
@@ -1983,10 +1961,10 @@ function publicDomainStatus(status: string): { kind: "ready" | "error" | "workin
     case "ready": return { kind: "ready", label: "READY" };
     case "error": return { kind: "error", label: "需要处理" };
     case "rate_limited": return { kind: "working", label: "CA 限流" };
-    case "retrying": return { kind: "working", label: "Caddy 自动重试" };
+    case "retrying": return { kind: "working", label: "自动重试中" };
     case "expired": return { kind: "error", label: "已过期" };
     case "checking": return { kind: "working", label: "检测中" };
-    case "configuring": return { kind: "working", label: "Caddy 配置中" };
+    case "configuring": return { kind: "working", label: "配置应用中" };
     default: return { kind: "working", label: "等待证书" };
   }
 }
@@ -2041,7 +2019,7 @@ function CertificateCell({
   const currentStage = certificate.progress?.stage ?? "waiting_configuration";
   const activeIndex = phases.findIndex(([stage]) => stage === currentStage);
   const phaseIndex = activeIndex >= 0 ? activeIndex : 0;
-  const stageLabel = currentStage === "retry_wait" ? "等待 Caddy 重试" : currentStage === "failed" ? "需要修复配置" : phases[phaseIndex][1];
+  const stageLabel = currentStage === "retry_wait" ? "等待自动重试" : currentStage === "failed" ? "需要修复配置" : phases[phaseIndex][1];
   return (
     <div className="domain-certificate-cell" aria-live="polite" aria-atomic="true">
       <div className="domain-certificate-heading">
@@ -2059,15 +2037,23 @@ function CertificateCell({
       <small>到期时间</small>
       <strong>{formatDomainTimestamp(certificate.not_after)}</strong>
       <small>{certificate.renewal_at
-        ? `下一次续期时间（预计进入 Caddy 续期窗口）：${formatDomainTimestamp(certificate.renewal_at)}`
+        ? `下一次续期时间（预计进入自动续期窗口）：${formatDomainTimestamp(certificate.renewal_at)}`
         : automatic
-          ? "证书签发后由 Caddy 计算下一次续期时间"
-          : "手动证书不会由 Caddy 自动续期"}</small>
+          ? "证书签发后由系统计算下一次续期时间"
+          : "手动证书不会自动续期"}</small>
       <small>最近尝试：{formatDomainTimestamp(certificate.progress?.last_event_at ?? null, "暂无事件")} · {certificate.progress?.attempt_count ?? 0} 次</small>
       {certificate.progress?.next_retry_at && <small>下次自动重试：{formatDomainTimestamp(certificate.progress.next_retry_at)}</small>}
-      {certificate.progress?.error_message && <details className="certificate-error"><summary>查看错误与处理建议</summary><p>{certificate.progress.error_message}</p><p>检查 Cloudflare Zone DNS 编辑权限、DNS only 设置及 DNS 传播；修复后由 Caddy 继续处理。</p></details>}
+      {certificate.progress?.error_message && <details className="certificate-error"><summary>查看错误与处理建议</summary><p>{certificate.progress.error_message}</p><p>检查 Cloudflare Zone DNS 编辑权限、DNS only 设置及 DNS 传播；修复后系统会继续处理。</p></details>}
     </div>
   );
+}
+
+// 行内菜单项打开弹窗前先收起菜单，并把焦点回归点固定到仍可见的菜单触发器。
+function closeDomainActionMenu(button: HTMLButtonElement): HTMLElement {
+  const menu = button.closest("details");
+  const trigger = menu?.querySelector<HTMLElement>("summary") ?? button;
+  menu?.removeAttribute("open");
+  return trigger;
 }
 
 function PublicDomainsPanel({
@@ -2083,18 +2069,35 @@ function PublicDomainsPanel({
   const [batchBusy, setBatchBusy] = useState(false);
   const [batchMessage, setBatchMessage] = useState<string | null>(null);
   const [batchError, setBatchError] = useState<string | null>(null);
+  const [search, setSearch] = useState("");
+  const [statusFilter, setStatusFilter] = useState("all");
+  const [sourceFilter, setSourceFilter] = useState("all");
+  const [usageFilter, setUsageFilter] = useState("all");
+  const [expandedId, setExpandedId] = useState<string | null>(null);
   const [editorDomain, setEditorDomain] = useState<PublicDomain | null | undefined>(undefined);
-  const [editorTrigger, setEditorTrigger] = useState<HTMLButtonElement | null>(null);
+  const [editorTrigger, setEditorTrigger] = useState<HTMLElement | null>(null);
   const [deletingDomain, setDeletingDomain] = useState<PublicDomain | null>(null);
-  const [deleteTrigger, setDeleteTrigger] = useState<HTMLButtonElement | null>(null);
+  const [deleteTrigger, setDeleteTrigger] = useState<HTMLElement | null>(null);
   const [primaryDomain, setPrimaryDomain] = useState<PublicDomain | null>(null);
-  const [primaryTrigger, setPrimaryTrigger] = useState<HTMLButtonElement | null>(null);
+  const [primaryTrigger, setPrimaryTrigger] = useState<HTMLElement | null>(null);
   const [dnsDomains, setDnsDomains] = useState<PublicDomain[] | null>(null);
-  const [dnsTrigger, setDnsTrigger] = useState<HTMLButtonElement | null>(null);
+  const [dnsTrigger, setDnsTrigger] = useState<HTMLElement | null>(null);
+  const [logDomain, setLogDomain] = useState<PublicDomain | null | undefined>(undefined);
+  const [logTrigger, setLogTrigger] = useState<HTMLButtonElement | null>(null);
   const selectAllRef = useRef<HTMLInputElement>(null);
   const selectedSet = new Set(selectedIds);
   const allSelected = domains.length > 0 && domains.every((domain) => selectedSet.has(domain.id));
   const someSelected = selectedIds.length > 0 && !allSelected;
+  const filteredDomains = domains.filter((domain) => {
+    const state = publicDomainStatus(domain.apply_status);
+    return domain.domain.toLowerCase().includes(search.trim().toLowerCase())
+      && (statusFilter === "all" || state.kind === statusFilter)
+      && (sourceFilter === "all" || domain.certificate_mode === sourceFilter)
+      && (usageFilter === "all" || (usageFilter === "web" ? domain.usage_count > 0 : domain.is_primary));
+  });
+  const readyCount = domains.filter((domain) => publicDomainStatus(domain.apply_status).kind === "ready").length;
+  const issueCount = domains.filter((domain) => publicDomainStatus(domain.apply_status).kind === "error").length;
+  const workingCount = Math.max(0, domains.length - readyCount - issueCount);
 
   useEffect(() => {
     if (selectAllRef.current) selectAllRef.current.indeterminate = someSelected;
@@ -2107,7 +2110,7 @@ function PublicDomainsPanel({
     });
   }, [domains]);
 
-  const runBatch = async (action: "recheck" | "renew") => {
+  const runBatch = async (action: "recheck" | "renew", targetIds = selectedIds, preserveSelection = false) => {
     setBatchBusy(true);
     setBatchError(null);
     setBatchMessage(null);
@@ -2115,14 +2118,14 @@ function PublicDomainsPanel({
       const response = await request(`/api/v1/public-domains/batch/${action}`, {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ ids: selectedIds }),
+        body: JSON.stringify({ ids: targetIds }),
       });
       const body: unknown = await response.json().catch(() => null);
       if (!response.ok) throw new Error(readApiError(body, action === "recheck" ? "暂时无法批量检测域名" : "暂时无法批量申请证书"));
       const result = body as { message: string; skipped?: BatchSkippedItem[] };
       const skipped = result.skipped ?? [];
       setBatchMessage(skipped.length ? `${result.message}；${skipped.length} 项未执行：${skipped.map((item) => item.reason).join("；")}` : result.message);
-      setSelectedIds(skipped.map((item) => item.id));
+      if (!preserveSelection) setSelectedIds(skipped.map((item) => item.id));
       await onRefresh();
     } catch (requestError) {
       setBatchError(requestError instanceof Error ? requestError.message : "批量操作失败");
@@ -2139,7 +2142,7 @@ function PublicDomainsPanel({
       const response = await request(`/api/v1/public-domains/${encodeURIComponent(domain.id)}/${action}`, { method: "POST" });
       const body: unknown = await response.json().catch(() => null);
       if (!response.ok) throw new Error(readApiError(body, action === "recheck" ? "暂时无法检测域名" : "暂时无法申请证书"));
-      setBatchMessage(action === "recheck" ? `已重新检测 ${domain.domain}` : `已请求 Caddy 处理 ${domain.domain} 的证书；CA 限流将按官方退避自动重试`);
+      setBatchMessage(action === "recheck" ? `已重新检测 ${domain.domain}` : `已提交 ${domain.domain} 的自动证书申请；限流时系统会按计划重试`);
       await onRefresh();
     } catch (requestError) {
       setBatchError(requestError instanceof Error ? requestError.message : "域名操作失败");
@@ -2158,73 +2161,280 @@ function PublicDomainsPanel({
     <section className="panel page-panel domains-panel">
       <div className="panel-heading domains-panel-heading">
         <div>
-          <p className="eyebrow">访问基础配置</p>
-          <h2 id="public-domain-list-heading" tabIndex={-1}>{domains.length ? `${domains.length} 个公网域名` : "还没有公网域名"}</h2>
-          <p className="panel-description">每个域名独立管理 DNS-01 凭据、根证书和泛域名证书。Caddy 负责自动签发、续期和指数退避。</p>
+          <p className="eyebrow">域名资源</p>
+          <h2 id="public-domain-list-heading" tabIndex={-1}>{domains.length ? `${domains.length} 个域名` : "还没有域名"}</h2>
         </div>
         <div className="panel-heading-actions domains-heading-actions">
           {selectedIds.length > 0 && <div className="batch-toolbar" role="toolbar" aria-label="公网域名批量操作">
             <span className="batch-selection-count">已选 {selectedIds.length} 项</span>
-            <button className="secondary-button compact-button" type="button" disabled={batchBusy} onClick={() => void runBatch("recheck")}><RefreshCw size={15} aria-hidden="true" />批量重新检测</button>
-            <button className="secondary-button compact-button" type="button" disabled={batchBusy} onClick={() => void runBatch("renew")}><ShieldCheck size={15} aria-hidden="true" />批量申请证书</button>
-            <button className="secondary-button compact-button" type="button" disabled={batchBusy || !domains.some((domain) => selectedSet.has(domain.id) && domain.dns_management.enabled)} onClick={(event) => { setDnsTrigger(event.currentTarget); setDnsDomains(domains.filter((domain) => selectedSet.has(domain.id) && domain.dns_management.enabled)); }}><Globe2 size={15} aria-hidden="true" />批量同步 DNS</button>
+            <button className="secondary-button compact-button" type="button" disabled={batchBusy} onClick={() => void runBatch("recheck")}><RefreshCw size={15} aria-hidden="true" />重新检测</button>
+            <button className="secondary-button compact-button" type="button" disabled={batchBusy} onClick={() => void runBatch("renew")}><ShieldCheck size={15} aria-hidden="true" />申请证书</button>
+            <button className="secondary-button compact-button" type="button" disabled={batchBusy || !domains.some((domain) => selectedSet.has(domain.id) && domain.dns_management.enabled)} onClick={(event) => { setDnsTrigger(event.currentTarget); setDnsDomains(domains.filter((domain) => selectedSet.has(domain.id) && domain.dns_management.enabled)); }}><Globe2 size={15} aria-hidden="true" />同步 DNS</button>
           </div>}
+          <button className="secondary-button" type="button" disabled={batchBusy || domains.length === 0} onClick={() => void runBatch("recheck", domains.map((domain) => domain.id), true)}><RefreshCw size={16} aria-hidden="true" />重新检测</button>
+          <button className="secondary-button" type="button" onClick={(event) => { setLogTrigger(event.currentTarget); setLogDomain(null); }}><ScrollText size={16} aria-hidden="true" />运行日志</button>
           <button className="primary-button" type="button" onClick={(event) => { setEditorTrigger(event.currentTarget); setEditorDomain(null); }}><Plus size={16} aria-hidden="true" />添加域名</button>
         </div>
       </div>
+      <div className="domain-summary-strip" aria-label="域名状态摘要">
+        <button type="button" className={statusFilter === "all" ? "active" : ""} onClick={() => setStatusFilter("all")}>全部 <strong>{domains.length}</strong></button>
+        <button type="button" className={statusFilter === "ready" ? "active" : ""} onClick={() => setStatusFilter("ready")}>正常 <strong>{readyCount}</strong></button>
+        <button type="button" className={statusFilter === "working" ? "active" : ""} onClick={() => setStatusFilter("working")}>处理中 <strong>{workingCount}</strong></button>
+        <button type="button" className={statusFilter === "error" ? "active" : ""} onClick={() => setStatusFilter("error")}>需处理 <strong>{issueCount}</strong></button>
+      </div>
+      <div className="domain-filter-bar">
+        <label className="domain-search"><Search size={15} aria-hidden="true" /><span className="sr-only">搜索域名</span><input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="搜索域名" /></label>
+        <label><span className="sr-only">证书来源</span><select value={sourceFilter} onChange={(event) => setSourceFilter(event.target.value)}><option value="all">全部证书来源</option><option value="cloudflare">自动证书</option><option value="manual">手动证书</option></select></label>
+        <label><span className="sr-only">用途</span><select value={usageFilter} onChange={(event) => setUsageFilter(event.target.value)}><option value="all">全部用途</option><option value="web">Web 穿透</option><option value="entry">系统与网络入口</option></select></label>
+      </div>
       {(batchMessage || batchError) && <p className={batchError ? "network-error batch-feedback" : "action-status batch-feedback"} role={batchError ? "alert" : "status"}>{batchError ?? batchMessage}</p>}
       {domains.length === 0 ? (
-        <EmptyState icon={Globe2} title="还没有公网域名" detail="添加一个根域名后，Caddy 才能为根域名和泛域名申请证书。" />
+        <EmptyState icon={Globe2} title="还没有公网域名" detail="添加根域名后，可以配置公网入口、网络互联地址和 Web 服务。" />
       ) : (
-        <div className="domain-list">
-          <div className="domain-list-header">
-            <label className="selection-control"><input ref={selectAllRef} type="checkbox" checked={allSelected} onChange={(event) => setSelectedIds(event.target.checked ? domains.map((domain) => domain.id) : [])} aria-label="全选公网域名" /><span>全选</span></label>
-            <span>{selectedIds.length ? `已选择 ${selectedIds.length} 项` : "选择域名后可批量检测或申请证书"}</span>
+        <div className="domain-table" role="table" aria-label="域名与 HTTPS 列表">
+          <div className="domain-table-head" role="row">
+            <span role="columnheader"><input ref={selectAllRef} type="checkbox" checked={allSelected} onChange={(event) => setSelectedIds(event.target.checked ? domains.map((domain) => domain.id) : [])} aria-label="全选公网域名" /></span>
+            <span role="columnheader">域名与用途</span><span role="columnheader">证书</span><span role="columnheader">综合状态</span><span role="columnheader">有效期</span><span role="columnheader">操作</span>
           </div>
-          {domains.map((domain) => {
+          {filteredDomains.map((domain) => {
             const state = publicDomainStatus(domain.apply_status);
             const rootDns = dnsCheckLabel(domain.dns_check.root);
             const wildcardDns = dnsCheckLabel(domain.dns_check.wildcard);
-            const managedDns = dnsManagementLabel(domain.dns_management);
             const rateLimited = domain.apply_status.toLowerCase() === "rate_limited" || domain.error_code === "acme_rate_limited";
+            const expiresAt = [domain.root_certificate.not_after, domain.wildcard_certificate.not_after].filter((value): value is number => Boolean(value)).sort((a, b) => a - b)[0] ?? null;
+            const expanded = expandedId === domain.id;
+            const sourceLabel = domain.certificate_mode === "cloudflare" ? "自动证书" : "手动证书";
             return (
-              <article className="domain-row" key={domain.id}>
-                <div className="domain-row-main">
-                  <label className="selection-control domain-selection"><input type="checkbox" checked={selectedSet.has(domain.id)} onChange={(event) => setSelectedIds((current) => event.target.checked ? (current.includes(domain.id) ? current : [...current, domain.id]) : current.filter((id) => id !== domain.id))} aria-label={`选择 ${domain.domain}`} /><span /></label>
-                  <div className="domain-identity">
-                    <div className="domain-title"><strong>{domain.domain}</strong>{domain.is_primary && <span className="domain-primary-badge">主域名</span>}</div>
-                    <span>{domain.usage_count} 个 Web 服务 · {domain.certificate_mode === "cloudflare" ? "Cloudflare DNS-01" : "手动证书"} · {domain.dns_management.enabled ? "Nexo 托管 DNS" : "外部管理 DNS"}</span>
+              <div className={`domain-table-item${expanded ? " expanded" : ""}`} key={domain.id} role="rowgroup">
+                <div className="domain-table-row" role="row">
+                  <span role="cell"><input type="checkbox" checked={selectedSet.has(domain.id)} onChange={(event) => setSelectedIds((current) => event.target.checked ? (current.includes(domain.id) ? current : [...current, domain.id]) : current.filter((id) => id !== domain.id))} aria-label={`选择 ${domain.domain}`} /></span>
+                  <div className="domain-identity" role="cell"><div className="domain-title"><strong>{domain.domain}</strong>{domain.is_primary && <span className="domain-primary-badge">主域名</span>}</div><span>{domain.usage_count} 个 Web 服务{domain.is_primary ? " · 网络互联" : ""}</span></div>
+                  <div className="domain-certificate-summary" role="cell"><strong>{sourceLabel}</strong><span>{domain.certificate_mode === "cloudflare" ? "DNS-01 自动申请与续期" : "自动申请已停止"}</span></div>
+                  <div className="domain-combined-status" role="cell">
+                    <strong className={`status-pill ${state.kind}`}><i />{state.label}</strong>
+                    <span>根 DNS {rootDns.label} · 泛 DNS {wildcardDns.label} · HTTPS {domain.https_enabled && expiresAt ? "正常" : "待配置"}{domain.is_primary ? ` · Nexo ${expiresAt ? "可用" : "待配置"} · Mesh ${wildcardDns.kind === "ready" && expiresAt ? "可用" : "异常"}` : ""}</span>
                   </div>
-                  <span className={`status-pill ${state.kind}`}><i />{state.label}</span>
+                  <div className="domain-validity" role="cell"><strong>{formatDomainTimestamp(expiresAt, "未签发")}</strong><span>{domain.certificate_mode === "cloudflare" ? `预计续期 ${formatDomainTimestamp(domain.root_certificate.renewal_at, "待计算")}` : "到期后不会自动续期"}</span></div>
+                  <div className="domain-compact-actions" role="cell">
+                    <button className="secondary-button compact-button" type="button" disabled={batchBusy || (rateLimited && domain.certificate_mode === "cloudflare")} onClick={(event) => { if (state.kind === "error" || domain.certificate_mode === "manual") { setEditorTrigger(event.currentTarget); setEditorDomain(domain); } else { setExpandedId(expanded ? null : domain.id); } }}>{state.kind === "error" ? "修复问题" : domain.certificate_mode === "manual" ? "更新证书" : "查看进度"}</button>
+                    <button className="icon-button compact-icon-button" type="button" title="运行日志" aria-label={`查看 ${domain.domain} 运行日志`} onClick={(event) => { setLogTrigger(event.currentTarget); setLogDomain(domain); }}><ScrollText size={16} aria-hidden="true" /></button>
+                    <details className="domain-action-menu" name="domain-actions"><summary aria-label={`更多 ${domain.domain} 操作`} title="更多操作"><MoreHorizontal size={18} aria-hidden="true" /></summary><div>
+                      <button type="button" onClick={(event) => { setEditorTrigger(closeDomainActionMenu(event.currentTarget)); setEditorDomain(domain); }}>编辑设置</button>
+                      <button type="button" onClick={(event) => { closeDomainActionMenu(event.currentTarget); void runSingle(domain, "recheck"); }}>重新检测</button>
+                      {domain.certificate_mode === "cloudflare" && <button type="button" disabled={rateLimited} onClick={(event) => { closeDomainActionMenu(event.currentTarget); void runSingle(domain, "renew"); }}>申请自动证书</button>}
+                      {domain.dns_management.enabled && <button type="button" onClick={(event) => { setDnsTrigger(closeDomainActionMenu(event.currentTarget)); setDnsDomains([domain]); }}>同步 DNS</button>}
+                      {!domain.is_primary && <button type="button" onClick={(event) => { setPrimaryTrigger(closeDomainActionMenu(event.currentTarget)); setPrimaryDomain(domain); }}>设为主域名</button>}
+                      <button className="danger-menu-item" type="button" onClick={(event) => { setDeleteTrigger(closeDomainActionMenu(event.currentTarget)); setDeletingDomain(domain); }}>删除域名</button>
+                    </div></details>
+                    <button className="icon-button compact-icon-button" type="button" aria-expanded={expanded} aria-label={`${expanded ? "收起" : "展开"} ${domain.domain} 详情`} onClick={() => setExpandedId(expanded ? null : domain.id)}><ChevronDown className={expanded ? "rotated" : ""} size={17} aria-hidden="true" /></button>
+                  </div>
                 </div>
-                <div className="domain-facts-grid">
-                  <div className="domain-fact"><span>DNS 根域名</span><strong className={`inline-state ${rootDns.kind}`}><i />{rootDns.label}</strong></div>
-                  <div className="domain-fact"><span>DNS 泛域名</span><strong className={`inline-state ${wildcardDns.kind}`}><i />{wildcardDns.label}</strong></div>
-                  <div className="domain-fact"><span>Cloudflare DNS 托管</span><strong className={`inline-state ${managedDns.kind}`}><i />{managedDns.label}</strong></div>
-                  <div className="domain-fact"><span>DNS 目标地址</span><strong>{[domain.dns_management.target_ipv4, domain.dns_management.target_ipv6].filter(Boolean).join(" · ") || "由外部 DNS 管理"}</strong></div>
+                {expanded && <div className="domain-expanded" role="row"><div role="cell" className="domain-expanded-grid">
+                  {(domain.apply_error || domain.dns_management.error) && <div className="domain-expanded-problem"><strong>当前问题</strong><p>{domain.apply_error ?? domain.dns_management.error}</p>{rateLimited && <span>系统将在 {formatDomainTimestamp(domain.next_retry_at ?? domain.retry_after, "稍后")} 自动重试。</span>}</div>}
+                  <div><span>DNS</span><strong>@ {rootDns.label} · * {wildcardDns.label}</strong><small>{domain.dns_management.enabled ? `自动管理 · ${[domain.dns_management.target_ipv4, domain.dns_management.target_ipv6].filter(Boolean).join(" · ")}` : "外部管理"}</small>{domain.is_primary && <><span>服务入口</span><small>管理入口：{domain.management_entry ?? `https://nexo.${domain.domain}`}</small><small>Mesh 入口：{domain.mesh_entry ?? `https://mesh.${domain.domain}`}</small></>}</div>
                   <CertificateCell label="根证书" certificate={domain.root_certificate} automatic={domain.certificate_mode === "cloudflare"} />
                   <CertificateCell label="泛域名证书" certificate={domain.wildcard_certificate} automatic={domain.certificate_mode === "cloudflare"} />
-                </div>
-                <div className="domain-row-actions">
-                  <button className="secondary-button compact-button" type="button" disabled={batchBusy} onClick={() => void runSingle(domain, "recheck")}><RefreshCw size={15} aria-hidden="true" />重新检测</button>
-                  <button className="secondary-button compact-button" type="button" disabled={batchBusy || rateLimited} onClick={(event) => { if (domain.certificate_mode === "manual") { setEditorTrigger(event.currentTarget); setEditorDomain(domain); } else { void runSingle(domain, "renew"); } }} title={rateLimited ? "CA 限流窗口内由 Caddy 自动重试" : undefined}><ShieldCheck size={15} aria-hidden="true" />{domain.certificate_mode === "manual" ? "更新证书" : "手动申请证书"}</button>
-                  {domain.dns_management.enabled && <button className="secondary-button compact-button" type="button" disabled={batchBusy} onClick={(event) => { setDnsTrigger(event.currentTarget); setDnsDomains([domain]); }}><Globe2 size={15} aria-hidden="true" />同步 DNS</button>}
-                  <button className="secondary-button compact-button" type="button" onClick={(event) => { setEditorTrigger(event.currentTarget); setEditorDomain(domain); }}><Settings size={15} aria-hidden="true" />编辑</button>
-                  {!domain.is_primary && <button className="secondary-button compact-button" type="button" disabled={batchBusy} onClick={(event) => { setPrimaryTrigger(event.currentTarget); setPrimaryDomain(domain); }}><ArrowRight size={15} aria-hidden="true" />设为主域名</button>}
-                  {!domain.is_primary && <button className="delete-icon-button" type="button" aria-label={`删除 ${domain.domain}`} title="删除" disabled={batchBusy} onClick={(event) => { setDeleteTrigger(event.currentTarget); setDeletingDomain(domain); }}><Trash2 size={16} aria-hidden="true" /></button>}
-                </div>
-                {(rateLimited || domain.apply_error || domain.dns_management.error) && <details className="domain-error-details"><summary>{rateLimited ? "查看 CA 限流与自动重试" : "查看配置错误"}</summary><div>{domain.apply_error && <p>{domain.apply_error}</p>}{domain.dns_management.error && <p>{domain.dns_management.error}</p>}{rateLimited && <p>Caddy 正在自动重试，不会绕过 CA 限流。下一次尝试：<strong>{formatDomainTimestamp(domain.next_retry_at ?? domain.retry_after, "等待 Caddy 计算")}</strong>；已尝试 {domain.attempt_count} 次。</p>}<p>mesh.{domain.domain} 必须保持 DNS only；启用托管后 Nexo 只维护 @ 和 * 记录。</p></div></details>}
-              </article>
+                </div></div>}
+              </div>
             );
           })}
+          {filteredDomains.length === 0 && <p className="domain-no-results">没有符合筛选条件的域名</p>}
         </div>
       )}
-      {editorDomain !== undefined && <FormDialog eyebrow="域名与 HTTPS" title={editorDomain ? `编辑 ${editorDomain.domain}` : "添加公网域名"} description="先保存域名策略，再由 Caddy 负责证书签发、续期和官方退避。" onClose={() => { setEditorDomain(undefined); setEditorTrigger(null); }} returnFocus={editorTrigger}><PublicDomainEditor domain={editorDomain} request={request} onCancel={() => { setEditorDomain(undefined); setEditorTrigger(null); }} onSaved={handleEditorSaved} /></FormDialog>}
+      {editorDomain !== undefined && <FormDialog eyebrow="域名与 HTTPS" title={editorDomain ? `编辑 ${editorDomain.domain}` : "添加公网域名"} description="配置域名、证书来源和可选的 DNS 自动管理。" onClose={() => { setEditorDomain(undefined); setEditorTrigger(null); }} returnFocus={editorTrigger} variant="sheet"><PublicDomainEditor domain={editorDomain} request={request} onCancel={() => { setEditorDomain(undefined); setEditorTrigger(null); }} onSaved={handleEditorSaved} /></FormDialog>}
       {deletingDomain && <PublicDomainDeleteDialog domain={deletingDomain} domains={domains} request={request} returnFocus={deleteTrigger} onDeleted={async () => { setDeletingDomain(null); setDeleteTrigger(null); await onRefresh(); }} onClose={() => { setDeletingDomain(null); setDeleteTrigger(null); }} />}
       {primaryDomain && <PublicDomainPrimaryDialog domain={primaryDomain} request={request} returnFocus={primaryTrigger} onStarted={onRefresh} onClose={() => { setPrimaryDomain(null); setPrimaryTrigger(null); }} />}
       {dnsDomains && <ManagedDnsDialog domains={dnsDomains} request={request} returnFocus={dnsTrigger} onApplied={async () => { setDnsDomains(null); setDnsTrigger(null); await onRefresh(); }} onClose={() => { setDnsDomains(null); setDnsTrigger(null); }} />}
+      {logDomain !== undefined && <RuntimeLogDialog domain={logDomain} domains={domains} request={request} returnFocus={logTrigger} onClose={() => { setLogDomain(undefined); setLogTrigger(null); }} />}
     </section>
   );
+}
+
+const runtimeCategoryLabels: Record<string, string> = {
+  configuration: "配置应用",
+  automatic_certificate: "自动证书",
+  manual_certificate: "手动证书",
+  dns_validation: "DNS 校验",
+  certificate_storage: "证书加载",
+  https: "HTTPS",
+  reverse_proxy: "反向代理",
+  service_runtime: "服务运行",
+};
+
+function runtimeLevelLabel(level: string): string {
+  switch (level.toLowerCase()) {
+    case "error": return "错误";
+    case "warning": return "警告";
+    case "debug": return "调试";
+    default: return "信息";
+  }
+}
+
+/**
+ * 运行日志使用独立模态承载排障时间线。后台轮询只缓存新事件数量，避免用户
+ * 阅读历史详情时被插入内容推走；由用户主动合并后才更新列表和滚动位置。
+ */
+function RuntimeLogDialog({
+  domain,
+  domains,
+  request,
+  returnFocus,
+  onClose,
+}: {
+  domain: PublicDomain | null;
+  domains: PublicDomain[];
+  request: ApiRequest;
+  returnFocus: HTMLElement | null;
+  onClose: () => void;
+}) {
+  const [events, setEvents] = useState<RuntimeEvent[]>([]);
+  const eventsRef = useRef<RuntimeEvent[]>([]);
+  const [pendingEvents, setPendingEvents] = useState<RuntimeEvent[]>([]);
+  const [nextCursor, setNextCursor] = useState<number | null>(null);
+  const [domainFilter, setDomainFilter] = useState(domain?.id ?? "all");
+  const [level, setLevel] = useState("all");
+  const [category, setCategory] = useState("all");
+  const [range, setRange] = useState("24h");
+  const [search, setSearch] = useState("");
+  const [loading, setLoading] = useState(true);
+  const [loadingMore, setLoadingMore] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [copyStatus, setCopyStatus] = useState<string | null>(null);
+
+  useEffect(() => { eventsRef.current = events; }, [events]);
+
+  const queryString = (cursor?: number | null) => {
+    const params = new URLSearchParams({ limit: "100" });
+    if (domainFilter !== "all") params.set("public_domain_id", domainFilter);
+    if (level !== "all") params.set("level", level);
+    if (category !== "all") params.set("category", category);
+    if (search.trim()) params.set("search", search.trim());
+    const seconds = range === "1h" ? 3600 : range === "24h" ? 86400 : 604800;
+    params.set("since", String(Math.floor(Date.now() / 1000) - seconds));
+    if (cursor) params.set("cursor", String(cursor));
+    return params.toString();
+  };
+
+  useEffect(() => {
+    let active = true;
+    const timer = window.setTimeout(async () => {
+      setLoading(true);
+      setError(null);
+      setPendingEvents([]);
+      try {
+        const response = await request(`/api/v1/public-domain-runtime-events?${queryString()}`);
+        const body: unknown = await response.json().catch(() => null);
+        if (!response.ok) throw new Error(readApiError(body, "暂时无法读取域名服务运行日志"));
+        if (active) {
+          const page = body as RuntimeEventPage;
+          setEvents(page.events);
+          setNextCursor(page.next_cursor);
+        }
+      } catch (requestError) {
+        if (active) setError(requestError instanceof Error ? requestError.message : "暂时无法读取域名服务运行日志");
+      } finally {
+        if (active) setLoading(false);
+      }
+    }, 180);
+    return () => { active = false; window.clearTimeout(timer); };
+  }, [category, domainFilter, level, range, request, search]);
+
+  useEffect(() => {
+    let active = true;
+    const timer = window.setInterval(async () => {
+      const response = await request(`/api/v1/public-domain-runtime-events?${queryString()}`);
+      const body: unknown = await response.json().catch(() => null);
+      if (!active || !response.ok) return;
+      const known = new Set(eventsRef.current.map((event) => event.id));
+      setPendingEvents((current) => {
+        const currentIds = new Set(current.map((event) => event.id));
+        return [...(body as RuntimeEventPage).events.filter((event) => !known.has(event.id) && !currentIds.has(event.id)), ...current];
+      });
+    }, 5000);
+    return () => { active = false; window.clearInterval(timer); };
+  }, [category, domainFilter, level, range, request, search]);
+
+  const mergePending = () => {
+    setEvents((current) => {
+      const ids = new Set(current.map((event) => event.id));
+      return [...pendingEvents.filter((event) => !ids.has(event.id)), ...current];
+    });
+    setPendingEvents([]);
+  };
+
+  const loadMore = async () => {
+    if (!nextCursor) return;
+    setLoadingMore(true);
+    setError(null);
+    try {
+      const response = await request(`/api/v1/public-domain-runtime-events?${queryString(nextCursor)}`);
+      const body: unknown = await response.json().catch(() => null);
+      if (!response.ok) throw new Error(readApiError(body, "暂时无法加载更多运行日志"));
+      const page = body as RuntimeEventPage;
+      setEvents((current) => [...current, ...page.events]);
+      setNextCursor(page.next_cursor);
+    } catch (requestError) {
+      setError(requestError instanceof Error ? requestError.message : "暂时无法加载更多运行日志");
+    } finally {
+      setLoadingMore(false);
+    }
+  };
+
+  const copyVisible = async () => {
+    try {
+      await navigator.clipboard.writeText(JSON.stringify(events, null, 2));
+      setCopyStatus(`已复制 ${events.length} 条脱敏日志`);
+    } catch {
+      setCopyStatus("复制失败，请检查浏览器剪贴板权限");
+    }
+  };
+
+  const exportEvents = async () => {
+    setError(null);
+    try {
+      const response = await request(`/api/v1/public-domain-runtime-events/export?${queryString()}`);
+      if (!response.ok) {
+        const body: unknown = await response.json().catch(() => null);
+        throw new Error(readApiError(body, "暂时无法导出运行日志"));
+      }
+      const url = URL.createObjectURL(await response.blob());
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = `domain-runtime-events-${new Date().toISOString().slice(0, 10)}.json`;
+      link.click();
+      URL.revokeObjectURL(url);
+    } catch (requestError) {
+      setError(requestError instanceof Error ? requestError.message : "暂时无法导出运行日志");
+    }
+  };
+
+  return <FormDialog eyebrow="域名与 HTTPS" title="域名服务运行日志" description={domain ? `已筛选 ${domain.domain}，用于定位证书、DNS、HTTPS 与反向代理问题。` : "查看域名服务的配置、证书、DNS、HTTPS 与反向代理事件。"} onClose={onClose} returnFocus={returnFocus} initialFocusSelector="input[type=search]" wide>
+    <div className="runtime-log-dialog">
+      <div className="runtime-log-filters">
+        <label className="domain-search"><Search size={15} aria-hidden="true" /><span className="sr-only">搜索运行日志</span><input type="search" value={search} onChange={(event) => setSearch(event.target.value)} placeholder="搜索摘要、错误代码或详情" /></label>
+        <label><span className="sr-only">域名</span><select aria-label="域名" value={domainFilter} onChange={(event) => setDomainFilter(event.target.value)}><option value="all">全部域名与全局事件</option>{domains.map((item) => <option key={item.id} value={item.id}>{item.domain}</option>)}</select></label>
+        <label><span className="sr-only">级别</span><select aria-label="级别" value={level} onChange={(event) => setLevel(event.target.value)}><option value="all">全部级别</option><option value="error">错误</option><option value="warning">警告</option><option value="info">信息</option><option value="debug">调试</option></select></label>
+        <label><span className="sr-only">类型</span><select aria-label="类型" value={category} onChange={(event) => setCategory(event.target.value)}><option value="all">全部类型</option>{Object.entries(runtimeCategoryLabels).map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select></label>
+        <label><span className="sr-only">时间范围</span><select aria-label="时间范围" value={range} onChange={(event) => setRange(event.target.value)}><option value="1h">最近 1 小时</option><option value="24h">最近 24 小时</option><option value="7d">最近 7 天</option></select></label>
+      </div>
+      <div className="runtime-log-toolbar" role="toolbar" aria-label="运行日志操作">
+        <span>{loading ? "读取中…" : `${events.length} 条事件`}</span>
+        <div><button className="secondary-button compact-button" type="button" onClick={() => void copyVisible()} disabled={events.length === 0}><Copy size={15} aria-hidden="true" />复制</button><button className="secondary-button compact-button" type="button" onClick={() => void exportEvents()}><Download size={15} aria-hidden="true" />导出</button></div>
+      </div>
+      {pendingEvents.length > 0 && <button className="runtime-log-new" type="button" onClick={mergePending}>有 {pendingEvents.length} 条新日志</button>}
+      {copyStatus && <p className="runtime-log-feedback" role="status">{copyStatus}</p>}
+      {error && <p className="form-error" role="alert">{error}</p>}
+      <div className="runtime-log-list" aria-live="polite" aria-busy={loading}>
+        {!loading && events.length === 0 && <EmptyState icon={ScrollText} title="当前筛选范围没有日志" detail="更改筛选条件，或稍后刷新查看新的运行事件。" />}
+        {events.map((event) => <article className={`runtime-log-event ${event.level.toLowerCase()}`} key={event.id}>
+          <div className="runtime-log-event-main"><time dateTime={new Date(event.occurred_at * 1000).toISOString()}>{formatDomainTimestamp(event.occurred_at)}</time><span className={`runtime-log-level ${event.level.toLowerCase()}`}>{runtimeLevelLabel(event.level)}</span><strong>{runtimeCategoryLabels[event.category] ?? "服务运行"}</strong><span>{event.domain ?? "全局"}</span></div>
+          <p>{event.summary}</p>
+          {(event.error_code || event.retry_at || event.technical_detail) && <details><summary>查看技术详情</summary>{event.error_code && <p>错误代码：{event.error_code}</p>}{event.retry_at && <p>下次重试：{formatDomainTimestamp(event.retry_at)}</p>}{event.technical_detail && <pre>{event.technical_detail}</pre>}</details>}
+        </article>)}
+      </div>
+      {nextCursor && <button className="secondary-button runtime-log-more" type="button" onClick={() => void loadMore()} disabled={loadingMore}>{loadingMore ? "加载中…" : "加载更早日志"}</button>}
+    </div>
+  </FormDialog>;
 }
 
 function PublicDomainEditor({
@@ -2251,6 +2461,8 @@ function PublicDomainEditor({
   const [privateKeyFile, setPrivateKeyFile] = useState<File | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const manualCertificatePresent = Boolean(existing?.certificate_mode === "manual"
+    && (existing.root_certificate.subjects.length || existing.wildcard_certificate.subjects.length));
 
   const save = async (event: React.FormEvent<HTMLFormElement>) => {
     event.preventDefault();
@@ -2263,6 +2475,10 @@ function PublicDomainEditor({
       setError("手动证书需要同时选择证书和私钥文件");
       return;
     }
+    if (httpsEnabled && certificateMode === "manual" && existing?.certificate_mode !== "manual" && (!certificateFile || !privateKeyFile)) {
+      setError("切换到手动证书时，请同时选择证书和私钥文件");
+      return;
+    }
     if (dnsManagementEnabled && !dnsTargetIpv4.trim() && !dnsTargetIpv6.trim()) {
       setError("启用 DNS 托管时必须填写公网 IPv4 或 IPv6 地址");
       return;
@@ -2270,6 +2486,25 @@ function PublicDomainEditor({
     setBusy(true);
     setError(null);
     try {
+      const secrets: Record<string, string | boolean> = {};
+      const token = cloudflareToken.trim();
+      if ((dnsManagementEnabled || (httpsEnabled && certificateMode === "cloudflare")) && token) secrets.cloudflare_token = token;
+      if (httpsEnabled && certificateMode === "manual" && certificateFile && privateKeyFile) {
+        secrets.certificate_pem = await certificateFile.text();
+        secrets.private_key_pem = await privateKeyFile.text();
+        secrets.activate_manual_certificate = true;
+      }
+      const uploadSecrets = async (domainId: string) => {
+        if (Object.keys(secrets).length === 0) return;
+        const secretResponse = await request(`/api/v1/public-domains/${encodeURIComponent(domainId)}/credentials`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify(secrets),
+        });
+        const secretBody: unknown = await secretResponse.json().catch(() => null);
+        if (!secretResponse.ok) throw new Error(readApiError(secretBody, "证书或 Cloudflare Token 上传失败"));
+      };
+
       if (existing?.dns_management.enabled && !dnsManagementEnabled && deleteManagedRecords) {
         const releaseResponse = await request(`/api/v1/public-domains/${encodeURIComponent(existing.id)}/dns/managed-records`, {
           method: "DELETE",
@@ -2279,6 +2514,13 @@ function PublicDomainEditor({
         const releaseBody: unknown = await releaseResponse.json().catch(() => null);
         if (!releaseResponse.ok) throw new Error(readApiError(releaseBody, "无法安全删除 Nexo 创建的 DNS 记录"));
       }
+      // 已有自动域名先通过原子凭据接口完成证书校验与模式切换，避免保存表单时提前停止自动维护。
+      const activatedBeforeSave = Boolean(existing
+        && existing.certificate_mode !== "manual"
+        && certificateMode === "manual"
+        && certificateFile
+        && privateKeyFile);
+      if (activatedBeforeSave) await uploadSecrets(existing.id);
       const response = await request(existing ? `/api/v1/public-domains/${encodeURIComponent(existing.id)}` : "/api/v1/public-domains", {
         method: existing ? "PUT" : "POST",
         headers: { "content-type": "application/json" },
@@ -2287,28 +2529,29 @@ function PublicDomainEditor({
       const body: unknown = await response.json().catch(() => null);
       if (!response.ok) throw new Error(readApiError(body, "暂时无法保存公网域名"));
       const saved = body as PublicDomain;
-      const secrets: Record<string, string> = {};
-      const token = cloudflareToken.trim();
-      if ((dnsManagementEnabled || (httpsEnabled && certificateMode === "cloudflare")) && token) secrets.cloudflare_token = token;
-      if (httpsEnabled && certificateMode === "manual" && certificateFile && privateKeyFile) {
-        secrets.certificate_pem = await certificateFile.text();
-        secrets.private_key_pem = await privateKeyFile.text();
-      }
-      if (Object.keys(secrets).length > 0) {
-        const secretResponse = await request(`/api/v1/public-domains/${encodeURIComponent(saved.id)}/credentials`, {
-          method: "POST",
-          headers: { "content-type": "application/json" },
-          body: JSON.stringify(secrets),
-        });
-        const secretBody: unknown = await secretResponse.json().catch(() => null);
-        if (!secretResponse.ok) throw new Error(readApiError(secretBody, "证书或 Cloudflare Token 上传失败"));
-      }
+      if (!activatedBeforeSave) await uploadSecrets(saved.id);
       setCloudflareToken("");
       setCertificateFile(null);
       setPrivateKeyFile(null);
       await onSaved();
     } catch (requestError) {
       setError(requestError instanceof Error ? requestError.message : "暂时无法保存公网域名");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const deleteManualCertificate = async () => {
+    if (!existing || !window.confirm("确定删除当前手动证书吗？删除后仍保持手动模式，自动申请不会恢复，HTTPS 将不可用直到上传新证书或明确切回自动证书。")) return;
+    setBusy(true);
+    setError(null);
+    try {
+      const response = await request(`/api/v1/public-domains/${encodeURIComponent(existing.id)}/manual-certificate`, { method: "DELETE" });
+      const body: unknown = await response.json().catch(() => null);
+      if (!response.ok) throw new Error(readApiError(body, "暂时无法删除手动证书"));
+      await onSaved();
+    } catch (requestError) {
+      setError(requestError instanceof Error ? requestError.message : "暂时无法删除手动证书");
     } finally {
       setBusy(false);
     }
@@ -2331,7 +2574,7 @@ function PublicDomainEditor({
           </select>
         </label>
         {(dnsManagementEnabled || (httpsEnabled && certificateMode === "cloudflare")) && <div className="public-entry-form-row"><label htmlFor="public-domain-cloudflare-token">Cloudflare API Token</label><div className="field-control"><div className="secret-input-control"><input id="public-domain-cloudflare-token" type={showToken ? "text" : "password"} value={cloudflareToken} onChange={(event) => setCloudflareToken(event.target.value)} placeholder="留空则保留已保存的 Token" autoComplete="off" autoCapitalize="none" spellCheck={false} /><button className="secret-visibility-button" type="button" aria-label={`${showToken ? "隐藏" : "显示"} Cloudflare API Token`} onClick={() => setShowToken((value) => !value)}>{showToken ? <EyeOff size={18} aria-hidden="true" /> : <Eye size={18} aria-hidden="true" />}</button></div><small>需要 Zone DNS 编辑权限。Token 不会写入配置、日志或页面。</small></div></div>}
-        {httpsEnabled && certificateMode === "manual" && <><label><span>证书文件</span><input type="file" accept=".pem,.crt,text/plain" onChange={(event) => setCertificateFile(event.currentTarget.files?.[0] ?? null)} /></label><label><span>私钥文件</span><input type="file" accept=".pem,.key,text/plain" onChange={(event) => setPrivateKeyFile(event.currentTarget.files?.[0] ?? null)} /></label><p className="form-hint">证书必须同时覆盖根域名和 *.根域名，并且私钥匹配；保存前由 Server 校验。</p></>}
+        {httpsEnabled && certificateMode === "manual" && <><div className="manual-certificate-warning"><AlertTriangle size={16} aria-hidden="true" /><p><strong>启用后停止自动申请和续期</strong><span>删除或过期后也不会自动恢复，需要上传新证书或明确切回自动证书。</span></p></div><label><span>证书文件</span><input type="file" accept=".pem,.crt,text/plain" onChange={(event) => setCertificateFile(event.currentTarget.files?.[0] ?? null)} /></label><label><span>私钥文件</span><input type="file" accept=".pem,.key,text/plain" onChange={(event) => setPrivateKeyFile(event.currentTarget.files?.[0] ?? null)} /></label><p className="form-hint">支持未加密的 PKCS#1、PKCS#8 和 SEC1 私钥。证书必须覆盖根域名和 *.根域名，并与私钥匹配。</p>{manualCertificatePresent && <button className="text-danger-button" type="button" disabled={busy} onClick={() => void deleteManualCertificate()}><Trash2 size={15} aria-hidden="true" />删除当前手动证书</button>}</>}
       </fieldset>
       <fieldset>
         <legend>DNS 托管</legend>
@@ -2442,16 +2685,21 @@ function PublicDomainDeleteDialog({
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const candidates = domains.filter((item) => item.id !== domain.id && item.apply_status.toLowerCase() === "ready");
+  const deletingOnlyPrimary = domain.is_primary && domains.length === 1;
+  const deletingPrimaryWithAlternatives = domain.is_primary && domains.length > 1;
   const submit = async (event: React.FormEvent<HTMLFormElement>) => {
     event.preventDefault();
     if (!confirmed) { setError("请确认删除影响后再继续"); return; }
-    if (domain.usage_count > 0 && !replacement) { setError("该域名仍被服务使用，请先选择已 READY 的替代域名"); return; }
+    if (deletingPrimaryWithAlternatives) { setError("存在其他域名时，请先将一个已就绪域名设为主域名"); return; }
+    if (!deletingOnlyPrimary && domain.usage_count > 0 && !replacement) { setError("该域名仍被服务使用，请先选择已 READY 的替代域名"); return; }
     setBusy(true); setError(null);
     try {
       const response = await request(`/api/v1/public-domains/${encodeURIComponent(domain.id)}`, {
         method: "DELETE",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify(domain.usage_count > 0 ? { replacement_domain_id: replacement } : {}),
+        body: JSON.stringify(deletingOnlyPrimary
+          ? { disable_public_access: true }
+          : domain.usage_count > 0 ? { replacement_domain_id: replacement } : {}),
       });
       const body: unknown = await response.json().catch(() => null);
       if (!response.ok) throw new Error(readApiError(body, "暂时无法删除公网域名"));
@@ -2460,7 +2708,10 @@ function PublicDomainDeleteDialog({
       setError(requestError instanceof Error ? requestError.message : "暂时无法删除公网域名");
     } finally { setBusy(false); }
   };
-  return <FormDialog eyebrow="域名与 HTTPS" title={`删除 ${domain.domain}`} description="删除会清理该域名的凭据目录；已绑定服务必须先迁移到另一个 READY 域名。" onClose={onClose} returnFocus={returnFocus} role="alertdialog" compact initialFocusSelector="input[type=checkbox]"><form className="domain-delete-form" aria-busy={busy} onSubmit={submit}><p>此操作不可撤销。主域名不能直接删除，未完成的主域名迁移也会阻止删除。</p>{domain.usage_count > 0 && <label><span>替代域名</span><select value={replacement} onChange={(event) => setReplacement(event.target.value)}><option value="">选择已 READY 的域名</option>{candidates.map((item) => <option key={item.id} value={item.id}>{item.domain}</option>)}</select></label>}<label className="confirmation-check"><input type="checkbox" checked={confirmed} onChange={(event) => setConfirmed(event.target.checked)} /><span>我确认删除该域名及其凭据</span></label>{error && <p className="form-error" role="alert">{error}</p>}<div className="dialog-actions"><button className="secondary-button" type="button" onClick={onClose} disabled={busy}>取消</button><button className="danger-button" type="submit" disabled={busy}>{busy ? "删除中…" : "确认删除"}</button></div></form></FormDialog>;
+  const description = deletingOnlyPrimary
+    ? "删除唯一主域名会关闭公网域名入口，但保留穿透服务配置和启用状态。"
+    : "删除会清理该域名的凭据目录；已绑定服务必须先迁移到另一个已就绪域名。";
+  return <FormDialog eyebrow="域名与 HTTPS" title={`删除 ${domain.domain}`} description={description} onClose={onClose} returnFocus={returnFocus} role="alertdialog" compact initialFocusSelector="input[type=checkbox]"><form className="domain-delete-form" aria-busy={busy} onSubmit={submit}>{deletingOnlyPrimary ? <div className="domain-delete-impact"><strong>将关闭以下公网能力</strong><p>Nexo 管理入口、Mesh 公网入口和全部 Web 穿透公网路由会停止生成。</p><p>{domain.usage_count} 个 Web 穿透服务会保留并解除域名绑定；添加新的首个主域名后，未显式绑定的服务会重新使用它。</p><p>Cloudflare DNS 默认保留，Headscale 地址回退到内部地址，设备不会被自动要求重新认证。</p></div> : <p>{deletingPrimaryWithAlternatives ? "请先从更多操作中把一个已就绪域名设为主域名。未完成的主域名迁移仍会阻止删除。" : "此操作不可撤销。未完成的主域名迁移仍会阻止删除。"}</p>}{!deletingOnlyPrimary && domain.usage_count > 0 && <label><span>替代域名</span><select value={replacement} onChange={(event) => setReplacement(event.target.value)}><option value="">选择已就绪的域名</option>{candidates.map((item) => <option key={item.id} value={item.id}>{item.domain}</option>)}</select></label>}<label className="confirmation-check"><input type="checkbox" checked={confirmed} onChange={(event) => setConfirmed(event.target.checked)} /><span>{deletingOnlyPrimary ? "我确认关闭公网域名入口并删除该域名及凭据" : "我确认删除该域名及其凭据"}</span></label>{error && <p className="form-error" role="alert">{error}</p>}<div className="dialog-actions"><button className="secondary-button" type="button" onClick={onClose} disabled={busy}>取消</button><button className="danger-button" type="submit" disabled={busy || deletingPrimaryWithAlternatives}>{busy ? "删除中…" : "确认删除"}</button></div></form></FormDialog>;
 }
 
 function PublicDomainPrimaryDialog({
@@ -2518,6 +2769,7 @@ function PublicDomainPrimaryDialog({
 function NetworksPage({
   sites,
   devices,
+  publicDomains,
   siteNetworks,
   siteLinks,
   error,
@@ -2546,6 +2798,7 @@ function NetworksPage({
 }: {
   sites: Site[];
   devices: Device[];
+  publicDomains: PublicDomain[];
   siteNetworks: SiteNetwork[];
   siteLinks: SiteLink[];
   error: string | null;
@@ -2578,6 +2831,10 @@ function NetworksPage({
   const [selectedMobileLink, setSelectedMobileLink] = useState<SiteLink | null>(null);
   const networkFormSite = sites.find((site) => site.id === networkFormSiteId);
   const linkFormSite = sites.find((site) => site.id === linkFormSiteId);
+  const primaryDomain = publicDomains.find((domain) => domain.is_primary);
+  const meshEntryReady = Boolean(primaryDomain
+    && dnsCheckLabel(primaryDomain.dns_check.wildcard).kind === "ready"
+    && primaryDomain.wildcard_certificate.status.toLowerCase() === "ready");
 
   /** 展开状态按站点独立保存，便于同时对照两个站点的互联状态。 */
   const toggleSite = (siteId: string) => {
@@ -2596,6 +2853,10 @@ function NetworksPage({
     <>
       <PageHeader eyebrow="局域网互联" title="网络互联" subtitle="按站点管理网关、共享网络、互联关系和本站静态路由。" action={action} />
       <PageError error={error} onRetry={onRefresh} />
+      <section className={`domain-dependency-notice ${meshEntryReady ? "ready" : "warning"}`}>
+        <div><strong>{meshEntryReady ? `网络入口 mesh.${primaryDomain?.domain} 已就绪` : "网络互联公网入口尚未就绪"}</strong><span>{meshEntryReady ? "设备继续使用统一的安全控制地址。" : "现有局域网路由配置会保留；新增设备公网接入前请完成主域名和 HTTPS 配置。"}</span></div>
+        <a className="secondary-button compact-button" href="#/domains">管理域名</a>
+      </section>
       <div className="network-view-switch" role="tablist" aria-label="网络互联视图">
         <button type="button" role="tab" aria-selected={networkView === "topology"} className={networkView === "topology" ? "selected" : ""} onClick={() => setNetworkView("topology")}><Network size={15} aria-hidden="true" />互联拓扑</button>
         <button type="button" role="tab" aria-selected={networkView === "sites"} className={networkView === "sites" ? "selected" : ""} onClick={() => setNetworkView("sites")}><Building2 size={15} aria-hidden="true" />站点与网段</button>
@@ -2798,6 +3059,8 @@ function FormDialog({
   returnFocus: explicitReturnFocus,
   role,
   compact = false,
+  wide = false,
+  variant = "modal",
   initialFocusSelector,
 }: {
   eyebrow: string;
@@ -2808,6 +3071,8 @@ function FormDialog({
   returnFocus?: HTMLElement | null;
   role?: "dialog" | "alertdialog";
   compact?: boolean;
+  wide?: boolean;
+  variant?: "modal" | "sheet";
   initialFocusSelector?: string;
 }) {
   const dialogRef = useRef<HTMLDialogElement>(null);
@@ -2828,13 +3093,13 @@ function FormDialog({
   return (
     <dialog
       ref={dialogRef}
-      className="form-dialog"
+      className={`form-dialog ${variant === "sheet" ? "form-sheet" : ""}`}
       role={role}
       aria-labelledby={titleId.current}
       onCancel={(event) => { event.preventDefault(); if (!submitting()) onClose(); }}
       onClick={(event) => { if (event.target === event.currentTarget && !submitting()) onClose(); }}
     >
-      <div className={`form-dialog-surface${compact ? " compact" : ""}`} onClick={(event) => event.stopPropagation()}>
+      <div className={`form-dialog-surface${compact ? " compact" : ""}${wide ? " wide" : ""}`} onClick={(event) => event.stopPropagation()}>
         <header className="form-dialog-header">
           <div><p className="eyebrow">{eyebrow}</p><h2 id={titleId.current}>{title}</h2><p>{description}</p></div>
           <button className="icon-button" type="button" aria-label={`关闭${title}窗口`} onClick={() => { if (!submitting()) onClose(); }}>
@@ -3579,7 +3844,7 @@ function CreateSiteLinkForm({
   );
 }
 
-const RELEASE_AGENT_IMAGE = "ghcr.io/thelinyue/nexo-agent:0.1.10";
+const RELEASE_AGENT_IMAGE = "ghcr.io/thelinyue/nexo-agent:0.1.11";
 
 function buildAgentCompose(serverUrl: string, token: string): string {
   return `name: nexo-agent

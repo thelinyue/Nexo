@@ -4,7 +4,7 @@ name: nexo
 # Agent 控制通道和 Tunnel 数据通道由宿主机网络直接提供。
 services:
   nexo-server:
-    image: ghcr.io/thelinyue/nexo-server:0.1.10
+    image: ghcr.io/thelinyue/nexo-server:0.1.11
     container_name: nexo-server
     network_mode: host
     environment:

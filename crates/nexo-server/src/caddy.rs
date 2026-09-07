@@ -56,6 +56,7 @@ pub struct CaddyRuntimeConfig {
 #[derive(Debug, Clone, Default)]
 pub struct CaddyLogEvent {
     pub level: Option<String>,
+    pub logger: Option<String>,
     pub message: String,
     pub identifier: Option<String>,
     pub status_code: Option<u16>,
@@ -129,6 +130,7 @@ pub fn parse_caddy_log_line(line: &str) -> Option<CaddyLogEvent> {
             retry_after_secs: parse_retry_after(&message),
             identifier: None,
             level: None,
+            logger: None,
             message,
         };
         return Some(event);
@@ -171,6 +173,10 @@ pub fn parse_caddy_log_line(line: &str) -> Option<CaddyLogEvent> {
     Some(CaddyLogEvent {
         level: object
             .get("level")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        logger: object
+            .get("logger")
             .and_then(Value::as_str)
             .map(str::to_owned),
         message,
@@ -994,6 +1000,9 @@ pub struct CaddyDomain {
     pub certificate_mode: String,
     pub acme_environment: String,
     pub secret_dir: PathBuf,
+    /// 手动证书文件已经通过 Server 校验且仍存在；缺失时保持自动申请关闭，
+    /// 但不能把不存在的路径提交给域名服务。
+    pub manual_certificate_available: bool,
     pub token_env: Option<String>,
     pub https_ready: bool,
     /// 只有主域名或迁移期间保留旧别名的域名才暴露 `nexo`、`mesh`
@@ -1028,8 +1037,10 @@ pub fn build_multi_caddy_config(
     let mut http_routes = Vec::new();
     let mut https_routes = Vec::new();
     let mut policies = Vec::new();
+    let mut connection_policies = Vec::new();
     let mut automatic_subjects = Vec::new();
     let mut manual_certificates = Vec::new();
+    let mut skip_automatic_certificates = Vec::new();
     for domain in domains {
         let name = domain.domain.as_str();
         let bound = tunnels.iter().filter(|item| item.domain_id == domain.id);
@@ -1082,10 +1093,19 @@ pub fn build_multi_caddy_config(
                 automatic_subjects.push(format!("*.{}", domain.domain));
             }
             if domain.certificate_mode == "manual" {
+                skip_automatic_certificates.push(domain.domain.clone());
+                skip_automatic_certificates.push(format!("*.{}", domain.domain));
+            }
+            if domain.certificate_mode == "manual" && domain.manual_certificate_available {
+                let tag = format!("nexo-manual-{}", domain.id);
                 manual_certificates.push(json!({
                     "certificate": domain.secret_dir.join("certificate.pem"),
                     "key": domain.secret_dir.join("private-key.pem"),
-                    "tags": [format!("nexo-manual-{}", domain.id)]
+                    "tags": [tag]
+                }));
+                connection_policies.push(json!({
+                    "match": {"sni": [domain.domain, format!("*.{}", domain.domain)]},
+                    "certificate_selection": {"any_tag": [format!("nexo-manual-{}", domain.id)]}
                 }));
             }
         } else if domain.system_entry {
@@ -1106,6 +1126,7 @@ pub fn build_multi_caddy_config(
             "https".to_owned(),
             json!({
                 "listen": [":443"],
+                "automatic_https": {"skip_certificates": skip_automatic_certificates},
                 "trusted_proxies": {"source": "static", "ranges": ["127.0.0.1/32", "::1/128"]},
                 "trusted_proxies_strict": 1,
                 "routes": https_routes
@@ -1117,14 +1138,22 @@ pub fn build_multi_caddy_config(
         "storage": { "module": "file_system", "root": storage_root },
         "apps": { "http": { "servers": servers } }
     });
-    if !policies.is_empty() {
-        config["apps"]["tls"] = json!({
-            "automation": { "policies": policies },
-            "certificates": { "automate": automatic_subjects }
-        });
+    if !policies.is_empty() || !manual_certificates.is_empty() {
+        let mut tls = json!({"certificates": {}});
+        if !policies.is_empty() {
+            tls["automation"] = json!({"policies": policies});
+            tls["certificates"]["automate"] = json!(automatic_subjects);
+        }
+        if !manual_certificates.is_empty() {
+            tls["certificates"]["load_files"] = json!(manual_certificates);
+        }
+        config["apps"]["tls"] = tls;
     }
     if !manual_certificates.is_empty() {
-        config["apps"]["tls"]["certificates"]["load_files"] = json!(manual_certificates);
+        // 未匹配手动域名的连接仍落入默认策略，以便使用其他域名的自动证书。
+        connection_policies.push(json!({}));
+        config["apps"]["http"]["servers"]["https"]["tls_connection_policies"] =
+            json!(connection_policies);
     }
     config
 }
@@ -1298,6 +1327,7 @@ mod tests {
                 certificate_mode: "manual".to_owned(),
                 acme_environment: "production".to_owned(),
                 secret_dir: PathBuf::from("/data/secrets/primary"),
+                manual_certificate_available: true,
                 token_env: None,
                 https_ready: true,
                 system_entry: true,
@@ -1440,6 +1470,7 @@ mod tests {
                     certificate_mode: "cloudflare".to_owned(),
                     acme_environment: "production".to_owned(),
                     secret_dir: PathBuf::from("/data/secrets/domain-a"),
+                    manual_certificate_available: false,
                     token_env: Some("{env.NEXO_CLOUDFLARE_TOKEN_DOMAIN_A}".to_owned()),
                     https_ready: true,
                     system_entry: true,
@@ -1451,6 +1482,7 @@ mod tests {
                     certificate_mode: "manual".to_owned(),
                     acme_environment: "production".to_owned(),
                     secret_dir: PathBuf::from("/data/secrets/domain-b"),
+                    manual_certificate_available: true,
                     token_env: None,
                     https_ready: true,
                     system_entry: false,
@@ -1513,5 +1545,40 @@ mod tests {
             .position(|route| route["match"][0]["host"] == json!(["*.b.example.com"]))
             .expect("域名应生成泛域名 404 兜底");
         assert!(exact < fallback, "精确服务路由必须位于泛域名兜底之前");
+    }
+
+    #[test]
+    fn manual_only_domain_loads_tagged_certificate_without_automatic_policy() {
+        let config = build_multi_caddy_config(
+            &[CaddyDomain {
+                id: "manual-domain".to_owned(),
+                domain: "example.com".to_owned(),
+                https_enabled: true,
+                certificate_mode: "manual".to_owned(),
+                acme_environment: "production".to_owned(),
+                secret_dir: PathBuf::from("/data/secrets/manual-domain"),
+                manual_certificate_available: true,
+                token_env: None,
+                https_ready: true,
+                system_entry: true,
+            }],
+            &[],
+            Path::new("/data/nexo/caddy-storage"),
+        );
+
+        assert!(config["apps"]["tls"].get("automation").is_none());
+        assert_eq!(
+            config["apps"]["http"]["servers"]["https"]["automatic_https"]["skip_certificates"],
+            json!(["example.com", "*.example.com"])
+        );
+        assert_eq!(
+            config["apps"]["tls"]["certificates"]["load_files"][0]["tags"],
+            json!(["nexo-manual-manual-domain"])
+        );
+        assert_eq!(
+            config["apps"]["http"]["servers"]["https"]["tls_connection_policies"][0]
+                ["certificate_selection"]["any_tag"],
+            json!(["nexo-manual-manual-domain"])
+        );
     }
 }
