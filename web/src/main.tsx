@@ -407,7 +407,7 @@ type CreatedEnrollment = {
 
 type TailscaleClientConfig = {
   login_server: string;
-  browser_authorization_url: string;
+  browser_authorization_url: string | null;
   supported_platforms: string[];
   notes: string[];
 };
@@ -1557,10 +1557,10 @@ function OfficialClientPanel({
         </div>
         <div className="official-client-facts">
           <div><span>登录服务器</span><code>{clientConfig?.login_server ?? "正在读取…"}</code></div>
-          <div><span>浏览器授权</span><a href={clientConfig?.browser_authorization_url ?? "#"} target="_blank" rel="noreferrer">打开授权入口</a></div>
+          <div><span>授权方式</span><strong>由客户端发起</strong></div>
           <div><span>平台</span><strong>{clientConfig?.supported_platforms.join("、") ?? "Linux、Windows、macOS、iOS、Android、tvOS"}</strong></div>
         </div>
-        <p className="form-hint">客户端首次连接会进入 Headscale 授权流程；授权后设备先保持隔离，确认归属后才进入当前工作空间。只有 Nexo Agent 设备可作为穿透或网关。</p>
+        <p className="form-hint">请在官方 Tailscale 客户端填写登录服务器并开始连接，客户端会打开带本次注册上下文的一次性授权页面；授权完成后设备先保持隔离，确认归属后才进入当前工作空间。只有 Nexo Agent 设备可作为穿透或网关。</p>
       </section>
       <div className="official-client-grid">
         <section className="panel page-panel">
@@ -3844,7 +3844,7 @@ function CreateSiteLinkForm({
   );
 }
 
-const RELEASE_AGENT_IMAGE = "ghcr.io/thelinyue/nexo-agent:0.1.11";
+const RELEASE_AGENT_IMAGE = "ghcr.io/thelinyue/nexo-agent:0.1.12";
 
 function buildAgentCompose(serverUrl: string, token: string): string {
   return `name: nexo-agent

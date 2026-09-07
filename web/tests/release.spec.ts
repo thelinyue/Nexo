@@ -855,7 +855,7 @@ test("添加设备生成最小 Compose 配置", async ({ page, context }) => {
   await page.getByLabel("设备名称").fill("家庭 NAS");
   await page.getByRole("button", { name: "生成设备配置" }).click();
   const compose = await page.getByLabel("Docker Compose 配置").inputValue();
-  expect(compose).toContain("ghcr.io/thelinyue/nexo-agent:0.1.11");
+  expect(compose).toContain("ghcr.io/thelinyue/nexo-agent:0.1.12");
   expect(compose).toContain("TZ: ${TZ:-Asia/Shanghai}");
   expect(compose.match(/NEXO_[A-Z_]+:/g)).toEqual(["NEXO_SERVER_URL:", "NEXO_ENROLLMENT_TOKEN:"]);
   await page.getByRole("button", { name: "复制 Compose 配置" }).click();

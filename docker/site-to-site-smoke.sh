@@ -264,7 +264,7 @@ echo "✓ LAN HTTP Session 已建立"
 echo "配置验收域名、手动证书并启用 HTTPS"
 put_json "$HTTP_URL/api/v1/settings/public-entry" \
   "$(jq -cn --arg domain "$PUBLIC_DOMAIN" \
-    '{base_domain:$domain,https_enabled:false,certificate_mode:"manual",acme_environment:"staging"}')" \
+    '{base_domain:$domain,https_enabled:true,certificate_mode:"manual",acme_environment:"staging"}')" \
   >/dev/null
 post_json "$HTTP_URL/api/v1/settings/public-entry/certificate" \
   "$(jq -cn --arg certificate "$(<"$CERT_DIR/server.crt")" \

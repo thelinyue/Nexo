@@ -923,7 +923,9 @@ struct TailscaleExternalNodeResponse {
 #[derive(Debug, Serialize)]
 struct TailscaleClientConfigResponse {
     login_server: String,
-    browser_authorization_url: String,
+    /// Headscale 的授权地址必须由客户端在登录时带注册上下文生成，不能拼接
+    /// 一个无效的固定 `/register` 页面。
+    browser_authorization_url: Option<String>,
     supported_platforms: Vec<String>,
     notes: Vec<String>,
 }
@@ -1413,6 +1415,12 @@ async fn main() -> Result<()> {
         headscale_runtime: headscale_runtime.clone(),
     };
     sync_headscale_server_url(&state).await;
+    // 旧版本曾把字面量 `*.domain` 写入 DNS 快照；后台只修复这类明确可识别
+    // 的历史数据，避免启动时阻塞服务，也不覆盖用户已经重新检测的结果。
+    let legacy_dns_state = state.clone();
+    tokio::spawn(async move {
+        refresh_legacy_public_domain_dns_checks(&legacy_dns_state).await;
+    });
     restore_public_tunnel_listeners(&state).await;
     if let Err(error) = write_caddy_startup_config(&state) {
         tracing::warn!("无法生成 Caddy 启动配置，公网 Web 服务将在恢复后重试：{error:#}");
@@ -4402,9 +4410,35 @@ async fn lookup_public_dns(hostname: &str) -> std::result::Result<Vec<String>, S
             resolved.dedup();
             Ok(resolved)
         }
-        Ok(Err(error)) => Err(error.to_string()),
+        Ok(Err(error)) => Err(format!("DNS 解析失败：{error}")),
         Err(_) => Err("DNS 检测超时".to_owned()),
     }
+}
+
+/// DNS 不能查询字面量 `*.domain`；使用 Nexo 固定入口作为通配记录的
+/// 实际探针，同时在报告中保留 `*.domain` 作为用户可识别的目标说明。
+fn wildcard_dns_probe_hostname(domain: &str) -> String {
+    format!("nexo.{domain}")
+}
+
+/// 判断一条 DNS 快照是否来自旧版对字面量通配符的错误查询。
+///
+/// 新格式会同时保存 `hostname: nexo.domain` 和 `probe: *.domain`，因此只
+/// 对缺少 `probe` 且 hostname 恰好是 `*.domain` 的快照执行一次启动自愈。
+fn legacy_dns_check_needs_refresh(serialized: &str, domain: &str) -> bool {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(serialized) else {
+        return false;
+    };
+    let expected_wildcard = format!("*.{domain}");
+    value
+        .get("wildcard")
+        .and_then(|item| item.get("hostname"))
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|hostname| hostname == expected_wildcard)
+        && value
+            .get("wildcard")
+            .and_then(|item| item.get("probe"))
+            .is_none()
 }
 
 fn build_dns_check(
@@ -4424,16 +4458,15 @@ fn build_dns_check(
         }),
     };
     let wildcard_hostname = format!("*.{domain}");
+    let wildcard_probe = wildcard_dns_probe_hostname(domain);
     let wildcard_value = match &wildcard {
         Ok(addresses) => serde_json::json!({
-            // DNS 查询不能使用字面 `*.domain`；这里探测一个系统保留的
-            // 一级子域名，用实际解析结果判断通配记录是否覆盖服务入口。
-            "hostname": format!("nexo.{domain}"),
+            "hostname": wildcard_probe,
             "probe": wildcard_hostname,
             "resolved": addresses,
         }),
         Err(error) => serde_json::json!({
-            "hostname": format!("nexo.{domain}"),
+            "hostname": wildcard_probe,
             "probe": wildcard_hostname,
             "resolved": [],
             "error": error,
@@ -4484,6 +4517,114 @@ fn public_domain_dns_ready(serialized: &str) -> bool {
     }
 }
 
+/// 启动后修复升级前保存的错误通配 DNS 快照。
+///
+/// 这不是周期性 DNS 轮询：只处理明确包含字面量 `*.domain` 且缺少新格式
+/// `probe` 字段的旧记录，并把结果写回多域名表及主域名兼容投影。网络查询在
+/// 后台任务中执行，不阻塞 Nexo HTTP、控制通道或 Caddy 启动。
+async fn refresh_legacy_public_domain_dns_checks(state: &AppState) {
+    let targets = {
+        let connection = match state.db.lock() {
+            Ok(connection) => connection,
+            Err(_) => {
+                tracing::warn!("读取旧版 DNS 检测快照失败：数据库锁不可用");
+                return;
+            }
+        };
+        let mut statement = match connection.prepare(
+            "SELECT id, tenant_id, domain, is_primary, dns_check_json
+             FROM public_domains",
+        ) {
+            Ok(statement) => statement,
+            Err(error) => {
+                tracing::warn!("读取旧版 DNS 检测快照失败：{error}");
+                return;
+            }
+        };
+        match statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)? != 0,
+                    row.get::<_, String>(4)?,
+                ))
+            })
+            .and_then(|rows| rows.collect::<rusqlite::Result<Vec<_>>>())
+        {
+            Ok(targets) => targets
+                .into_iter()
+                .filter(|(_, _, domain, _, dns_check)| {
+                    legacy_dns_check_needs_refresh(dns_check, domain)
+                })
+                .collect::<Vec<_>>(),
+            Err(error) => {
+                tracing::warn!("解析旧版 DNS 检测快照失败：{error}");
+                return;
+            }
+        }
+    };
+
+    for (id, tenant_id, domain, is_primary, _) in targets {
+        let wildcard = wildcard_dns_probe_hostname(&domain);
+        let (root_result, wildcard_result) =
+            tokio::join!(lookup_public_dns(&domain), lookup_public_dns(&wildcard));
+        let dns_check = build_dns_check(&domain, root_result, wildcard_result).to_string();
+        let connection = match state.db.lock() {
+            Ok(connection) => connection,
+            Err(_) => {
+                tracing::warn!(domain = %domain, "刷新旧版 DNS 检测结果失败：数据库锁不可用");
+                continue;
+            }
+        };
+        let transaction = match connection.unchecked_transaction() {
+            Ok(transaction) => transaction,
+            Err(error) => {
+                tracing::warn!(domain = %domain, "刷新旧版 DNS 检测结果失败：无法开始事务：{error}");
+                continue;
+            }
+        };
+        let updated = match transaction.execute(
+            "UPDATE public_domains SET dns_check_json = ?1, updated_at = unixepoch()
+             WHERE id = ?2 AND tenant_id = ?3",
+            rusqlite::params![dns_check, id, tenant_id],
+        ) {
+            Ok(updated) => updated,
+            Err(error) => {
+                tracing::warn!(domain = %domain, "刷新域名 DNS 检测结果失败：{error}");
+                continue;
+            }
+        };
+        if updated != 1 {
+            tracing::warn!(domain = %domain, "刷新域名 DNS 检测结果失败：未找到目标域名");
+            continue;
+        }
+        if is_primary {
+            let projected = match transaction.execute(
+                "UPDATE public_entry_settings SET dns_check_json = ?1, updated_at = unixepoch()
+                 WHERE id = 1 AND tenant_id = ?2",
+                rusqlite::params![dns_check, tenant_id],
+            ) {
+                Ok(projected) => projected,
+                Err(error) => {
+                    tracing::warn!(domain = %domain, "刷新主域名兼容 DNS 检测结果失败：{error}");
+                    continue;
+                }
+            };
+            if projected != 1 {
+                tracing::warn!(domain = %domain, "刷新主域名兼容 DNS 检测结果失败：未找到兼容投影");
+                continue;
+            }
+        }
+        if let Err(error) = transaction.commit() {
+            tracing::warn!(domain = %domain, "提交 DNS 检测结果失败：{error}");
+            continue;
+        }
+        tracing::info!(domain = %domain, "已自动刷新旧版泛域名 DNS 检测结果");
+    }
+}
+
 async fn recheck_public_entry(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -4531,7 +4672,7 @@ async fn recheck_public_entry(
     };
     let domain = snapshot.base_domain.clone();
     let dns_check = if let Some(domain) = domain.as_deref() {
-        let wildcard = format!("*.{domain}");
+        let wildcard = wildcard_dns_probe_hostname(domain);
         let (root_result, wildcard_result) =
             tokio::join!(lookup_public_dns(domain), lookup_public_dns(&wildcard));
         build_dns_check(domain, root_result, wildcard_result)
@@ -6421,7 +6562,7 @@ async fn recheck_public_domain(
             .map_err(|_| ApiError::new(StatusCode::NOT_FOUND, "域名不存在"))?
     };
     let root = lookup_public_dns(&domain).await;
-    let wildcard = lookup_public_dns(&format!("nexo.{domain}")).await;
+    let wildcard = lookup_public_dns(&wildcard_dns_probe_hostname(&domain)).await;
     let dns = build_dns_check(&domain, root, wildcard);
     // 页面轮询只读检查 Cloudflare 漂移，不在后台覆盖用户手工修改。
     let managed_dns_check = if dns_management_enabled {
@@ -10491,12 +10632,107 @@ fn apply_tunnel_results(
     Ok(())
 }
 
+/// 一条 Web Tunnel 实际使用的公网域名状态。
+///
+/// 多域名上线后，不能再从单例 `public_entry_settings` 推断所有 Tunnel 的
+/// HTTPS 状态。显式绑定的域名、租户主域名和旧版兼容投影分别走不同来源，
+/// 这里把三者收敛为同一份只读状态，再交给纯判定函数处理。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct TunnelPublicDomainState {
+    domain: Option<String>,
+    https_enabled: bool,
+    certificate_mode: Option<String>,
+    apply_status: Option<String>,
+    apply_error: Option<String>,
+    desired_revision: i64,
+    applied_revision: i64,
+    root_certificate_status: Option<String>,
+    wildcard_certificate_status: Option<String>,
+    /// 只有旧版单例投影使用该字段。多域名记录始终通过根/泛域名状态判断。
+    legacy_ready: bool,
+}
+
+/// 解析一条 Tunnel 应使用的公网域名。
+///
+/// `public_domain_id` 是用户的显式选择；没有显式选择时才使用同租户主域名。
+/// 显式 ID 无效时不能静默回退到主域名，否则会让用户访问到错误的服务入口。
+fn resolve_tunnel_public_domain_state(
+    public_domain_id: Option<&str>,
+    primary_domain_id: Option<&str>,
+    domains: &HashMap<String, TunnelPublicDomainState>,
+    legacy_state: Option<&TunnelPublicDomainState>,
+) -> TunnelPublicDomainState {
+    if let Some(domain_id) = public_domain_id {
+        return domains.get(domain_id).cloned().unwrap_or_default();
+    }
+    if let Some(primary_id) = primary_domain_id {
+        return domains.get(primary_id).cloned().unwrap_or_default();
+    }
+    legacy_state.cloned().unwrap_or_default()
+}
+
+/// 判断域名服务是否已经满足 Web Tunnel 的公网就绪门槛。
+///
+/// 返回 `None` 表示域名服务已就绪；返回值中的状态和错误直接写入 Tunnel
+/// 状态。HTTP 只要求域名路由配置已经应用，即使同域名的 HTTPS 证书仍在
+/// 申请也不能阻塞 HTTP；HTTPS 才要求根证书和泛域名证书均为 READY。
+fn evaluate_tunnel_public_readiness(
+    protocol: &str,
+    public_domain: &TunnelPublicDomainState,
+) -> Option<(String, String)> {
+    if public_domain.domain.is_none() {
+        return Some((
+            "checking".to_owned(),
+            "穿透服务尚未绑定可用公网域名".to_owned(),
+        ));
+    }
+
+    let route_config_ready = public_domain.desired_revision == public_domain.applied_revision
+        && public_domain.apply_status.as_deref() != Some("error");
+    if !route_config_ready {
+        let status = match public_domain.apply_status.as_deref() {
+            Some("error" | "retrying" | "rate_limited") => "retrying",
+            _ => "checking",
+        };
+        let message = public_domain
+            .apply_error
+            .clone()
+            .unwrap_or_else(|| "公网路由配置正在应用".to_owned());
+        return Some((status.to_owned(), message));
+    }
+
+    if protocol != "https" {
+        return None;
+    }
+
+    if !public_domain.https_enabled {
+        return Some(("checking".to_owned(), "绑定域名尚未启用 HTTPS".to_owned()));
+    }
+
+    let certificate_ready = if public_domain.legacy_ready {
+        public_domain.apply_status.as_deref() == Some("ready")
+    } else {
+        public_domain.root_certificate_status.as_deref() == Some("ready")
+            && public_domain.wildcard_certificate_status.as_deref() == Some("ready")
+    };
+    if !certificate_ready {
+        let message = if public_domain.certificate_mode.as_deref() == Some("manual") {
+            "手动证书尚未加载".to_owned()
+        } else {
+            "等待 HTTPS 证书生效".to_owned()
+        };
+        return Some(("checking".to_owned(), message));
+    }
+
+    None
+}
+
 /// 汇总一条 Tunnel 是否真正可用。
 ///
 /// Agent ACK 只代表它能连接本地 Origin；只有数据面会话、Server 监听器、
-/// Caddy 已应用的 revision（Web Service）以及 HTTPS 证书状态都满足时，
-/// 才把用户可见状态改为 `ready`。这条边界避免“数据库保存成功”被误报成
-/// 公网入口已经可以访问。
+/// 实际绑定域名的路由配置、证书状态和反向代理健康检查都满足时，才把用户
+/// 可见状态改为 `ready`。这条边界避免“数据库保存成功”被误报成公网入口已经
+/// 可以访问，同时避免无关主域名状态阻塞附加域名。
 async fn refresh_tunnel_readiness(state: &AppState, device_id: &str) {
     let data_session = state.tunnel_sessions.lock().await.contains_key(device_id);
     let caddy_healthy = state.caddy.healthy().await;
@@ -10528,27 +10764,108 @@ async fn refresh_tunnel_readiness(state: &AppState, device_id: &str) {
             .ok()
             .flatten()
             .is_some_and(|status| status == "online");
-        let entry = connection
+        let tenant_id = connection
             .query_row(
-                "SELECT base_domain, https_enabled, apply_status, desired_revision, applied_revision
-                 FROM public_entry_settings WHERE id = 1",
-                [],
-                |row| {
-                    Ok((
-                        row.get::<_, Option<String>>(0)?,
-                        row.get::<_, i64>(1)? != 0,
-                        row.get::<_, String>(2)?,
-                        row.get::<_, i64>(3)?,
-                        row.get::<_, i64>(4)?,
-                    ))
-                },
+                "SELECT tenant_id FROM tunnels
+                 WHERE device_id = ?1 AND deleted_at IS NULL LIMIT 1",
+                [device_id],
+                |row| row.get::<_, String>(0),
             )
-            .ok();
+            .optional()
+            .ok()
+            .flatten();
+        let mut domain_states = HashMap::new();
+        let mut primary_domain_id = None;
+        if let Some(tenant_id) = tenant_id.as_deref() {
+            let mut domain_statement = match connection.prepare(
+                "SELECT id, domain, is_primary, https_enabled, certificate_mode,
+                        apply_status, apply_error, desired_revision, applied_revision,
+                        root_certificate_status, wildcard_certificate_status
+                 FROM public_domains WHERE tenant_id = ?1",
+            ) {
+                Ok(statement) => statement,
+                Err(error) => {
+                    tracing::warn!(device_id = %device_id, "读取绑定域名状态失败：{error}");
+                    return;
+                }
+            };
+            let rows = match domain_statement.query_map([tenant_id], |row| {
+                let id: String = row.get(0)?;
+                let is_primary = row.get::<_, i64>(2)? != 0;
+                let state = TunnelPublicDomainState {
+                    domain: row.get(1)?,
+                    https_enabled: row.get::<_, i64>(3)? != 0,
+                    certificate_mode: row.get(4)?,
+                    apply_status: row.get(5)?,
+                    apply_error: row.get(6)?,
+                    desired_revision: row.get(7)?,
+                    applied_revision: row.get(8)?,
+                    root_certificate_status: row.get(9)?,
+                    wildcard_certificate_status: row.get(10)?,
+                    legacy_ready: false,
+                };
+                Ok((id, is_primary, state))
+            }) {
+                Ok(rows) => rows,
+                Err(error) => {
+                    tracing::warn!(device_id = %device_id, "读取绑定域名状态失败：{error}");
+                    return;
+                }
+            };
+            for row in rows {
+                match row {
+                    Ok((id, is_primary, state)) => {
+                        if is_primary {
+                            primary_domain_id = Some(id.clone());
+                        }
+                        domain_states.insert(id, state);
+                    }
+                    Err(error) => {
+                        tracing::warn!(device_id = %device_id, "解析绑定域名状态失败：{error}");
+                        return;
+                    }
+                }
+            }
+        }
+        let legacy_state = if domain_states.is_empty() {
+            tenant_id.as_deref().and_then(|tenant_id| {
+                connection
+                    .query_row(
+                        "SELECT base_domain, https_enabled, certificate_mode, apply_status,
+                                apply_error, desired_revision, applied_revision
+                         FROM public_entry_settings WHERE id = 1 AND tenant_id = ?1",
+                        [tenant_id],
+                        |row| {
+                            let apply_status: String = row.get(3)?;
+                            let desired_revision: i64 = row.get(5)?;
+                            let applied_revision: i64 = row.get(6)?;
+                            Ok(TunnelPublicDomainState {
+                                domain: row.get(0)?,
+                                https_enabled: row.get::<_, i64>(1)? != 0,
+                                certificate_mode: row.get(2)?,
+                                apply_status: Some(apply_status.clone()),
+                                apply_error: row.get(4)?,
+                                desired_revision,
+                                applied_revision,
+                                root_certificate_status: None,
+                                wildcard_certificate_status: None,
+                                legacy_ready: apply_status == "ready"
+                                    && desired_revision == applied_revision,
+                            })
+                        },
+                    )
+                    .optional()
+                    .ok()
+                    .flatten()
+            })
+        } else {
+            None
+        };
         let mut statement = match connection.prepare(
             "SELECT t.id, t.protocol, t.enabled, t.apply_revision, t.applied_revision,
                      t.apply_status, t.apply_error,
                      COALESCE(a.applied_revision, 0), COALESCE(a.apply_status, 'checking'),
-                     a.apply_error, t.deletion_requested
+                     a.apply_error, t.deletion_requested, t.public_domain_id
              FROM tunnels t
              LEFT JOIN tunnel_applied_states a ON a.tunnel_id = t.id
              WHERE t.device_id = ?1 AND t.deleted_at IS NULL",
@@ -10573,18 +10890,54 @@ async fn refresh_tunnel_readiness(state: &AppState, device_id: &str) {
                     row.get::<_, String>(8)?,
                     row.get::<_, Option<String>>(9)?,
                     row.get::<_, i64>(10)? != 0,
+                    row.get::<_, Option<String>>(11)?,
                 ))
             })
             .and_then(|rows| rows.collect::<rusqlite::Result<Vec<_>>>())
             .unwrap_or_default();
-        (entry, tunnels, device_online)
+        let tunnels = tunnels
+            .into_iter()
+            .map(
+                |(
+                    tunnel_id,
+                    protocol,
+                    enabled,
+                    desired_tunnel_revision,
+                    previous_applied_revision,
+                    current_status,
+                    current_error,
+                    agent_revision,
+                    agent_status,
+                    agent_error,
+                    deletion_requested,
+                    public_domain_id,
+                )| {
+                    let public_domain = resolve_tunnel_public_domain_state(
+                        public_domain_id.as_deref(),
+                        primary_domain_id.as_deref(),
+                        &domain_states,
+                        legacy_state.as_ref(),
+                    );
+                    (
+                        tunnel_id,
+                        protocol,
+                        enabled,
+                        desired_tunnel_revision,
+                        previous_applied_revision,
+                        current_status,
+                        current_error,
+                        agent_revision,
+                        agent_status,
+                        agent_error,
+                        deletion_requested,
+                        public_domain,
+                    )
+                },
+            )
+            .collect::<Vec<_>>();
+        (tunnels, device_online)
     };
-    let Some((base_domain, _https_enabled, public_status, desired_revision, applied_revision)) =
-        snapshot.0
-    else {
-        return;
-    };
-    let device_online = snapshot.2;
+    let (tunnels, device_online) = snapshot;
     let connection = match state.db.lock() {
         Ok(connection) => connection,
         Err(_) => return,
@@ -10601,7 +10954,8 @@ async fn refresh_tunnel_readiness(state: &AppState, device_id: &str) {
         agent_status,
         agent_error,
         deletion_requested,
-    ) in snapshot.1
+        public_domain,
+    ) in tunnels
     {
         if !enabled {
             let pending_delete =
@@ -10661,21 +11015,14 @@ async fn refresh_tunnel_readiness(state: &AppState, device_id: &str) {
                 Some("Web 穿透服务暂时不可用".to_owned()),
                 false,
             )
-        } else if matches!(protocol.as_str(), "http" | "https")
-            && (base_domain.is_none()
-                || applied_revision != desired_revision
-                || public_status == "error"
-                || (protocol == "https" && public_status != "ready"))
-        {
-            (
-                "checking".to_owned(),
-                Some(if protocol == "https" {
-                    "等待 HTTPS 证书和公网配置生效".to_owned()
-                } else {
-                    "等待 Web 公网配置生效".to_owned()
-                }),
-                false,
-            )
+        } else if matches!(protocol.as_str(), "http" | "https") {
+            if let Some((status, error)) =
+                evaluate_tunnel_public_readiness(&protocol, &public_domain)
+            {
+                (status, Some(error), false)
+            } else {
+                ("ready".to_owned(), None, true)
+            }
         } else {
             ("ready".to_owned(), None, true)
         };
@@ -13783,7 +14130,7 @@ async fn mesh_status(
 }
 
 /// 返回官方客户端所需的登录服务器地址和平台清单。浏览器授权流程由
-/// Headscale 官方注册页面完成，Nexo 只负责提供入口、审批和归属认领。
+/// Tailscale 客户端发起，Headscale 会根据本次登录生成带上下文的授权地址。
 async fn tailscale_client_config(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -13791,14 +14138,15 @@ async fn tailscale_client_config(
     auth::admin_tenant_id(&state, &headers)?;
     let login_server = state.headscale_runtime.server_url();
     Ok(Json(TailscaleClientConfigResponse {
-        browser_authorization_url: format!("{}/register", login_server.trim_end_matches('/')),
+        browser_authorization_url: None,
         login_server,
         supported_platforms: ["Linux", "Windows", "macOS", "iOS", "Android", "tvOS"]
             .into_iter()
             .map(str::to_owned)
             .collect(),
         notes: vec![
-            "官方客户端首次连接会打开 Headscale 浏览器授权页面".to_owned(),
+            "请在官方 Tailscale 客户端填写登录服务器并开始连接，客户端会打开一次性授权页面"
+                .to_owned(),
             "授权完成后，设备会先进入隔离列表，认领后才加入当前工作空间".to_owned(),
         ],
     }))
@@ -18747,6 +19095,50 @@ mod tests {
     }
 
     #[test]
+    fn wildcard_dns_probe_uses_a_concrete_hostname() {
+        assert_eq!(
+            wildcard_dns_probe_hostname("example.com"),
+            "nexo.example.com"
+        );
+    }
+
+    #[test]
+    fn legacy_dns_snapshot_is_refreshed_only_once() {
+        let legacy = serde_json::json!({
+            "root": {"hostname": "example.com", "resolved": ["192.0.2.10"]},
+            "wildcard": {"hostname": "*.example.com", "resolved": [], "error": "DNS 解析失败"}
+        });
+        let current = serde_json::json!({
+            "root": {"hostname": "example.com", "resolved": ["192.0.2.10"]},
+            "wildcard": {"hostname": "nexo.example.com", "probe": "*.example.com", "resolved": ["192.0.2.10"]}
+        });
+        assert!(legacy_dns_check_needs_refresh(
+            &legacy.to_string(),
+            "example.com"
+        ));
+        assert!(!legacy_dns_check_needs_refresh(
+            &current.to_string(),
+            "example.com"
+        ));
+        assert!(!legacy_dns_check_needs_refresh("{}", "example.com"));
+    }
+
+    #[test]
+    fn client_config_does_not_publish_a_fixed_registration_url() {
+        let response = TailscaleClientConfigResponse {
+            login_server: "https://mesh.example.com".to_owned(),
+            browser_authorization_url: None,
+            supported_platforms: Vec::new(),
+            notes: Vec::new(),
+        };
+        let serialized = serde_json::to_value(response).expect("客户端配置应可序列化");
+        assert_eq!(
+            serialized["browser_authorization_url"],
+            serde_json::Value::Null
+        );
+    }
+
+    #[test]
     fn time_consistency_migration_converts_legacy_text_epochs_once() {
         let connection = Connection::open_in_memory().expect("应打开迁移测试数据库");
         connection
@@ -19303,6 +19695,177 @@ mod tests {
             .expect("应读取静态路由确认时间"),
             Some(1_893_456_000)
         );
+    }
+
+    #[test]
+    fn explicitly_bound_manual_domain_ignores_pending_primary_projection() {
+        let mut domains = HashMap::new();
+        domains.insert(
+            "domain-primary".to_owned(),
+            TunnelPublicDomainState {
+                domain: Some("primary.example.com".to_owned()),
+                https_enabled: true,
+                certificate_mode: Some("cloudflare".to_owned()),
+                apply_status: Some("configuring".to_owned()),
+                desired_revision: 4,
+                applied_revision: 4,
+                root_certificate_status: Some("pending".to_owned()),
+                wildcard_certificate_status: Some("pending".to_owned()),
+                ..TunnelPublicDomainState::default()
+            },
+        );
+        domains.insert(
+            "domain-manual".to_owned(),
+            TunnelPublicDomainState {
+                domain: Some("manual.example.com".to_owned()),
+                https_enabled: true,
+                certificate_mode: Some("manual".to_owned()),
+                apply_status: Some("ready".to_owned()),
+                desired_revision: 7,
+                applied_revision: 7,
+                root_certificate_status: Some("ready".to_owned()),
+                wildcard_certificate_status: Some("ready".to_owned()),
+                ..TunnelPublicDomainState::default()
+            },
+        );
+        let legacy = TunnelPublicDomainState {
+            domain: Some("legacy.example.com".to_owned()),
+            https_enabled: true,
+            apply_status: Some("configuring".to_owned()),
+            ..TunnelPublicDomainState::default()
+        };
+
+        let resolved = resolve_tunnel_public_domain_state(
+            Some("domain-manual"),
+            Some("domain-primary"),
+            &domains,
+            Some(&legacy),
+        );
+
+        assert_eq!(resolved.domain.as_deref(), Some("manual.example.com"));
+        assert_eq!(evaluate_tunnel_public_readiness("https", &resolved), None);
+    }
+
+    #[test]
+    fn unassigned_tunnel_follows_primary_domain_state() {
+        let mut domains = HashMap::new();
+        domains.insert(
+            "domain-primary".to_owned(),
+            TunnelPublicDomainState {
+                domain: Some("primary.example.com".to_owned()),
+                https_enabled: true,
+                certificate_mode: Some("manual".to_owned()),
+                apply_status: Some("ready".to_owned()),
+                desired_revision: 3,
+                applied_revision: 3,
+                root_certificate_status: Some("pending".to_owned()),
+                wildcard_certificate_status: Some("pending".to_owned()),
+                ..TunnelPublicDomainState::default()
+            },
+        );
+        let resolved =
+            resolve_tunnel_public_domain_state(None, Some("domain-primary"), &domains, None);
+
+        assert_eq!(resolved.domain.as_deref(), Some("primary.example.com"));
+        assert_eq!(
+            evaluate_tunnel_public_readiness("https", &resolved),
+            Some(("checking".to_owned(), "手动证书尚未加载".to_owned()))
+        );
+    }
+
+    #[test]
+    fn http_tunnel_does_not_wait_for_unrelated_certificate() {
+        let state = TunnelPublicDomainState {
+            domain: Some("web.example.com".to_owned()),
+            https_enabled: true,
+            certificate_mode: Some("cloudflare".to_owned()),
+            apply_status: Some("configuring".to_owned()),
+            desired_revision: 9,
+            applied_revision: 9,
+            root_certificate_status: Some("pending".to_owned()),
+            wildcard_certificate_status: Some("pending".to_owned()),
+            ..TunnelPublicDomainState::default()
+        };
+
+        assert_eq!(evaluate_tunnel_public_readiness("http", &state), None);
+    }
+
+    #[test]
+    fn https_tunnel_waits_for_route_revision_before_certificate_state() {
+        let state = TunnelPublicDomainState {
+            domain: Some("web.example.com".to_owned()),
+            https_enabled: true,
+            certificate_mode: Some("manual".to_owned()),
+            apply_status: Some("checking".to_owned()),
+            desired_revision: 10,
+            applied_revision: 9,
+            root_certificate_status: Some("ready".to_owned()),
+            wildcard_certificate_status: Some("ready".to_owned()),
+            ..TunnelPublicDomainState::default()
+        };
+
+        assert_eq!(
+            evaluate_tunnel_public_readiness("https", &state),
+            Some(("checking".to_owned(), "公网路由配置正在应用".to_owned()))
+        );
+    }
+
+    #[test]
+    fn https_tunnel_reports_missing_manual_certificate() {
+        let state = TunnelPublicDomainState {
+            domain: Some("web.example.com".to_owned()),
+            https_enabled: true,
+            certificate_mode: Some("manual".to_owned()),
+            apply_status: Some("ready".to_owned()),
+            desired_revision: 2,
+            applied_revision: 2,
+            root_certificate_status: Some("ready".to_owned()),
+            wildcard_certificate_status: Some("pending".to_owned()),
+            ..TunnelPublicDomainState::default()
+        };
+
+        assert_eq!(
+            evaluate_tunnel_public_readiness("https", &state),
+            Some(("checking".to_owned(), "手动证书尚未加载".to_owned()))
+        );
+    }
+
+    #[test]
+    fn automatic_https_domain_requires_root_and_wildcard_certificates() {
+        let state = TunnelPublicDomainState {
+            domain: Some("web.example.com".to_owned()),
+            https_enabled: true,
+            certificate_mode: Some("cloudflare".to_owned()),
+            apply_status: Some("ready".to_owned()),
+            desired_revision: 5,
+            applied_revision: 5,
+            root_certificate_status: Some("ready".to_owned()),
+            wildcard_certificate_status: Some("pending".to_owned()),
+            ..TunnelPublicDomainState::default()
+        };
+
+        assert_eq!(
+            evaluate_tunnel_public_readiness("https", &state),
+            Some(("checking".to_owned(), "等待 HTTPS 证书生效".to_owned()))
+        );
+    }
+
+    #[test]
+    fn legacy_projection_is_used_without_multi_domain_records() {
+        let legacy = TunnelPublicDomainState {
+            domain: Some("legacy.example.com".to_owned()),
+            https_enabled: true,
+            apply_status: Some("ready".to_owned()),
+            desired_revision: 2,
+            applied_revision: 2,
+            legacy_ready: true,
+            ..TunnelPublicDomainState::default()
+        };
+        let resolved =
+            resolve_tunnel_public_domain_state(None, None, &HashMap::new(), Some(&legacy));
+
+        assert_eq!(resolved, legacy);
+        assert_eq!(evaluate_tunnel_public_readiness("https", &resolved), None);
     }
 
     #[tokio::test]

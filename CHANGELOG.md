@@ -2,6 +2,14 @@
 
 本项目使用 [Semantic Versioning](https://semver.org/) 记录公开版本。
 
+## [0.1.12] - 2026-09-07
+
+### Fixed
+
+- 修复泛域名 DNS 检测使用字面量 `*.domain` 查询的问题，改用具体探针并自动修复旧版快照。
+- 修复 Web Tunnel 只读取主域名状态的问题，按显式绑定域名分别判断 HTTP/HTTPS 公网就绪状态。
+- 移除无效的固定 Headscale `/register` 链接，改由官方 Tailscale 客户端发起带上下文的授权流程。
+
 ## [0.1.11] - 2026-09-07
 
 ### Added

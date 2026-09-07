@@ -88,7 +88,7 @@ async function installTailscaleMocks(page: Page, role: Role) {
     if (path === "/api/v1/mesh/client-config") {
       await json(route, {
         login_server: "https://mesh.example.com",
-        browser_authorization_url: "https://mesh.example.com/register",
+        browser_authorization_url: null,
         supported_platforms: ["Linux", "Windows", "macOS", "iOS", "Android", "tvOS"],
         notes: [],
       });
@@ -143,6 +143,8 @@ test("管理员官方客户端页支持 Auth Key 和隔离节点认领", async (
   const mock = await installTailscaleMocks(page, "system_admin");
   await page.goto("/#/devices/official");
   await expect(page.getByRole("heading", { name: "官方客户端" }).first()).toBeVisible();
+  await expect(page.getByText("由客户端发起", { exact: true })).toBeVisible();
+  await expect(page.getByRole("link", { name: "打开授权入口" })).toHaveCount(0);
   await expect(page.getByText("Linux、Windows、macOS、iOS、Android、tvOS", { exact: true })).toBeVisible();
   await expect(page.getByText("外部笔记本", { exact: true })).toBeVisible();
 
