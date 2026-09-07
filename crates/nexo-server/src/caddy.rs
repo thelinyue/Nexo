@@ -72,6 +72,47 @@ impl CaddyLogEvent {
                 .contains("too many certificates")
             || self.message.to_ascii_lowercase().contains("retry-after")
     }
+
+    /// 将 Caddy 可观察日志映射为离散阶段，不伪造 Caddy 未提供的百分比。
+    pub fn certificate_stage(&self) -> Option<&'static str> {
+        let message = self.message.to_ascii_lowercase();
+        if self.is_rate_limited()
+            || self.retry_after_secs.is_some()
+            || message.contains("will retry")
+            || message.contains("retrying in")
+        {
+            return Some("retry_wait");
+        }
+        if message.contains("presenting") && message.contains("challenge") {
+            return Some("presenting_dns");
+        }
+        if message.contains("propagation") || message.contains("dns record") {
+            return Some("waiting_dns");
+        }
+        if message.contains("validating")
+            || message.contains("authorization")
+            || message.contains("challenge accepted")
+        {
+            return Some("validating");
+        }
+        if message.contains("certificate obtained") || message.contains("downloaded certificate") {
+            return Some("issued");
+        }
+        if message.contains("certificate loaded")
+            || message.contains("finished cleaning storage units")
+        {
+            return Some("active");
+        }
+        if message.contains("obtaining certificate") || message.contains("acme client") {
+            return Some("waiting_configuration");
+        }
+        if self.level.as_deref() == Some("error")
+            || self.status_code.is_some_and(|code| code >= 400)
+        {
+            return Some("failed");
+        }
+        None
+    }
 }
 
 /// 解析 Caddy 默认 JSON 日志；纯文本日志也会保留为可读事件，便于用户
@@ -93,22 +134,28 @@ pub fn parse_caddy_log_line(line: &str) -> Option<CaddyLogEvent> {
         return Some(event);
     };
     let object = value.as_object()?;
-    let message = ["msg", "message", "error"]
-        .iter()
-        .find_map(|key| object.get(*key).and_then(Value::as_str))
-        .or_else(|| {
-            object
-                .get("error")
-                .and_then(|value| value.as_object())
-                .and_then(|object| {
-                    object
-                        .get("message")
-                        .and_then(Value::as_str)
-                        .or_else(|| object.get("msg").and_then(Value::as_str))
-                })
+    let summary = object
+        .get("msg")
+        .and_then(Value::as_str)
+        .or_else(|| object.get("message").and_then(Value::as_str));
+    let detail = object.get("error").and_then(|value| {
+        value.as_str().or_else(|| {
+            value.as_object().and_then(|error| {
+                error
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .or_else(|| error.get("msg").and_then(Value::as_str))
+            })
         })
-        .unwrap_or(line)
-        .to_owned();
+    });
+    // Caddy 的 `msg` 往往只是“获取证书失败”，真正的 Cloudflare/ACME
+    // 原因在 `error`。两者都保留，避免 UI 被笼统摘要覆盖。
+    let message = match (summary, detail) {
+        (Some(summary), Some(detail)) if summary != detail => format!("{summary}：{detail}"),
+        (Some(summary), _) => summary.to_owned(),
+        (_, Some(detail)) => detail.to_owned(),
+        _ => line.to_owned(),
+    };
     let identifier = ["identifier", "domain", "host"]
         .iter()
         .find_map(|key| object.get(*key).and_then(Value::as_str))
@@ -117,7 +164,7 @@ pub fn parse_caddy_log_line(line: &str) -> Option<CaddyLogEvent> {
         .iter()
         .find_map(|key| object.get(*key).and_then(parse_u16_value))
         .or_else(|| parse_status_code(&message));
-    let retry_after_secs = ["retry_after", "retry-after", "retryAfter"]
+    let retry_after_secs = ["retry_after", "retry-after", "retryAfter", "retrying_in"]
         .iter()
         .find_map(|key| object.get(*key).and_then(parse_u64_value))
         .or_else(|| parse_retry_after(&message));
@@ -141,7 +188,36 @@ fn parse_u16_value(value: &Value) -> Option<u16> {
 }
 
 fn parse_u64_value(value: &Value) -> Option<u64> {
-    value.as_u64().or_else(|| value.as_str()?.parse().ok())
+    value
+        .as_u64()
+        .or_else(|| value.as_f64().map(|number| number.ceil() as u64))
+        .or_else(|| parse_duration_seconds(value.as_str()?))
+}
+
+fn parse_duration_seconds(value: &str) -> Option<u64> {
+    if let Ok(seconds) = value.parse::<u64>() {
+        return Some(seconds);
+    }
+    let mut total = 0u64;
+    let mut number = String::new();
+    let mut parsed = false;
+    for character in value.chars() {
+        if character.is_ascii_digit() {
+            number.push(character);
+            continue;
+        }
+        let multiplier = match character {
+            'h' => 3600,
+            'm' => 60,
+            's' => 1,
+            _ => continue,
+        };
+        let amount = number.parse::<u64>().ok()?;
+        total = total.saturating_add(amount.saturating_mul(multiplier));
+        number.clear();
+        parsed = true;
+    }
+    parsed.then_some(total)
 }
 
 fn parse_status_code(message: &str) -> Option<u16> {
@@ -756,11 +832,18 @@ pub fn build_caddy_config_with_environment_and_readiness(
         json!({
             "listen": [":80"],
             "automatic_https": {"disable": true},
+            "trusted_proxies": {"source": "static", "ranges": ["127.0.0.1/32", "::1/128"]},
+            "trusted_proxies_strict": true,
             "routes": http_routes
         }),
     );
     if https_enabled {
-        let mut https_server = json!({ "listen": [":443"], "routes": https_routes });
+        let mut https_server = json!({
+            "listen": [":443"],
+            "trusted_proxies": {"source": "static", "ranges": ["127.0.0.1/32", "::1/128"]},
+            "trusted_proxies_strict": true,
+            "routes": https_routes
+        });
         if certificate_mode == "manual" {
             https_server["tls_connection_policies"] = json!([{
                 "certificate_selection": { "any_tag": ["nexo-manual"] }
@@ -921,7 +1004,9 @@ pub struct CaddyDomain {
 /// 这里仅承载 HTTP/HTTPS 服务的 Socket 和公开子域名前缀。
 #[derive(Debug, Clone)]
 pub struct CaddyBoundTunnel {
-    pub domain: String,
+    /// 使用数据库稳定 ID 绑定域名，避免把 ID 与可变的 DNS 名称混用后
+    /// 静默过滤全部服务路由。
+    pub domain_id: String,
     pub tunnel: CaddyTunnel,
 }
 
@@ -945,7 +1030,7 @@ pub fn build_multi_caddy_config(
     let mut manual_certificates = Vec::new();
     for domain in domains {
         let name = domain.domain.as_str();
-        let bound = tunnels.iter().filter(|item| item.domain == name);
+        let bound = tunnels.iter().filter(|item| item.domain_id == domain.id);
         let http_services = bound
             .clone()
             .filter(|item| item.tunnel.enabled && item.tunnel.protocol == "http");
@@ -1007,13 +1092,20 @@ pub fn build_multi_caddy_config(
     servers.insert(
         "http".to_owned(),
         json!({
-            "listen": [":80"], "automatic_https": {"disable": true}, "routes": http_routes
+            "listen": [":80"], "automatic_https": {"disable": true},
+            "trusted_proxies": {"source": "static", "ranges": ["127.0.0.1/32", "::1/128"]},
+            "trusted_proxies_strict": true, "routes": http_routes
         }),
     );
     if !https_routes.is_empty() {
         servers.insert(
             "https".to_owned(),
-            json!({ "listen": [":443"], "routes": https_routes }),
+            json!({
+                "listen": [":443"],
+                "trusted_proxies": {"source": "static", "ranges": ["127.0.0.1/32", "::1/128"]},
+                "trusted_proxies_strict": true,
+                "routes": https_routes
+            }),
         );
     }
     let mut config = json!({
@@ -1113,6 +1205,18 @@ mod tests {
         assert_eq!(event.status_code, Some(429));
         assert_eq!(event.retry_after_secs, Some(120));
         assert!(event.is_rate_limited());
+    }
+
+    #[test]
+    fn keeps_detailed_acme_error_and_parses_caddy_retrying_in() {
+        let event = parse_caddy_log_line(
+            r#"{"level":"error","msg":"could not get certificate","error":"cloudflare: authentication error for *.example.com","identifier":"*.example.com","retrying_in":"2m30s"}"#,
+        )
+        .expect("Caddy ACME 日志应能解析");
+        assert!(event.message.contains("could not get certificate"));
+        assert!(event.message.contains("cloudflare: authentication error"));
+        assert_eq!(event.retry_after_secs, Some(150));
+        assert_eq!(event.certificate_stage(), Some("retry_wait"));
     }
 
     #[test]
@@ -1342,7 +1446,7 @@ mod tests {
                 },
             ],
             &[CaddyBoundTunnel {
-                domain: "b.example.com".to_owned(),
+                domain_id: "domain-b".to_owned(),
                 tunnel: CaddyTunnel {
                     hostname: Some("app".to_owned()),
                     bridge_socket: "/data/tunnels/app.sock".to_owned(),
@@ -1372,5 +1476,17 @@ mod tests {
             .replace('\\', "/");
         assert_eq!(certificate_path, "/data/secrets/domain-b/certificate.pem");
         assert!(config.to_string().contains("app.b.example.com"));
+        let routes = config["apps"]["http"]["servers"]["https"]["routes"]
+            .as_array()
+            .expect("HTTPS 路由应为数组");
+        let exact = routes
+            .iter()
+            .position(|route| route["match"][0]["host"] == json!(["app.b.example.com"]))
+            .expect("绑定服务应生成精确路由");
+        let fallback = routes
+            .iter()
+            .position(|route| route["match"][0]["host"] == json!(["*.b.example.com"]))
+            .expect("域名应生成泛域名 404 兜底");
+        assert!(exact < fallback, "精确服务路由必须位于泛域名兜底之前");
     }
 }

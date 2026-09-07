@@ -332,13 +332,24 @@ code { overflow-wrap: anywhere; }
 .domain-title strong { overflow-wrap: anywhere; font-size: 15px; }
 .domain-primary-badge { min-height: 22px; display: inline-flex; align-items: center; padding: 2px 7px; border-radius: 5px; background: var(--success-soft); color: var(--success); font-size: 10px; font-weight: 700; }
 .domain-identity > span { display: block; margin-top: 4px; color: var(--text-muted); font-size: 11px; overflow-wrap: anywhere; }
-.domain-facts-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px; padding-left: 39px; }
+.domain-facts-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; padding-left: 39px; }
 .domain-fact, .domain-certificate-cell { min-width: 0; min-height: 78px; display: grid; align-content: start; gap: 7px; padding: 11px 12px; border: 1px solid var(--border); border-radius: 7px; background: var(--surface-soft); }
 .domain-fact > span, .domain-certificate-heading > span { color: var(--text-muted); font-size: 10px; font-weight: 650; }
 .domain-fact strong { font-size: 12px; font-weight: 650; }
 .domain-certificate-heading { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
 .domain-certificate-cell > strong { color: var(--text-secondary); font-size: 11px; line-height: 1.45; overflow-wrap: anywhere; }
 .domain-certificate-cell small { color: var(--text-muted); font-size: 10px; line-height: 1.45; overflow-wrap: anywhere; }
+.certificate-stage-label { color: var(--text) !important; font-size: 12px !important; }
+.certificate-stage-track { min-width: 0; display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); gap: 4px; margin: 2px 0 4px; padding: 0; list-style: none; }
+.certificate-stage-track li { min-width: 0; display: grid; justify-items: center; gap: 4px; color: var(--text-muted); font-size: 9px; text-align: center; }
+.certificate-stage-track li i { width: 100%; height: 3px; border-radius: 2px; background: var(--border-strong); transition: background-color 180ms ease-out; }
+.certificate-stage-track li.complete, .certificate-stage-track li.current { color: var(--text-secondary); }
+.certificate-stage-track li.complete i { background: var(--success); }
+.certificate-stage-track li.current i { background: var(--primary); animation: certificate-stage-pulse 1.8s ease-in-out infinite; }
+.certificate-subjects { font-family: ui-monospace, SFMono-Regular, Consolas, monospace; }
+.certificate-error summary { cursor: pointer; color: var(--warning); font-size: 10px; }
+.certificate-error p { margin: 7px 0 0; color: var(--text-secondary); font-size: 10px; line-height: 1.5; }
+@keyframes certificate-stage-pulse { 50% { opacity: .42; } }
 .inline-state { display: inline-flex; align-items: center; gap: 6px; }
 .inline-state i { width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
 .inline-state.ready { color: var(--success); }
@@ -363,6 +374,16 @@ code { overflow-wrap: anywhere; }
 .domain-delete-form > label:not(.confirmation-check) > span { color: var(--text-secondary); font-size: 11px; font-weight: 650; }
 .confirmation-check { display: flex !important; align-items: flex-start; gap: 9px; color: var(--text-secondary); font-size: 12px; line-height: 1.5; }
 .confirmation-check input { width: 18px; height: 18px; flex: 0 0 auto; margin: 0; accent-color: var(--primary); }
+.managed-dns-preview { display: grid; gap: 14px; padding-top: 10px; }
+.dns-preview-status { min-height: 20px; color: var(--text-muted); font-size: 11px; }
+.dns-preview-domain { display: grid; gap: 8px; }
+.dns-preview-domain h3 { margin: 0; font-size: 13px; }
+.dns-change-list { display: grid; border-top: 1px solid var(--border); }
+.dns-change { min-width: 0; display: grid; grid-template-columns: minmax(130px, .7fr) minmax(0, 1fr) auto minmax(0, 1fr); align-items: center; gap: 9px; padding: 10px 0; border-bottom: 1px solid var(--border); }
+.dns-change > div { min-width: 0; display: grid; gap: 2px; }
+.dns-change > div span { color: var(--text-muted); font-size: 10px; }
+.dns-change.replace > div span { color: var(--warning); }
+.dns-change code { min-width: 0; overflow-wrap: anywhere; color: var(--text-secondary); font: 11px/1.45 ui-monospace, SFMono-Regular, Consolas, monospace; }
 .migration-impact { display: grid; gap: 8px; padding: 12px; border: 1px solid var(--border); border-radius: 7px; background: var(--surface-soft); }
 .migration-impact strong { color: var(--text); font-size: 12px; }
 .migration-progress { display: grid; gap: 9px; padding: 12px; border: 1px solid var(--border); border-radius: 7px; background: var(--surface-soft); }
@@ -587,6 +608,8 @@ fieldset.form-grid { min-width: 0; margin: 0; padding: 0; border: 0; }
   .domain-facts-grid { grid-template-columns: 1fr; padding-left: 39px; }
   .domain-row-actions, .domain-error-details { padding-left: 39px; margin-left: 0; }
   .domain-row-actions .compact-button { flex: 1 1 auto; }
+  .dns-change { grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr); }
+  .dns-change > div { grid-column: 1 / -1; }
   .domain-list-header { align-items: flex-start; flex-direction: column; gap: 5px; padding-block: 8px; }
   .domain-editor-form fieldset > label { grid-template-columns: 1fr; align-items: stretch; gap: 6px; padding: 10px 0; }
   .domain-editor-form .public-entry-form-row { grid-template-columns: 1fr; align-items: stretch; gap: 6px; }
@@ -640,6 +663,7 @@ fieldset.form-grid { min-width: 0; margin: 0; padding: 0; border: 0; }
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { scroll-behavior: auto !important; animation-duration: .01ms !important; animation-iteration-count: 1 !important; transition-duration: .01ms !important; }
   .topology-detail, .mobile-site-link-detail { animation: none !important; }
+  .certificate-stage-track li.current i { animation: none !important; }
   .primary-button:active, .secondary-button:active, .danger-button:active, .icon-button:active, .delete-icon-button:active, .secret-visibility-button:active, .tunnel-copy-button:active, .quick-link:active, .attention-row:active { transform: none !important; }
 }
 

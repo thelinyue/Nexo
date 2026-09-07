@@ -46,10 +46,12 @@ const seedPublicDomain = {
   root_certificate: {
     status: "ready", not_before: 1890000000, not_after: 1893456000, renewal_at: 1892304000,
     subjects: ["example.com", "*.example.com"],
+    progress: { stage: "active", attempt_count: 1, last_event_at: 1890000000, next_retry_at: null, error_code: null, error_message: null },
   },
   wildcard_certificate: {
     status: "ready", not_before: 1890000000, not_after: 1893456000, renewal_at: 1892304000,
     subjects: ["example.com", "*.example.com"],
+    progress: { stage: "active", attempt_count: 1, last_event_at: 1890000000, next_retry_at: null, error_code: null, error_message: null },
   },
   usage_count: 2,
   desired_revision: 4,
@@ -57,6 +59,7 @@ const seedPublicDomain = {
   retry_after: null as number | null,
   attempt_count: 0,
   next_retry_at: null as number | null,
+  dns_management: { enabled: true, target_ipv4: "203.0.113.10", target_ipv6: null, status: "ready", error: null, version: 1 },
 };
 
 const seedSites = [
@@ -285,6 +288,23 @@ async function installApiMocks(page: Page, options: MockOptions) {
     if (path === "/api/v1/tunnels" && method === "GET") { await fulfillJson(route, state.tunnels); return; }
     if (supportsPublicDomains && path === "/api/v1/public-domains" && method === "GET") {
       await fulfillJson(route, state.publicDomains);
+      return;
+    }
+    const dnsPreviewMatch = path.match(/^\/api\/v1\/public-domains\/([^/]+)\/dns\/preview$/);
+    if (supportsPublicDomains && dnsPreviewMatch && method === "GET") {
+      const domain = state.publicDomains.find((item) => item.id === dnsPreviewMatch[1]);
+      if (!domain) { await fulfillJson(route, { error: "域名不存在" }, 404); return; }
+      await fulfillJson(route, { domain_id: domain.id, zone_name: domain.domain, has_conflicts: false, changes: [
+        { action: "adopt", record_type: "A", name: "@", desired_content: domain.dns_management.target_ipv4, current_content: domain.dns_management.target_ipv4, record_id: "record-root" },
+        { action: "adopt", record_type: "A", name: "*", desired_content: domain.dns_management.target_ipv4, current_content: domain.dns_management.target_ipv4, record_id: "record-wildcard" },
+      ] });
+      return;
+    }
+    const dnsApplyMatch = path.match(/^\/api\/v1\/public-domains\/([^/]+)\/dns\/apply$/);
+    if (supportsPublicDomains && dnsApplyMatch && method === "POST") {
+      const domain = state.publicDomains.find((item) => item.id === dnsApplyMatch[1]);
+      if (!domain) { await fulfillJson(route, { error: "域名不存在" }, 404); return; }
+      await fulfillJson(route, { domain_id: domain.id, zone_name: domain.domain, has_conflicts: false, changes: [] });
       return;
     }
     if (supportsPublicDomains && path === "/api/v1/public-domains/batch/recheck" && method === "POST") {
@@ -762,7 +782,7 @@ test("添加设备生成最小 Compose 配置", async ({ page, context }) => {
   await page.getByLabel("设备名称").fill("家庭 NAS");
   await page.getByRole("button", { name: "生成设备配置" }).click();
   const compose = await page.getByLabel("Docker Compose 配置").inputValue();
-  expect(compose).toContain("ghcr.io/thelinyue/nexo-agent:0.1.7");
+  expect(compose).toContain("ghcr.io/thelinyue/nexo-agent:0.1.8");
   expect(compose).toContain("TZ: ${TZ:-Asia/Shanghai}");
   expect(compose.match(/NEXO_[A-Z_]+:/g)).toEqual(["NEXO_SERVER_URL:", "NEXO_ENROLLMENT_TOKEN:"]);
   await page.getByRole("button", { name: "复制 Compose 配置" }).click();
@@ -1015,8 +1035,8 @@ test("多域名列表展示证书生命周期并支持批量与手动申请", as
     apply_status: "rate_limited",
     apply_error: "CA 返回 HTTP 429",
     error_code: "acme_rate_limited",
-    root_certificate: { ...seedPublicDomain.root_certificate, status: "pending", not_before: null, not_after: null, renewal_at: null, subjects: [] },
-    wildcard_certificate: { ...seedPublicDomain.wildcard_certificate, status: "pending", not_before: null, not_after: null, renewal_at: null, subjects: [] },
+    root_certificate: { ...seedPublicDomain.root_certificate, status: "pending", not_before: null, not_after: null, renewal_at: null, subjects: [], progress: { stage: "retry_wait", attempt_count: 3, last_event_at: 1892000000, next_retry_at: 1893000000, error_code: "acme_rate_limited", error_message: "CA 返回 HTTP 429" } },
+    wildcard_certificate: { ...seedPublicDomain.wildcard_certificate, status: "pending", not_before: null, not_after: null, renewal_at: null, subjects: [], progress: { stage: "waiting_dns", attempt_count: 2, last_event_at: 1892000000, next_retry_at: null, error_code: null, error_message: null } },
     usage_count: 0,
     retry_after: 1893000000,
     next_retry_at: 1893000000,
@@ -1045,7 +1065,7 @@ test("多域名列表展示证书生命周期并支持批量与手动申请", as
   await expect(primaryRow).toContainText("预计进入 Caddy 续期窗口");
   const limitedRow = page.locator(".domain-row").filter({ hasText: "rate.example.com" });
   await expect(limitedRow.getByRole("button", { name: "手动申请证书" })).toBeDisabled();
-  await limitedRow.locator("summary").click();
+  await limitedRow.getByText("查看 CA 限流与自动重试").click();
   await expect(limitedRow).toContainText("Caddy 正在自动重试");
   await expect(limitedRow).toContainText("下一次尝试");
 
@@ -1067,6 +1087,39 @@ test("多域名列表展示证书生命周期并支持批量与手动申请", as
   await expect(dialog.getByLabel("私钥文件")).toBeVisible();
   await dialog.getByRole("button", { name: "取消" }).click();
   await expect(dialog).toBeHidden();
+  await expectNoHorizontalOverflow(page);
+});
+
+test("DNS 托管先预览再同步并展示真实证书阶段", async ({ page }) => {
+  await installApiMocks(page, {
+    initialized: true,
+    authenticated: true,
+    publicDomains: [seedPublicDomain],
+  });
+  await page.goto("/#/public-access/domain");
+
+  const row = page.locator(".domain-row").filter({ hasText: "example.com" });
+  await expect(row).toContainText("CA 校验");
+  await expect(row).toContainText("已签发");
+  await expect(row).toContainText("已启用");
+  await expect(row).toContainText("SAN");
+
+  await row.getByRole("button", { name: "编辑" }).click();
+  const editor = page.getByRole("dialog", { name: "编辑 example.com" });
+  await expect(editor.getByText("ACME 环境")).toHaveCount(0);
+  await expect(editor.getByRole("checkbox", { name: "由 Nexo 自动管理 Cloudflare DNS" })).toBeChecked();
+  await expect(editor.getByLabel("公网 IPv4")).toHaveValue("203.0.113.10");
+  await editor.getByRole("button", { name: "取消" }).click();
+
+  await row.getByRole("button", { name: "同步 DNS" }).click();
+  const preview = page.getByRole("dialog", { name: "同步 example.com" });
+  await expect(preview).toContainText("接管同值记录");
+  await expect(preview).toContainText("A @");
+  await expect(preview).toContainText("A *");
+  const applyRequest = page.waitForRequest((request) => new URL(request.url()).pathname === "/api/v1/public-domains/domain-primary/dns/apply");
+  await preview.getByRole("button", { name: "确认同步 DNS" }).click();
+  expect((await applyRequest).postDataJSON()).toEqual({ confirm_conflicts: false });
+  await expect(preview).toBeHidden();
   await expectNoHorizontalOverflow(page);
 });
 

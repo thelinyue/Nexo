@@ -121,6 +121,8 @@ const MULTI_PUBLIC_DOMAINS_MIGRATION: &str =
 const TAILSCALE_CLIENT_MIGRATION: &str =
     include_str!("../../../migrations/0016_tailscale_clients.sql");
 const ACCESS_CONTROL_MIGRATION: &str = include_str!("../../../migrations/0017_access_control.sql");
+const PUBLIC_DOMAIN_OPERATIONS_MIGRATION: &str =
+    include_str!("../../../migrations/0018_public_domain_operations.sql");
 
 #[derive(Clone)]
 pub(crate) struct AppState {
@@ -379,7 +381,6 @@ struct UpdatePublicEntryRequest {
     base_domain: Option<String>,
     https_enabled: bool,
     certificate_mode: String,
-    acme_environment: Option<String>,
 }
 
 /// 证书和 Provider Token 只接受一次并写入 0600 Secret 文件，响应永远不回显。
@@ -413,6 +414,7 @@ struct PublicDomainResponse {
     retry_after: Option<i64>,
     attempt_count: i64,
     next_retry_at: Option<i64>,
+    dns_management: DnsManagementResponse,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -424,6 +426,27 @@ struct CertificateStatusResponse {
     /// 不是对 CA 或 Caddy 后台调度的硬承诺。
     renewal_at: Option<i64>,
     subjects: Vec<String>,
+    progress: CertificateProgressResponse,
+}
+
+#[derive(Debug, Serialize, Clone)]
+struct CertificateProgressResponse {
+    stage: String,
+    attempt_count: i64,
+    last_event_at: Option<i64>,
+    next_retry_at: Option<i64>,
+    error_code: Option<String>,
+    error_message: Option<String>,
+}
+
+#[derive(Debug, Serialize, Clone)]
+struct DnsManagementResponse {
+    enabled: bool,
+    target_ipv4: Option<String>,
+    target_ipv6: Option<String>,
+    status: String,
+    error: Option<String>,
+    version: i64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -434,7 +457,11 @@ struct CreatePublicDomainRequest {
     #[serde(default = "default_cloudflare")]
     certificate_mode: String,
     #[serde(default)]
-    acme_environment: Option<String>,
+    dns_management_enabled: bool,
+    #[serde(default)]
+    dns_target_ipv4: Option<String>,
+    #[serde(default)]
+    dns_target_ipv6: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -446,7 +473,49 @@ struct UpdatePublicDomainRequest {
     #[serde(default)]
     certificate_mode: Option<String>,
     #[serde(default)]
-    acme_environment: Option<String>,
+    dns_management_enabled: Option<bool>,
+    #[serde(default)]
+    dns_target_ipv4: Option<Option<String>>,
+    #[serde(default)]
+    dns_target_ipv6: Option<Option<String>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ApplyManagedDnsRequest {
+    #[serde(default)]
+    confirm_conflicts: bool,
+}
+
+#[derive(Debug, Serialize, Clone)]
+struct ManagedDnsChange {
+    action: String,
+    record_type: String,
+    name: String,
+    desired_content: String,
+    current_content: Option<String>,
+    record_id: Option<String>,
+}
+
+#[derive(Debug, Serialize, Clone)]
+struct ManagedDnsPreviewResponse {
+    domain_id: String,
+    zone_name: String,
+    changes: Vec<ManagedDnsChange>,
+    has_conflicts: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct ManagedDnsBatchRequest {
+    #[serde(default)]
+    ids: Vec<String>,
+    #[serde(default)]
+    confirm_conflicts: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct ReleaseManagedDnsRequest {
+    #[serde(default)]
+    delete_created_records: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1077,6 +1146,8 @@ async fn main() -> Result<()> {
     apply_tailscale_client_migration(&connection)
         .context("无法初始化官方客户端和 Auth Key 数据结构")?;
     apply_access_control_migration(&connection).context("无法初始化可视化访问控制数据结构")?;
+    apply_public_domain_operations_migration(&connection)
+        .context("无法初始化域名 DNS 托管和证书进度数据结构")?;
     let legacy_tunnel_count = finalize_legacy_pending_tunnel_deletions(&connection)
         .context("无法清理旧版本遗留的待删除穿透服务")?;
     if legacy_tunnel_count > 0 {
@@ -1271,6 +1342,22 @@ async fn main() -> Result<()> {
         .route(
             "/api/v1/public-domains/{id}/renew",
             post(renew_public_domain),
+        )
+        .route(
+            "/api/v1/public-domains/{id}/dns/preview",
+            get(preview_public_domain_dns),
+        )
+        .route(
+            "/api/v1/public-domains/{id}/dns/apply",
+            post(apply_public_domain_dns),
+        )
+        .route(
+            "/api/v1/public-domains/{id}/dns/managed-records",
+            delete(release_public_domain_dns),
+        )
+        .route(
+            "/api/v1/public-domains/batch/dns/apply",
+            post(batch_apply_public_domain_dns),
         )
         .route(
             "/api/v1/public-domains/batch/recheck",
@@ -1519,6 +1606,7 @@ fn run_cli_command(command: CliCommand) -> Result<()> {
     apply_multi_public_domains_migration(&connection)?;
     apply_tailscale_client_migration(&connection)?;
     apply_access_control_migration(&connection)?;
+    apply_public_domain_operations_migration(&connection)?;
     ensure_mesh_identity_online_column(&connection)?;
     let data_dir = db_path.parent().context("Nexo 数据库路径缺少父目录")?;
     migrate_legacy_public_domain_secrets(data_dir, &connection)
@@ -1626,6 +1714,25 @@ fn apply_access_control_migration(connection: &Connection) -> Result<()> {
     }
     let transaction = connection.unchecked_transaction()?;
     transaction.execute_batch(ACCESS_CONTROL_MIGRATION)?;
+    transaction.commit()?;
+    Ok(())
+}
+
+/// 为公网域名补充 DNS 托管元数据和两条互相独立的证书阶段轨迹。
+///
+/// 历史域名不会被自动接管；迁移只把已保存的测试 CA 选择收敛为正式 CA。
+/// Cloudflare Token 仍保存在 Secret 文件中，数据库只记录公开的 record ID。
+fn apply_public_domain_operations_migration(connection: &Connection) -> Result<()> {
+    let applied = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version = 18)",
+        [],
+        |row| row.get::<_, bool>(0),
+    )?;
+    if applied {
+        return Ok(());
+    }
+    let transaction = connection.unchecked_transaction()?;
+    transaction.execute_batch(PUBLIC_DOMAIN_OPERATIONS_MIGRATION)?;
     transaction.commit()?;
     Ok(())
 }
@@ -1990,18 +2097,10 @@ async fn list_tunnels(
         .lock()
         .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "数据库锁不可用"))?;
     let mut statement = connection
-        .prepare(
-            "SELECT t.id, t.tenant_id, t.device_id, d.name, t.name, t.protocol,
-                    t.local_address, t.local_port, t.public_port, t.hostname,
-                    t.origin_protocol, t.origin_tls_server_name,
-                    COALESCE(t.origin_tls_verification, 'system'), t.service_name,
-                    t.enabled, t.apply_status, t.apply_error, t.apply_revision,
-                    t.applied_revision, t.deletion_requested, p.base_domain
-             FROM tunnels t LEFT JOIN devices d ON d.id = t.device_id
-             LEFT JOIN public_entry_settings p ON p.id = 1
-             WHERE t.deleted_at IS NULL AND t.tenant_id = ?1
+        .prepare(&tunnel_query(
+            "WHERE t.deleted_at IS NULL AND t.tenant_id = ?1
              ORDER BY t.updated_at DESC, t.name ASC",
-        )
+        ))
         .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法读取穿透服务列表"))?;
     let rows = statement
         .query_map([tenant_id], tunnel_response_from_row)
@@ -3699,17 +3798,7 @@ async fn update_public_entry(
             "HTTPS 需要手动证书或 Cloudflare 证书模式",
         ));
     }
-    let environment = request
-        .acme_environment
-        .unwrap_or_else(|| "production".to_owned())
-        .trim()
-        .to_ascii_lowercase();
-    if !matches!(environment.as_str(), "staging" | "production") {
-        return Err(ApiError::new(
-            StatusCode::BAD_REQUEST,
-            "ACME 环境只能是 staging 或 production",
-        ));
-    }
+    let environment = "production".to_owned();
     // 旧接口的 `none` 只属于兼容投影；多域名表始终使用手动或
     // Cloudflare 两种证书来源，关闭 HTTPS 时统一落为 Cloudflare，
     // 这样重新开启 HTTPS 不会触发表约束错误。
@@ -3853,6 +3942,15 @@ async fn update_public_entry(
                     ],
                 )
                 .map_err(|_| ApiError::new(StatusCode::CONFLICT, "域名已存在或保存失败"))?;
+            connection
+                .execute(
+                    "INSERT INTO public_domain_certificate_progress
+                     (public_domain_id, certificate_type) VALUES (?1, 'root'), (?1, 'wildcard')",
+                    [&id],
+                )
+                .map_err(|_| {
+                    ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法初始化证书进度")
+                })?;
         }
         connection
             .execute(
@@ -3961,12 +4059,7 @@ async fn upload_public_entry_secret(
             "Cloudflare DNS-01 模式不能上传手动证书",
         ));
     }
-    if primary_mode.as_deref() == Some("manual") && request.cloudflare_token.is_some() {
-        return Err(ApiError::new(
-            StatusCode::BAD_REQUEST,
-            "手动证书模式不能上传 Cloudflare Token",
-        ));
-    }
+    // Cloudflare Token 也可仅用于 DNS 托管，因此不能再与手动证书模式互斥。
     /*
      * Secret 正文只在文件系统中保留。主域名存在时，旧接口写入与多域名
      * 接口相同的隔离目录，避免兼容调用把凭据写到已经不再读取的旧路径。
@@ -4469,6 +4562,14 @@ fn public_domain_response_from_row(
                 .then(|| estimated_caddy_renewal(root_not_before, root_not_after))
                 .flatten(),
             subjects: serde_json::from_str(&root_subjects).unwrap_or_default(),
+            progress: CertificateProgressResponse {
+                stage: row.get(31)?,
+                attempt_count: row.get(32)?,
+                last_event_at: row.get(33)?,
+                next_retry_at: row.get(34)?,
+                error_code: row.get(35)?,
+                error_message: row.get(36)?,
+            },
         },
         wildcard_certificate: CertificateStatusResponse {
             status: row.get(15)?,
@@ -4478,6 +4579,14 @@ fn public_domain_response_from_row(
                 .then(|| estimated_caddy_renewal(wildcard_not_before, wildcard_not_after))
                 .flatten(),
             subjects: serde_json::from_str(&wildcard_subjects).unwrap_or_default(),
+            progress: CertificateProgressResponse {
+                stage: row.get(37)?,
+                attempt_count: row.get(38)?,
+                last_event_at: row.get(39)?,
+                next_retry_at: row.get(40)?,
+                error_code: row.get(41)?,
+                error_message: row.get(42)?,
+            },
         },
         retry_after: row.get(19)?,
         attempt_count: row.get(20)?,
@@ -4485,6 +4594,14 @@ fn public_domain_response_from_row(
         desired_revision: row.get(22)?,
         applied_revision: row.get(23)?,
         usage_count: row.get(24)?,
+        dns_management: DnsManagementResponse {
+            enabled: row.get::<_, i64>(25)? != 0,
+            target_ipv4: row.get(26)?,
+            target_ipv6: row.get(27)?,
+            status: row.get(28)?,
+            error: row.get(29)?,
+            version: row.get(30)?,
+        },
     })
 }
 
@@ -4514,9 +4631,633 @@ fn public_domain_query_ordered(filter: &str) -> String {
                 p.desired_revision, p.applied_revision,
                 (SELECT COUNT(*) FROM tunnels t
                  WHERE t.public_domain_id = p.id AND t.deleted_at IS NULL
-                   AND t.protocol IN ('http', 'https')) AS usage_count
+                   AND t.protocol IN ('http', 'https')) AS usage_count,
+                p.dns_management_enabled, p.dns_target_ipv4, p.dns_target_ipv6,
+                p.dns_management_status, p.dns_management_error,
+                p.dns_management_version,
+                COALESCE((SELECT stage FROM public_domain_certificate_progress
+                    WHERE public_domain_id = p.id AND certificate_type = 'root'), 'waiting_configuration'),
+                COALESCE((SELECT attempt_count FROM public_domain_certificate_progress
+                    WHERE public_domain_id = p.id AND certificate_type = 'root'), 0),
+                (SELECT last_event_at FROM public_domain_certificate_progress
+                    WHERE public_domain_id = p.id AND certificate_type = 'root'),
+                (SELECT next_retry_at FROM public_domain_certificate_progress
+                    WHERE public_domain_id = p.id AND certificate_type = 'root'),
+                (SELECT error_code FROM public_domain_certificate_progress
+                    WHERE public_domain_id = p.id AND certificate_type = 'root'),
+                (SELECT error_message FROM public_domain_certificate_progress
+                    WHERE public_domain_id = p.id AND certificate_type = 'root'),
+                COALESCE((SELECT stage FROM public_domain_certificate_progress
+                    WHERE public_domain_id = p.id AND certificate_type = 'wildcard'), 'waiting_configuration'),
+                COALESCE((SELECT attempt_count FROM public_domain_certificate_progress
+                    WHERE public_domain_id = p.id AND certificate_type = 'wildcard'), 0),
+                (SELECT last_event_at FROM public_domain_certificate_progress
+                    WHERE public_domain_id = p.id AND certificate_type = 'wildcard'),
+                (SELECT next_retry_at FROM public_domain_certificate_progress
+                    WHERE public_domain_id = p.id AND certificate_type = 'wildcard'),
+                (SELECT error_code FROM public_domain_certificate_progress
+                    WHERE public_domain_id = p.id AND certificate_type = 'wildcard'),
+                (SELECT error_message FROM public_domain_certificate_progress
+                    WHERE public_domain_id = p.id AND certificate_type = 'wildcard')
          FROM public_domains p {filter}"
     )
+}
+
+#[derive(Debug)]
+struct ManagedDnsDomainConfig {
+    domain: String,
+    target_ipv4: Option<String>,
+    target_ipv6: Option<String>,
+    token: String,
+}
+
+fn cloudflare_api_base() -> String {
+    std::env::var("NEXO_CLOUDFLARE_API_BASE")
+        .unwrap_or_else(|_| "https://api.cloudflare.com/client/v4".to_owned())
+        .trim_end_matches('/')
+        .to_owned()
+}
+
+fn load_managed_dns_config(
+    state: &AppState,
+    tenant_id: &str,
+    id: &str,
+) -> Result<ManagedDnsDomainConfig, ApiError> {
+    let (domain, enabled, ipv4, ipv6, secret_dir): (
+        String,
+        bool,
+        Option<String>,
+        Option<String>,
+        String,
+    ) = state
+        .db
+        .lock()
+        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "数据库锁不可用"))?
+        .query_row(
+            "SELECT domain, dns_management_enabled, dns_target_ipv4,
+                    dns_target_ipv6, secret_dir
+             FROM public_domains WHERE id = ?1 AND tenant_id = ?2",
+            rusqlite::params![id, tenant_id],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get::<_, i64>(1)? != 0,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
+        )
+        .map_err(|_| ApiError::new(StatusCode::NOT_FOUND, "域名不存在"))?;
+    if !enabled {
+        return Err(ApiError::new(
+            StatusCode::CONFLICT,
+            "请先启用“由 Nexo 自动管理 DNS”并保存目标地址",
+        ));
+    }
+    let token_path = if PathBuf::from(&secret_dir).is_absolute() {
+        PathBuf::from(secret_dir)
+    } else {
+        state.data_dir.join(secret_dir)
+    }
+    .join("cloudflare.token");
+    let token = fs::read_to_string(token_path)
+        .map_err(|_| ApiError::new(StatusCode::CONFLICT, "请先配置 Cloudflare API Token"))?;
+    let token = token.trim().to_owned();
+    if token.is_empty() {
+        return Err(ApiError::new(
+            StatusCode::CONFLICT,
+            "Cloudflare API Token 为空",
+        ));
+    }
+    Ok(ManagedDnsDomainConfig {
+        domain,
+        target_ipv4: ipv4,
+        target_ipv6: ipv6,
+        token,
+    })
+}
+
+async fn cloudflare_json(
+    method: reqwest::Method,
+    url: String,
+    token: &str,
+    body: Option<serde_json::Value>,
+) -> Result<serde_json::Value, ApiError> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .build()
+        .map_err(|_| {
+            ApiError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "无法初始化 Cloudflare 客户端",
+            )
+        })?;
+    let mut request = client.request(method, url).bearer_auth(token);
+    if let Some(body) = body {
+        request = request.json(&body);
+    }
+    let response = request.send().await.map_err(|error| {
+        ApiError::new(
+            StatusCode::BAD_GATEWAY,
+            format!("Cloudflare 请求失败：{error}"),
+        )
+    })?;
+    let status = response.status();
+    let value = response
+        .json::<serde_json::Value>()
+        .await
+        .map_err(|_| ApiError::new(StatusCode::BAD_GATEWAY, "Cloudflare 返回了无法解析的响应"))?;
+    let success = value
+        .get("success")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(status.is_success());
+    if !status.is_success() || !success {
+        let details = value
+            .get("errors")
+            .and_then(serde_json::Value::as_array)
+            .map(|errors| {
+                errors
+                    .iter()
+                    .filter_map(|error| error.get("message").and_then(serde_json::Value::as_str))
+                    .collect::<Vec<_>>()
+                    .join("；")
+            })
+            .filter(|message| !message.is_empty())
+            .unwrap_or_else(|| format!("HTTP {status}"));
+        return Err(ApiError::new(
+            StatusCode::BAD_GATEWAY,
+            format!("Cloudflare API 拒绝了操作：{details}"),
+        ));
+    }
+    Ok(value)
+}
+
+async fn build_managed_dns_preview(
+    state: &AppState,
+    tenant_id: &str,
+    id: &str,
+) -> Result<(ManagedDnsPreviewResponse, ManagedDnsDomainConfig, String), ApiError> {
+    let config = load_managed_dns_config(state, tenant_id, id)?;
+    let base = cloudflare_api_base();
+    let zones = reqwest::Client::new()
+        .get(format!("{base}/zones"))
+        .bearer_auth(&config.token)
+        .query(&[("name", config.domain.as_str())])
+        .send()
+        .await
+        .map_err(|error| {
+            ApiError::new(
+                StatusCode::BAD_GATEWAY,
+                format!("无法查询 Cloudflare Zone：{error}"),
+            )
+        })?;
+    let zones_status = zones.status();
+    let zones = zones
+        .json::<serde_json::Value>()
+        .await
+        .map_err(|_| ApiError::new(StatusCode::BAD_GATEWAY, "Cloudflare Zone 响应格式无效"))?;
+    if !zones_status.is_success()
+        || !zones
+            .get("success")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+    {
+        return Err(ApiError::new(
+            StatusCode::BAD_GATEWAY,
+            "Cloudflare Token 无法读取该域名的 Zone，请检查 Zone DNS 权限",
+        ));
+    }
+    let zone = zones
+        .get("result")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|zones| {
+            zones.iter().find(|zone| {
+                zone.get("name").and_then(serde_json::Value::as_str) == Some(config.domain.as_str())
+            })
+        })
+        .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "Cloudflare 中未找到同名 Zone"))?;
+    let zone_id = zone
+        .get("id")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| ApiError::new(StatusCode::BAD_GATEWAY, "Cloudflare Zone 缺少 ID"))?
+        .to_owned();
+    let records = cloudflare_json(
+        reqwest::Method::GET,
+        format!("{base}/zones/{zone_id}/dns_records?per_page=100"),
+        &config.token,
+        None,
+    )
+    .await?;
+    let records = records
+        .get("result")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let changes = plan_managed_dns_changes(
+        &config.domain,
+        config.target_ipv4.as_deref(),
+        config.target_ipv6.as_deref(),
+        &records,
+    );
+    let has_conflicts = changes.iter().any(|change| change.action == "replace");
+    Ok((
+        ManagedDnsPreviewResponse {
+            domain_id: id.to_owned(),
+            zone_name: config.domain.clone(),
+            changes,
+            has_conflicts,
+        },
+        config,
+        zone_id,
+    ))
+}
+
+/// 根据 Cloudflare 当前快照生成纯预览，不修改任何记录。相同内容会接管
+/// record ID；缺失项创建；地址、类型或代理状态不同都必须显式确认替换。
+fn plan_managed_dns_changes(
+    domain: &str,
+    target_ipv4: Option<&str>,
+    target_ipv6: Option<&str>,
+    records: &[serde_json::Value],
+) -> Vec<ManagedDnsChange> {
+    let mut desired = Vec::new();
+    if let Some(ipv4) = target_ipv4 {
+        desired.push(("A", ipv4));
+    }
+    if let Some(ipv6) = target_ipv6 {
+        desired.push(("AAAA", ipv6));
+    }
+    let mut changes = Vec::new();
+    for (record_type, content) in desired {
+        for (record_name, fqdn) in [("@", domain.to_owned()), ("*", format!("*.{domain}"))] {
+            let matches = records
+                .iter()
+                .filter(|record| {
+                    record.get("name").and_then(serde_json::Value::as_str) == Some(fqdn.as_str())
+                })
+                .collect::<Vec<_>>();
+            let exact = matches.iter().find(|record| {
+                record.get("type").and_then(serde_json::Value::as_str) == Some(record_type)
+            });
+            // A 与 AAAA 可以在同一名称共存；只有同类型记录或 CNAME 才是
+            // 当前目标的替换对象，不能为了新增双栈记录误删另一个地址族。
+            let current = exact.copied().or_else(|| {
+                matches.iter().find_map(|record| {
+                    (record.get("type").and_then(serde_json::Value::as_str) == Some("CNAME"))
+                        .then_some(*record)
+                })
+            });
+            let same = exact.is_some_and(|record| {
+                record.get("content").and_then(serde_json::Value::as_str) == Some(content)
+                    && record.get("proxied").and_then(serde_json::Value::as_bool) == Some(false)
+            });
+            let action = if same {
+                "adopt"
+            } else if current.is_some() {
+                "replace"
+            } else {
+                "create"
+            };
+            changes.push(ManagedDnsChange {
+                action: action.to_owned(),
+                record_type: record_type.to_owned(),
+                name: record_name.to_owned(),
+                desired_content: content.to_owned(),
+                current_content: current.and_then(|record| {
+                    record
+                        .get("content")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_owned)
+                }),
+                record_id: current.and_then(|record| {
+                    record
+                        .get("id")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_owned)
+                }),
+            });
+        }
+    }
+    changes
+}
+
+async fn preview_public_domain_dns(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<Json<ManagedDnsPreviewResponse>, ApiError> {
+    let tenant_id = auth::admin_tenant_id(&state, &headers)?;
+    let (preview, _, _) = build_managed_dns_preview(&state, &tenant_id, &id).await?;
+    state
+        .db
+        .lock()
+        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "数据库锁不可用"))?
+        .execute(
+            "UPDATE public_domains SET dns_management_status = ?1,
+             dns_management_error = NULL, updated_at = unixepoch()
+             WHERE id = ?2 AND tenant_id = ?3",
+            rusqlite::params![
+                if preview.has_conflicts {
+                    "conflict"
+                } else {
+                    "previewed"
+                },
+                id,
+                tenant_id
+            ],
+        )
+        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法保存 DNS 预览状态"))?;
+    Ok(Json(preview))
+}
+
+fn record_managed_dns_error(state: &AppState, tenant_id: &str, id: &str, error: &ApiError) {
+    let status = if error.status == StatusCode::CONFLICT {
+        "conflict"
+    } else {
+        "error"
+    };
+    if let Ok(connection) = state.db.lock() {
+        if let Err(update_error) = connection.execute(
+            "UPDATE public_domains SET dns_management_status = ?1,
+             dns_management_error = ?2, updated_at = unixepoch()
+             WHERE id = ?3 AND tenant_id = ?4",
+            rusqlite::params![
+                status,
+                truncate_error_message(&error.message),
+                id,
+                tenant_id
+            ],
+        ) {
+            tracing::warn!("无法保存 DNS 托管错误：{update_error}");
+        }
+    }
+}
+
+async fn apply_managed_dns(
+    state: &AppState,
+    tenant_id: &str,
+    id: &str,
+    confirm_conflicts: bool,
+) -> Result<ManagedDnsPreviewResponse, ApiError> {
+    let (preview, config, zone_id) = build_managed_dns_preview(state, tenant_id, id).await?;
+    if preview.has_conflicts && !confirm_conflicts {
+        let conflicts = preview
+            .changes
+            .iter()
+            .filter(|change| change.action == "replace")
+            .map(|change| {
+                format!(
+                    "{} {}：{} → {}",
+                    change.record_type,
+                    change.name,
+                    change.current_content.as_deref().unwrap_or("空"),
+                    change.desired_content
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("；");
+        return Err(ApiError::new(
+            StatusCode::CONFLICT,
+            format!("DNS 记录存在冲突，请确认后替换：{conflicts}"),
+        ));
+    }
+    let base = cloudflare_api_base();
+    let mut consumed_record_ids = std::collections::HashSet::new();
+    for change in &preview.changes {
+        let fqdn = if change.name == "@" {
+            config.domain.clone()
+        } else {
+            format!("*.{}", config.domain)
+        };
+        let payload = serde_json::json!({
+            "type": change.record_type,
+            "name": fqdn,
+            "content": change.desired_content,
+            "ttl": 1,
+            "proxied": false,
+        });
+        let (record_id, created_by_nexo) =
+            match (change.action.as_str(), change.record_id.as_deref()) {
+                ("adopt", Some(record_id)) => (record_id.to_owned(), false),
+                ("replace", Some(record_id))
+                    if consumed_record_ids.insert(record_id.to_owned()) =>
+                {
+                    let result = cloudflare_json(
+                        reqwest::Method::PUT,
+                        format!("{base}/zones/{zone_id}/dns_records/{record_id}"),
+                        &config.token,
+                        Some(payload),
+                    )
+                    .await?;
+                    (
+                        result
+                            .get("result")
+                            .and_then(|item| item.get("id"))
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or(record_id)
+                            .to_owned(),
+                        false,
+                    )
+                }
+                _ => {
+                    let result = cloudflare_json(
+                        reqwest::Method::POST,
+                        format!("{base}/zones/{zone_id}/dns_records"),
+                        &config.token,
+                        Some(payload),
+                    )
+                    .await?;
+                    let record_id = result
+                        .get("result")
+                        .and_then(|item| item.get("id"))
+                        .and_then(serde_json::Value::as_str)
+                        .ok_or_else(|| {
+                            ApiError::new(
+                                StatusCode::BAD_GATEWAY,
+                                "Cloudflare 创建记录后未返回 record ID",
+                            )
+                        })?;
+                    (record_id.to_owned(), true)
+                }
+            };
+        state
+            .db
+            .lock()
+            .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "数据库锁不可用"))?
+            .execute(
+                "INSERT INTO public_domain_dns_records
+                 (id, public_domain_id, record_type, record_name, cloudflare_record_id,
+                  last_applied_content, apply_status, created_by_nexo, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'ready', ?7, unixepoch())
+                 ON CONFLICT(public_domain_id, record_type, record_name) DO UPDATE SET
+                  cloudflare_record_id = excluded.cloudflare_record_id,
+                  last_applied_content = excluded.last_applied_content,
+                  apply_status = 'ready', apply_error = NULL,
+                  created_by_nexo = CASE
+                    WHEN public_domain_dns_records.created_by_nexo = 1 THEN 1
+                    ELSE excluded.created_by_nexo END,
+                  updated_at = unixepoch()",
+                rusqlite::params![
+                    Uuid::new_v4().to_string(),
+                    id,
+                    change.record_type,
+                    change.name,
+                    record_id,
+                    change.desired_content,
+                    i64::from(created_by_nexo)
+                ],
+            )
+            .map_err(|_| {
+                ApiError::new(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "DNS 已应用但无法保存 record ID",
+                )
+            })?;
+    }
+    state
+        .db
+        .lock()
+        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "数据库锁不可用"))?
+        .execute(
+            "UPDATE public_domains SET dns_management_status = 'ready',
+             dns_management_error = NULL,
+             dns_management_version = dns_management_version + 1,
+             updated_at = unixepoch() WHERE id = ?1 AND tenant_id = ?2",
+            rusqlite::params![id, tenant_id],
+        )
+        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法保存 DNS 托管状态"))?;
+    Ok(preview)
+}
+
+async fn apply_public_domain_dns(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(request): Json<ApplyManagedDnsRequest>,
+) -> Result<Json<ManagedDnsPreviewResponse>, ApiError> {
+    let tenant_id = auth::admin_tenant_id(&state, &headers)?;
+    match apply_managed_dns(&state, &tenant_id, &id, request.confirm_conflicts).await {
+        Ok(preview) => Ok(Json(preview)),
+        Err(error) => {
+            record_managed_dns_error(&state, &tenant_id, &id, &error);
+            Err(error)
+        }
+    }
+}
+
+async fn batch_apply_public_domain_dns(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<ManagedDnsBatchRequest>,
+) -> Result<Json<Vec<ManagedDnsPreviewResponse>>, ApiError> {
+    let tenant_id = auth::admin_tenant_id(&state, &headers)?;
+    let mut applied = Vec::new();
+    for id in request.ids {
+        match apply_managed_dns(&state, &tenant_id, &id, request.confirm_conflicts).await {
+            Ok(preview) => applied.push(preview),
+            Err(error) => {
+                record_managed_dns_error(&state, &tenant_id, &id, &error);
+                return Err(error);
+            }
+        }
+    }
+    Ok(Json(applied))
+}
+
+async fn release_public_domain_dns(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(request): Json<ReleaseManagedDnsRequest>,
+) -> Result<Json<DeleteResponse>, ApiError> {
+    let tenant_id = auth::admin_tenant_id(&state, &headers)?;
+    if !request.delete_created_records {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "未确认删除 Nexo 创建的 DNS 记录；关闭托管默认会保留记录",
+        ));
+    }
+    let (_, config, zone_id) = build_managed_dns_preview(&state, &tenant_id, &id).await?;
+    let tracked = state
+        .db
+        .lock()
+        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "数据库锁不可用"))?
+        .prepare(
+            "SELECT id, record_type, record_name, cloudflare_record_id, last_applied_content
+             FROM public_domain_dns_records
+             WHERE public_domain_id = ?1 AND created_by_nexo = 1",
+        )
+        .and_then(|mut statement| {
+            statement
+                .query_map([&id], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                        row.get::<_, String>(4)?,
+                    ))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()
+        })
+        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法读取受管 DNS 记录"))?;
+    let base = cloudflare_api_base();
+    for (tracked_id, record_type, record_name, record_id, last_content) in tracked {
+        let Some(record_id) = record_id else { continue };
+        let current = cloudflare_json(
+            reqwest::Method::GET,
+            format!("{base}/zones/{zone_id}/dns_records/{record_id}"),
+            &config.token,
+            None,
+        )
+        .await?;
+        let current = current.get("result").cloned().unwrap_or_default();
+        let expected_name = if record_name == "@" {
+            config.domain.clone()
+        } else {
+            format!("*.{}", config.domain)
+        };
+        let still_matches = current.get("type").and_then(serde_json::Value::as_str)
+            == Some(record_type.as_str())
+            && current.get("name").and_then(serde_json::Value::as_str)
+                == Some(expected_name.as_str())
+            && current.get("content").and_then(serde_json::Value::as_str)
+                == Some(last_content.as_str())
+            && current.get("proxied").and_then(serde_json::Value::as_bool) == Some(false);
+        if !still_matches {
+            return Err(ApiError::new(
+                StatusCode::CONFLICT,
+                format!(
+                    "{record_type} {record_name} 已在 Cloudflare 中被修改，为避免误删已停止操作"
+                ),
+            ));
+        }
+        cloudflare_json(
+            reqwest::Method::DELETE,
+            format!("{base}/zones/{zone_id}/dns_records/{record_id}"),
+            &config.token,
+            None,
+        )
+        .await?;
+        state
+            .db
+            .lock()
+            .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "数据库锁不可用"))?
+            .execute(
+                "DELETE FROM public_domain_dns_records WHERE id = ?1",
+                [&tracked_id],
+            )
+            .map_err(|_| {
+                ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法清理 DNS 跟踪记录")
+            })?;
+    }
+    Ok(Json(DeleteResponse {
+        deleted: true,
+        pending: false,
+        id,
+        message: "已删除仍与最后应用内容一致的 Nexo 创建记录；接管的历史记录已保留".to_owned(),
+    }))
 }
 
 async fn list_public_domains(
@@ -4547,7 +5288,6 @@ fn validate_public_domain_options(
     domain: &str,
     https_enabled: bool,
     certificate_mode: &str,
-    acme_environment: &str,
 ) -> Result<(), ApiError> {
     if !https_enabled {
         return Ok(());
@@ -4556,12 +5296,6 @@ fn validate_public_domain_options(
         return Err(ApiError::new(
             StatusCode::BAD_REQUEST,
             "证书模式只能是 manual 或 cloudflare",
-        ));
-    }
-    if !matches!(acme_environment, "staging" | "production") {
-        return Err(ApiError::new(
-            StatusCode::BAD_REQUEST,
-            "ACME 环境只能是 staging 或 production",
         ));
     }
     if domain.is_empty() {
@@ -4573,6 +5307,33 @@ fn validate_public_domain_options(
     Ok(())
 }
 
+/// DNS 托管目标必须由管理员明确填写；不从网卡或请求来源猜测公网地址。
+fn normalize_dns_targets(
+    enabled: bool,
+    ipv4: Option<&str>,
+    ipv6: Option<&str>,
+) -> Result<(Option<String>, Option<String>), ApiError> {
+    let ipv4 = ipv4
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| value.parse::<std::net::Ipv4Addr>().map(|ip| ip.to_string()))
+        .transpose()
+        .map_err(|_| ApiError::new(StatusCode::BAD_REQUEST, "DNS 托管 IPv4 地址无效"))?;
+    let ipv6 = ipv6
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| value.parse::<std::net::Ipv6Addr>().map(|ip| ip.to_string()))
+        .transpose()
+        .map_err(|_| ApiError::new(StatusCode::BAD_REQUEST, "DNS 托管 IPv6 地址无效"))?;
+    if enabled && ipv4.is_none() && ipv6.is_none() {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "启用 DNS 托管时必须填写公网 IPv4 或 IPv6 地址",
+        ));
+    }
+    Ok((ipv4, ipv6))
+}
+
 async fn create_public_domain(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -4581,12 +5342,12 @@ async fn create_public_domain(
     let tenant_id = auth::admin_tenant_id(&state, &headers)?;
     let domain = normalize_public_domain(&request.domain)?;
     let mode = request.certificate_mode.trim().to_ascii_lowercase();
-    let environment = request
-        .acme_environment
-        .unwrap_or_else(|| "production".to_owned())
-        .trim()
-        .to_ascii_lowercase();
-    validate_public_domain_options(&domain, request.https_enabled, &mode, &environment)?;
+    validate_public_domain_options(&domain, request.https_enabled, &mode)?;
+    let (dns_ipv4, dns_ipv6) = normalize_dns_targets(
+        request.dns_management_enabled,
+        request.dns_target_ipv4.as_deref(),
+        request.dns_target_ipv6.as_deref(),
+    )?;
     let id = Uuid::new_v4().to_string();
     let secret_dir = domain_secret_dir(&state, &id);
     let is_primary = {
@@ -4605,8 +5366,10 @@ async fn create_public_domain(
             .execute(
                 "INSERT INTO public_domains
                  (id, tenant_id, domain, is_primary, https_enabled, certificate_mode,
-                  acme_environment, secret_dir, apply_status)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'pending')",
+                  acme_environment, secret_dir, apply_status, dns_management_enabled,
+                  dns_target_ipv4, dns_target_ipv6, dns_management_status)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'production', ?7, 'pending',
+                         ?8, ?9, ?10, ?11)",
                 rusqlite::params![
                     id,
                     tenant_id,
@@ -4614,14 +5377,28 @@ async fn create_public_domain(
                     i64::from(count == 0),
                     i64::from(request.https_enabled),
                     mode,
-                    environment,
                     secret_dir.to_string_lossy().to_string(),
+                    i64::from(request.dns_management_enabled),
+                    dns_ipv4,
+                    dns_ipv6,
+                    if request.dns_management_enabled {
+                        "pending"
+                    } else {
+                        "disabled"
+                    },
                 ],
             )
             .map_err(|error| {
                 tracing::error!("保存公网域名失败：{error}");
                 ApiError::new(StatusCode::CONFLICT, "域名已存在或保存失败")
             })?;
+        connection
+            .execute(
+                "INSERT INTO public_domain_certificate_progress
+                 (public_domain_id, certificate_type) VALUES (?1, 'root'), (?1, 'wildcard')",
+                [&id],
+            )
+            .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法初始化证书进度"))?;
         count == 0
     };
     if is_primary {
@@ -4654,11 +5431,22 @@ async fn update_public_domain(
             .db
             .lock()
             .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "数据库锁不可用"))?;
-        let current: (String, bool, bool, String, String, i64) = connection
+        let current: (
+            String,
+            bool,
+            bool,
+            String,
+            String,
+            i64,
+            bool,
+            Option<String>,
+            Option<String>,
+        ) = connection
             .query_row(
                 "SELECT domain, is_primary, https_enabled, certificate_mode,
                     acme_environment, (SELECT COUNT(*) FROM tunnels t
-                     WHERE t.public_domain_id = public_domains.id AND t.deleted_at IS NULL)
+                     WHERE t.public_domain_id = public_domains.id AND t.deleted_at IS NULL),
+                    dns_management_enabled, dns_target_ipv4, dns_target_ipv6
              FROM public_domains WHERE id = ?1 AND tenant_id = ?2",
                 rusqlite::params![id, tenant_id],
                 |row| {
@@ -4669,6 +5457,9 @@ async fn update_public_domain(
                         row.get(3)?,
                         row.get(4)?,
                         row.get(5)?,
+                        row.get::<_, i64>(6)? != 0,
+                        row.get(7)?,
+                        row.get(8)?,
                     ))
                 },
             )
@@ -4691,14 +5482,21 @@ async fn update_public_domain(
             .unwrap_or_else(|| current.3.clone())
             .trim()
             .to_ascii_lowercase();
-        let environment = request
-            .acme_environment
-            .unwrap_or_else(|| current.4.clone())
-            .trim()
-            .to_ascii_lowercase();
-        validate_public_domain_options(&next_domain, https_enabled, &mode, &environment)?;
-        let reset_certificates =
-            next_domain != current.0 || mode != current.3 || environment != current.4;
+        validate_public_domain_options(&next_domain, https_enabled, &mode)?;
+        let dns_enabled = request.dns_management_enabled.unwrap_or(current.6);
+        let requested_ipv4 = request
+            .dns_target_ipv4
+            .as_ref()
+            .and_then(|value| value.as_deref())
+            .or(current.7.as_deref());
+        let requested_ipv6 = request
+            .dns_target_ipv6
+            .as_ref()
+            .and_then(|value| value.as_deref())
+            .or(current.8.as_deref());
+        let (dns_ipv4, dns_ipv6) =
+            normalize_dns_targets(dns_enabled, requested_ipv4, requested_ipv6)?;
+        let reset_certificates = next_domain != current.0 || mode != current.3;
         let revision = connection
             .query_row(
                 "SELECT desired_revision FROM public_domains WHERE id = ?1",
@@ -4710,29 +5508,48 @@ async fn update_public_domain(
         connection
             .execute(
                 "UPDATE public_domains SET domain = ?1, https_enabled = ?2,
-             certificate_mode = ?3, acme_environment = ?4, desired_revision = ?5,
+             certificate_mode = ?3, acme_environment = 'production', desired_revision = ?4,
              apply_status = 'checking', apply_error = NULL, error_code = NULL,
-             root_certificate_status = CASE WHEN ?8 = 1 THEN 'pending' ELSE root_certificate_status END,
-             wildcard_certificate_status = CASE WHEN ?8 = 1 THEN 'pending' ELSE wildcard_certificate_status END,
-             root_certificate_not_before = CASE WHEN ?8 = 1 THEN NULL ELSE root_certificate_not_before END,
-             root_certificate_not_after = CASE WHEN ?8 = 1 THEN NULL ELSE root_certificate_not_after END,
-             wildcard_certificate_not_before = CASE WHEN ?8 = 1 THEN NULL ELSE wildcard_certificate_not_before END,
-             wildcard_certificate_not_after = CASE WHEN ?8 = 1 THEN NULL ELSE wildcard_certificate_not_after END,
-             root_certificate_subjects_json = CASE WHEN ?8 = 1 THEN '[]' ELSE root_certificate_subjects_json END,
-             wildcard_certificate_subjects_json = CASE WHEN ?8 = 1 THEN '[]' ELSE wildcard_certificate_subjects_json END,
-             updated_at = unixepoch() WHERE id = ?6 AND tenant_id = ?7",
+             root_certificate_status = CASE WHEN ?7 = 1 THEN 'pending' ELSE root_certificate_status END,
+             wildcard_certificate_status = CASE WHEN ?7 = 1 THEN 'pending' ELSE wildcard_certificate_status END,
+             root_certificate_not_before = CASE WHEN ?7 = 1 THEN NULL ELSE root_certificate_not_before END,
+             root_certificate_not_after = CASE WHEN ?7 = 1 THEN NULL ELSE root_certificate_not_after END,
+             wildcard_certificate_not_before = CASE WHEN ?7 = 1 THEN NULL ELSE wildcard_certificate_not_before END,
+             wildcard_certificate_not_after = CASE WHEN ?7 = 1 THEN NULL ELSE wildcard_certificate_not_after END,
+             root_certificate_subjects_json = CASE WHEN ?7 = 1 THEN '[]' ELSE root_certificate_subjects_json END,
+             wildcard_certificate_subjects_json = CASE WHEN ?7 = 1 THEN '[]' ELSE wildcard_certificate_subjects_json END,
+             dns_management_enabled = ?8, dns_target_ipv4 = ?9, dns_target_ipv6 = ?10,
+             dns_management_status = CASE WHEN ?8 = 1 THEN 'pending' ELSE 'disabled' END,
+             dns_management_error = NULL,
+             updated_at = unixepoch() WHERE id = ?5 AND tenant_id = ?6",
                 rusqlite::params![
                     next_domain,
                     i64::from(https_enabled),
                     mode,
-                    environment,
                     revision,
                     id,
                     tenant_id,
-                    i64::from(reset_certificates)
+                    i64::from(reset_certificates),
+                    i64::from(dns_enabled),
+                    dns_ipv4,
+                    dns_ipv6,
                 ],
             )
             .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法保存域名设置"))?;
+        if reset_certificates {
+            connection
+                .execute(
+                    "UPDATE public_domain_certificate_progress
+                     SET stage = 'waiting_configuration', attempt_count = 0,
+                         last_event_at = NULL, next_retry_at = NULL,
+                         error_code = NULL, error_message = NULL, updated_at = unixepoch()
+                     WHERE public_domain_id = ?1",
+                    [&id],
+                )
+                .map_err(|_| {
+                    ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法重置证书进度")
+                })?;
+        }
         revision
     };
     reconcile_caddy_config_best_effort(&state).await;
@@ -4932,7 +5749,9 @@ async fn upload_public_domain_credentials(
             )
             .map_err(|_| ApiError::new(StatusCode::NOT_FOUND, "域名不存在"))?
     };
-    match mode.as_str() {
+    // 先完成全部模式和证书校验，再触碰 Secret 文件。这样即使同一请求还
+    // 携带 Cloudflare Token，证书错误也不会留下部分生效的凭据。
+    let certificate_metadata = match mode.as_str() {
         "cloudflare" => {
             if request.certificate_pem.is_some() || request.private_key_pem.is_some() {
                 return Err(ApiError::new(
@@ -4940,35 +5759,70 @@ async fn upload_public_domain_credentials(
                     "Cloudflare DNS-01 模式不能上传手动证书",
                 ));
             }
-            if let Some(token) = request.cloudflare_token.as_deref() {
-                write_secret_file(
-                    &domain_secret_dir(&state, &id).join("cloudflare.token"),
-                    token,
-                )?;
-            }
+            None
         }
         "manual" => {
-            if request.cloudflare_token.is_some() {
-                return Err(ApiError::new(
-                    StatusCode::BAD_REQUEST,
-                    "手动证书模式不能上传 Cloudflare Token",
-                ));
-            }
-            if let (Some(certificate), Some(private_key)) = (
+            match (
                 request.certificate_pem.as_deref(),
                 request.private_key_pem.as_deref(),
             ) {
-                let metadata =
-                    validate_certificate_pair_for_domain(certificate, private_key, Some(&domain))?;
-                let directory = domain_secret_dir(&state, &id);
-                write_secret_file(&directory.join("certificate.pem"), certificate)?;
-                write_secret_file(&directory.join("private-key.pem"), private_key)?;
-                let subjects =
-                    serde_json::to_string(&metadata.subjects).unwrap_or_else(|_| "[]".to_owned());
-                let connection = state.db.lock().map_err(|_| {
-                    ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "数据库锁不可用")
-                })?;
-                connection
+                (Some(certificate), Some(private_key)) => Some(
+                    validate_certificate_pair_for_domain(certificate, private_key, Some(&domain))?,
+                ),
+                (None, None) => None,
+                _ => {
+                    return Err(ApiError::new(
+                        StatusCode::BAD_REQUEST,
+                        "证书和私钥必须同时提供",
+                    ));
+                }
+            }
+        }
+        _ => {
+            return Err(ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "证书模式无效，请先保存域名设置",
+            ));
+        }
+    };
+    if request
+        .cloudflare_token
+        .as_deref()
+        .is_some_and(|token| token.trim().is_empty())
+    {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "Cloudflare Token 不能为空",
+        ));
+    }
+
+    let directory = domain_secret_dir(&state, &id);
+    let mut secret_rollbacks = Vec::new();
+    // Cloudflare Token 同时服务于自动证书 DNS-01 和可选 DNS 托管，
+    // 因此它不再与证书来源绑定；手动证书域名也可以保存 Token。
+    if let Some(token) = request.cloudflare_token.as_deref() {
+        let path = directory.join("cloudflare.token");
+        capture_secret_rollback(&mut secret_rollbacks, &path);
+        write_secret_file(&path, token)?;
+    }
+    if let (Some(certificate), Some(private_key), Some(metadata)) = (
+        request.certificate_pem.as_deref(),
+        request.private_key_pem.as_deref(),
+        certificate_metadata.as_ref(),
+    ) {
+        let certificate_path = directory.join("certificate.pem");
+        let private_key_path = directory.join("private-key.pem");
+        capture_secret_rollback(&mut secret_rollbacks, &certificate_path);
+        capture_secret_rollback(&mut secret_rollbacks, &private_key_path);
+        write_secret_file(&certificate_path, certificate)?;
+        write_secret_file(&private_key_path, private_key)?;
+        let subjects =
+            serde_json::to_string(&metadata.subjects).unwrap_or_else(|_| "[]".to_owned());
+        let connection = state
+            .db
+            .lock()
+            .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "数据库锁不可用"))?;
+        connection
                     .execute(
                         "UPDATE public_domains SET root_certificate_status = 'ready',
                          wildcard_certificate_status = 'ready', root_certificate_not_before = ?1,
@@ -4988,19 +5842,16 @@ async fn upload_public_domain_credentials(
                     .map_err(|_| {
                         ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法保存证书元数据")
                     })?;
-            } else if request.certificate_pem.is_some() || request.private_key_pem.is_some() {
-                return Err(ApiError::new(
-                    StatusCode::BAD_REQUEST,
-                    "证书和私钥必须同时提供",
-                ));
-            }
-        }
-        _ => {
-            return Err(ApiError::new(
-                StatusCode::BAD_REQUEST,
-                "证书模式无效，请先保存域名设置",
-            ));
-        }
+        connection
+            .execute(
+                "UPDATE public_domain_certificate_progress
+                         SET stage = 'active', last_event_at = unixepoch(),
+                             next_retry_at = NULL, error_code = NULL,
+                             error_message = NULL, updated_at = unixepoch()
+                         WHERE public_domain_id = ?1",
+                [&id],
+            )
+            .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法保存证书进度"))?;
     }
     {
         let connection = state
@@ -5023,14 +5874,20 @@ async fn upload_public_domain_credentials(
         .db
         .lock()
         .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "数据库锁不可用"))?;
-    connection
+    let response = connection
         .query_row(
             &public_domain_query_ordered("WHERE p.id = ?1 AND p.tenant_id = ?2"),
             rusqlite::params![id, tenant_id],
             public_domain_response_from_row,
         )
         .map(Json)
-        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法读取域名证书状态"))
+        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法读取域名证书状态"));
+    if response.is_ok() {
+        for rollback in &mut secret_rollbacks {
+            rollback.commit();
+        }
+    }
+    response
 }
 
 async fn recheck_public_domain(
@@ -5039,14 +5896,22 @@ async fn recheck_public_domain(
     Path(id): Path<String>,
 ) -> Result<Json<PublicDomainResponse>, ApiError> {
     let tenant_id = auth::admin_tenant_id(&state, &headers)?;
-    let (domain, https_enabled, is_primary, certificate_mode, previous_retry_after) = {
+    let (
+        domain,
+        https_enabled,
+        is_primary,
+        certificate_mode,
+        previous_retry_after,
+        dns_management_enabled,
+    ) = {
         let connection = state
             .db
             .lock()
             .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "数据库锁不可用"))?;
         connection
             .query_row(
-                "SELECT domain, https_enabled, is_primary, certificate_mode, retry_after
+                "SELECT domain, https_enabled, is_primary, certificate_mode, retry_after,
+                        dns_management_enabled
                  FROM public_domains WHERE id = ?1 AND tenant_id = ?2",
                 rusqlite::params![id, tenant_id],
                 |row| {
@@ -5056,6 +5921,7 @@ async fn recheck_public_domain(
                         row.get::<_, i64>(2)? != 0,
                         row.get::<_, String>(3)?,
                         row.get::<_, Option<i64>>(4)?,
+                        row.get::<_, i64>(5)? != 0,
                     ))
                 },
             )
@@ -5064,45 +5930,84 @@ async fn recheck_public_domain(
     let root = lookup_public_dns(&domain).await;
     let wildcard = lookup_public_dns(&format!("nexo.{domain}")).await;
     let dns = build_dns_check(&domain, root, wildcard);
-    let tls_ready = !https_enabled || !is_primary || probe_public_https(&domain).await;
-    let certificate_metadata = if https_enabled {
-        if certificate_mode.eq_ignore_ascii_case("manual") {
-            let certificate_path = domain_secret_dir(&state, &id).join("certificate.pem");
-            let private_key_path = domain_secret_dir(&state, &id).join("private-key.pem");
-            match (
-                fs::read_to_string(certificate_path),
-                fs::read_to_string(private_key_path),
-            ) {
-                (Ok(certificate), Ok(private_key)) => {
-                    validate_certificate_pair_for_domain(&certificate, &private_key, Some(&domain))
-                        .ok()
-                }
-                _ => None,
+    // 页面轮询只读检查 Cloudflare 漂移，不在后台覆盖用户手工修改。
+    let managed_dns_check = if dns_management_enabled {
+        match build_managed_dns_preview(&state, &tenant_id, &id).await {
+            Ok((preview, _, _))
+                if preview
+                    .changes
+                    .iter()
+                    .all(|change| change.action == "adopt") =>
+            {
+                ("ready".to_owned(), None)
             }
+            Ok(_) => (
+                "drifted".to_owned(),
+                Some("Cloudflare 记录与 Nexo 目标不一致，请查看预览后手动同步".to_owned()),
+            ),
+            Err(error) => ("error".to_owned(), Some(error.message)),
+        }
+    } else {
+        ("disabled".to_owned(), None)
+    };
+    let tls_ready = !https_enabled || !is_primary || probe_public_https(&domain).await;
+    let manual_certificate_metadata = if https_enabled
+        && certificate_mode.eq_ignore_ascii_case("manual")
+    {
+        let certificate_path = domain_secret_dir(&state, &id).join("certificate.pem");
+        let private_key_path = domain_secret_dir(&state, &id).join("private-key.pem");
+        match (
+            fs::read_to_string(certificate_path),
+            fs::read_to_string(private_key_path),
+        ) {
+            (Ok(certificate), Ok(private_key)) => {
+                validate_certificate_pair_for_domain(&certificate, &private_key, Some(&domain)).ok()
+            }
+            _ => None,
+        }
+    } else {
+        None
+    };
+    let root_certificate_metadata = if https_enabled {
+        if certificate_mode.eq_ignore_ascii_case("manual") {
+            manual_certificate_metadata.clone()
         } else {
             find_caddy_certificate_metadata(&state.data_dir, &domain)
         }
     } else {
         None
     };
+    let wildcard_certificate_metadata = if https_enabled {
+        if certificate_mode.eq_ignore_ascii_case("manual") {
+            manual_certificate_metadata
+        } else {
+            find_caddy_certificate_metadata(&state.data_dir, &format!("*.{domain}"))
+        }
+    } else {
+        None
+    };
     let now = unix_now();
-    let certificate_current = certificate_metadata
-        .as_ref()
-        .is_some_and(|metadata| metadata.not_before <= now && metadata.not_after > now);
-    let certificate_expired = certificate_metadata
-        .as_ref()
-        .is_some_and(|metadata| metadata.not_after <= now);
-    let certificate_ready = !https_enabled || certificate_current;
+    let certificate_status = |metadata: &Option<CertificateMetadata>| {
+        if !https_enabled
+            || metadata
+                .as_ref()
+                .is_some_and(|item| item.not_before <= now && item.not_after > now)
+        {
+            "ready"
+        } else if metadata.as_ref().is_some_and(|item| item.not_after <= now) {
+            "expired"
+        } else {
+            "pending"
+        }
+    };
+    let root_certificate_status = certificate_status(&root_certificate_metadata);
+    let wildcard_certificate_status = certificate_status(&wildcard_certificate_metadata);
+    let certificate_ready = !https_enabled
+        || (root_certificate_status == "ready" && wildcard_certificate_status == "ready");
+    let certificate_expired =
+        root_certificate_status == "expired" || wildcard_certificate_status == "expired";
     let rate_limited =
         !certificate_ready && previous_retry_after.is_some_and(|retry_after| retry_after > now);
-    let root_certificate_status = if !https_enabled || certificate_current {
-        "ready"
-    } else if certificate_expired {
-        "expired"
-    } else {
-        "pending"
-    };
-    let wildcard_certificate_status = root_certificate_status;
     let apply_status = if !https_enabled || (certificate_ready && tls_ready) {
         "ready"
     } else if rate_limited {
@@ -5116,10 +6021,8 @@ async fn recheck_public_domain(
         Some("CA 限流窗口尚未结束，Caddy 将按官方退避自动重试")
     } else if certificate_expired {
         Some("证书已过期，Caddy 将按 Automatic HTTPS 规则自动续期")
-    } else if certificate_metadata.is_some() {
-        Some("证书已找到但尚未生效，Caddy 将自动重试")
     } else {
-        Some("尚未找到同时覆盖根域名和泛域名的证书，Caddy 将自动重试")
+        Some("根域名或泛域名证书尚未签发，Caddy 将自动重试")
     };
     let error_code = if apply_status == "ready" {
         None
@@ -5135,9 +6038,11 @@ async fn recheck_public_domain(
     let next_retry_at = (apply_status == "rate_limited")
         .then(|| previous_retry_after.filter(|retry_after| *retry_after > now))
         .flatten();
-    let certificate_subjects = certificate_metadata
-        .as_ref()
-        .and_then(|metadata| serde_json::to_string(&metadata.subjects).ok());
+    let certificate_json = |metadata: &Option<CertificateMetadata>| {
+        metadata
+            .as_ref()
+            .and_then(|item| serde_json::to_string(&item.subjects).ok())
+    };
     {
         let connection = state
             .db
@@ -5147,15 +6052,16 @@ async fn recheck_public_domain(
             .execute(
                 "UPDATE public_domains SET dns_check_json = ?1,
              root_certificate_status = ?2, wildcard_certificate_status = ?3,
-             apply_status = ?4, apply_error = ?5, error_code = ?6,
-             root_certificate_not_before = COALESCE(?7, root_certificate_not_before),
-             root_certificate_not_after = COALESCE(?8, root_certificate_not_after),
-             root_certificate_subjects_json = COALESCE(?9, root_certificate_subjects_json),
-             wildcard_certificate_not_before = COALESCE(?7, wildcard_certificate_not_before),
-             wildcard_certificate_not_after = COALESCE(?8, wildcard_certificate_not_after),
-             wildcard_certificate_subjects_json = COALESCE(?9, wildcard_certificate_subjects_json),
-             retry_after = ?10, next_retry_at = ?10,
-             updated_at = unixepoch() WHERE id = ?11 AND tenant_id = ?12",
+             apply_status = ?4,
+             apply_error = CASE WHEN ?4 = 'ready' THEN NULL ELSE COALESCE(apply_error, ?5) END,
+             error_code = CASE WHEN ?4 = 'ready' THEN NULL ELSE COALESCE(error_code, ?6) END,
+             root_certificate_not_before = ?7, root_certificate_not_after = ?8,
+             root_certificate_subjects_json = COALESCE(?9, '[]'),
+             wildcard_certificate_not_before = ?10, wildcard_certificate_not_after = ?11,
+             wildcard_certificate_subjects_json = COALESCE(?12, '[]'),
+             retry_after = ?13, next_retry_at = ?13,
+             dns_management_status = ?14, dns_management_error = ?15,
+             updated_at = unixepoch() WHERE id = ?16 AND tenant_id = ?17",
                 rusqlite::params![
                     dns.to_string(),
                     root_certificate_status,
@@ -5163,14 +6069,23 @@ async fn recheck_public_domain(
                     apply_status,
                     apply_error,
                     error_code,
-                    certificate_metadata
+                    root_certificate_metadata
                         .as_ref()
                         .map(|metadata| metadata.not_before),
-                    certificate_metadata
+                    root_certificate_metadata
                         .as_ref()
                         .map(|metadata| metadata.not_after),
-                    certificate_subjects,
+                    certificate_json(&root_certificate_metadata),
+                    wildcard_certificate_metadata
+                        .as_ref()
+                        .map(|metadata| metadata.not_before),
+                    wildcard_certificate_metadata
+                        .as_ref()
+                        .map(|metadata| metadata.not_after),
+                    certificate_json(&wildcard_certificate_metadata),
                     next_retry_at,
+                    managed_dns_check.0,
+                    managed_dns_check.1,
                     id,
                     tenant_id,
                 ],
@@ -5178,6 +6093,35 @@ async fn recheck_public_domain(
             .map_err(|_| {
                 ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法保存 DNS 检查结果")
             })?;
+        for (certificate_type, certificate_status) in [
+            ("root", root_certificate_status),
+            ("wildcard", wildcard_certificate_status),
+        ] {
+            connection
+                .execute(
+                    "UPDATE public_domain_certificate_progress SET
+                     stage = CASE WHEN ?1 = 'ready' THEN 'active'
+                         WHEN ?2 = 'rate_limited' THEN 'retry_wait'
+                         WHEN stage IN ('active', 'issued') THEN 'waiting_configuration'
+                         ELSE stage END,
+                     next_retry_at = ?3,
+                     last_event_at = CASE WHEN ?1 = 'ready' THEN unixepoch() ELSE last_event_at END,
+                     error_code = CASE WHEN ?1 = 'ready' THEN NULL ELSE error_code END,
+                     error_message = CASE WHEN ?1 = 'ready' THEN NULL ELSE error_message END,
+                     updated_at = unixepoch()
+                     WHERE public_domain_id = ?4 AND certificate_type = ?5",
+                    rusqlite::params![
+                        certificate_status,
+                        apply_status,
+                        next_retry_at,
+                        id,
+                        certificate_type
+                    ],
+                )
+                .map_err(|_| {
+                    ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法保存证书进度")
+                })?;
+        }
     }
     reconcile_caddy_config_best_effort(&state).await;
     let connection = state
@@ -5326,6 +6270,18 @@ async fn renew_public_domains(
                 )
                 .map_err(|_| {
                     ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法更新域名续期任务")
+                })?;
+            connection
+                .execute(
+                    "UPDATE public_domain_certificate_progress
+                     SET stage = 'waiting_configuration', attempt_count = attempt_count + 1,
+                         last_event_at = unixepoch(), next_retry_at = NULL,
+                         error_code = NULL, error_message = NULL, updated_at = unixepoch()
+                     WHERE public_domain_id = ?1",
+                    [id],
+                )
+                .map_err(|_| {
+                    ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法更新证书申请进度")
                 })?;
         }
     }
@@ -5654,10 +6610,10 @@ fn load_caddy_desired_config_with_readiness(
                     .to_string()
             });
             Ok(caddy::CaddyBoundTunnel {
-                domain: row.get::<_, Option<String>>(5)?.unwrap_or_else(|| {
+                domain_id: row.get::<_, Option<String>>(5)?.unwrap_or_else(|| {
                     domains
                         .first()
-                        .map(|domain| domain.domain.clone())
+                        .map(|domain| domain.id.clone())
                         .unwrap_or_default()
                 }),
                 tunnel: caddy::CaddyTunnel {
@@ -5694,10 +6650,10 @@ fn load_caddy_desired_config_with_readiness(
         }
         let aliases = tunnels
             .iter()
-            .filter(|tunnel| tunnel.domain == to_domain.domain)
+            .filter(|tunnel| tunnel.domain_id == to_domain.id)
             .cloned()
             .map(|mut tunnel| {
-                tunnel.domain = from_domain.domain.clone();
+                tunnel.domain_id = from_domain.id.clone();
                 tunnel
             })
             .collect::<Vec<_>>();
@@ -5830,9 +6786,8 @@ async fn reconcile_caddy_config_best_effort(state: &AppState) {
     refresh_all_tunnel_readiness(state).await;
 }
 
-/// 将 Caddy 日志中的 ACME 429 投影为域名级的等待窗口。Server 不会自行
-/// 重新发起 ACME 订单；窗口只用于 UI，真正的指数退避和下一次尝试仍由
-/// Caddy 的自动 HTTPS 维护器决定。
+/// 将 Caddy 日志投影为根域名/泛域名的阶段轨迹。Server 不会自行发起
+/// ACME 订单；这里只记录 Caddy 已公开的阶段、错误和下次尝试时间。
 fn apply_caddy_log_events(state: &AppState, events: &[caddy::CaddyLogEvent]) -> Result<()> {
     let connection = state
         .db
@@ -5851,31 +6806,79 @@ fn apply_caddy_log_events(state: &AppState, events: &[caddy::CaddyLogEvent]) -> 
             Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
-    for event in events.iter().filter(|event| event.is_rate_limited()) {
-        let Some(identifier) = event.identifier.as_deref() else {
-            tracing::warn!("Caddy 报告了未标识域名的 CA 限流：{}", event.message);
+    for event in events {
+        let Some(stage) = event.certificate_stage() else {
             continue;
         };
-        let identifier = identifier
-            .trim()
-            .trim_start_matches("*.")
-            .trim_end_matches('.')
-            .to_ascii_lowercase();
-        let retry_after = event
+        let normalized_identifier = event
+            .identifier
+            .as_deref()
+            .map(|identifier| identifier.trim().trim_end_matches('.').to_ascii_lowercase());
+        let lower_message = event.message.to_ascii_lowercase();
+        let retry_at = event
             .retry_after_secs
-            .map(|seconds| unix_now().saturating_add(i64::try_from(seconds).unwrap_or(i64::MAX)))
-            .unwrap_or_else(|| unix_now().saturating_add(60 * 60));
-        for (id, _domain) in domains.iter().filter(|(_, domain)| {
-            identifier == domain.as_str() || identifier.ends_with(&format!(".{domain}"))
+            .map(|seconds| unix_now().saturating_add(i64::try_from(seconds).unwrap_or(i64::MAX)));
+        for (id, domain) in domains.iter().filter(|(_, domain)| {
+            normalized_identifier.as_ref().is_some_and(|identifier| {
+                identifier == domain || identifier == &format!("*.{domain}")
+            }) || lower_message.contains(domain.as_str())
         }) {
+            let wildcard_identifier = format!("*.{domain}");
+            let certificate_type = if normalized_identifier.as_deref()
+                == Some(wildcard_identifier.as_str())
+                || lower_message.contains(&wildcard_identifier)
+            {
+                "wildcard"
+            } else {
+                "root"
+            };
+            let is_error = matches!(stage, "retry_wait" | "failed");
             connection.execute(
-                "UPDATE public_domains SET apply_status = 'rate_limited',
-                 apply_error = ?1, error_code = 'acme_rate_limited', retry_after = ?2,
-                 next_retry_at = ?2, attempt_count = attempt_count + 1,
-                 updated_at = unixepoch() WHERE id = ?3 AND tenant_id = ?4",
+                "UPDATE public_domain_certificate_progress
+                 SET stage = ?1,
+                     attempt_count = attempt_count + CASE
+                         WHEN ?1 IN ('waiting_configuration', 'presenting_dns') THEN 1 ELSE 0 END,
+                     last_event_at = unixepoch(), next_retry_at = ?2,
+                     error_code = CASE WHEN ?3 = 1 THEN ?4 ELSE NULL END,
+                     error_message = CASE WHEN ?3 = 1 THEN ?5 ELSE NULL END,
+                     updated_at = unixepoch()
+                 WHERE public_domain_id = ?6 AND certificate_type = ?7",
                 rusqlite::params![
+                    stage,
+                    retry_at,
+                    i64::from(is_error),
+                    if event.is_rate_limited() {
+                        "acme_rate_limited"
+                    } else {
+                        "acme_failed"
+                    },
                     truncate_error_message(&event.message),
-                    retry_after,
+                    id,
+                    certificate_type,
+                ],
+            )?;
+            if !is_error {
+                continue;
+            }
+            let rate_limited = event.is_rate_limited();
+            connection.execute(
+                "UPDATE public_domains SET apply_status = ?1,
+                 apply_error = ?2, error_code = ?3, retry_after = ?4,
+                 next_retry_at = ?4, attempt_count = attempt_count + 1,
+                 updated_at = unixepoch() WHERE id = ?5 AND tenant_id = ?6",
+                rusqlite::params![
+                    if rate_limited {
+                        "rate_limited"
+                    } else {
+                        "retrying"
+                    },
+                    truncate_error_message(&event.message),
+                    if rate_limited {
+                        "acme_rate_limited"
+                    } else {
+                        "acme_failed"
+                    },
+                    retry_at,
                     id,
                     tenant_id,
                 ],
@@ -5949,8 +6952,8 @@ fn update_public_domain_apply_states(state: &AppState, error: Option<&str>) -> R
 /// 从 Caddy 持久化 storage 同步自动证书的公开元数据。
 ///
 /// Caddy 的 ACME 维护器在后台签发和续期，Server 不另起重试器；每次
-/// 配置协调时只扫描本地 storage 中覆盖根域名与泛域名的叶子证书，更新
-/// 到期时间和 SAN。这样容器重启或页面轮询后，UI 看到的是实际证书状态。
+/// 配置协调时分别扫描根域名和泛域名叶子证书。Caddy 会为两类标识维护
+/// 独立证书，不能要求一张证书同时包含两类 SAN。
 fn sync_caddy_certificate_metadata(state: &AppState) -> Result<()> {
     let domains = {
         let connection = state
@@ -5969,67 +6972,86 @@ fn sync_caddy_certificate_metadata(state: &AppState) -> Result<()> {
         rows
     };
     let now = unix_now();
-    let mut updates = Vec::new();
-    for (id, domain) in domains {
-        let Some(metadata) = find_caddy_certificate_metadata(&state.data_dir, &domain) else {
-            // storage 中没有匹配证书时不能保留旧的 READY 状态；否则管理界面
-            // 会把已经被清理的证书误报为可用，手动申请按钮也会失去意义。
-            updates.push((
-                id,
-                "pending",
-                None,
-                None,
-                "[]".to_owned(),
-                "Caddy storage 中尚未找到同时覆盖根域名和泛域名的证书，Caddy 将自动重试".to_owned(),
-                "certificate_pending",
-            ));
-            continue;
-        };
-        let (status, message, error_code) = if metadata.not_before <= now
-            && metadata.not_after > now
-        {
-            ("ready", String::new(), "")
-        } else {
-            (
-                "expired",
-                "Caddy storage 中的证书已过期，Caddy 将按 Automatic HTTPS 规则自动续期".to_owned(),
-                "certificate_expired",
-            )
-        };
-        let subjects =
-            serde_json::to_string(&metadata.subjects).unwrap_or_else(|_| "[]".to_owned());
-        updates.push((
-            id,
-            status,
-            Some(metadata.not_before),
-            Some(metadata.not_after),
-            subjects,
-            message,
-            error_code,
-        ));
-    }
-    if updates.is_empty() {
-        return Ok(());
-    }
     let connection = state
         .db
         .lock()
         .map_err(|_| anyhow::anyhow!("数据库锁不可用"))?;
-    for (id, status, not_before, not_after, subjects, message, error_code) in updates {
+    for (id, domain) in domains {
+        let root = find_caddy_certificate_metadata(&state.data_dir, &domain);
+        let wildcard = find_caddy_certificate_metadata(&state.data_dir, &format!("*.{domain}"));
+        let status = |metadata: &Option<CertificateMetadata>| {
+            if metadata
+                .as_ref()
+                .is_some_and(|item| item.not_before <= now && item.not_after > now)
+            {
+                "ready"
+            } else if metadata.as_ref().is_some_and(|item| item.not_after <= now) {
+                "expired"
+            } else {
+                "pending"
+            }
+        };
+        let root_status = status(&root);
+        let wildcard_status = status(&wildcard);
+        let metadata_fields = |metadata: &Option<CertificateMetadata>| {
+            (
+                metadata.as_ref().map(|item| item.not_before),
+                metadata.as_ref().map(|item| item.not_after),
+                metadata
+                    .as_ref()
+                    .and_then(|item| serde_json::to_string(&item.subjects).ok())
+                    .unwrap_or_else(|| "[]".to_owned()),
+            )
+        };
+        let (root_not_before, root_not_after, root_subjects) = metadata_fields(&root);
+        let (wildcard_not_before, wildcard_not_after, wildcard_subjects) =
+            metadata_fields(&wildcard);
+        let all_ready = root_status == "ready" && wildcard_status == "ready";
         connection.execute(
             "UPDATE public_domains SET
-             root_certificate_status = ?1, wildcard_certificate_status = ?1,
-             root_certificate_not_before = ?2, root_certificate_not_after = ?3,
-             wildcard_certificate_not_before = ?2, wildcard_certificate_not_after = ?3,
-             root_certificate_subjects_json = ?4, wildcard_certificate_subjects_json = ?4,
-             apply_status = CASE WHEN ?1 = 'ready' THEN apply_status
+             root_certificate_status = ?1, wildcard_certificate_status = ?2,
+             root_certificate_not_before = ?3, root_certificate_not_after = ?4,
+             root_certificate_subjects_json = ?5,
+             wildcard_certificate_not_before = ?6, wildcard_certificate_not_after = ?7,
+             wildcard_certificate_subjects_json = ?8,
+             apply_status = CASE WHEN ?9 = 1 THEN 'ready'
                  WHEN retry_after IS NOT NULL AND retry_after > unixepoch() THEN 'rate_limited'
                  ELSE 'retrying' END,
-             apply_error = CASE WHEN ?1 = 'ready' THEN NULL ELSE ?5 END,
-             error_code = CASE WHEN ?1 = 'ready' THEN NULL ELSE ?6 END,
-             updated_at = unixepoch() WHERE id = ?7",
-            rusqlite::params![status, not_before, not_after, subjects, message, error_code, id],
+             apply_error = CASE WHEN ?9 = 1 THEN NULL
+                 ELSE COALESCE(apply_error, '根域名或泛域名证书尚未签发，Caddy 将自动重试') END,
+             error_code = CASE WHEN ?9 = 1 THEN NULL
+                 ELSE COALESCE(error_code, 'certificate_pending') END,
+             updated_at = unixepoch() WHERE id = ?10",
+            rusqlite::params![
+                root_status,
+                wildcard_status,
+                root_not_before,
+                root_not_after,
+                root_subjects,
+                wildcard_not_before,
+                wildcard_not_after,
+                wildcard_subjects,
+                i64::from(all_ready),
+                id,
+            ],
         )?;
+        for (certificate_type, certificate_status) in
+            [("root", root_status), ("wildcard", wildcard_status)]
+        {
+            connection.execute(
+                "UPDATE public_domain_certificate_progress
+                 SET stage = CASE WHEN ?1 = 'ready' THEN 'active'
+                         WHEN ?1 = 'expired' THEN 'retry_wait'
+                         WHEN stage IN ('active', 'issued') THEN 'waiting_configuration'
+                         ELSE stage END,
+                     last_event_at = CASE WHEN ?1 = 'ready' THEN unixepoch() ELSE last_event_at END,
+                     error_code = CASE WHEN ?1 = 'ready' THEN NULL ELSE error_code END,
+                     error_message = CASE WHEN ?1 = 'ready' THEN NULL ELSE error_message END,
+                     updated_at = unixepoch()
+                 WHERE public_domain_id = ?2 AND certificate_type = ?3",
+                rusqlite::params![certificate_status, id, certificate_type],
+            )?;
+        }
     }
     Ok(())
 }
@@ -6227,13 +7249,13 @@ fn parse_certificate_metadata(
 /// 从 Caddy file_system storage 找到覆盖根域名与泛域名的最新证书。
 /// Caddy 的目录布局由发行版维护，因此不依赖固定的文件名，只读取
 /// `.crt`/`.pem` 文件并以 SAN 判断归属；找不到时保留原有状态。
-fn find_caddy_certificate_metadata(data_dir: &FsPath, domain: &str) -> Option<CertificateMetadata> {
+fn find_caddy_certificate_metadata(
+    data_dir: &FsPath,
+    identifier: &str,
+) -> Option<CertificateMetadata> {
     let mut pending = vec![data_dir.join("caddy-storage")];
     let mut latest = None;
-    let wildcard = format!(
-        "*.{}",
-        domain.trim().trim_end_matches('.').to_ascii_lowercase()
-    );
+    let identifier = identifier.trim().trim_end_matches('.').to_ascii_lowercase();
     while let Some(path) = pending.pop() {
         let Ok(entries) = fs::read_dir(&path) else {
             continue;
@@ -6241,6 +7263,13 @@ fn find_caddy_certificate_metadata(data_dir: &FsPath, domain: &str) -> Option<Ce
         for entry in entries.flatten() {
             let entry_path = entry.path();
             if entry_path.is_dir() {
+                if entry_path
+                    .to_string_lossy()
+                    .to_ascii_lowercase()
+                    .contains("staging")
+                {
+                    continue;
+                }
                 pending.push(entry_path);
                 continue;
             }
@@ -6259,8 +7288,10 @@ fn find_caddy_certificate_metadata(data_dir: &FsPath, domain: &str) -> Option<Ce
             let Ok(metadata) = parse_certificate_metadata(&contents, false) else {
                 continue;
             };
-            if metadata.subjects.iter().any(|subject| subject == domain)
-                && metadata.subjects.iter().any(|subject| subject == &wildcard)
+            if metadata
+                .subjects
+                .iter()
+                .any(|subject| subject == &identifier)
             {
                 let replace = latest.as_ref().is_none_or(|current: &CertificateMetadata| {
                     metadata.not_after > current.not_after
@@ -16317,6 +17348,94 @@ mod tests {
         assert!(public_domain_dns_ready(&legacy.to_string()));
     }
 
+    #[test]
+    fn tunnel_list_query_keeps_public_domain_columns_aligned() {
+        let state = test_state();
+        insert_test_tunnel(&state, true);
+        let connection = state.db.lock().expect("数据库锁应可用");
+        let response = connection
+            .query_row(
+                &tunnel_query("WHERE t.id = 'tunnel-1'"),
+                [],
+                tunnel_response_from_row,
+            )
+            .expect("历史 Tunnel 查询必须返回完整 22 列");
+        assert_eq!(response.id, "tunnel-1");
+        assert_eq!(response.public_domain_id, None);
+    }
+
+    #[test]
+    fn public_domain_operations_migration_is_present_and_idempotent() {
+        let state = test_state();
+        let connection = state.db.lock().expect("数据库锁应可用");
+        assert!(connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version = 18)",
+                [],
+                |row| row.get::<_, bool>(0),
+            )
+            .expect("应读取迁移版本"));
+        assert!(connection
+            .prepare("SELECT dns_management_enabled FROM public_domains")
+            .is_ok());
+        assert!(connection
+            .prepare("SELECT stage FROM public_domain_certificate_progress")
+            .is_ok());
+        apply_public_domain_operations_migration(&connection).expect("重复执行版本 18 应保持幂等");
+    }
+
+    #[test]
+    fn caddy_certificate_scan_finds_root_and_wildcard_independently() {
+        let root = std::env::temp_dir().join(format!("nexo-cert-scan-{}", Uuid::new_v4()));
+        let storage = root
+            .join("caddy-storage")
+            .join("certificates")
+            .join("production");
+        fs::create_dir_all(&storage).expect("应创建证书测试目录");
+        for (name, subject) in [
+            ("root.crt", "example.com"),
+            ("wildcard.crt", "*.example.com"),
+        ] {
+            let key = KeyPair::generate().expect("应生成测试私钥");
+            let certificate = CertificateParams::new(vec![subject.to_owned()])
+                .expect("应创建测试证书参数")
+                .self_signed(&key)
+                .expect("应签发测试证书");
+            fs::write(storage.join(name), certificate.pem()).expect("应写入测试证书");
+        }
+        let root_metadata =
+            find_caddy_certificate_metadata(&root, "example.com").expect("应找到根域名证书");
+        let wildcard_metadata =
+            find_caddy_certificate_metadata(&root, "*.example.com").expect("应找到泛域名证书");
+        assert_eq!(root_metadata.subjects, vec!["example.com"]);
+        assert_eq!(wildcard_metadata.subjects, vec!["*.example.com"]);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn managed_dns_preview_adopts_creates_and_blocks_conflicts() {
+        let records = vec![
+            serde_json::json!({"id":"root-a","type":"A","name":"example.com","content":"192.0.2.10","proxied":false}),
+            serde_json::json!({"id":"wild-a","type":"A","name":"*.example.com","content":"192.0.2.99","proxied":false}),
+        ];
+        let changes = plan_managed_dns_changes(
+            "example.com",
+            Some("192.0.2.10"),
+            Some("2001:db8::10"),
+            &records,
+        );
+        assert_eq!(changes.len(), 4, "双栈只应规划 @ 和 * 各两条记录");
+        assert_eq!(changes[0].action, "adopt");
+        assert_eq!(changes[1].action, "replace");
+        assert!(changes
+            .iter()
+            .filter(|change| change.record_type == "AAAA")
+            .all(|change| change.action == "create"));
+        assert!(changes
+            .iter()
+            .all(|change| matches!(change.name.as_str(), "@" | "*")));
+    }
+
     fn test_state() -> AppState {
         test_state_with_headscale(Arc::new(HeadscaleAdapter))
     }
@@ -16359,6 +17478,8 @@ mod tests {
         apply_multi_public_domains_migration(&connection).expect("应初始化多域名和主域名迁移结构");
         apply_tailscale_client_migration(&connection).expect("应初始化官方客户端和 Auth Key 结构");
         apply_access_control_migration(&connection).expect("应初始化可视化访问控制结构");
+        apply_public_domain_operations_migration(&connection)
+            .expect("应初始化域名 DNS 托管和证书进度结构");
         ensure_mesh_identity_online_column(&connection).expect("应初始化组网在线状态字段");
         ensure_server_ca(&connection).expect("应初始化测试 CA");
         ensure_server_control_identity(&connection).expect("应初始化测试控制证书");

@@ -221,6 +221,25 @@ type CertificateStatus = {
   not_after: number | null;
   renewal_at: number | null;
   subjects: string[];
+  progress: CertificateProgress;
+};
+
+type CertificateProgress = {
+  stage: "waiting_configuration" | "presenting_dns" | "waiting_dns" | "validating" | "issued" | "active" | "retry_wait" | "failed" | string;
+  attempt_count: number;
+  last_event_at: number | null;
+  next_retry_at: number | null;
+  error_code: string | null;
+  error_message: string | null;
+};
+
+type DnsManagement = {
+  enabled: boolean;
+  target_ipv4: string | null;
+  target_ipv6: string | null;
+  status: string;
+  error: string | null;
+  version: number;
 };
 
 type PublicDomain = {
@@ -247,6 +266,23 @@ type PublicDomain = {
   retry_after: number | null;
   attempt_count: number;
   next_retry_at: number | null;
+  dns_management: DnsManagement;
+};
+
+type ManagedDnsChange = {
+  action: "adopt" | "create" | "replace" | string;
+  record_type: string;
+  name: string;
+  desired_content: string;
+  current_content: string | null;
+  record_id: string | null;
+};
+
+type ManagedDnsPreview = {
+  domain_id: string;
+  zone_name: string;
+  changes: ManagedDnsChange[];
+  has_conflicts: boolean;
 };
 
 type PublicDomainMigration = {
@@ -1972,6 +2008,18 @@ function dnsCheckLabel(check: { resolved?: string[]; error?: string } | undefine
   return { kind: "working", label: "未检测" };
 }
 
+function dnsManagementLabel(management: DnsManagement): { kind: "ready" | "error" | "working"; label: string } {
+  if (!management.enabled) return { kind: "working", label: "未接管" };
+  switch (management.status) {
+    case "ready": return { kind: "ready", label: "已同步" };
+    case "drifted": return { kind: "error", label: "检测到漂移" };
+    case "conflict": return { kind: "error", label: "等待确认冲突" };
+    case "error": return { kind: "error", label: "同步失败" };
+    case "previewed": return { kind: "working", label: "等待确认" };
+    default: return { kind: "working", label: "待同步" };
+  }
+}
+
 function CertificateCell({
   label,
   certificate,
@@ -1982,12 +2030,32 @@ function CertificateCell({
   automatic: boolean;
 }) {
   const state = publicDomainStatus(certificate.status);
+  const phases = [
+    ["waiting_configuration", "等待配置"],
+    ["presenting_dns", "创建 DNS-01"],
+    ["waiting_dns", "等待 DNS"],
+    ["validating", "CA 校验"],
+    ["issued", "已签发"],
+    ["active", "已启用"],
+  ] as const;
+  const currentStage = certificate.progress?.stage ?? "waiting_configuration";
+  const activeIndex = phases.findIndex(([stage]) => stage === currentStage);
+  const phaseIndex = activeIndex >= 0 ? activeIndex : 0;
+  const stageLabel = currentStage === "retry_wait" ? "等待 Caddy 重试" : currentStage === "failed" ? "需要修复配置" : phases[phaseIndex][1];
   return (
-    <div className="domain-certificate-cell">
+    <div className="domain-certificate-cell" aria-live="polite" aria-atomic="true">
       <div className="domain-certificate-heading">
         <span>{label}</span>
         <span className={`status-pill ${state.kind}`}><i />{certificateStatusLabel(certificate.status)}</span>
       </div>
+      <strong className="certificate-stage-label">{stageLabel}</strong>
+      <ol className="certificate-stage-track" aria-label={`${label}申请进度`}>
+        {phases.map(([stage, phaseLabel], index) => <li key={stage} className={index < phaseIndex ? "complete" : index === phaseIndex ? "current" : ""} aria-current={index === phaseIndex ? "step" : undefined}><i /><span>{phaseLabel}</span></li>)}
+      </ol>
+      <small>SAN</small>
+      <strong className="certificate-subjects">{certificate.subjects.length ? certificate.subjects.join("、") : "等待证书签发"}</strong>
+      <small>签发时间</small>
+      <strong>{formatDomainTimestamp(certificate.not_before)}</strong>
       <small>到期时间</small>
       <strong>{formatDomainTimestamp(certificate.not_after)}</strong>
       <small>{certificate.renewal_at
@@ -1995,6 +2063,9 @@ function CertificateCell({
         : automatic
           ? "证书签发后由 Caddy 计算下一次续期时间"
           : "手动证书不会由 Caddy 自动续期"}</small>
+      <small>最近尝试：{formatDomainTimestamp(certificate.progress?.last_event_at ?? null, "暂无事件")} · {certificate.progress?.attempt_count ?? 0} 次</small>
+      {certificate.progress?.next_retry_at && <small>下次自动重试：{formatDomainTimestamp(certificate.progress.next_retry_at)}</small>}
+      {certificate.progress?.error_message && <details className="certificate-error"><summary>查看错误与处理建议</summary><p>{certificate.progress.error_message}</p><p>检查 Cloudflare Zone DNS 编辑权限、DNS only 设置及 DNS 传播；修复后由 Caddy 继续处理。</p></details>}
     </div>
   );
 }
@@ -2018,6 +2089,8 @@ function PublicDomainsPanel({
   const [deleteTrigger, setDeleteTrigger] = useState<HTMLButtonElement | null>(null);
   const [primaryDomain, setPrimaryDomain] = useState<PublicDomain | null>(null);
   const [primaryTrigger, setPrimaryTrigger] = useState<HTMLButtonElement | null>(null);
+  const [dnsDomains, setDnsDomains] = useState<PublicDomain[] | null>(null);
+  const [dnsTrigger, setDnsTrigger] = useState<HTMLButtonElement | null>(null);
   const selectAllRef = useRef<HTMLInputElement>(null);
   const selectedSet = new Set(selectedIds);
   const allSelected = domains.length > 0 && domains.every((domain) => selectedSet.has(domain.id));
@@ -2094,6 +2167,7 @@ function PublicDomainsPanel({
             <span className="batch-selection-count">已选 {selectedIds.length} 项</span>
             <button className="secondary-button compact-button" type="button" disabled={batchBusy} onClick={() => void runBatch("recheck")}><RefreshCw size={15} aria-hidden="true" />批量重新检测</button>
             <button className="secondary-button compact-button" type="button" disabled={batchBusy} onClick={() => void runBatch("renew")}><ShieldCheck size={15} aria-hidden="true" />批量申请证书</button>
+            <button className="secondary-button compact-button" type="button" disabled={batchBusy || !domains.some((domain) => selectedSet.has(domain.id) && domain.dns_management.enabled)} onClick={(event) => { setDnsTrigger(event.currentTarget); setDnsDomains(domains.filter((domain) => selectedSet.has(domain.id) && domain.dns_management.enabled)); }}><Globe2 size={15} aria-hidden="true" />批量同步 DNS</button>
           </div>}
           <button className="primary-button" type="button" onClick={(event) => { setEditorTrigger(event.currentTarget); setEditorDomain(null); }}><Plus size={16} aria-hidden="true" />添加域名</button>
         </div>
@@ -2111,6 +2185,7 @@ function PublicDomainsPanel({
             const state = publicDomainStatus(domain.apply_status);
             const rootDns = dnsCheckLabel(domain.dns_check.root);
             const wildcardDns = dnsCheckLabel(domain.dns_check.wildcard);
+            const managedDns = dnsManagementLabel(domain.dns_management);
             const rateLimited = domain.apply_status.toLowerCase() === "rate_limited" || domain.error_code === "acme_rate_limited";
             return (
               <article className="domain-row" key={domain.id}>
@@ -2118,24 +2193,27 @@ function PublicDomainsPanel({
                   <label className="selection-control domain-selection"><input type="checkbox" checked={selectedSet.has(domain.id)} onChange={(event) => setSelectedIds((current) => event.target.checked ? (current.includes(domain.id) ? current : [...current, domain.id]) : current.filter((id) => id !== domain.id))} aria-label={`选择 ${domain.domain}`} /><span /></label>
                   <div className="domain-identity">
                     <div className="domain-title"><strong>{domain.domain}</strong>{domain.is_primary && <span className="domain-primary-badge">主域名</span>}</div>
-                    <span>{domain.usage_count} 个 Web 服务 · {domain.certificate_mode === "cloudflare" ? "Cloudflare DNS-01" : "手动证书"} · {domain.acme_environment === "staging" ? "测试 CA" : "正式 CA"}</span>
+                    <span>{domain.usage_count} 个 Web 服务 · {domain.certificate_mode === "cloudflare" ? "Cloudflare DNS-01" : "手动证书"} · {domain.dns_management.enabled ? "Nexo 托管 DNS" : "外部管理 DNS"}</span>
                   </div>
                   <span className={`status-pill ${state.kind}`}><i />{state.label}</span>
                 </div>
                 <div className="domain-facts-grid">
                   <div className="domain-fact"><span>DNS 根域名</span><strong className={`inline-state ${rootDns.kind}`}><i />{rootDns.label}</strong></div>
                   <div className="domain-fact"><span>DNS 泛域名</span><strong className={`inline-state ${wildcardDns.kind}`}><i />{wildcardDns.label}</strong></div>
+                  <div className="domain-fact"><span>Cloudflare DNS 托管</span><strong className={`inline-state ${managedDns.kind}`}><i />{managedDns.label}</strong></div>
+                  <div className="domain-fact"><span>DNS 目标地址</span><strong>{[domain.dns_management.target_ipv4, domain.dns_management.target_ipv6].filter(Boolean).join(" · ") || "由外部 DNS 管理"}</strong></div>
                   <CertificateCell label="根证书" certificate={domain.root_certificate} automatic={domain.certificate_mode === "cloudflare"} />
                   <CertificateCell label="泛域名证书" certificate={domain.wildcard_certificate} automatic={domain.certificate_mode === "cloudflare"} />
                 </div>
                 <div className="domain-row-actions">
                   <button className="secondary-button compact-button" type="button" disabled={batchBusy} onClick={() => void runSingle(domain, "recheck")}><RefreshCw size={15} aria-hidden="true" />重新检测</button>
                   <button className="secondary-button compact-button" type="button" disabled={batchBusy || rateLimited} onClick={(event) => { if (domain.certificate_mode === "manual") { setEditorTrigger(event.currentTarget); setEditorDomain(domain); } else { void runSingle(domain, "renew"); } }} title={rateLimited ? "CA 限流窗口内由 Caddy 自动重试" : undefined}><ShieldCheck size={15} aria-hidden="true" />{domain.certificate_mode === "manual" ? "更新证书" : "手动申请证书"}</button>
+                  {domain.dns_management.enabled && <button className="secondary-button compact-button" type="button" disabled={batchBusy} onClick={(event) => { setDnsTrigger(event.currentTarget); setDnsDomains([domain]); }}><Globe2 size={15} aria-hidden="true" />同步 DNS</button>}
                   <button className="secondary-button compact-button" type="button" onClick={(event) => { setEditorTrigger(event.currentTarget); setEditorDomain(domain); }}><Settings size={15} aria-hidden="true" />编辑</button>
                   {!domain.is_primary && <button className="secondary-button compact-button" type="button" disabled={batchBusy} onClick={(event) => { setPrimaryTrigger(event.currentTarget); setPrimaryDomain(domain); }}><ArrowRight size={15} aria-hidden="true" />设为主域名</button>}
                   {!domain.is_primary && <button className="delete-icon-button" type="button" aria-label={`删除 ${domain.domain}`} title="删除" disabled={batchBusy} onClick={(event) => { setDeleteTrigger(event.currentTarget); setDeletingDomain(domain); }}><Trash2 size={16} aria-hidden="true" /></button>}
                 </div>
-                {(rateLimited || domain.apply_error) && <details className="domain-error-details"><summary>{rateLimited ? "查看 CA 限流与自动重试" : "查看配置错误"}</summary><div>{domain.apply_error && <p>{domain.apply_error}</p>}{rateLimited && <p>Caddy 正在自动重试，不会绕过 CA 限流。下一次尝试：<strong>{formatDomainTimestamp(domain.next_retry_at ?? domain.retry_after, "等待 Caddy 计算")}</strong>；已尝试 {domain.attempt_count} 次。</p>}<p>mesh.{domain.domain} 必须在 Cloudflare 中设置为 DNS only，Nexo 只检测，不会修改 DNS。</p></div></details>}
+                {(rateLimited || domain.apply_error || domain.dns_management.error) && <details className="domain-error-details"><summary>{rateLimited ? "查看 CA 限流与自动重试" : "查看配置错误"}</summary><div>{domain.apply_error && <p>{domain.apply_error}</p>}{domain.dns_management.error && <p>{domain.dns_management.error}</p>}{rateLimited && <p>Caddy 正在自动重试，不会绕过 CA 限流。下一次尝试：<strong>{formatDomainTimestamp(domain.next_retry_at ?? domain.retry_after, "等待 Caddy 计算")}</strong>；已尝试 {domain.attempt_count} 次。</p>}<p>mesh.{domain.domain} 必须保持 DNS only；启用托管后 Nexo 只维护 @ 和 * 记录。</p></div></details>}
               </article>
             );
           })}
@@ -2144,6 +2222,7 @@ function PublicDomainsPanel({
       {editorDomain !== undefined && <FormDialog eyebrow="域名与 HTTPS" title={editorDomain ? `编辑 ${editorDomain.domain}` : "添加公网域名"} description="先保存域名策略，再由 Caddy 负责证书签发、续期和官方退避。" onClose={() => { setEditorDomain(undefined); setEditorTrigger(null); }} returnFocus={editorTrigger}><PublicDomainEditor domain={editorDomain} request={request} onCancel={() => { setEditorDomain(undefined); setEditorTrigger(null); }} onSaved={handleEditorSaved} /></FormDialog>}
       {deletingDomain && <PublicDomainDeleteDialog domain={deletingDomain} domains={domains} request={request} returnFocus={deleteTrigger} onDeleted={async () => { setDeletingDomain(null); setDeleteTrigger(null); await onRefresh(); }} onClose={() => { setDeletingDomain(null); setDeleteTrigger(null); }} />}
       {primaryDomain && <PublicDomainPrimaryDialog domain={primaryDomain} request={request} returnFocus={primaryTrigger} onStarted={onRefresh} onClose={() => { setPrimaryDomain(null); setPrimaryTrigger(null); }} />}
+      {dnsDomains && <ManagedDnsDialog domains={dnsDomains} request={request} returnFocus={dnsTrigger} onApplied={async () => { setDnsDomains(null); setDnsTrigger(null); await onRefresh(); }} onClose={() => { setDnsDomains(null); setDnsTrigger(null); }} />}
     </section>
   );
 }
@@ -2162,7 +2241,10 @@ function PublicDomainEditor({
   const [domain, setDomain] = useState(existing?.domain ?? "");
   const [httpsEnabled, setHttpsEnabled] = useState(existing?.https_enabled ?? true);
   const [certificateMode, setCertificateMode] = useState(existing?.certificate_mode ?? "cloudflare");
-  const [acmeEnvironment, setAcmeEnvironment] = useState(existing?.acme_environment ?? "production");
+  const [dnsManagementEnabled, setDnsManagementEnabled] = useState(existing?.dns_management.enabled ?? false);
+  const [dnsTargetIpv4, setDnsTargetIpv4] = useState(existing?.dns_management.target_ipv4 ?? "");
+  const [dnsTargetIpv6, setDnsTargetIpv6] = useState(existing?.dns_management.target_ipv6 ?? "");
+  const [deleteManagedRecords, setDeleteManagedRecords] = useState(false);
   const [cloudflareToken, setCloudflareToken] = useState("");
   const [showToken, setShowToken] = useState(false);
   const [certificateFile, setCertificateFile] = useState<File | null>(null);
@@ -2181,20 +2263,33 @@ function PublicDomainEditor({
       setError("手动证书需要同时选择证书和私钥文件");
       return;
     }
+    if (dnsManagementEnabled && !dnsTargetIpv4.trim() && !dnsTargetIpv6.trim()) {
+      setError("启用 DNS 托管时必须填写公网 IPv4 或 IPv6 地址");
+      return;
+    }
     setBusy(true);
     setError(null);
     try {
+      if (existing?.dns_management.enabled && !dnsManagementEnabled && deleteManagedRecords) {
+        const releaseResponse = await request(`/api/v1/public-domains/${encodeURIComponent(existing.id)}/dns/managed-records`, {
+          method: "DELETE",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ delete_created_records: true }),
+        });
+        const releaseBody: unknown = await releaseResponse.json().catch(() => null);
+        if (!releaseResponse.ok) throw new Error(readApiError(releaseBody, "无法安全删除 Nexo 创建的 DNS 记录"));
+      }
       const response = await request(existing ? `/api/v1/public-domains/${encodeURIComponent(existing.id)}` : "/api/v1/public-domains", {
         method: existing ? "PUT" : "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ domain: normalized, https_enabled: httpsEnabled, certificate_mode: httpsEnabled ? certificateMode : "cloudflare", acme_environment: acmeEnvironment }),
+        body: JSON.stringify({ domain: normalized, https_enabled: httpsEnabled, certificate_mode: httpsEnabled ? certificateMode : "cloudflare", dns_management_enabled: dnsManagementEnabled, dns_target_ipv4: dnsTargetIpv4.trim(), dns_target_ipv6: dnsTargetIpv6.trim() }),
       });
       const body: unknown = await response.json().catch(() => null);
       if (!response.ok) throw new Error(readApiError(body, "暂时无法保存公网域名"));
       const saved = body as PublicDomain;
       const secrets: Record<string, string> = {};
       const token = cloudflareToken.trim();
-      if (httpsEnabled && certificateMode === "cloudflare" && token) secrets.cloudflare_token = token;
+      if ((dnsManagementEnabled || (httpsEnabled && certificateMode === "cloudflare")) && token) secrets.cloudflare_token = token;
       if (httpsEnabled && certificateMode === "manual" && certificateFile && privateKeyFile) {
         secrets.certificate_pem = await certificateFile.text();
         secrets.private_key_pem = await privateKeyFile.text();
@@ -2235,24 +2330,96 @@ function PublicDomainEditor({
             <option value="manual">手动证书</option>
           </select>
         </label>
-        <label>
-          <span>ACME 环境</span>
-          <select value={acmeEnvironment} onChange={(event) => setAcmeEnvironment(event.target.value)} disabled={!httpsEnabled || certificateMode !== "cloudflare"}>
-            <option value="production">正式环境</option>
-            <option value="staging">测试环境</option>
-          </select>
-        </label>
-        {httpsEnabled && certificateMode === "cloudflare" && <div className="public-entry-form-row"><label htmlFor="public-domain-cloudflare-token">Cloudflare API Token</label><div className="field-control"><div className="secret-input-control"><input id="public-domain-cloudflare-token" type={showToken ? "text" : "password"} value={cloudflareToken} onChange={(event) => setCloudflareToken(event.target.value)} placeholder="留空则保留已保存的 Token" autoComplete="off" autoCapitalize="none" spellCheck={false} /><button className="secret-visibility-button" type="button" aria-label={`${showToken ? "隐藏" : "显示"} Cloudflare API Token`} onClick={() => setShowToken((value) => !value)}>{showToken ? <EyeOff size={18} aria-hidden="true" /> : <Eye size={18} aria-hidden="true" />}</button></div><small>需要 Zone DNS 编辑权限。Token 不会写入配置、日志或页面。</small></div></div>}
+        {(dnsManagementEnabled || (httpsEnabled && certificateMode === "cloudflare")) && <div className="public-entry-form-row"><label htmlFor="public-domain-cloudflare-token">Cloudflare API Token</label><div className="field-control"><div className="secret-input-control"><input id="public-domain-cloudflare-token" type={showToken ? "text" : "password"} value={cloudflareToken} onChange={(event) => setCloudflareToken(event.target.value)} placeholder="留空则保留已保存的 Token" autoComplete="off" autoCapitalize="none" spellCheck={false} /><button className="secret-visibility-button" type="button" aria-label={`${showToken ? "隐藏" : "显示"} Cloudflare API Token`} onClick={() => setShowToken((value) => !value)}>{showToken ? <EyeOff size={18} aria-hidden="true" /> : <Eye size={18} aria-hidden="true" />}</button></div><small>需要 Zone DNS 编辑权限。Token 不会写入配置、日志或页面。</small></div></div>}
         {httpsEnabled && certificateMode === "manual" && <><label><span>证书文件</span><input type="file" accept=".pem,.crt,text/plain" onChange={(event) => setCertificateFile(event.currentTarget.files?.[0] ?? null)} /></label><label><span>私钥文件</span><input type="file" accept=".pem,.key,text/plain" onChange={(event) => setPrivateKeyFile(event.currentTarget.files?.[0] ?? null)} /></label><p className="form-hint">证书必须同时覆盖根域名和 *.根域名，并且私钥匹配；保存前由 Server 校验。</p></>}
       </fieldset>
       <fieldset>
-        <legend>DNS 检查</legend>
-        <p className="form-hint">保存后可在列表中重新检测根域名和泛域名解析。mesh.{domain.trim() || "example.com"} 必须保持 DNS only，Cloudflare 代理会阻断 Headscale 长连接。</p>
+        <legend>DNS 托管</legend>
+        <label className="confirmation-check"><input type="checkbox" checked={dnsManagementEnabled} onChange={(event) => setDnsManagementEnabled(event.target.checked)} /><span>由 Nexo 自动管理 Cloudflare DNS</span></label>
+        {dnsManagementEnabled && <><label><span>公网 IPv4</span><input value={dnsTargetIpv4} onChange={(event) => setDnsTargetIpv4(event.target.value)} placeholder="101.36.109.178" inputMode="decimal" autoCapitalize="none" spellCheck={false} /></label><label><span>公网 IPv6</span><input value={dnsTargetIpv6} onChange={(event) => setDnsTargetIpv6(event.target.value)} placeholder="可选" inputMode="text" autoCapitalize="none" spellCheck={false} /></label></>}
+        {existing?.dns_management.enabled && !dnsManagementEnabled && <label className="confirmation-check"><input type="checkbox" checked={deleteManagedRecords} onChange={(event) => setDeleteManagedRecords(event.target.checked)} /><span>同时删除仍与最后应用内容一致、且由 Nexo 创建的记录</span></label>}
+        <p className="form-hint">保存设置不会立即修改 DNS。请返回列表查看变更预览，再确认同步 @ 和 * 的 A/AAAA 记录；记录始终为 DNS only。</p>
       </fieldset>
       {error && <p className="form-error" role="alert">{error}</p>}
       <div className="dialog-actions"><button className="secondary-button" type="button" onClick={onCancel} disabled={busy}>取消</button><button className="primary-button" type="submit" disabled={busy}>{busy ? "保存中…" : existing ? "保存修改" : "添加域名"}</button></div>
     </form>
   );
+}
+
+function ManagedDnsDialog({
+  domains,
+  request,
+  returnFocus,
+  onApplied,
+  onClose,
+}: {
+  domains: PublicDomain[];
+  request: ApiRequest;
+  returnFocus: HTMLElement | null;
+  onApplied: () => Promise<void>;
+  onClose: () => void;
+}) {
+  const [previews, setPreviews] = useState<ManagedDnsPreview[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [applying, setApplying] = useState(false);
+  const [confirmed, setConfirmed] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    let active = true;
+    const load = async () => {
+      setLoading(true);
+      setError(null);
+      try {
+        const loaded = await Promise.all(domains.map(async (domain) => {
+          const response = await request(`/api/v1/public-domains/${encodeURIComponent(domain.id)}/dns/preview`);
+          const body: unknown = await response.json().catch(() => null);
+          if (!response.ok) throw new Error(readApiError(body, `无法预览 ${domain.domain} 的 DNS 变更`));
+          return body as ManagedDnsPreview;
+        }));
+        if (active) setPreviews(loaded);
+      } catch (requestError) {
+        if (active) setError(requestError instanceof Error ? requestError.message : "无法读取 DNS 变更预览");
+      } finally {
+        if (active) setLoading(false);
+      }
+    };
+    void load();
+    return () => { active = false; };
+  }, [domains, request]);
+
+  const hasConflicts = previews.some((preview) => preview.has_conflicts);
+  const apply = async () => {
+    setApplying(true);
+    setError(null);
+    try {
+      for (const domain of domains) {
+        const response = await request(`/api/v1/public-domains/${encodeURIComponent(domain.id)}/dns/apply`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ confirm_conflicts: confirmed }),
+        });
+        const body: unknown = await response.json().catch(() => null);
+        if (!response.ok) throw new Error(readApiError(body, `无法同步 ${domain.domain} 的 DNS`));
+      }
+      await onApplied();
+    } catch (requestError) {
+      setError(requestError instanceof Error ? requestError.message : "DNS 同步失败");
+    } finally {
+      setApplying(false);
+    }
+  };
+
+  const actionLabel = (action: string) => action === "adopt" ? "接管同值记录" : action === "create" ? "创建" : "替换冲突记录";
+  return <FormDialog eyebrow="Cloudflare DNS" title={domains.length === 1 ? `同步 ${domains[0].domain}` : `同步 ${domains.length} 个域名`} description="Nexo 只处理预览中的 @ 与 * 记录，所有记录固定为 DNS only。" onClose={onClose} returnFocus={returnFocus} role={hasConflicts ? "alertdialog" : "dialog"}>
+    <div className="managed-dns-preview" aria-busy={loading || applying}>
+      <div className="dns-preview-status" role="status" aria-live="polite">{loading ? "正在读取 Cloudflare 当前记录…" : error ? "DNS 预览或同步失败" : `已读取 ${previews.length} 个域名的变更`}</div>
+      {previews.map((preview) => <section key={preview.domain_id} className="dns-preview-domain"><h3>{preview.zone_name}</h3><div className="dns-change-list">{preview.changes.map((change) => <div className={`dns-change ${change.action}`} key={`${change.record_type}-${change.name}`}><div><strong>{change.record_type} {change.name}</strong><span>{actionLabel(change.action)}</span></div><code>{change.current_content ?? "不存在"}</code><ArrowRight size={15} aria-hidden="true" /><code>{change.desired_content}</code></div>)}</div></section>)}
+      {hasConflicts && <label className="confirmation-check"><input type="checkbox" checked={confirmed} onChange={(event) => setConfirmed(event.target.checked)} /><span>我确认替换上方冲突记录；MX、TXT、CAA 等其他记录不会修改</span></label>}
+      {error && <p className="form-error" role="alert">{error}</p>}
+      <div className="dialog-actions"><button className="secondary-button" type="button" onClick={onClose} disabled={applying}>取消</button><button className="primary-button" type="button" onClick={() => void apply()} disabled={loading || applying || previews.length === 0 || (hasConflicts && !confirmed)}>{applying ? "同步中…" : "确认同步 DNS"}</button></div>
+    </div>
+  </FormDialog>;
 }
 
 function PublicDomainDeleteDialog({
@@ -3412,7 +3579,7 @@ function CreateSiteLinkForm({
   );
 }
 
-const RELEASE_AGENT_IMAGE = "ghcr.io/thelinyue/nexo-agent:0.1.7";
+const RELEASE_AGENT_IMAGE = "ghcr.io/thelinyue/nexo-agent:0.1.8";
 
 function buildAgentCompose(serverUrl: string, token: string): string {
   return `name: nexo-agent
@@ -3611,7 +3778,6 @@ function PublicEntrySettings({
   const [domain, setDomain] = useState("");
   const [httpsEnabled, setHttpsEnabled] = useState(false);
   const [certificateMode, setCertificateMode] = useState("none");
-  const [acmeEnvironment, setAcmeEnvironment] = useState("production");
   const [certificateFile, setCertificateFile] = useState<File | null>(null);
   const [privateKeyFile, setPrivateKeyFile] = useState<File | null>(null);
   const [cloudflareToken, setCloudflareToken] = useState("");
@@ -3623,7 +3789,6 @@ function PublicEntrySettings({
     setDomain(entry.base_domain ?? "");
     setHttpsEnabled(entry.https_enabled);
     setCertificateMode(entry.certificate_mode);
-    setAcmeEnvironment(entry.acme_environment);
   }, [entry]);
 
   const save = async (event: React.FormEvent<HTMLFormElement>) => {
@@ -3651,7 +3816,6 @@ function PublicEntrySettings({
           base_domain: trimmedDomain || null,
           https_enabled: httpsEnabled,
           certificate_mode: httpsEnabled ? certificateMode : "none",
-          acme_environment: acmeEnvironment,
         }),
       });
       const body: unknown = await response.json().catch(() => null);
@@ -3707,13 +3871,6 @@ function PublicEntrySettings({
               <option value="none">未配置</option>
               <option value="cloudflare">自动申请</option>
               <option value="manual">手动证书</option>
-            </select>
-          </label>
-          <label>
-            <span>证书环境</span>
-            <select value={acmeEnvironment} onChange={(event) => setAcmeEnvironment(event.target.value)} disabled={!httpsEnabled || certificateMode !== "cloudflare"}>
-              <option value="production">正式环境</option>
-              <option value="staging">测试环境</option>
             </select>
           </label>
           {httpsEnabled && certificateMode === "manual" && (
