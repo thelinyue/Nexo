@@ -3579,7 +3579,7 @@ function CreateSiteLinkForm({
   );
 }
 
-const RELEASE_AGENT_IMAGE = "ghcr.io/thelinyue/nexo-agent:0.1.8";
+const RELEASE_AGENT_IMAGE = "ghcr.io/thelinyue/nexo-agent:0.1.9";
 
 function buildAgentCompose(serverUrl: string, token: string): string {
   return `name: nexo-agent

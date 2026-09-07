@@ -833,7 +833,7 @@ pub fn build_caddy_config_with_environment_and_readiness(
             "listen": [":80"],
             "automatic_https": {"disable": true},
             "trusted_proxies": {"source": "static", "ranges": ["127.0.0.1/32", "::1/128"]},
-            "trusted_proxies_strict": true,
+            "trusted_proxies_strict": 1,
             "routes": http_routes
         }),
     );
@@ -841,7 +841,7 @@ pub fn build_caddy_config_with_environment_and_readiness(
         let mut https_server = json!({
             "listen": [":443"],
             "trusted_proxies": {"source": "static", "ranges": ["127.0.0.1/32", "::1/128"]},
-            "trusted_proxies_strict": true,
+            "trusted_proxies_strict": 1,
             "routes": https_routes
         });
         if certificate_mode == "manual" {
@@ -1094,7 +1094,7 @@ pub fn build_multi_caddy_config(
         json!({
             "listen": [":80"], "automatic_https": {"disable": true},
             "trusted_proxies": {"source": "static", "ranges": ["127.0.0.1/32", "::1/128"]},
-            "trusted_proxies_strict": true, "routes": http_routes
+            "trusted_proxies_strict": 1, "routes": http_routes
         }),
     );
     if !https_routes.is_empty() {
@@ -1103,7 +1103,7 @@ pub fn build_multi_caddy_config(
             json!({
                 "listen": [":443"],
                 "trusted_proxies": {"source": "static", "ranges": ["127.0.0.1/32", "::1/128"]},
-                "trusted_proxies_strict": true,
+                "trusted_proxies_strict": 1,
                 "routes": https_routes
             }),
         );
@@ -1457,6 +1457,15 @@ mod tests {
             Path::new("/data/nexo/caddy-storage"),
         );
         assert_eq!(config["storage"]["root"], json!("/data/nexo/caddy-storage"));
+        assert_eq!(
+            config["apps"]["http"]["servers"]["http"]["trusted_proxies_strict"],
+            json!(1),
+            "Caddy 2.11 原生 JSON 使用整数表示严格代理解析开关"
+        );
+        assert_eq!(
+            config["apps"]["http"]["servers"]["https"]["trusted_proxies_strict"],
+            json!(1)
+        );
         let policies = config["apps"]["tls"]["automation"]["policies"]
             .as_array()
             .expect("Cloudflare 域名应生成独立 TLS policy");

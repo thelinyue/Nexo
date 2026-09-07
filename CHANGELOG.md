@@ -2,6 +2,12 @@
 
 本项目使用 [Semantic Versioning](https://semver.org/) 记录公开版本。
 
+## [0.1.9] - 2026-09-07
+
+### Fixed
+
+- 修正 Caddy 2.11 原生 JSON 中 `trusted_proxies_strict` 的字段类型，恢复 HTTPS 配置加载、证书选择和公网 Host 路由。
+
 ## [0.1.8] - 2026-09-07
 
 ### Added
