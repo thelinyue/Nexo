@@ -4,6 +4,8 @@
 //! `* -> *` 或“无 Policy 默认全网互通”。输出是 Headscale 接受的 JSON/HUJSON
 //! 子集，可直接通过官方 `/api/v1/policy` 接口更新。
 
+use std::collections::BTreeMap;
+
 use serde::Serialize;
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -40,6 +42,8 @@ struct PolicySshGrantDocument<'a> {
 struct PolicyDocument<'a> {
     grants: Vec<PolicyGrantDocument<'a>>,
     ssh: Vec<PolicySshGrantDocument<'a>>,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    groups: BTreeMap<String, Vec<String>>,
 }
 
 fn grant_protocols(grant: &PolicyGrant) -> Vec<String> {
@@ -71,7 +75,19 @@ fn grant_protocols(grant: &PolicyGrant) -> Vec<String> {
 }
 
 /// 生成只包含显式 Grant 的最小策略文档。
+#[allow(dead_code)]
 pub fn generate_policy(grants: &[PolicyGrant]) -> String {
+    generate_policy_with_groups(&BTreeMap::new(), grants)
+}
+
+/// 生成带工作空间用户组的策略。
+///
+/// 组成员可以是 OIDC 的稳定 provider identifier，也可以是明确的机器服务
+/// 身份；个人账号不会把可变的 Nexo 用户名写进授权主键。
+pub fn generate_policy_with_groups(
+    groups: &BTreeMap<String, Vec<String>>,
+    grants: &[PolicyGrant],
+) -> String {
     let mut ssh = Vec::new();
     let grants = grants
         .iter()
@@ -97,7 +113,12 @@ pub fn generate_policy(grants: &[PolicyGrant]) -> String {
             }
         })
         .collect();
-    serde_json::to_string_pretty(&PolicyDocument { grants, ssh }).expect("策略结构应始终可序列化")
+    serde_json::to_string_pretty(&PolicyDocument {
+        grants,
+        ssh,
+        groups: groups.clone(),
+    })
+    .expect("策略结构应始终可序列化")
 }
 
 #[cfg(test)]
@@ -159,5 +180,27 @@ mod tests {
         }]);
         assert!(policy.contains("tcp:*"));
         assert!(!policy.contains("\"*\""));
+    }
+
+    #[test]
+    fn policy_groups_use_stable_oidc_provider_identifier() {
+        let groups = BTreeMap::from([(
+            "group:nexo-workspace-default".to_owned(),
+            vec!["https://nexo.example.com/user-uuid@".to_owned()],
+        )]);
+        let policy = generate_policy_with_groups(
+            &groups,
+            &[PolicyGrant {
+                source_tenant: "default".to_owned(),
+                target_tenant: "default".to_owned(),
+                sources: vec!["group:nexo-workspace-default".to_owned()],
+                destinations: vec!["100.64.0.8".to_owned()],
+                protocols: Vec::new(),
+                ports: vec!["*".to_owned()],
+                ssh: false,
+            }],
+        );
+        assert!(policy.contains("group:nexo-workspace-default"));
+        assert!(policy.contains("https://nexo.example.com/user-uuid@"));
     }
 }

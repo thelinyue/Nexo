@@ -55,7 +55,11 @@ pub struct NodeRouteReport {
     pub error_message: Option<String>,
 }
 
-/// Headscale 节点的 Nexo 所需投影。未知字段由 serde 忽略，兼容小版本响应。
+/// Headscale 节点的 Nexo 所需投影。
+///
+/// `user`、`register_method` 和用户的 provider 字段是 OIDC 自动归属所需的
+/// 官方 API 投影；其余未知字段仍由 serde 忽略，避免 Nexo 依赖 Headscale
+/// 内部数据库结构。
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct HeadscaleNode {
@@ -78,6 +82,10 @@ pub struct HeadscaleNode {
     pub subnet_routes: Vec<String>,
     #[serde(default)]
     pub pre_auth_key: Option<HeadscalePreAuthKey>,
+    #[serde(default)]
+    pub user: Option<HeadscaleUser>,
+    #[serde(default)]
+    pub register_method: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
@@ -109,6 +117,12 @@ pub struct HeadscaleUser {
     pub id: String,
     #[serde(default)]
     pub name: String,
+    #[serde(default)]
+    pub display_name: String,
+    #[serde(default)]
+    pub provider_id: Option<String>,
+    #[serde(default)]
+    pub provider: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

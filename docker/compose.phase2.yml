@@ -20,7 +20,7 @@ services:
       NEXO_HEADSCALE_LISTEN_ADDR: 127.0.0.1:8281
       NEXO_HEADSCALE_API_URL: http://127.0.0.1:8281
       # 正式组网地址应为 https://mesh.<domain>；未配置域名时请保留默认受限状态。
-      NEXO_HEADSCALE_URL: ${NEXO_MESH_ENDPOINT:-https://mesh.example.com}
+      NEXO_HEADSCALE_URL: ${NEXO_HEADSCALE_URL:-https://mesh.example.com}
       NEXO_MESH_DNS_BASE_DOMAIN: ${NEXO_MESH_DNS_BASE_DOMAIN:-mesh.nexo.internal}
       NEXO_CADDY_ENABLED: "true"
       NEXO_CADDY_BIN: /usr/local/bin/caddy

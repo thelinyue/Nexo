@@ -138,7 +138,7 @@ cargo run -p nexo-server -- bootstrap-code
 cargo run -p nexo-server -- admin recover
 ```
 
-命令只显示 10 分钟有效、仅可使用一次的 Recovery Code；在恢复页面设置新密码后，所有旧 Session 会立即吊销。旧版 `recover` 命令仍兼容，但新部署统一使用 `admin recover`。
+命令只显示 10 分钟有效、仅可使用一次的 Recovery Code；在恢复页面设置新密码后，所有旧 Session 会立即吊销。当前版本只支持 `admin recover`。
 
 官方 Server 镜像同样提供 `nexo` 命令别名：
 
@@ -196,6 +196,10 @@ docker compose up -d
 
 数据库迁移只向前执行。升级后的数据目录不得直接交给旧版本二进制；需要回滚时，
 必须同时恢复升级前的完整数据备份和对应旧镜像。
+
+v0.1.12 将历史 0001–0019 及在线结构补丁收敛为单一初始 Baseline。全新数据库
+直接创建该 Baseline；已有数据库必须已经记录迁移版本 19，低于 v0.1.12 的数据库
+会以中文错误拒绝启动，不能由当前版本自动补齐历史结构。
 
 ## 穿透服务
 

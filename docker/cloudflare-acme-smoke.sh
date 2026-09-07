@@ -12,7 +12,7 @@ IMAGE="${NEXO_ACME_IMAGE:-nexo-acme-acceptance:local}"
 HTTP_PORT="${NEXO_ACME_HTTP_PORT:-29838}"
 PUBLIC_HTTP_PORT="${NEXO_ACME_PUBLIC_HTTP_PORT:-28090}"
 HTTPS_PORT="${NEXO_ACME_HTTPS_PORT:-28453}"
-BOOTSTRAP_CODE="nexo-acme-bootstrap"
+BOOTSTRAP_CODE=""
 ADMIN_USERNAME="nexo-acme-admin"
 ADMIN_PASSWORD="nexo-acme-password-1234"
 HTTP_URL="http://127.0.0.1:$HTTP_PORT"
@@ -22,6 +22,7 @@ COOKIE_JAR="$TMP_DIR/cookies.txt"
 CURRENT_CONTAINER=""
 CURRENT_VOLUME=""
 CSRF_TOKEN=""
+PUBLIC_DOMAIN_ID=""
 
 usage() {
   echo "用法：NEXO_REAL_ACME_DOMAIN=<domain> NEXO_CLOUDFLARE_TOKEN_FILE=<path> $0 staging|production" >&2
@@ -40,6 +41,7 @@ cleanup_instance() {
   CURRENT_CONTAINER=""
   CURRENT_VOLUME=""
   CSRF_TOKEN=""
+  PUBLIC_DOMAIN_ID=""
   : >"$COOKIE_JAR"
 }
 
@@ -124,8 +126,38 @@ instance_healthy() {
 
 entry_has_status() {
   local expected="$1"
-  api "$HTTP_URL/api/v1/settings/public-entry" | jq -e --arg expected "$expected" \
-    '.apply_status == $expected'
+  ensure_primary_domain
+  api "$HTTP_URL/api/v1/public-domains" | jq -e \
+    --arg id "$PUBLIC_DOMAIN_ID" --arg expected "$expected" \
+    'map(select(.id == $id))[0].apply_status == $expected'
+}
+
+read_bootstrap_code() {
+  local code
+  code="$(docker exec "$CURRENT_CONTAINER" nexo bootstrap-code | tr -d '\r\n')"
+  if [[ -z "$code" ]]; then
+    echo "无法读取 Nexo Bootstrap Code" >&2
+    return 1
+  fi
+  printf '%s' "$code"
+}
+
+ensure_primary_domain() {
+  if [[ -n "$PUBLIC_DOMAIN_ID" ]]; then
+    return 0
+  fi
+  PUBLIC_DOMAIN_ID="$(api "$HTTP_URL/api/v1/public-domains" \
+    | jq -r 'map(select(.is_primary == true))[0].id // empty')"
+  if [[ -z "$PUBLIC_DOMAIN_ID" ]]; then
+    PUBLIC_DOMAIN_ID="$(jq -cn --arg domain "$DOMAIN" \
+      '{domain:$domain,https_enabled:false,certificate_mode:"cloudflare"}' \
+      | request_json_stdin POST "$HTTP_URL/api/v1/public-domains" \
+      | jq -r '.id')"
+  fi
+  if [[ -z "$PUBLIC_DOMAIN_ID" || "$PUBLIC_DOMAIN_ID" == "null" ]]; then
+    echo "无法创建或读取 ACME 验收主域名" >&2
+    return 1
+  fi
 }
 
 start_instance() {
@@ -138,7 +170,6 @@ start_instance() {
     --publish "127.0.0.1:$HTTP_PORT:8280" \
     --publish "127.0.0.1:$PUBLIC_HTTP_PORT:80" \
     --publish "127.0.0.1:$HTTPS_PORT:443" \
-    --env "NEXO_ADMIN_TOKEN=$BOOTSTRAP_CODE" \
     --env NEXO_HTTP_ADDR=0.0.0.0:8280 \
     --env NEXO_PUBLIC_BACKEND_ADDR=127.0.0.1:9888 \
     --env NEXO_CONTROL_ADDR=0.0.0.0:9890 \
@@ -155,6 +186,7 @@ start_instance() {
     --volume "$CURRENT_VOLUME:/data/nexo" \
     "$IMAGE" >/dev/null
   wait_for "Nexo Server 健康" 90 instance_healthy
+  BOOTSTRAP_CODE="$(read_bootstrap_code)"
   initialize_admin
 }
 
@@ -173,30 +205,34 @@ initialize_admin() {
 }
 
 set_public_entry_disabled() {
-  jq -cn --arg domain "$DOMAIN" --arg environment "$ENVIRONMENT" \
-    '{base_domain:$domain,https_enabled:false,certificate_mode:"cloudflare",acme_environment:$environment}' \
-    | request_json_stdin PUT "$HTTP_URL/api/v1/settings/public-entry" >/dev/null
+  ensure_primary_domain
+  jq -cn --arg domain "$DOMAIN" \
+    '{domain:$domain,https_enabled:false,certificate_mode:"cloudflare"}' \
+    | request_json_stdin PUT "$HTTP_URL/api/v1/public-domains/$PUBLIC_DOMAIN_ID" >/dev/null
 }
 
 enable_public_entry() {
-  jq -cn --arg domain "$DOMAIN" --arg environment "$ENVIRONMENT" \
-    '{base_domain:$domain,https_enabled:true,certificate_mode:"cloudflare",acme_environment:$environment}' \
-    | request_json_stdin PUT "$HTTP_URL/api/v1/settings/public-entry" >/dev/null
+  ensure_primary_domain
+  jq -cn --arg domain "$DOMAIN" \
+    '{domain:$domain,https_enabled:true,certificate_mode:"cloudflare"}' \
+    | request_json_stdin PUT "$HTTP_URL/api/v1/public-domains/$PUBLIC_DOMAIN_ID" >/dev/null
 }
 
 upload_invalid_token() {
+  ensure_primary_domain
   jq -cn '{cloudflare_token:"nexo-invalid-cloudflare-token"}' \
-    | request_json_stdin POST "$HTTP_URL/api/v1/settings/public-entry/certificate" >/dev/null
+    | request_json_stdin POST "$HTTP_URL/api/v1/public-domains/$PUBLIC_DOMAIN_ID/credentials" >/dev/null
 }
 
 upload_real_token() {
+  ensure_primary_domain
   jq -n --rawfile token "$TOKEN_FILE" \
     '{cloudflare_token:($token | gsub("[\\r\\n]+$"; ""))}' \
-    | request_json_stdin POST "$HTTP_URL/api/v1/settings/public-entry/certificate" >/dev/null
+    | request_json_stdin POST "$HTTP_URL/api/v1/public-domains/$PUBLIC_DOMAIN_ID/credentials" >/dev/null
 }
 
 assert_not_ready() {
-  if entry_has_status READY >/dev/null 2>&1; then
+  if entry_has_status ready >/dev/null 2>&1; then
     echo "无效 Token 被错误标记为 READY" >&2
     return 1
   fi

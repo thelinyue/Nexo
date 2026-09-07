@@ -9,23 +9,9 @@ type MockOptions = {
   tunnelDeleteDelayMs?: number;
   failFirstNetworkCreate?: boolean;
   failFirstLinkCreate?: boolean;
-  failFirstPublicEntryUpdate?: boolean;
+  failFirstPublicDomainUpdate?: boolean;
   failFirstNetworksLoad?: boolean;
-  publicEntry?: Partial<typeof publicEntry>;
   publicDomains?: Array<typeof seedPublicDomain>;
-};
-
-const publicEntry = {
-  base_domain: "nexo.example.com" as string | null,
-  https_enabled: true,
-  certificate_mode: "cloudflare",
-  acme_environment: "production",
-  apply_status: "ready",
-  apply_error: null,
-  certificate_not_before: 1890000000,
-  certificate_not_after: 1893456000,
-  certificate_subjects: ["*.nexo.example.com"],
-  dns_check: { resolved: ["203.0.113.10"] },
 };
 
 const seedPublicDomain = {
@@ -170,12 +156,8 @@ const seedLinks = [
     tenant_id: "default",
     left_site_id: "site-home",
     right_site_id: "site-office",
-    left_network_id: "network-home",
-    right_network_id: "network-office",
     left_site_name: "家庭",
     right_site_name: "办公室",
-    left_network_prefix: "192.168.1.0/24",
-    right_network_prefix: "10.20.0.0/24",
     left_networks: [{ id: "network-home", name: "家庭局域网", prefix: "192.168.1.0/24", source: "detected", address_family: "ipv4", publisher_device_id: "device-home", publisher_device_name: "家庭网关", gateway_address: "192.168.1.1", apply_status: "ready" }],
     right_networks: [{ id: "network-office", name: "办公室局域网", prefix: "10.20.0.0/24", source: "detected", address_family: "ipv4", publisher_device_id: "device-office", publisher_device_name: "办公室网关", gateway_address: "10.20.0.1", apply_status: "ready" }],
     static_routes: [
@@ -215,7 +197,7 @@ async function installApiMocks(page: Page, options: MockOptions) {
   let failTunnelDelete = Boolean(options.failFirstTunnelDelete);
   let failNetworkCreate = Boolean(options.failFirstNetworkCreate);
   let failLinkCreate = Boolean(options.failFirstLinkCreate);
-  let failPublicEntryUpdate = Boolean(options.failFirstPublicEntryUpdate);
+  let failPublicDomainUpdate = Boolean(options.failFirstPublicDomainUpdate);
   let failNetworksLoad = Boolean(options.failFirstNetworksLoad);
   const state = {
     sites: structuredClone(seedSites),
@@ -228,7 +210,6 @@ async function installApiMocks(page: Page, options: MockOptions) {
       { id: "session-current", channel: "local_http", created_at: 1890000000, last_seen_at: 1891000000, expires_at: 1893456000 },
       { id: "session-other", channel: "public_https", created_at: 1889000000, last_seen_at: 1890000000, expires_at: 1893000000 },
     ],
-    publicEntry: { ...structuredClone(publicEntry), ...options.publicEntry },
     publicDomains: structuredClone(options.publicDomains ?? []),
   };
   const supportsPublicDomains = options.publicDomains !== undefined;
@@ -317,7 +298,7 @@ async function installApiMocks(page: Page, options: MockOptions) {
     }
     const publicDomainMatch = path.match(/^\/api\/v1\/public-domains\/([^/]+)$/);
     if (supportsPublicDomains && publicDomainMatch && method === "PUT") {
-      if (failPublicEntryUpdate) { failPublicEntryUpdate = false; await fulfillJson(route, { error: "模拟域名与 HTTPS 设置失败" }, 422); return; }
+      if (failPublicDomainUpdate) { failPublicDomainUpdate = false; await fulfillJson(route, { error: "模拟域名与 HTTPS 设置失败" }, 422); return; }
       const domain = state.publicDomains.find((item) => item.id === decodeURIComponent(publicDomainMatch[1]));
       if (!domain) { await fulfillJson(route, { error: "域名不存在" }, 404); return; }
       const body = request.postDataJSON() as Record<string, unknown>;
@@ -407,23 +388,8 @@ async function installApiMocks(page: Page, options: MockOptions) {
       await fulfillJson(route, domain);
       return;
     }
-    if (path === "/api/v1/settings/public-entry" && method === "GET") { await fulfillJson(route, state.publicEntry); return; }
-
     if (path === "/api/v1/enrollments" && method === "POST") {
       await fulfillJson(route, { enrollment_id: "enrollment-release", token: "release-one-time-token", expires_at: 1893456000 }); return;
-    }
-    if (path === "/api/v1/settings/public-entry" && method === "PUT") {
-      if (failPublicEntryUpdate) { failPublicEntryUpdate = false; await fulfillJson(route, { error: "模拟域名与 HTTPS 设置失败" }, 422); return; }
-      const body = request.postDataJSON() as Partial<typeof publicEntry>;
-      state.publicEntry = { ...state.publicEntry, ...body, apply_status: "configuring", apply_error: null };
-      await fulfillJson(route, state.publicEntry); return;
-    }
-    if (path === "/api/v1/settings/public-entry/certificate" && method === "POST") {
-      await fulfillJson(route, state.publicEntry); return;
-    }
-    if (path === "/api/v1/settings/public-entry/recheck" && method === "POST") {
-      state.publicEntry = { ...state.publicEntry, apply_status: "ready", apply_error: null };
-      await fulfillJson(route, state.publicEntry); return;
     }
     if (path === "/api/v1/sites" && method === "POST") {
       const body = request.postDataJSON() as { name: string; tenant_id: string };
@@ -440,23 +406,25 @@ async function installApiMocks(page: Page, options: MockOptions) {
     }
     if (path === "/api/v1/site-links" && method === "POST") {
       if (failLinkCreate) { failLinkCreate = false; await fulfillJson(route, { error: "模拟站点互联创建失败" }, 422); return; }
-      const body = request.postDataJSON() as Record<string, string>;
+      const body = request.postDataJSON() as { tenant_id: string; left_site_id: string; right_site_id: string; left_network_ids: string[]; right_network_ids: string[]; next_hops?: unknown };
       const left = state.sites.find((item) => item.id === body.left_site_id)!;
       const right = state.sites.find((item) => item.id === body.right_site_id)!;
-      const leftNetwork = state.networks.find((item) => item.id === body.left_network_id)!;
-      const rightNetwork = state.networks.find((item) => item.id === body.right_network_id)!;
+      const toSummary = (network: (typeof state.networks)[number]) => ({ id: network.id, name: network.name, prefix: network.desired_prefix, source: network.source, address_family: network.desired_prefix.includes(":") ? "ipv6" : "ipv4", publisher_device_id: network.publisher_device_id, publisher_device_name: network.publisher_device_name, gateway_address: network.gateway_address, apply_status: network.apply_status });
+      const leftNetworks = body.left_network_ids.map((id) => state.networks.find((item) => item.id === id)).filter((network): network is (typeof state.networks)[number] => Boolean(network)).map(toSummary);
+      const rightNetworks = body.right_network_ids.map((id) => state.networks.find((item) => item.id === id)).filter((network): network is (typeof state.networks)[number] => Boolean(network)).map(toSummary);
+      const leftNetwork = leftNetworks[0]!;
+      const rightNetwork = rightNetworks[0]!;
       const created = {
         id: "link-created", tenant_id: "default", ...body, left_site_name: left.name, right_site_name: right.name,
-        left_network_prefix: leftNetwork.desired_prefix, right_network_prefix: rightNetwork.desired_prefix,
-        left_networks: [{ id: leftNetwork.id, name: leftNetwork.name, prefix: leftNetwork.desired_prefix, source: leftNetwork.source, address_family: leftNetwork.desired_prefix.includes(":") ? "ipv6" : "ipv4", publisher_device_id: leftNetwork.publisher_device_id, publisher_device_name: leftNetwork.publisher_device_name, gateway_address: leftNetwork.gateway_address, apply_status: leftNetwork.apply_status }],
-        right_networks: [{ id: rightNetwork.id, name: rightNetwork.name, prefix: rightNetwork.desired_prefix, source: rightNetwork.source, address_family: rightNetwork.desired_prefix.includes(":") ? "ipv6" : "ipv4", publisher_device_id: rightNetwork.publisher_device_id, publisher_device_name: rightNetwork.publisher_device_name, gateway_address: rightNetwork.gateway_address, apply_status: rightNetwork.apply_status }],
+        left_networks: leftNetworks,
+        right_networks: rightNetworks,
         static_routes: [
-          { router_site_id: left.id, destination_site_id: right.id, router_site_name: left.name, destination_site_name: right.name, destination_prefix: rightNetwork.desired_prefix, next_hop: "192.168.1.2", router_confirmed: false },
-          { router_site_id: right.id, destination_site_id: left.id, router_site_name: right.name, destination_site_name: left.name, destination_prefix: leftNetwork.desired_prefix, next_hop: "10.20.0.2", router_confirmed: false },
+          { router_site_id: left.id, destination_site_id: right.id, router_site_name: left.name, destination_site_name: right.name, destination_prefix: rightNetwork.prefix, next_hop: "192.168.1.2", router_confirmed: false },
+          { router_site_id: right.id, destination_site_id: left.id, router_site_name: right.name, destination_site_name: left.name, destination_prefix: leftNetwork.prefix, next_hop: "10.20.0.2", router_confirmed: false },
         ],
         route_statuses: [
-          { network_id: rightNetwork.id, router_site_id: left.id, destination_site_id: right.id, destination_prefix: rightNetwork.desired_prefix, address_family: rightNetwork.desired_prefix.includes(":") ? "ipv6" : "ipv4", device_status: "pending", control_plane_status: "pending", remote_status: "pending", error: null, checked_at: null },
-          { network_id: leftNetwork.id, router_site_id: right.id, destination_site_id: left.id, destination_prefix: leftNetwork.desired_prefix, address_family: leftNetwork.desired_prefix.includes(":") ? "ipv6" : "ipv4", device_status: "pending", control_plane_status: "pending", remote_status: "pending", error: null, checked_at: null },
+          { network_id: rightNetwork.id, router_site_id: left.id, destination_site_id: right.id, destination_prefix: rightNetwork.prefix, address_family: rightNetwork.address_family, device_status: "pending", control_plane_status: "pending", remote_status: "pending", error: null, checked_at: null },
+          { network_id: leftNetwork.id, router_site_id: right.id, destination_site_id: left.id, destination_prefix: leftNetwork.prefix, address_family: leftNetwork.address_family, device_status: "pending", control_plane_status: "pending", remote_status: "pending", error: null, checked_at: null },
         ],
         enabled: true, apply_status: "checking", apply_error: null, health_status: "degraded", health_error: null, deletion_pending: false,
         route_confirmations: [] as { site_id: string; confirmed_at: number }[],
@@ -467,16 +435,15 @@ async function installApiMocks(page: Page, options: MockOptions) {
       const id = decodeURIComponent(path.split("/").at(-1) ?? "");
       const link = state.links.find((item) => item.id === id);
       if (!link) { await fulfillJson(route, { error: "站点互联不存在" }, 404); return; }
-      const body = request.postDataJSON() as { left_network_ids?: string[]; right_network_ids?: string[]; left_network_id?: string; right_network_id?: string; next_hops?: unknown };
-      const leftId = body.left_network_ids?.[0] ?? body.left_network_id ?? link.left_network_id;
-      const rightId = body.right_network_ids?.[0] ?? body.right_network_id ?? link.right_network_id;
-      const leftNetwork = state.networks.find((item) => item.id === leftId)!;
-      const rightNetwork = state.networks.find((item) => item.id === rightId)!;
+      const body = request.postDataJSON() as { left_network_ids?: string[]; right_network_ids?: string[]; next_hops?: unknown };
+      const leftIds = body.left_network_ids ?? link.left_networks.map((network) => network.id);
+      const rightIds = body.right_network_ids ?? link.right_networks.map((network) => network.id);
+      const toSummary = (network: (typeof state.networks)[number]) => ({ id: network.id, name: network.name, prefix: network.desired_prefix, source: network.source, address_family: network.desired_prefix.includes(":") ? "ipv6" : "ipv4", publisher_device_id: network.publisher_device_id, publisher_device_name: network.publisher_device_name, gateway_address: network.gateway_address, apply_status: network.apply_status });
+      const leftNetworks = leftIds.map((networkId) => state.networks.find((item) => item.id === networkId)).filter((network): network is (typeof state.networks)[number] => Boolean(network)).map(toSummary);
+      const rightNetworks = rightIds.map((networkId) => state.networks.find((item) => item.id === networkId)).filter((network): network is (typeof state.networks)[number] => Boolean(network)).map(toSummary);
       Object.assign(link, body, {
-        left_network_id: leftId,
-        right_network_id: rightId,
-        left_network_prefix: leftNetwork.desired_prefix,
-        right_network_prefix: rightNetwork.desired_prefix,
+        left_networks: leftNetworks,
+        right_networks: rightNetworks,
         apply_status: "checking",
         health_status: "degraded",
         route_confirmations: [],
@@ -603,7 +570,7 @@ async function installApiMocks(page: Page, options: MockOptions) {
       const id = decodeURIComponent(path.split("/").at(-1) ?? "");
       const network = state.networks.find((item) => item.id === id);
       if (!network) { await fulfillJson(route, { error: "共享网络不存在" }, 404); return; }
-      const references = state.links.filter((item) => item.left_network_id === id || item.right_network_id === id).length;
+      const references = state.links.filter((item) => item.left_networks.some((network) => network.id === id) || item.right_networks.some((network) => network.id === id)).length;
       if (references) { await fulfillJson(route, { error: `共享网络仍被 ${references} 个互联关系引用，请先删除互联关系` }, 409); return; }
       network.enabled = false; network.apply_status = "checking"; network.deletion_pending = true;
       await fulfillJson(route, { deleted: false, pending: true, id, message: "已请求删除共享网络，等待 Agent 与 Headscale 完成路由撤销" }); return;
@@ -1029,7 +996,7 @@ test("已添加设备支持编辑名称与所属站点", async ({ page }) => {
 });
 
 test("域名编辑 Sheet 在失败后保留表单并安全提交 Cloudflare Token", async ({ page }) => {
-  await installApiMocks(page, { initialized: true, authenticated: true, failFirstPublicEntryUpdate: true, publicDomains: [seedPublicDomain] });
+  await installApiMocks(page, { initialized: true, authenticated: true, failFirstPublicDomainUpdate: true, publicDomains: [seedPublicDomain] });
   let secretRequestCount = 0;
   page.on("request", (request) => {
     if (new URL(request.url()).pathname === "/api/v1/public-domains/domain-primary/credentials") secretRequestCount += 1;

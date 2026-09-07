@@ -9,7 +9,6 @@ services:
       context: ..
       dockerfile: docker/Dockerfile.server
     environment:
-      NEXO_ADMIN_TOKEN: ${NEXO_ADMIN_TOKEN:-integration-admin}
       NEXO_HTTP_ADDR: 0.0.0.0:8280
       NEXO_PUBLIC_BACKEND_ADDR: 127.0.0.1:9888
       NEXO_CONTROL_ADDR: 0.0.0.0:9890

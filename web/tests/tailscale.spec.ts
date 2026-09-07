@@ -127,7 +127,7 @@ async function installTailscaleMocks(page: Page, role: Role) {
       return;
     }
     if (path === "/api/v1/tunnels" && method === "GET") { await json(route, []); return; }
-    if (path === "/api/v1/public-domains" || path === "/api/v1/settings/public-entry") {
+    if (path === "/api/v1/public-domains") {
       await json(route, { error: "当前账号没有系统设置权限" }, 403);
       return;
     }

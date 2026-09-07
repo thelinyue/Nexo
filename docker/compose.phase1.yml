@@ -7,13 +7,11 @@ services:
       dockerfile: docker/Dockerfile.server
     environment:
       TZ: ${TZ:-Asia/Shanghai}
-      NEXO_ADMIN_TOKEN: ${NEXO_ADMIN_TOKEN:?请设置 NEXO_ADMIN_TOKEN}
       # Headscale 只绑定 Server 容器内部端口；这里的 loopback 映射仅供同机
       # host-network Agent 使用，不作为公网入口。
       NEXO_HEADSCALE_LISTEN_ADDR: 127.0.0.1:8281
       NEXO_HEADSCALE_API_URL: http://127.0.0.1:8281
       NEXO_HEADSCALE_URL: ${NEXO_HEADSCALE_URL:-http://127.0.0.1:8281}
-      NEXO_MESH_ENDPOINT: ${NEXO_MESH_ENDPOINT:-http://127.0.0.1:8281}
       NEXO_MESH_DNS_BASE_DOMAIN: ${NEXO_MESH_DNS_BASE_DOMAIN:-mesh.nexo.internal}
       # 阶段一仅用于内部测试；正式部署需使用 HTTPS 公网组网入口。
       NEXO_MESH_ALLOW_INSECURE: ${NEXO_MESH_ALLOW_INSECURE:-true}
@@ -45,7 +43,6 @@ services:
       NEXO_SERVER_URL: ${NEXO_SERVER_URL:-http://127.0.0.1:8280}
       NEXO_CONTROL_ADDR: ${NEXO_CONTROL_ADDR:-127.0.0.1:9890}
       NEXO_CONTROL_SERVER_NAME: ${NEXO_CONTROL_SERVER_NAME:-nexo-server}
-      NEXO_MESH_ENDPOINT: ${NEXO_MESH_ENDPOINT:-http://127.0.0.1:8281}
       NEXO_ENROLLMENT_TOKEN: ${NEXO_ENROLLMENT_TOKEN:-}
       NEXO_DEVICE_NAME: ${NEXO_DEVICE_NAME:-Nexo Gateway}
       NEXO_AGENT_CAPABILITIES: ${NEXO_AGENT_CAPABILITIES:-mesh,subnet_gateway,site_gateway}

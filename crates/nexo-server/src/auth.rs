@@ -4,7 +4,7 @@
 //! 写入 SQLite。LAN HTTP 与公网 HTTPS 使用不同的 Session 通道，避免一个
 //! 未加密入口的 Cookie 被误用于公网安全入口。
 
-use std::{env, fs, net::IpAddr, path::Path};
+use std::{fs, net::IpAddr, path::Path};
 
 use argon2::{
     password_hash::{
@@ -158,6 +158,8 @@ pub struct UserResponse {
     pub role: String,
     pub workspace_id: String,
     pub created_at: i64,
+    pub enabled: bool,
+    pub mesh_revocation_pending: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -183,18 +185,9 @@ pub fn ensure_bootstrap_code(
         return Ok(());
     }
     fs::create_dir_all(data_dir)?;
-    // 旧版本通过 NEXO_ADMIN_TOKEN 提供首次凭证。未初始化时把它一次性
-    // 迁移到同一份受限 Secret 文件，初始化完成后文件删除，环境变量即使
-    // 仍存在也不会重新获得管理权限。
-    let code = env::var("NEXO_ADMIN_TOKEN")
-        .ok()
-        .map(|value| value.trim().to_owned())
-        .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| {
-            let mut bytes = [0_u8; 32];
-            OsRng.fill_bytes(&mut bytes);
-            hex::encode(bytes)
-        });
+    let mut bytes = [0_u8; 32];
+    OsRng.fill_bytes(&mut bytes);
+    let code = hex::encode(bytes);
     let temporary = data_dir.join(format!(".{BOOTSTRAP_FILE}.{}.tmp", std::process::id()));
     fs::write(&temporary, code.as_bytes())?;
     set_private_permissions(&temporary)?;
@@ -326,8 +319,7 @@ pub fn require_csrf(state: &AppState, headers: &HeaderMap) -> Result<(), ApiErro
 /// 管理 API 的统一授权边界。
 ///
 /// Bootstrap Code 只属于初始化接口，不能作为普通管理 API 的长期凭证。
-/// 所有业务请求都必须携带当前入口对应的有效管理员 Session；这样即使旧版
-/// `NEXO_ADMIN_TOKEN` 仍存在于容器环境，也不会绕过登录、CSRF 和 Session 吊销。
+/// 所有业务请求都必须携带当前入口对应的有效管理员 Session。
 pub fn authorize_admin(state: &AppState, headers: &HeaderMap) -> Result<(), ApiError> {
     let channel = request_channel(headers);
     let session = load_session(state, headers, channel)
@@ -507,6 +499,8 @@ pub async fn create_user(
         role: "tenant".to_owned(),
         workspace_id,
         created_at: now,
+        enabled: true,
+        mesh_revocation_pending: false,
     }))
 }
 
@@ -522,7 +516,8 @@ pub async fn list_users(
         .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "数据库锁不可用"))?;
     let mut statement = connection
         .prepare(
-            "SELECT id, username, role, COALESCE(tenant_id, ''), created_at
+            "SELECT id, username, role, COALESCE(tenant_id, ''), created_at,
+                    enabled, mesh_revocation_pending
              FROM users ORDER BY role ASC, username ASC",
         )
         .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法读取用户列表"))?;
@@ -534,6 +529,8 @@ pub async fn list_users(
                 role: row.get(2)?,
                 workspace_id: row.get(3)?,
                 created_at: row.get(4)?,
+                enabled: row.get::<_, i64>(5)? != 0,
+                mesh_revocation_pending: row.get::<_, i64>(6)? != 0,
             })
         })
         .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法读取用户列表"))?;
@@ -760,7 +757,7 @@ pub async fn login(
             .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "数据库锁不可用"))?;
         connection
             .query_row(
-                "SELECT id, tenant_id, role, password_hash FROM users
+                "SELECT id, tenant_id, role, password_hash, enabled FROM users
                  WHERE username = ?1",
                 [&request.username],
                 |row| {
@@ -769,13 +766,14 @@ pub async fn login(
                         row.get::<_, String>(1)?,
                         row.get::<_, String>(2)?,
                         row.get::<_, String>(3)?,
+                        row.get::<_, i64>(4)? != 0,
                     ))
                 },
             )
             .optional()
             .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法读取管理员账号"))?
     };
-    let Some((user_id, tenant_id, role, password_hash)) = record else {
+    let Some((user_id, tenant_id, role, password_hash, enabled)) = record else {
         record_login_attempt(&state, &request.username, &source, false)?;
         return Err(ApiError::new(StatusCode::UNAUTHORIZED, "用户名或密码错误"));
     };
@@ -783,6 +781,12 @@ pub async fn login(
     record_login_attempt(&state, &request.username, &source, valid)?;
     if !valid {
         return Err(ApiError::new(StatusCode::UNAUTHORIZED, "用户名或密码错误"));
+    }
+    if !enabled {
+        return Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "当前账号已停用，请联系系统管理员",
+        ));
     }
     let (session, csrf_token) = {
         let connection = state
@@ -827,6 +831,181 @@ pub async fn logout(
     clear_cookie(&mut response, channel.session_cookie(), channel.secure());
     clear_cookie(&mut response, channel.csrf_cookie(), channel.secure());
     Ok(response)
+}
+
+/// 停用账号时先原子关闭 Nexo 登录面，再尽力过期该账号的 OIDC 节点。
+/// Headscale 暂时不可用时保留 `mesh_revocation_pending`，由后台协调器重试。
+pub async fn disable_user(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Result<Json<RecoveryResponse>, ApiError> {
+    authorize_admin(&state, &headers)?;
+    let id = id.trim().to_owned();
+    if id.is_empty() {
+        return Err(ApiError::new(StatusCode::BAD_REQUEST, "用户 ID 不能为空"));
+    }
+    {
+        let mut connection = state
+            .db
+            .lock()
+            .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "数据库锁不可用"))?;
+        let transaction = connection.transaction().map_err(|_| {
+            ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法开始账号停用事务")
+        })?;
+        let changed = transaction
+            .execute(
+                "UPDATE users SET enabled = 0, mesh_revocation_pending = 1 WHERE id = ?1",
+                [&id],
+            )
+            .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法停用账号"))?;
+        if changed == 0 {
+            return Err(ApiError::new(StatusCode::NOT_FOUND, "用户不存在"));
+        }
+        transaction
+            .execute(
+                "UPDATE auth_sessions SET revoked_at = ?1
+                 WHERE user_id = ?2 AND revoked_at IS NULL",
+                params![unix_now(), id],
+            )
+            .map_err(|_| {
+                ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法吊销账号登录状态")
+            })?;
+        transaction
+            .execute(
+                "UPDATE mesh_oidc_accounts
+                 SET sync_status = 'pending', last_error = '账号已停用', updated_at = unixepoch()
+                 WHERE nexo_user_id = ?1",
+                [&id],
+            )
+            .map_err(|_| {
+                ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法记录组网撤销状态")
+            })?;
+        transaction.commit().map_err(|_| {
+            ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法提交账号停用事务")
+        })?;
+    }
+    match revoke_user_mesh(&state, &id).await {
+        Ok(()) => Ok(Json(RecoveryResponse {
+            message: "账号已停用，登录状态和组网节点已撤销".to_owned(),
+        })),
+        Err(error) => {
+            tracing::warn!(user_id = %id, "账号已停用，但组网节点将在 Headscale 恢复后自动撤销：{error:#}");
+            Ok(Json(RecoveryResponse {
+                message: "账号已停用，组网节点撤销将在服务恢复后自动完成".to_owned(),
+            }))
+        }
+    }
+}
+
+/// 启用账号只恢复 Nexo 登录资格，不复活被停用时过期的旧 OIDC 节点。
+pub async fn enable_user(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Result<Json<RecoveryResponse>, ApiError> {
+    authorize_admin(&state, &headers)?;
+    let id = id.trim().to_owned();
+    let connection = state
+        .db
+        .lock()
+        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "数据库锁不可用"))?;
+    let changed = connection
+        .execute("UPDATE users SET enabled = 1 WHERE id = ?1", [&id])
+        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法启用账号"))?;
+    if changed == 0 {
+        return Err(ApiError::new(StatusCode::NOT_FOUND, "用户不存在"));
+    }
+    Ok(Json(RecoveryResponse {
+        message: "账号已启用，请重新进行组网登录".to_owned(),
+    }))
+}
+
+async fn revoke_user_mesh(state: &AppState, user_id: &str) -> anyhow::Result<()> {
+    let mapping: Option<(String, Option<String>)> = {
+        let connection = state
+            .db
+            .lock()
+            .map_err(|_| anyhow::anyhow!("数据库锁不可用"))?;
+        connection
+            .query_row(
+                "SELECT provider_id, headscale_user_id FROM mesh_oidc_accounts
+                 WHERE nexo_user_id = ?1",
+                [user_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?
+    };
+    let Some((provider_id, headscale_user_id)) = mapping else {
+        let connection = state
+            .db
+            .lock()
+            .map_err(|_| anyhow::anyhow!("数据库锁不可用"))?;
+        connection.execute(
+            "UPDATE users SET mesh_revocation_pending = 0 WHERE id = ?1",
+            [user_id],
+        )?;
+        return Ok(());
+    };
+    let nodes = state.headscale.list_nodes().await?;
+    for node in nodes {
+        let matches_user = node.user.as_ref().is_some_and(|user| {
+            user.provider_id.as_deref() == Some(provider_id.as_str())
+                || headscale_user_id.as_deref() == Some(user.id.as_str())
+        });
+        if matches_user {
+            state
+                .headscale
+                .expire_node(
+                    &node.id,
+                    &super::format_headscale_expiration(super::unix_now().max(0) as u64),
+                )
+                .await?;
+        }
+    }
+    let connection = state
+        .db
+        .lock()
+        .map_err(|_| anyhow::anyhow!("数据库锁不可用"))?;
+    connection.execute(
+        "UPDATE users SET mesh_revocation_pending = 0 WHERE id = ?1",
+        [user_id],
+    )?;
+    connection.execute(
+        "UPDATE mesh_oidc_accounts SET sync_status = 'revoked', last_error = NULL, updated_at = unixepoch()
+         WHERE nexo_user_id = ?1",
+        [user_id],
+    )?;
+    Ok(())
+}
+
+/// 后台协调器重试停用账号的 Headscale 节点撤销；每个账号独立失败，避免
+/// 一个暂时不可用的节点阻塞其他账号的撤销任务。
+pub async fn reconcile_pending_mesh_revocations(state: &AppState) -> anyhow::Result<()> {
+    let user_ids = {
+        let connection = state
+            .db
+            .lock()
+            .map_err(|_| anyhow::anyhow!("数据库锁不可用"))?;
+        let mut statement = connection
+            .prepare("SELECT id FROM users WHERE mesh_revocation_pending = 1 ORDER BY id")?;
+        let user_ids = statement
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        user_ids
+    };
+    let mut first_error = None;
+    for user_id in user_ids {
+        if let Err(error) = revoke_user_mesh(state, &user_id).await {
+            tracing::warn!(user_id = %user_id, "停用账号的组网节点撤销失败，将继续重试：{error:#}");
+            first_error.get_or_insert(error);
+        }
+    }
+    if let Some(error) = first_error {
+        Err(error)
+    } else {
+        Ok(())
+    }
 }
 
 pub async fn change_password(
@@ -1058,8 +1237,11 @@ fn load_session(
     let connection = state.db.lock().ok()?;
     let record = connection
         .query_row(
-            "SELECT id, user_id, tenant_id, csrf_digest, created_at, last_seen_at, expires_at, revoked_at
-             FROM auth_sessions WHERE session_digest = ?1 AND channel = ?2",
+            "SELECT s.id, s.user_id, s.tenant_id, s.csrf_digest, s.created_at,
+                    s.last_seen_at, s.expires_at, s.revoked_at
+             FROM auth_sessions s
+             JOIN users u ON u.id = s.user_id
+             WHERE s.session_digest = ?1 AND s.channel = ?2 AND u.enabled = 1",
             params![session_digest, channel.as_str()],
             |row| {
                 Ok((
@@ -1194,11 +1376,48 @@ fn user_count(connection: &rusqlite::Connection) -> Result<i64, ApiError> {
 }
 
 fn validate_username(username: &str) -> Result<(), ApiError> {
-    let length = username.trim().chars().count();
-    if !(1..=64).contains(&length) {
+    let length = username.chars().count();
+    if length < 2 {
         return Err(ApiError::new(
             StatusCode::BAD_REQUEST,
-            "管理员用户名长度必须为 1-64 个字符",
+            "用户名至少需要 2 个字符",
+        ));
+    }
+    if username.chars().any(char::is_whitespace) {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "用户名不能包含空白字符",
+        ));
+    }
+    let mut at_count = 0;
+    for (index, character) in username.chars().enumerate() {
+        if index == 0 && !character.is_alphabetic() {
+            return Err(ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "用户名必须以字母开头",
+            ));
+        }
+        if character == '@' {
+            at_count += 1;
+            if at_count > 1 {
+                return Err(ApiError::new(
+                    StatusCode::BAD_REQUEST,
+                    "用户名最多只能包含一个 @",
+                ));
+            }
+            continue;
+        }
+        if !(character.is_alphanumeric() || matches!(character, '-' | '.' | '_')) {
+            return Err(ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "用户名只能包含字母、数字、连字符、点号、下划线和一个 @",
+            ));
+        }
+    }
+    if username.ends_with('@') {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "用户名不能以 @ 结尾",
         ));
     }
     Ok(())
@@ -1378,7 +1597,14 @@ mod tests {
                 "CREATE TABLE tenants (id TEXT PRIMARY KEY, name TEXT NOT NULL);
                  CREATE TABLE users (
                     id TEXT PRIMARY KEY, tenant_id TEXT, username TEXT NOT NULL UNIQUE,
-                    role TEXT NOT NULL, password_hash TEXT NOT NULL
+                    role TEXT NOT NULL, password_hash TEXT NOT NULL,
+                    enabled INTEGER NOT NULL DEFAULT 1,
+                    mesh_revocation_pending INTEGER NOT NULL DEFAULT 0
+                 );
+                 CREATE TABLE oidc_settings (
+                    id INTEGER PRIMARY KEY CHECK (id = 1), issuer TEXT,
+                    private_key_pem TEXT NOT NULL, public_key_pem TEXT NOT NULL,
+                    key_id TEXT NOT NULL
                  );
                  CREATE TABLE auth_sessions (
                     id TEXT PRIMARY KEY, user_id TEXT NOT NULL, tenant_id TEXT NOT NULL,
@@ -1406,6 +1632,9 @@ mod tests {
             .expect("应创建认证测试表");
         let data_dir = std::env::temp_dir().join(format!("nexo-auth-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&data_dir).expect("应创建认证 Secret 测试目录");
+        let oidc = Arc::new(
+            crate::oidc::OidcRuntime::initialize(&connection).expect("应初始化认证测试 OIDC 状态"),
+        );
         AppState {
             db: Arc::new(std::sync::Mutex::new(connection)),
             data_dir: data_dir.clone(),
@@ -1425,6 +1654,7 @@ mod tests {
             headscale_runtime: Arc::new(headscale::HeadscaleSupervisor::new(
                 headscale::HeadscaleRuntimeConfig::from_env(data_dir),
             )),
+            oidc,
         }
     }
 
@@ -1633,6 +1863,38 @@ mod tests {
             validate_password("联巢联巢联巢").unwrap_err().status,
             StatusCode::BAD_REQUEST
         );
+    }
+
+    #[test]
+    fn username_validation_matches_headscale_acceptance_rules() {
+        for username in [
+            "linyue",
+            "ab-1._2",
+            "linyue@example",
+            "用户1",
+            &"a".repeat(64),
+            &"a".repeat(65),
+        ] {
+            assert!(
+                validate_username(username).is_ok(),
+                "应接受用户名 {username}"
+            );
+        }
+        for username in [
+            "",
+            "a",
+            "1linyue",
+            "-linyue",
+            "linyue@@example",
+            "linyue@",
+            "lin yue",
+            "linyue/mesh",
+        ] {
+            assert!(
+                validate_username(username).is_err(),
+                "应拒绝用户名 {username}"
+            );
+        }
     }
 
     #[test]

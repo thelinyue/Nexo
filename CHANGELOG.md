@@ -2,6 +2,18 @@
 
 本项目使用 [Semantic Versioning](https://semver.org/) 记录公开版本。
 
+## [0.1.13] - 2026-09-07
+
+### Added
+
+- 增加 Nexo 账号与 Headscale OIDC 账号映射、固定签名密钥和账号撤销同步。
+- 增加 OIDC 登录、授权回调及官方 Tailscale 客户端注册流程。
+- 增加 OIDC 账号迁移和相关服务端、浏览器验收测试。
+
+### Changed
+
+- 收敛认证、Headscale、策略和公网入口状态处理，统一错误日志和部署检查。
+
 ## [0.1.12] - 2026-09-07
 
 ### Fixed

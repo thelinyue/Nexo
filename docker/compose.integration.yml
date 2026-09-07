@@ -8,13 +8,11 @@ services:
       context: ..
       dockerfile: docker/Dockerfile.server
     environment:
-      NEXO_ADMIN_TOKEN: integration-admin
       NEXO_HTTP_ADDR: 0.0.0.0:8280
       NEXO_CONTROL_ADDR: 0.0.0.0:9890
       NEXO_HEADSCALE_LISTEN_ADDR: 0.0.0.0:8281
       NEXO_HEADSCALE_API_URL: http://127.0.0.1:8281
       NEXO_HEADSCALE_URL: http://172.27.0.2:8281
-      NEXO_MESH_ENDPOINT: http://172.27.0.2:8281
       # 集成拓扑使用内部 HTTP Mesh 地址；生产 Compose 不设置此开关。
       NEXO_MESH_ALLOW_INSECURE: "true"
       NEXO_MESH_DNS_BASE_DOMAIN: mesh.nexo.internal

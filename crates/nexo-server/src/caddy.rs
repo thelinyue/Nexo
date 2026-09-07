@@ -36,9 +36,6 @@ pub struct CaddyRuntimeConfig {
     pub binary: PathBuf,
     pub config_path: PathBuf,
     pub applied_path: PathBuf,
-    /// Cloudflare Token 的唯一明文来源。配置文件只保存环境变量占位符，
-    /// Supervisor 启动 Caddy 时再从这个 0600 文件注入子进程环境。
-    pub cloudflare_token_path: PathBuf,
     /// 多域名 Secret 根目录；Supervisor 会把每个域名的 Token 以独立
     /// 环境变量注入 Caddy，避免不同 Cloudflare 账号互相覆盖。
     pub cloudflare_token_root: PathBuf,
@@ -269,10 +266,6 @@ impl CaddyRuntimeConfig {
             binary,
             config_path: data_dir.join("caddy").join("config.json"),
             applied_path: data_dir.join("caddy").join("applied.json"),
-            cloudflare_token_path: data_dir
-                .join("secrets")
-                .join("public-entry")
-                .join("cloudflare.token"),
             cloudflare_token_root: data_dir.join("secrets").join("public-domains"),
             storage_root: data_dir.join("caddy-storage"),
             admin_url: env::var("NEXO_CADDY_ADMIN_URL")
@@ -363,21 +356,6 @@ impl CaddySupervisor {
 
     async fn spawn_once(&self) -> Result<()> {
         let mut command = Command::new(&self.config.binary);
-        // Caddy 的 JSON 配置只包含 `{env.NEXO_CLOUDFLARE_API_TOKEN}`，
-        // 避免把 Token 写入配置、命令行参数、日志或 SQLite。文件不存在时
-        // 不注入变量，让 Caddy 明确报告证书材料尚未准备好。
-        let token_digest = if let Ok(token) = fs::read_to_string(&self.config.cloudflare_token_path)
-        {
-            let token = token.trim();
-            if !token.is_empty() {
-                command.env("NEXO_CLOUDFLARE_API_TOKEN", token);
-                Some(hex::encode(Sha256::digest(token.as_bytes())))
-            } else {
-                None
-            }
-        } else {
-            None
-        };
         // 多域名模式为每个 Secret 目录注入独立变量。目录名来自 Server
         // 生成的 UUID，不接受用户输入，因此不会产生可注入的环境变量名。
         let mut domain_token_digests = Vec::new();
@@ -408,8 +386,8 @@ impl CaddySupervisor {
             spawn_caddy_log_reader(stderr, Arc::clone(&self.log_events), "stderr");
         }
         *self.child.lock().await = Some(child);
-        // 旧单例摘要与多域名摘要共同参与重启检测；摘要本身不含 Secret。
-        let mut digest = token_digest.unwrap_or_default();
+        // 摘要本身不含 Secret，只用于检测凭据变化并触发 Caddy 重启。
+        let mut digest = String::new();
         for (name, value) in domain_token_digests {
             digest.push('|');
             digest.push_str(&name);
@@ -558,12 +536,7 @@ impl CaddySupervisor {
     }
 
     async fn token_changed(&self) -> bool {
-        let legacy = fs::read_to_string(&self.config.cloudflare_token_path)
-            .ok()
-            .map(|token| token.trim().to_owned())
-            .filter(|token| !token.is_empty())
-            .map(|token| hex::encode(Sha256::digest(token.as_bytes())));
-        let mut digest = legacy.unwrap_or_default();
+        let mut digest = String::new();
         for (id, token) in read_domain_tokens(&self.config.cloudflare_token_root) {
             digest.push('|');
             digest.push_str(&format!(
@@ -1439,7 +1412,6 @@ mod tests {
             binary: PathBuf::from("caddy"),
             config_path: root.join("config.json"),
             applied_path: root.join("applied.json"),
-            cloudflare_token_path: root.join("cloudflare.token"),
             cloudflare_token_root: root.join("public-domains"),
             storage_root: root.join("caddy-storage"),
             admin_url: "http://127.0.0.1:8290".to_owned(),

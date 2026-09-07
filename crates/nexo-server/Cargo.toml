@@ -9,6 +9,7 @@ anyhow.workspace = true
 argon2.workspace = true
 async-trait.workspace = true
 axum.workspace = true
+base64.workspace = true
 clap.workspace = true
 futures-io.workspace = true
 nexo-core = { path = "../nexo-core" }
@@ -17,14 +18,17 @@ nexo-headscale-adapter = { path = "../nexo-headscale-adapter" }
 nexo-tunnel = { path = "../nexo-tunnel" }
 hex.workspace = true
 ipnet.workspace = true
+jsonwebtoken.workspace = true
 libc.workspace = true
 rusqlite.workspace = true
+rsa.workspace = true
 rcgen.workspace = true
 rustls.workspace = true
 rustls-pemfile.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 reqwest.workspace = true
+rand.workspace = true
 tokio.workspace = true
 tokio-rustls.workspace = true
 tokio-util.workspace = true
@@ -34,5 +38,7 @@ tracing-subscriber.workspace = true
 sha2.workspace = true
 time.workspace = true
 uuid.workspace = true
+oxide-auth.workspace = true
+oxide-auth-axum.workspace = true
 yamux.workspace = true
 x509-parser.workspace = true

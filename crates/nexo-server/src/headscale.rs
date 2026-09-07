@@ -51,6 +51,8 @@ pub struct HeadscaleRuntimeConfig {
     pub api_url: String,
     /// 下发给 Agent 的组网登录地址；可以与内部 API 地址不同。
     pub server_url: String,
+    /// Nexo OIDC 的固定 issuer；为空时表示公网主域名尚未就绪。
+    pub oidc_issuer: Option<String>,
     /// MagicDNS 为节点生成的内部后缀；不向 Web 暴露 Headscale 配置细节。
     pub dns_base_domain: String,
     /// 集成测试可启用内置 DERP，验证无法直连时的真实数据面。
@@ -77,6 +79,7 @@ impl HeadscaleRuntimeConfig {
                 .unwrap_or_else(|_| "http://127.0.0.1:8281".to_owned()),
             server_url: env::var("NEXO_HEADSCALE_URL")
                 .unwrap_or_else(|_| "http://nexo-server:8281".to_owned()),
+            oidc_issuer: env::var("NEXO_OIDC_ISSUER").ok(),
             dns_base_domain: env::var("NEXO_MESH_DNS_BASE_DOMAIN")
                 .unwrap_or_else(|_| "mesh.nexo.internal".to_owned()),
             embedded_derp_enabled: env::var("NEXO_HEADSCALE_EMBEDDED_DERP_ENABLED")
@@ -96,12 +99,10 @@ impl HeadscaleRuntimeConfig {
 
     /// 返回 Agent 在没有正式公网入口时使用的内部登录地址。
     ///
-    /// 生产部署可以通过 `NEXO_MESH_INTERNAL_URL` 指定宿主机/LAN 可达地址；
-    /// 集成拓扑继续兼容阶段一的 `NEXO_MESH_ENDPOINT`。两者都未设置时使用
-    /// API 地址作为保守回退，此时 Server 仍会阻止新的生产 Mesh Enrollment。
+    /// 生产部署通过 `NEXO_MESH_INTERNAL_URL` 指定宿主机或 LAN 可达地址；
+    /// 未配置时使用 Headscale API 地址作为保守回退。
     pub fn internal_server_url(&self) -> String {
         env::var("NEXO_MESH_INTERNAL_URL")
-            .or_else(|_| env::var("NEXO_MESH_ENDPOINT"))
             .unwrap_or_else(|_| self.api_url.clone())
             .trim_end_matches('/')
             .to_owned()
@@ -285,6 +286,7 @@ pub struct HeadscaleSupervisor {
     config: HeadscaleRuntimeConfig,
     /// 根域名修改后会更新 Headscale 的登录地址；其余启动参数保持不变。
     server_url: Arc<RwLock<String>>,
+    oidc_issuer: Arc<RwLock<Option<String>>>,
     child: Arc<Mutex<Option<Child>>>,
     stopping: Arc<AtomicBool>,
     shutdown_notify: Arc<Notify>,
@@ -304,6 +306,7 @@ impl HeadscaleSupervisor {
     pub fn new(config: HeadscaleRuntimeConfig) -> Self {
         Self {
             server_url: Arc::new(RwLock::new(config.server_url.clone())),
+            oidc_issuer: Arc::new(RwLock::new(config.oidc_issuer.clone())),
             config,
             child: Arc::new(Mutex::new(None)),
             stopping: Arc::new(AtomicBool::new(false)),
@@ -344,14 +347,29 @@ impl HeadscaleSupervisor {
             self.config.embedded_derp_enabled,
             &headscale_dir.join("derp_server_private.key"),
         );
+        let oidc_issuer = self
+            .oidc_issuer
+            .read()
+            .map_err(|_| anyhow!("Headscale OIDC issuer 锁不可用"))?
+            .clone();
+        let oidc_config = oidc_issuer
+            .as_deref()
+            .map(|issuer| {
+                format!(
+                    "oidc:\n  issuer: {}\n  client_id: headscale\n  client_secret: \"\"\n  use_expiry_from_token: false\n  scope: [\"openid\", \"profile\"]\n  pkce:\n    enabled: true\n    method: S256\n",
+                    yaml_quote(issuer)
+                )
+            })
+            .unwrap_or_default();
         let content = format!(
-            "server_url: {server_url}\nlisten_addr: {listen}\nmetrics_listen_addr: 127.0.0.1:9090\n# Caddy 与 Headscale 在同一容器内，只有回环反代可以提交真实客户端 IP。\ntrusted_proxies:\n  - 127.0.0.1/32\n  - ::1/128\nnoise:\n  private_key_path: {noise}\nprefixes:\n  v4: 100.64.0.0/10\n  v6: fd7a:115c:a1e0::/48\nderp:\n{derp_config}\n  update_frequency: 3h\ndatabase:\n  type: sqlite\n  sqlite:\n    path: {database}\npolicy:\n  # Headscale 0.29.x 只有 database 模式支持通过官方 API 更新策略。\n  mode: database\ndns:\n  magic_dns: true\n  base_domain: {dns_domain}\n  override_local_dns: true\n  nameservers:\n    # Headscale 0.29.x 在 override_local_dns 开启时要求至少一个上游 DNS。\n    # MagicDNS 仍负责 mesh.nexo.internal，其他名称交给这些公共解析器。\n    global:\n      - 1.1.1.1\n      - 1.0.0.1\n      - 2606:4700:4700::1111\n      - 2606:4700:4700::1001\n    split: {{}}\n  search_domains: []\n  extra_records: []\nunix_socket: {unix_socket}\nunix_socket_permission: \"0600\"\nlog:\n  level: info\n",
+            "server_url: {server_url}\nlisten_addr: {listen}\nmetrics_listen_addr: 127.0.0.1:9090\n# Caddy 与 Headscale 在同一容器内，只有回环反代可以提交真实客户端 IP。\ntrusted_proxies:\n  - 127.0.0.1/32\n  - ::1/128\nnoise:\n  private_key_path: {noise}\nprefixes:\n  v4: 100.64.0.0/10\n  v6: fd7a:115c:a1e0::/48\nderp:\n{derp_config}\n  update_frequency: 3h\ndatabase:\n  type: sqlite\n  sqlite:\n    path: {database}\npolicy:\n  # Headscale 0.29.x 只有 database 模式支持通过官方 API 更新策略。\n  mode: database\nnode:\n  expiry: 0\n{oidc_config}dns:\n  magic_dns: true\n  base_domain: {dns_domain}\n  override_local_dns: true\n  nameservers:\n    # Headscale 0.29.x 在 override_local_dns 开启时要求至少一个上游 DNS。\n    # MagicDNS 仍负责 mesh.nexo.internal，其他名称交给这些公共解析器。\n    global:\n      - 1.1.1.1\n      - 1.0.0.1\n      - 2606:4700:4700::1111\n      - 2606:4700:4700::1001\n    split: {{}}\n  search_domains: []\n  extra_records: []\nunix_socket: {unix_socket}\nunix_socket_permission: \"0600\"\nlog:\n  level: info\n",
             server_url = yaml_quote(server_url),
             listen = yaml_quote(&self.config.listen_addr),
             noise = yaml_quote(&noise_key_path.to_string_lossy()),
             database = yaml_quote(&database_path.to_string_lossy()),
             dns_domain = yaml_quote(&self.config.dns_base_domain),
             unix_socket = yaml_quote(&unix_socket_path.to_string_lossy()),
+            oidc_config = oidc_config,
         );
         let temporary = self.config.config_path().with_extension("yaml.tmp");
         fs::write(&temporary, content)?;
@@ -380,6 +398,33 @@ impl HeadscaleSupervisor {
                 return Ok(());
             }
             *current = server_url;
+        }
+        self.write_config()?;
+        if self.config.enabled {
+            self.restart_requested.store(true, Ordering::SeqCst);
+            self.shutdown_notify.notify_one();
+        }
+        Ok(())
+    }
+
+    /// 更新 Headscale 使用的 OIDC issuer。已有 issuer 只能保持不变，避免
+    /// 主域名迁移把现有 OIDC 用户的 providerId 变成另一套身份。
+    pub async fn update_oidc_issuer(&self, issuer: Option<String>) -> Result<()> {
+        let issuer = issuer.map(|value| value.trim_end_matches('/').to_owned());
+        {
+            let mut current = self
+                .oidc_issuer
+                .write()
+                .map_err(|_| anyhow!("Headscale OIDC issuer 锁不可用"))?;
+            match (&*current, &issuer) {
+                (Some(existing), Some(next)) if existing != next => {
+                    return Err(anyhow!(
+                        "Headscale OIDC issuer 已固定为 {existing}，不能改为 {next}"
+                    ));
+                }
+                (Some(_), None) => return Ok(()),
+                _ => *current = issuer,
+            }
         }
         self.write_config()?;
         if self.config.enabled {
@@ -701,6 +746,7 @@ mod tests {
             listen_addr: "127.0.0.1:8281".to_owned(),
             api_url: "http://127.0.0.1:8281".to_owned(),
             server_url: "https://mesh.example.com".to_owned(),
+            oidc_issuer: Some("https://nexo.example.com".to_owned()),
             dns_base_domain: "mesh.nexo.internal".to_owned(),
             embedded_derp_enabled: false,
             enabled: false,

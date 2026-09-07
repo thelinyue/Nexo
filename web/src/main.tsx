@@ -212,24 +212,6 @@ type BatchTunnelDeleteResponse = {
   message: string;
 };
 
-type PublicEntry = {
-  base_domain: string | null;
-  https_enabled: boolean;
-  certificate_mode: string;
-  acme_environment: string;
-  apply_status: string;
-  apply_error: string | null;
-  certificate_not_before: number | null;
-  certificate_not_after: number | null;
-  certificate_subjects: string[];
-  dns_check: {
-    resolved?: string[];
-    error?: string;
-    root?: { hostname?: string; resolved?: string[]; error?: string };
-    wildcard?: { hostname?: string; resolved?: string[]; error?: string };
-  };
-};
-
 type CertificateStatus = {
   status: string;
   not_before: number | null;
@@ -493,12 +475,8 @@ type SiteLink = {
   tenant_id: string;
   left_site_id: string;
   right_site_id: string;
-  left_network_id: string | null;
-  right_network_id: string | null;
   left_site_name: string;
   right_site_name: string;
-  left_network_prefix: string | null;
-  right_network_prefix: string | null;
   left_networks: SiteLinkNetworkSummary[];
   right_networks: SiteLinkNetworkSummary[];
   static_routes: StaticRouteGuide[];
@@ -593,7 +571,6 @@ function Dashboard({
   const [tailscaleExternalNodes, setTailscaleExternalNodes] = useState<TailscaleExternalNode[]>([]);
   const [tunnels, setTunnels] = useState<Tunnel[]>([]);
   const [publicDomains, setPublicDomains] = useState<PublicDomain[]>([]);
-  const [publicEntry, setPublicEntry] = useState<PublicEntry | null>(null);
   const [loading, setLoading] = useState(false);
   const [actionLinkId, setActionLinkId] = useState<string | null>(null);
   const [actionNetworkId, setActionNetworkId] = useState<string | null>(null);
@@ -716,10 +693,9 @@ function Dashboard({
         const domainsBody: unknown = await domainsResponse.json().catch(() => null);
         if (domainsResponse.ok) {
           setPublicDomains(Array.isArray(domainsBody) ? domainsBody as PublicDomain[] : []);
-          setPublicEntry(null);
         } else {
           setPublicDomains([]);
-          setPublicEntry(await read<PublicEntry>("/api/v1/settings/public-entry", "暂时无法读取域名与 HTTPS 配置"));
+          throw new Error(readApiError(domainsBody, "暂时无法读取域名与 HTTPS 配置"));
         }
       } else if (page === "public-access") {
         const [nextTunnels, nextDevices] = await Promise.all([
@@ -1007,7 +983,6 @@ function Dashboard({
           {route === "#/domains" && (
             <DomainsPage
               domains={publicDomains}
-              legacyEntry={publicEntry}
               error={error}
               request={request}
               onRefresh={refreshCurrentPage}
@@ -1741,9 +1716,8 @@ function AccessControlPage({
   );
 }
 
-function DomainsPage({ domains, legacyEntry, error, request, onRefresh }: {
+function DomainsPage({ domains, error, request, onRefresh }: {
   domains: PublicDomain[];
-  legacyEntry: PublicEntry | null;
   error: string | null;
   request: ApiRequest;
   onRefresh: () => Promise<void>;
@@ -1751,7 +1725,7 @@ function DomainsPage({ domains, legacyEntry, error, request, onRefresh }: {
   return <>
     <PageHeader eyebrow="公网基础设施" title="域名与 HTTPS" subtitle="统一管理公网入口、网络互联地址和 Web 服务使用的域名。" />
     <PageError error={error} onRetry={onRefresh} />
-    {legacyEntry ? <section className="panel page-panel"><EmptyState icon={Globe2} title="域名资源接口暂不可用" detail="当前服务仍返回旧版入口设置，请升级服务端后再管理多域名。" /></section> : <PublicDomainsPanel domains={domains} request={request} onRefresh={onRefresh} />}
+    <PublicDomainsPanel domains={domains} request={request} onRefresh={onRefresh} />
   </>;
 }
 
@@ -2573,7 +2547,7 @@ function PublicDomainEditor({
             <option value="manual">手动证书</option>
           </select>
         </label>
-        {(dnsManagementEnabled || (httpsEnabled && certificateMode === "cloudflare")) && <div className="public-entry-form-row"><label htmlFor="public-domain-cloudflare-token">Cloudflare API Token</label><div className="field-control"><div className="secret-input-control"><input id="public-domain-cloudflare-token" type={showToken ? "text" : "password"} value={cloudflareToken} onChange={(event) => setCloudflareToken(event.target.value)} placeholder="留空则保留已保存的 Token" autoComplete="off" autoCapitalize="none" spellCheck={false} /><button className="secret-visibility-button" type="button" aria-label={`${showToken ? "隐藏" : "显示"} Cloudflare API Token`} onClick={() => setShowToken((value) => !value)}>{showToken ? <EyeOff size={18} aria-hidden="true" /> : <Eye size={18} aria-hidden="true" />}</button></div><small>需要 Zone DNS 编辑权限。Token 不会写入配置、日志或页面。</small></div></div>}
+        {(dnsManagementEnabled || (httpsEnabled && certificateMode === "cloudflare")) && <div className="domain-secret-form-row"><label htmlFor="public-domain-cloudflare-token">Cloudflare API Token</label><div className="field-control"><div className="secret-input-control"><input id="public-domain-cloudflare-token" type={showToken ? "text" : "password"} value={cloudflareToken} onChange={(event) => setCloudflareToken(event.target.value)} placeholder="留空则保留已保存的 Token" autoComplete="off" autoCapitalize="none" spellCheck={false} /><button className="secret-visibility-button" type="button" aria-label={`${showToken ? "隐藏" : "显示"} Cloudflare API Token`} onClick={() => setShowToken((value) => !value)}>{showToken ? <EyeOff size={18} aria-hidden="true" /> : <Eye size={18} aria-hidden="true" />}</button></div><small>需要 Zone DNS 编辑权限。Token 不会写入配置、日志或页面。</small></div></div>}
         {httpsEnabled && certificateMode === "manual" && <><div className="manual-certificate-warning"><AlertTriangle size={16} aria-hidden="true" /><p><strong>启用后停止自动申请和续期</strong><span>删除或过期后也不会自动恢复，需要上传新证书或明确切回自动证书。</span></p></div><label><span>证书文件</span><input type="file" accept=".pem,.crt,text/plain" onChange={(event) => setCertificateFile(event.currentTarget.files?.[0] ?? null)} /></label><label><span>私钥文件</span><input type="file" accept=".pem,.key,text/plain" onChange={(event) => setPrivateKeyFile(event.currentTarget.files?.[0] ?? null)} /></label><p className="form-hint">支持未加密的 PKCS#1、PKCS#8 和 SEC1 私钥。证书必须覆盖根域名和 *.根域名，并与私钥匹配。</p>{manualCertificatePresent && <button className="text-danger-button" type="button" disabled={busy} onClick={() => void deleteManualCertificate()}><Trash2 size={15} aria-hidden="true" />删除当前手动证书</button>}</>}
       </fieldset>
       <fieldset>
@@ -3683,8 +3657,8 @@ function CreateSiteLinkForm({
   const [rightSiteId, setRightSiteId] = useState(initialLink?.right_site_id ?? candidateTargetSites[0]?.id ?? "");
   const [leftGatewayId, setLeftGatewayId] = useState(initialLink?.left_networks?.[0]?.publisher_device_id ?? "");
   const [rightGatewayId, setRightGatewayId] = useState(initialLink?.right_networks?.[0]?.publisher_device_id ?? "");
-  const [leftNetworkIds, setLeftNetworkIds] = useState<string[]>(initialLink?.left_networks?.map((network) => network.id) ?? (initialLink?.left_network_id ? [initialLink.left_network_id] : []));
-  const [rightNetworkIds, setRightNetworkIds] = useState<string[]>(initialLink?.right_networks?.map((network) => network.id) ?? (initialLink?.right_network_id ? [initialLink.right_network_id] : []));
+  const [leftNetworkIds, setLeftNetworkIds] = useState<string[]>(initialLink?.left_networks?.map((network) => network.id) ?? []);
+  const [rightNetworkIds, setRightNetworkIds] = useState<string[]>(initialLink?.right_networks?.map((network) => network.id) ?? []);
   const [step, setStep] = useState(1);
   const [leftIpv4, setLeftIpv4] = useState("");
   const [leftIpv6, setLeftIpv6] = useState("");
@@ -3780,10 +3754,8 @@ function CreateSiteLinkForm({
               tenant_id: leftSite.tenant_id,
               left_site_id: leftSite.id,
               left_network_ids: leftNetworkIds,
-              left_network_id: leftNetworkIds[0] ?? "",
               right_site_id: rightSite.id,
               right_network_ids: rightNetworkIds,
-              right_network_id: rightNetworkIds[0] ?? "",
               next_hops: { left: { ipv4: leftIpv4 || null, ipv6: leftIpv6 || null }, right: { ipv4: rightIpv4 || null, ipv6: rightIpv6 || null } },
             }),
           });
@@ -4014,174 +3986,6 @@ function readApiError(body: unknown, fallback: string): string {
     }
   }
   return fallback;
-}
-
-function publicEntryLabel(entry: PublicEntry | null): string {
-  if (!entry) return "域名与 HTTPS 状态检查中";
-  switch (entry.apply_status.toLowerCase()) {
-    case "ready": return "域名与 HTTPS 已生效";
-    case "configuring":
-    case "checking":
-    case "applying": return "域名与 HTTPS 配置中";
-    case "error": return "域名与 HTTPS 配置失败";
-    default: return "域名与 HTTPS 尚未配置";
-  }
-}
-
-/** 域名与 HTTPS 弹窗表单：普通配置与敏感材料一次提交，失败时保留现场供用户修正。 */
-function PublicEntrySettings({
-  entry,
-  request,
-  onCancel,
-  onSaved,
-}: {
-  entry: PublicEntry;
-  request: ApiRequest;
-  onCancel: () => void;
-  onSaved: () => Promise<void>;
-}) {
-  const [domain, setDomain] = useState("");
-  const [httpsEnabled, setHttpsEnabled] = useState(false);
-  const [certificateMode, setCertificateMode] = useState("none");
-  const [certificateFile, setCertificateFile] = useState<File | null>(null);
-  const [privateKeyFile, setPrivateKeyFile] = useState<File | null>(null);
-  const [cloudflareToken, setCloudflareToken] = useState("");
-  const [showCloudflareToken, setShowCloudflareToken] = useState(false);
-  const [busy, setBusy] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-
-  useEffect(() => {
-    setDomain(entry.base_domain ?? "");
-    setHttpsEnabled(entry.https_enabled);
-    setCertificateMode(entry.certificate_mode);
-  }, [entry]);
-
-  const save = async (event: React.FormEvent<HTMLFormElement>) => {
-    event.preventDefault();
-    const trimmedDomain = domain.trim().replace(/\.+$/, "").toLowerCase();
-    if (httpsEnabled && !trimmedDomain) {
-      setError("启用 HTTPS 前请填写根域名");
-      return;
-    }
-    if (trimmedDomain && !/^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$/i.test(trimmedDomain)) {
-      setError("根域名格式无效，请填写例如 example.com");
-      return;
-    }
-    if (certificateMode === "manual" && Boolean(certificateFile) !== Boolean(privateKeyFile)) {
-      setError("手动证书需要同时选择证书和私钥文件");
-      return;
-    }
-    setBusy(true);
-    setError(null);
-    try {
-      const response = await request("/api/v1/settings/public-entry", {
-        method: "PUT",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({
-          base_domain: trimmedDomain || null,
-          https_enabled: httpsEnabled,
-          certificate_mode: httpsEnabled ? certificateMode : "none",
-        }),
-      });
-      const body: unknown = await response.json().catch(() => null);
-      if (!response.ok) throw new Error(readApiError(body, "暂时无法保存域名与 HTTPS 设置"));
-
-      const secrets: Record<string, string> = {};
-      if (certificateMode === "manual" && certificateFile && privateKeyFile) {
-        secrets.certificate_pem = await certificateFile.text();
-        secrets.private_key_pem = await privateKeyFile.text();
-      }
-      const trimmedCloudflareToken = cloudflareToken.trim();
-      if (httpsEnabled && certificateMode === "cloudflare" && trimmedCloudflareToken) {
-        secrets.cloudflare_token = trimmedCloudflareToken;
-      }
-      if (Object.keys(secrets).length > 0) {
-        const secretResponse = await request("/api/v1/settings/public-entry/certificate", {
-          method: "POST",
-          headers: { "content-type": "application/json" },
-          body: JSON.stringify(secrets),
-        });
-        const secretBody: unknown = await secretResponse.json().catch(() => null);
-        if (!secretResponse.ok) throw new Error(readApiError(secretBody, "证书或访问凭据上传失败"));
-        setCertificateFile(null);
-        setPrivateKeyFile(null);
-        setCloudflareToken("");
-        setShowCloudflareToken(false);
-      }
-      await onSaved();
-    } catch (requestError) {
-      setError(requestError instanceof Error ? requestError.message : "暂时无法保存域名与 HTTPS 设置");
-    } finally {
-      setBusy(false);
-    }
-  };
-
-  return (
-      <form className="inline-form network-form-table public-entry-form" aria-busy={busy} onSubmit={save}>
-        <div className="form-grid public-entry-form-grid">
-          <label>
-            <span>根域名</span>
-            <input autoFocus value={domain} onChange={(event) => setDomain(event.target.value)} placeholder="example.com" inputMode="url" />
-          </label>
-          <label>
-            <span>HTTPS</span>
-            <select value={httpsEnabled ? "https" : "http"} onChange={(event) => { const enabled = event.target.value === "https"; setHttpsEnabled(enabled); if (!enabled) setCertificateMode("none"); else if (certificateMode === "none") setCertificateMode("cloudflare"); }}>
-              <option value="http">关闭（仅 HTTP）</option>
-              <option value="https">开启</option>
-            </select>
-          </label>
-          <label>
-            <span>证书来源</span>
-            <select value={httpsEnabled ? certificateMode : "none"} onChange={(event) => setCertificateMode(event.target.value)} disabled={!httpsEnabled}>
-              <option value="none">未配置</option>
-              <option value="cloudflare">自动申请</option>
-              <option value="manual">手动证书</option>
-            </select>
-          </label>
-          {httpsEnabled && certificateMode === "manual" && (
-            <>
-            <label><span>证书文件</span><input type="file" accept=".pem,.crt,text/plain" onChange={(event) => setCertificateFile(event.currentTarget.files?.[0] ?? null)} /></label>
-            <label><span>私钥文件</span><input type="file" accept=".pem,.key,text/plain" onChange={(event) => setPrivateKeyFile(event.currentTarget.files?.[0] ?? null)} /></label>
-            </>
-          )}
-          {httpsEnabled && certificateMode === "cloudflare" && (
-            <div className="public-entry-form-row">
-              <label htmlFor="public-entry-cloudflare-token">Cloudflare API Token</label>
-              <div className="field-control">
-                <div className="secret-input-control">
-                  <input
-                    id="public-entry-cloudflare-token"
-                    type={showCloudflareToken ? "text" : "password"}
-                    value={cloudflareToken}
-                    onChange={(event) => setCloudflareToken(event.target.value)}
-                    placeholder="留空则保留已保存的 Token"
-                    autoComplete="off"
-                    autoCapitalize="none"
-                    spellCheck={false}
-                  />
-                  <button
-                    className="secret-visibility-button"
-                    type="button"
-                    aria-label={`${showCloudflareToken ? "隐藏" : "显示"} Cloudflare API Token`}
-                    aria-pressed={showCloudflareToken}
-                    onClick={() => setShowCloudflareToken((visible) => !visible)}
-                  >
-                    {showCloudflareToken ? <EyeOff size={18} aria-hidden="true" /> : <Eye size={18} aria-hidden="true" />}
-                  </button>
-                </div>
-                <small>留空不会覆盖已保存的 Token；首次配置时请输入。Token 不会显示在页面或日志中。</small>
-              </div>
-            </div>
-          )}
-        </div>
-        <p className="form-hint">HTTP 使用 80 端口，HTTPS 使用 443 端口；子域名前缀 nexo 和 mesh 已由系统保留。</p>
-        {error && <p className="form-error" role="alert">{error}</p>}
-        <div className="dialog-actions">
-          <button className="secondary-button" type="button" onClick={onCancel} disabled={busy}>取消</button>
-          <button className="primary-button" type="submit" disabled={busy}>{busy ? "保存中…" : "保存设置"}</button>
-        </div>
-      </form>
-  );
 }
 
 function validateTunnelPorts(localPortValue: string, publicPortValue: string) {
@@ -5011,6 +4815,10 @@ function PwaUpdatePrompt() {
   );
 }
 
+function continueOidcLogin(ticket: string) {
+  window.location.replace(`/oidc/authorize?nexo_login_ticket=${encodeURIComponent(ticket)}`);
+}
+
 function InitializeScreen({ onDone }: { onDone: (body: AuthStatus & { csrf_token?: string | null }) => void }) {
   const [bootstrapCode, setBootstrapCode] = useState("");
   const [username, setUsername] = useState("admin");
@@ -5045,6 +4853,7 @@ function App() {
   const [checking, setChecking] = useState(true);
   const [authConnectionError, setAuthConnectionError] = useState(false);
   const [loginNotice, setLoginNotice] = useState<string | null>(null);
+  const oidcTicket = new URLSearchParams(window.location.search).get("oidc_ticket");
   const checkAuth = useCallback(async () => {
     setChecking(true);
     setAuthConnectionError(false);
@@ -5061,6 +4870,9 @@ function App() {
     }
   }, []);
   useEffect(() => { void checkAuth(); }, [checkAuth]);
+  useEffect(() => {
+    if (!checking && auth?.authenticated && oidcTicket) continueOidcLogin(oidcTicket);
+  }, [auth?.authenticated, checking, oidcTicket]);
   const request = useCallback<ApiRequest>(async (input, init = {}) => {
     const headers = new Headers(init.headers);
     const method = (init.method ?? "GET").toString().toUpperCase();
@@ -5074,8 +4886,18 @@ function App() {
   const onSessionEnded = useCallback((message: string) => { setLoginNotice(message); setCsrfToken(null); setAuth((current) => current ? { ...current, authenticated: false, csrf_token: null } : current); }, []);
   if (checking) return <AuthShell><p className="auth-copy">正在检查登录会话…</p></AuthShell>;
   if (authConnectionError || !auth) return <ConnectionErrorScreen busy={checking} onRetry={checkAuth} />;
-  if (!auth.initialized) return <InitializeScreen onDone={onAuthenticated} />;
-  if (!auth.authenticated) return <LoginScreen onDone={onAuthenticated} notice={loginNotice} />;
+  if (!auth.initialized) {
+    return <InitializeScreen onDone={(body) => {
+      if (oidcTicket) continueOidcLogin(oidcTicket);
+      else onAuthenticated(body);
+    }} />;
+  }
+  if (!auth.authenticated) {
+    return <LoginScreen onDone={(body) => {
+      if (oidcTicket) continueOidcLogin(oidcTicket);
+      else onAuthenticated(body);
+    }} notice={loginNotice} />;
+  }
   return <Dashboard request={request} auth={auth} onLogout={onLogout} onSessionEnded={onSessionEnded} />;
 }
 

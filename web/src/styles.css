@@ -309,15 +309,7 @@ code { overflow-wrap: anywhere; }
 .route-via { grid-column: 1 / 4; }
 .route-confirmed { color: var(--success); }
 
-.public-entry-summary { display: flex; align-items: center; justify-content: space-between; gap: 20px; }
-.public-entry-copy { min-width: 0; }
-.public-entry-copy p:last-child { margin: 7px 0 0; color: var(--text-muted); font-size: 12px; line-height: 1.5; }
-.public-entry-actions { display: flex; align-items: center; justify-content: flex-end; gap: 8px; flex-wrap: wrap; }
 .status-pill.error { color: var(--danger); }
-.public-entry-facts { display: flex; align-items: flex-start; gap: 28px; flex-wrap: wrap; margin: 18px 0 0; padding-top: 16px; border-top: 1px solid var(--border); }
-.public-entry-facts > div { min-width: 130px; }
-.public-entry-facts dt { color: var(--text-muted); font-size: 10px; font-weight: 650; }
-.public-entry-facts dd { margin: 4px 0 0; color: var(--text-secondary); font-size: 12px; overflow-wrap: anywhere; }
 .domains-panel-heading { align-items: center; }
 .panel-description { max-width: 760px; margin: 7px 0 0; color: var(--text-muted); font-size: 12px; line-height: 1.55; }
 .domains-heading-actions { align-items: center; }
@@ -423,7 +415,7 @@ code { overflow-wrap: anywhere; }
 .domain-editor-form legend { width: 100%; margin-bottom: 2px; padding: 10px 0 7px; border-bottom: 1px solid var(--border); color: var(--text); font-size: 12px; font-weight: 700; }
 .domain-editor-form fieldset > label { min-height: 64px; display: grid; grid-template-columns: 160px minmax(0, 1fr); align-items: center; gap: 16px; padding: 9px 0; border-bottom: 1px solid var(--border); }
 .domain-editor-form fieldset > label > span { color: var(--text-secondary); font-size: 12px; font-weight: 600; }
-.domain-editor-form .public-entry-form-row { margin: 0; }
+.domain-editor-form .domain-secret-form-row { margin: 0; }
 .domain-editor-form .form-hint { margin: 9px 0 0; }
 .domain-delete-form, .domain-primary-form { display: grid; gap: 15px; padding-top: 12px; }
 .domain-delete-form > p, .migration-impact p { margin: 0; color: var(--text-secondary); font-size: 12px; line-height: 1.6; }
@@ -491,8 +483,8 @@ fieldset.form-grid { min-width: 0; margin: 0; padding: 0; border: 0; }
 .form-dialog-body { min-height: 0; overflow-y: auto; padding: 6px 22px 18px; }
 .form-dialog .network-form-table { margin: 0; }
 .form-dialog .network-form-table > .form-grid { display: grid; grid-template-columns: 1fr; gap: 0; }
-.form-dialog .network-form-table > .form-grid > label, .form-dialog .network-form-table > .form-grid > .public-entry-form-row { min-height: 64px; display: grid; grid-template-columns: 160px minmax(0, 1fr); align-items: center; gap: 16px; padding: 9px 0; border-bottom: 1px solid var(--border); }
-.form-dialog .network-form-table > .form-grid > label > span, .public-entry-form-row > label { font-size: 12px; font-weight: 600; }
+.form-dialog .network-form-table > .form-grid > label, .form-dialog .network-form-table > .form-grid > .domain-secret-form-row { min-height: 64px; display: grid; grid-template-columns: 160px minmax(0, 1fr); align-items: center; gap: 16px; padding: 9px 0; border-bottom: 1px solid var(--border); }
+.form-dialog .network-form-table > .form-grid > label > span, .domain-secret-form-row > label { font-size: 12px; font-weight: 600; }
 .local-service-control { min-width: 0; display: grid; grid-template-columns: 112px minmax(0, 1fr); gap: 8px; }
 .form-dialog .network-form-table > .form-footer, .form-dialog .network-form-table > .dialog-actions { position: sticky; bottom: -18px; z-index: 2; margin: 8px -22px -18px; padding: 14px 22px; border-top: 1px solid var(--border); background: var(--surface); }
 .form-dialog .network-form-table > .form-error { margin-top: 4px; }
@@ -661,7 +653,7 @@ fieldset.form-grid { min-width: 0; margin: 0; padding: 0; border: 0; }
   .form-dialog-surface { width: 100%; max-height: calc(100dvh - env(safe-area-inset-top) - 16px); border-radius: 8px 8px 0 0; }
   .form-dialog-header { padding: 17px 16px 14px; }
   .form-dialog-body { padding: 4px 16px 14px; }
-  .form-dialog .network-form-table > .form-grid > label, .form-dialog .network-form-table > .form-grid > .public-entry-form-row { grid-template-columns: 1fr; align-items: stretch; gap: 6px; padding: 10px 0; }
+  .form-dialog .network-form-table > .form-grid > label, .form-dialog .network-form-table > .form-grid > .domain-secret-form-row { grid-template-columns: 1fr; align-items: stretch; gap: 6px; padding: 10px 0; }
   .form-dialog .network-form-table .field-error { grid-column: 1; }
   .network-source-switch { grid-template-columns: 1fr; align-items: stretch; gap: 6px; padding: 10px 0; border-bottom: 1px solid var(--border); }
   .network-source-switch > span { font-size: 11px; }
@@ -698,10 +690,6 @@ fieldset.form-grid { min-width: 0; margin: 0; padding: 0; border: 0; }
   .network-inline-heading { align-items: stretch; flex-direction: column; }
   .network-inline-heading .secondary-button { align-self: flex-start; }
   .panel-heading, .site-link-heading, .enrollment-result-heading { align-items: stretch; flex-direction: column; }
-  .public-entry-summary { align-items: stretch; flex-direction: column; }
-  .public-entry-actions { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); justify-content: stretch; }
-  .public-entry-actions .status-pill { grid-column: 1 / -1; justify-self: start; }
-  .public-entry-actions .secondary-button { width: 100%; }
   .domain-dependency-notice { align-items: stretch; flex-direction: column; }
   .domain-dependency-notice .secondary-button { width: fit-content; }
   .domain-summary-strip { overflow-x: auto; }
@@ -728,7 +716,7 @@ fieldset.form-grid { min-width: 0; margin: 0; padding: 0; border: 0; }
   .dns-change > div { grid-column: 1 / -1; }
   .domain-list-header { align-items: flex-start; flex-direction: column; gap: 5px; padding-block: 8px; }
   .domain-editor-form fieldset > label { grid-template-columns: 1fr; align-items: stretch; gap: 6px; padding: 10px 0; }
-  .domain-editor-form .public-entry-form-row { grid-template-columns: 1fr; align-items: stretch; gap: 6px; }
+  .domain-editor-form .domain-secret-form-row { grid-template-columns: 1fr; align-items: stretch; gap: 6px; }
   .migration-progress > div { align-items: flex-start; flex-direction: column; gap: 4px; }
   .panel-heading-actions, .site-link-actions { justify-content: flex-start; }
   .device-row { align-items: flex-start; flex-wrap: wrap; }

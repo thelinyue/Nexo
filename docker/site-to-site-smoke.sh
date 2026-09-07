@@ -10,7 +10,7 @@ COMPOSE_PROJECT_NAME="nexo-phase2-integration"
 export COMPOSE_PROJECT_NAME
 
 HTTP_URL="${NEXO_HTTP_URL:-http://127.0.0.1:29828}"
-BOOTSTRAP_CODE="${NEXO_ADMIN_TOKEN:-integration-admin}"
+BOOTSTRAP_CODE=""
 ADMIN_USERNAME="${NEXO_ADMIN_USERNAME:-integration-admin}"
 ADMIN_PASSWORD="${NEXO_ADMIN_PASSWORD:-integration-password-1234}"
 PUBLIC_DOMAIN="${NEXO_PHASE2_DOMAIN:-phase2.test}"
@@ -22,6 +22,7 @@ SECURE_COOKIE_JAR="$(mktemp)"
 CERT_DIR="$(mktemp -d -t nexo-phase2-certs.XXXXXX)"
 export NEXO_PHASE2_CERT_DIR="$CERT_DIR"
 CSRF_TOKEN=""
+PUBLIC_DOMAIN_ID=""
 HEADSCALE_PID=""
 HEADSCALE_STOPPED=0
 CADDY_PID=""
@@ -238,6 +239,42 @@ public_request() {
   http_curl --fail "${args[@]}" "$url"
 }
 
+read_bootstrap_code() {
+  local code
+  code="$(dc exec -T nexo-server nexo bootstrap-code | tr -d '\r\n')"
+  if [[ -z "$code" ]]; then
+    echo "无法读取 Nexo Bootstrap Code" >&2
+    return 1
+  fi
+  printf '%s' "$code"
+}
+
+ensure_primary_domain() {
+  if [[ -n "$PUBLIC_DOMAIN_ID" ]]; then
+    return 0
+  fi
+  PUBLIC_DOMAIN_ID="$(api "$HTTP_URL/api/v1/public-domains" \
+    | jq -r 'map(select(.is_primary == true))[0].id // empty')"
+  if [[ -z "$PUBLIC_DOMAIN_ID" ]]; then
+    PUBLIC_DOMAIN_ID="$(post_json "$HTTP_URL/api/v1/public-domains" \
+      "$(jq -cn --arg domain "$PUBLIC_DOMAIN" \
+        '{domain:$domain,https_enabled:false,certificate_mode:"cloudflare"}')" \
+      | jq -r '.id')"
+  fi
+  if [[ -z "$PUBLIC_DOMAIN_ID" || "$PUBLIC_DOMAIN_ID" == "null" ]]; then
+    echo "无法创建或读取验收主域名" >&2
+    return 1
+  fi
+}
+
+entry_has_status() {
+  local expected="$1"
+  ensure_primary_domain
+  api "$HTTP_URL/api/v1/public-domains" | jq -e \
+    --arg id "$PUBLIC_DOMAIN_ID" --arg expected "$expected" \
+    'map(select(.id == $id))[0].apply_status == $expected' >/dev/null
+}
+
 echo "生成阶段二临时 CA 和根域名/泛域名证书"
 generate_test_certificate
 
@@ -246,6 +283,7 @@ dc down --volumes --remove-orphans >/dev/null 2>&1 || true
 dc build nexo-server home-gateway office-gateway home-terminal office-terminal outside-probe
 dc up -d --no-build nexo-server
 wait_for "Nexo Server 健康" "http_curl --fail '$HTTP_URL/health'" 90
+BOOTSTRAP_CODE="$(read_bootstrap_code)"
 
 echo "初始化测试管理员 Session"
 initialize_response="$(http_curl --fail -c "$COOKIE_JAR" \
@@ -262,20 +300,21 @@ fi
 echo "✓ LAN HTTP Session 已建立"
 
 echo "配置验收域名、手动证书并启用 HTTPS"
-put_json "$HTTP_URL/api/v1/settings/public-entry" \
+ensure_primary_domain
+put_json "$HTTP_URL/api/v1/public-domains/$PUBLIC_DOMAIN_ID" \
   "$(jq -cn --arg domain "$PUBLIC_DOMAIN" \
-    '{base_domain:$domain,https_enabled:true,certificate_mode:"manual",acme_environment:"staging"}')" \
+    '{domain:$domain,https_enabled:false,certificate_mode:"cloudflare"}')" \
   >/dev/null
-post_json "$HTTP_URL/api/v1/settings/public-entry/certificate" \
+post_json "$HTTP_URL/api/v1/public-domains/$PUBLIC_DOMAIN_ID/credentials" \
   "$(jq -cn --arg certificate "$(<"$CERT_DIR/server.crt")" \
     --arg private_key "$(<"$CERT_DIR/server.key")" \
-    '{certificate_pem:$certificate,private_key_pem:$private_key}')" >/dev/null
-put_json "$HTTP_URL/api/v1/settings/public-entry" \
+    '{certificate_pem:$certificate,private_key_pem:$private_key,activate_manual_certificate:true}')" >/dev/null
+put_json "$HTTP_URL/api/v1/public-domains/$PUBLIC_DOMAIN_ID" \
   "$(jq -cn --arg domain "$PUBLIC_DOMAIN" \
-    '{base_domain:$domain,https_enabled:true,certificate_mode:"manual",acme_environment:"staging"}')" \
+    '{domain:$domain,https_enabled:true,certificate_mode:"manual"}')" \
   >/dev/null
 wait_for "公网 HTTPS 入口 READY" \
-  "test \"\$(api '$HTTP_URL/api/v1/settings/public-entry' | jq -r '.apply_status')\" = READY" 90
+  "entry_has_status ready" 90
 wait_for "Caddy HTTPS 管理入口可访问" \
   "public_request https nexo.$PUBLIC_DOMAIN /api/v1/auth/status | jq -e '.initialized == true'" 90
 wait_for "Headscale 组网组件正常" \
@@ -337,7 +376,7 @@ api "$HTTP_URL/api/v1/site-links" | jq -e 'length == 0' >/dev/null
 office_network="$(post_json "$HTTP_URL/api/v1/site-networks" \
   "{\"tenant_id\":\"default\",\"site_id\":\"$office_site\",\"name\":\"办公室局域网\",\"publisher_device_id\":\"$office_device\",\"interface_id\":\"$office_iface\",\"prefix\":\"192.168.20.0/24\"}" | jq -r '.id')"
 link="$(post_json "$HTTP_URL/api/v1/site-links" \
-  "{\"tenant_id\":\"default\",\"left_site_id\":\"$home_site\",\"left_network_id\":\"$home_network\",\"right_site_id\":\"$office_site\",\"right_network_id\":\"$office_network\"}" | jq -r '.id')"
+  "{\"tenant_id\":\"default\",\"left_site_id\":\"$home_site\",\"left_network_ids\":[\"$home_network\"],\"right_site_id\":\"$office_site\",\"right_network_ids\":[\"$office_network\"],\"next_hops\":{\"left\":{},\"right\":{}}}" | jq -r '.id')"
 post_json "$HTTP_URL/api/v1/site-links/$link/router-confirmations/$home_site" '{}' >/dev/null
 post_json "$HTTP_URL/api/v1/site-links/$link/router-confirmations/$office_site" '{}' >/dev/null
 wait_for "Site Gateway 路由 READY" \
