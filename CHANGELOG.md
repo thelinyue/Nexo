@@ -2,6 +2,13 @@
 
 本项目使用 [Semantic Versioning](https://semver.org/) 记录公开版本。
 
+## [0.1.10] - 2026-09-07
+
+### Fixed
+
+- 为 Cloudflare 自动证书显式配置 Caddy `certificates.automate`，恢复已有根证书选择及根域名、泛域名的自动签发与续期。
+- 自动证书与手动证书混用时同时保留 `automate` 和 `load_files`，避免不同域名的证书来源互相覆盖。
+
 ## [0.1.9] - 2026-09-07
 
 ### Fixed

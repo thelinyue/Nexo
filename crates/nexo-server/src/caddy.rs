@@ -882,7 +882,8 @@ pub fn build_caddy_config_with_environment_and_readiness(
             "automation": { "policies": [{
                 "subjects": [domain, format!("*.{domain}")],
                 "issuers": [issuer]
-            }] }
+            }] },
+            "certificates": { "automate": [domain, format!("*.{domain}")] }
         });
     }
     config
@@ -1027,6 +1028,7 @@ pub fn build_multi_caddy_config(
     let mut http_routes = Vec::new();
     let mut https_routes = Vec::new();
     let mut policies = Vec::new();
+    let mut automatic_subjects = Vec::new();
     let mut manual_certificates = Vec::new();
     for domain in domains {
         let name = domain.domain.as_str();
@@ -1076,6 +1078,8 @@ pub fn build_multi_caddy_config(
             }));
             if domain.certificate_mode == "cloudflare" {
                 policies.push(domain_tls_policy(domain));
+                automatic_subjects.push(domain.domain.clone());
+                automatic_subjects.push(format!("*.{}", domain.domain));
             }
             if domain.certificate_mode == "manual" {
                 manual_certificates.push(json!({
@@ -1114,10 +1118,13 @@ pub fn build_multi_caddy_config(
         "apps": { "http": { "servers": servers } }
     });
     if !policies.is_empty() {
-        config["apps"]["tls"] = json!({ "automation": { "policies": policies } });
+        config["apps"]["tls"] = json!({
+            "automation": { "policies": policies },
+            "certificates": { "automate": automatic_subjects }
+        });
     }
     if !manual_certificates.is_empty() {
-        config["apps"]["tls"]["certificates"] = json!({ "load_files": manual_certificates });
+        config["apps"]["tls"]["certificates"]["load_files"] = json!(manual_certificates);
     }
     config
 }
@@ -1240,6 +1247,10 @@ mod tests {
         let text = config.to_string();
         assert!(text.contains("*.example.com"));
         assert!(text.contains("{env.NEXO_CLOUDFLARE_API_TOKEN}"));
+        assert_eq!(
+            config["apps"]["tls"]["certificates"]["automate"],
+            json!(["example.com", "*.example.com"])
+        );
         assert_eq!(
             config["apps"]["http"]["servers"]["https"]["automatic_https"]["skip_certificates"],
             json!(["nexo.example.com", "mesh.example.com"])
@@ -1477,6 +1488,11 @@ mod tests {
         assert_eq!(
             policies[0]["issuers"][0]["challenges"]["dns"]["provider"]["api_token"],
             "{env.NEXO_CLOUDFLARE_TOKEN_DOMAIN_A}"
+        );
+        assert_eq!(
+            config["apps"]["tls"]["certificates"]["automate"],
+            json!(["a.example.com", "*.a.example.com"]),
+            "自动证书主题和手动证书文件必须同时保留"
         );
         let certificate_path = config["apps"]["tls"]["certificates"]["load_files"][0]
             ["certificate"]
