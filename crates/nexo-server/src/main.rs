@@ -4040,24 +4040,22 @@ async fn upload_public_entry_secret(
                     rusqlite::params![metadata.not_before, metadata.not_after, subjects_json, tenant_id],
                 )
             }
+        } else if let Some(primary_id) = primary_id.as_deref() {
+            connection.execute(
+                "UPDATE public_domains SET desired_revision = desired_revision + 1,
+                 apply_status = CASE WHEN https_enabled = 1 THEN 'checking' ELSE 'ready' END,
+                 apply_error = NULL, error_code = NULL, updated_at = unixepoch()
+                 WHERE id = ?1 AND tenant_id = ?2",
+                rusqlite::params![primary_id, tenant_id],
+            )
         } else {
-            if let Some(primary_id) = primary_id.as_deref() {
-                connection.execute(
-                    "UPDATE public_domains SET desired_revision = desired_revision + 1,
-                     apply_status = CASE WHEN https_enabled = 1 THEN 'checking' ELSE 'ready' END,
-                     apply_error = NULL, error_code = NULL, updated_at = unixepoch()
-                     WHERE id = ?1 AND tenant_id = ?2",
-                    rusqlite::params![primary_id, tenant_id],
-                )
-            } else {
-                connection.execute(
-                    "UPDATE public_entry_settings SET desired_revision = desired_revision + 1,
-                     apply_status = CASE WHEN https_enabled = 1 THEN 'configuring' ELSE apply_status END,
-                     apply_error = NULL, updated_at = unixepoch()
-                     WHERE id = 1 AND tenant_id = ?1",
-                    [&tenant_id],
-                )
-            }
+            connection.execute(
+                "UPDATE public_entry_settings SET desired_revision = desired_revision + 1,
+                 apply_status = CASE WHEN https_enabled = 1 THEN 'configuring' ELSE apply_status END,
+                 apply_error = NULL, updated_at = unixepoch()
+                 WHERE id = 1 AND tenant_id = ?1",
+                [&tenant_id],
+            )
         }
             .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法更新证书应用状态"))?;
     }
