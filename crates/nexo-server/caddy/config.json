@@ -1,1 +1,1 @@
-{"admin":{"listen":"127.0.0.1:8290"},"apps":{"http":{"servers":{}}}}
+{"admin":{"listen":"127.0.0.1:8290"},"apps":{"http":{"servers":{}}},"storage":{"module":"file_system","root":".\\caddy-storage"}}

@@ -2,6 +2,21 @@
 
 本项目使用 [Semantic Versioning](https://semver.org/) 记录公开版本。
 
+## [0.1.7] - 2026-09-07
+
+### Added
+
+- 将公网入口升级为“一个主域名 + 多个附加域名”，每个域名独立绑定 Web Service。
+- 域名列表支持全选、批量重新检测和批量申请证书；单域名可手动请求 Caddy 处理证书。
+- 展示根证书和泛域名证书的 SAN、到期时间、Caddy 预计续期窗口、CA 限流与下次重试时间。
+- 支持 Cloudflare DNS-01 独立 Token、手动证书校验，以及持久化 `/data/nexo/caddy-storage`。
+- 增加主域名迁移、设备 ACK 恢复、服务冲突检查和带替代域名的删除流程。
+
+### Changed
+
+- 证书申请、续期和指数退避完全交由 Caddy Automatic HTTPS；Server 只协调配置并呈现状态。
+- Headscale 反向代理保留 POST、长连接和 `tailscale-control-protocol` 升级，回环代理列入可信来源。
+
 ## [0.1.6] - 2026-09-07
 
 ### Added
@@ -95,6 +110,7 @@
 - 管理密码使用 Argon2id；LAN HTTP 与公网 HTTPS Session 相互隔离。
 - API Key、DNS Token、私钥和自定义 CA 保存为受限 Secret 文件。
 
+[0.1.7]: https://github.com/thelinyue/Nexo/releases/tag/v0.1.7
 [0.1.5]: https://github.com/thelinyue/Nexo/releases/tag/v0.1.5
 [0.1.6]: https://github.com/thelinyue/Nexo/releases/tag/v0.1.6
 [0.1.4]: https://github.com/thelinyue/Nexo/releases/tag/v0.1.4

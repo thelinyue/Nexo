@@ -12,6 +12,7 @@ type MockOptions = {
   failFirstPublicEntryUpdate?: boolean;
   failFirstNetworksLoad?: boolean;
   publicEntry?: Partial<typeof publicEntry>;
+  publicDomains?: Array<typeof seedPublicDomain>;
 };
 
 const publicEntry = {
@@ -25,6 +26,37 @@ const publicEntry = {
   certificate_not_after: 1893456000,
   certificate_subjects: ["*.nexo.example.com"],
   dns_check: { resolved: ["203.0.113.10"] },
+};
+
+const seedPublicDomain = {
+  id: "domain-primary",
+  tenant_id: "default",
+  domain: "example.com",
+  is_primary: true,
+  https_enabled: true,
+  certificate_mode: "cloudflare",
+  acme_environment: "production",
+  apply_status: "ready",
+  apply_error: null as string | null,
+  error_code: null as string | null,
+  dns_check: {
+    root: { hostname: "example.com", resolved: ["203.0.113.10"] },
+    wildcard: { hostname: "nexo.example.com", probe: "*.example.com", resolved: ["203.0.113.10"] },
+  },
+  root_certificate: {
+    status: "ready", not_before: 1890000000, not_after: 1893456000, renewal_at: 1892304000,
+    subjects: ["example.com", "*.example.com"],
+  },
+  wildcard_certificate: {
+    status: "ready", not_before: 1890000000, not_after: 1893456000, renewal_at: 1892304000,
+    subjects: ["example.com", "*.example.com"],
+  },
+  usage_count: 2,
+  desired_revision: 4,
+  applied_revision: 4,
+  retry_after: null as number | null,
+  attempt_count: 0,
+  next_retry_at: null as number | null,
 };
 
 const seedSites = [
@@ -41,7 +73,7 @@ const seedDevices = [
     name: "家庭网关",
     os: "linux",
     architecture: "amd64",
-    agent_version: "0.1.6",
+    agent_version: "0.1.7",
     status: "online",
     mesh_status: "connected",
     mesh_address: "100.64.0.2",
@@ -64,7 +96,7 @@ const seedDevices = [
     name: "办公室网关",
     os: "linux",
     architecture: "arm64",
-    agent_version: "0.1.6",
+    agent_version: "0.1.7",
     status: "online",
     mesh_status: "connected",
     mesh_address: "100.64.0.3",
@@ -87,7 +119,7 @@ const seedDevices = [
     name: "IPv6 网关",
     os: "linux",
     architecture: "amd64",
-    agent_version: "0.1.6",
+    agent_version: "0.1.7",
     status: "online",
     mesh_status: "connected",
     mesh_address: "fd7a:115c:a1e0::4",
@@ -191,7 +223,9 @@ async function installApiMocks(page: Page, options: MockOptions) {
       { id: "session-other", channel: "public_https", created_at: 1889000000, last_seen_at: 1890000000, expires_at: 1893000000 },
     ],
     publicEntry: { ...structuredClone(publicEntry), ...options.publicEntry },
+    publicDomains: structuredClone(options.publicDomains ?? []),
   };
+  const supportsPublicDomains = options.publicDomains !== undefined;
   const pendingRefreshes = new Map<string, number>();
   const deviceSnapshot = () => state.devices.map((device) => ({
     ...device,
@@ -249,6 +283,42 @@ async function installApiMocks(page: Page, options: MockOptions) {
     }
     if (path === "/api/v1/site-links" && method === "GET") { finishPendingDeletion("link", state.links); await fulfillJson(route, state.links); return; }
     if (path === "/api/v1/tunnels" && method === "GET") { await fulfillJson(route, state.tunnels); return; }
+    if (supportsPublicDomains && path === "/api/v1/public-domains" && method === "GET") {
+      await fulfillJson(route, state.publicDomains);
+      return;
+    }
+    if (supportsPublicDomains && path === "/api/v1/public-domains/batch/recheck" && method === "POST") {
+      const body = request.postDataJSON() as { ids: string[] };
+      const updated = state.publicDomains.filter((domain) => body.ids.includes(domain.id));
+      await fulfillJson(route, { updated, skipped: [], message: "已重新检测 " + updated.length + " 个域名" });
+      return;
+    }
+    if (supportsPublicDomains && path === "/api/v1/public-domains/batch/renew" && method === "POST") {
+      const body = request.postDataJSON() as { ids: string[] };
+      const updated = state.publicDomains.filter((domain) => body.ids.includes(domain.id) && domain.apply_status !== "rate_limited");
+      const skipped = state.publicDomains
+        .filter((domain) => body.ids.includes(domain.id) && domain.apply_status === "rate_limited")
+        .map((domain) => ({ id: domain.id, reason: "CA 限流窗口尚未结束，Caddy 会自动重试" }));
+      await fulfillJson(route, { updated, skipped, message: "已请求 Caddy 处理 " + updated.length + " 个域名，限流项将按官方退避自动重试" });
+      return;
+    }
+    if (supportsPublicDomains && /^\/api\/v1\/public-domains\/[^/]+\/(recheck|renew)$/.test(path) && method === "POST") {
+      const parts = path.split("/");
+      const domain = state.publicDomains.find((item) => item.id === decodeURIComponent(parts.at(-2) ?? ""));
+      if (!domain) { await fulfillJson(route, { error: "域名不存在" }, 404); return; }
+      if (parts.at(-1) === "renew" && domain.apply_status === "rate_limited") {
+        await fulfillJson(route, { error: "CA 限流窗口尚未结束，Caddy 会自动重试" }, 429);
+        return;
+      }
+      await fulfillJson(route, domain);
+      return;
+    }
+    if (supportsPublicDomains && /^\/api\/v1\/public-domains\/[^/]+\/credentials$/.test(path) && method === "POST") {
+      const domain = state.publicDomains.find((item) => item.id === decodeURIComponent(path.split("/").at(-2) ?? ""));
+      if (!domain) { await fulfillJson(route, { error: "域名不存在" }, 404); return; }
+      await fulfillJson(route, domain);
+      return;
+    }
     if (path === "/api/v1/settings/public-entry" && method === "GET") { await fulfillJson(route, state.publicEntry); return; }
 
     if (path === "/api/v1/enrollments" && method === "POST") {
@@ -692,7 +762,7 @@ test("添加设备生成最小 Compose 配置", async ({ page, context }) => {
   await page.getByLabel("设备名称").fill("家庭 NAS");
   await page.getByRole("button", { name: "生成设备配置" }).click();
   const compose = await page.getByLabel("Docker Compose 配置").inputValue();
-  expect(compose).toContain("ghcr.io/thelinyue/nexo-agent:0.1.6");
+  expect(compose).toContain("ghcr.io/thelinyue/nexo-agent:0.1.7");
   expect(compose).toContain("TZ: ${TZ:-Asia/Shanghai}");
   expect(compose.match(/NEXO_[A-Z_]+:/g)).toEqual(["NEXO_SERVER_URL:", "NEXO_ENROLLMENT_TOKEN:"]);
   await page.getByRole("button", { name: "复制 Compose 配置" }).click();
@@ -933,6 +1003,70 @@ test("未配置域名与 HTTPS 时通过配置弹窗完成设置", async ({ page
   await reopened.getByRole("button", { name: "保存设置" }).click();
   await expect(reopened).toBeHidden();
   await expect(page.getByRole("button", { name: "编辑域名与 HTTPS" })).toBeVisible();
+  await expectNoHorizontalOverflow(page);
+});
+
+test("多域名列表展示证书生命周期并支持批量与手动申请", async ({ page }) => {
+  const rateLimitedDomain = {
+    ...structuredClone(seedPublicDomain),
+    id: "domain-rate-limited",
+    domain: "rate.example.com",
+    is_primary: false,
+    apply_status: "rate_limited",
+    apply_error: "CA 返回 HTTP 429",
+    error_code: "acme_rate_limited",
+    root_certificate: { ...seedPublicDomain.root_certificate, status: "pending", not_before: null, not_after: null, renewal_at: null, subjects: [] },
+    wildcard_certificate: { ...seedPublicDomain.wildcard_certificate, status: "pending", not_before: null, not_after: null, renewal_at: null, subjects: [] },
+    usage_count: 0,
+    retry_after: 1893000000,
+    next_retry_at: 1893000000,
+    attempt_count: 3,
+  };
+  const manualDomain = {
+    ...structuredClone(seedPublicDomain),
+    id: "domain-manual",
+    domain: "manual.example.net",
+    is_primary: false,
+    certificate_mode: "manual",
+    root_certificate: { ...seedPublicDomain.root_certificate, renewal_at: null },
+    wildcard_certificate: { ...seedPublicDomain.wildcard_certificate, renewal_at: null },
+    usage_count: 0,
+  };
+  await installApiMocks(page, {
+    initialized: true,
+    authenticated: true,
+    publicDomains: [seedPublicDomain, rateLimitedDomain, manualDomain],
+  });
+  await page.goto("/#/public-access/domain");
+
+  const primaryRow = page.locator(".domain-row").filter({ hasText: "example.com" }).first();
+  await expect(primaryRow).toContainText("主域名");
+  await expect(primaryRow).toContainText("到期时间");
+  await expect(primaryRow).toContainText("预计进入 Caddy 续期窗口");
+  const limitedRow = page.locator(".domain-row").filter({ hasText: "rate.example.com" });
+  await expect(limitedRow.getByRole("button", { name: "手动申请证书" })).toBeDisabled();
+  await limitedRow.locator("summary").click();
+  await expect(limitedRow).toContainText("Caddy 正在自动重试");
+  await expect(limitedRow).toContainText("下一次尝试");
+
+  await page.getByRole("checkbox", { name: "全选公网域名" }).check();
+  const batchRecheck = page.waitForRequest((request) => new URL(request.url()).pathname === "/api/v1/public-domains/batch/recheck");
+  await page.getByRole("button", { name: "批量重新检测" }).click();
+  expect((await batchRecheck).postDataJSON()).toEqual({ ids: ["domain-primary", "domain-rate-limited", "domain-manual"] });
+  await expect(page.getByRole("status")).toContainText("已重新检测 3 个域名");
+
+  const singleRenew = page.waitForRequest((request) => new URL(request.url()).pathname === "/api/v1/public-domains/domain-primary/renew");
+  await primaryRow.getByRole("button", { name: "手动申请证书" }).click();
+  await singleRenew;
+  await expect(page.getByRole("status")).toContainText("已请求 Caddy 处理 example.com 的证书");
+
+  const manualRow = page.locator(".domain-row").filter({ hasText: "manual.example.net" });
+  await manualRow.getByRole("button", { name: "更新证书" }).click();
+  const dialog = page.getByRole("dialog", { name: "编辑 manual.example.net" });
+  await expect(dialog.getByLabel("证书文件")).toBeVisible();
+  await expect(dialog.getByLabel("私钥文件")).toBeVisible();
+  await dialog.getByRole("button", { name: "取消" }).click();
+  await expect(dialog).toBeHidden();
   await expectNoHorizontalOverflow(page);
 });
 

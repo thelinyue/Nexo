@@ -114,7 +114,12 @@ pub struct RecoverRequest {
 pub struct AuthStatusResponse {
     pub initialized: bool,
     pub authenticated: bool,
+    pub user_id: Option<String>,
     pub username: Option<String>,
+    pub role: Option<String>,
+    /// 内部工作空间 ID；普通用户固定绑定自己的空间，管理员可通过
+    /// `x-nexo-workspace` 选择要管理的空间。
+    pub workspace_id: Option<String>,
     pub channel: Option<String>,
     pub csrf_token: Option<String>,
     pub local_http_warning: bool,
@@ -131,10 +136,28 @@ pub struct SessionResponse {
 
 #[derive(Debug, Serialize)]
 pub struct AuthResponse {
+    pub user_id: String,
     pub username: String,
+    pub role: String,
+    pub workspace_id: String,
     pub channel: String,
     pub csrf_token: String,
     pub message: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CreateUserRequest {
+    pub username: String,
+    pub password: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct UserResponse {
+    pub id: String,
+    pub username: String,
+    pub role: String,
+    pub workspace_id: String,
+    pub created_at: i64,
 }
 
 #[derive(Debug, Serialize)]
@@ -232,6 +255,14 @@ pub async fn session_middleware(
             .insert(SESSION_AUTH_HEADER, HeaderValue::from_static("1"));
     }
     let path = request.uri().path();
+    if is_admin_only_path(path) {
+        if let Some(session) = load_session(&state, request.headers(), channel) {
+            if !session_is_system_admin(&state, &session) {
+                return ApiError::new(StatusCode::FORBIDDEN, "当前账号没有系统设置权限")
+                    .into_response();
+            }
+        }
+    }
     let unsafe_method = !matches!(
         request.method(),
         &axum::http::Method::GET | &axum::http::Method::HEAD | &axum::http::Method::OPTIONS
@@ -298,10 +329,20 @@ pub fn require_csrf(state: &AppState, headers: &HeaderMap) -> Result<(), ApiErro
 /// 所有业务请求都必须携带当前入口对应的有效管理员 Session；这样即使旧版
 /// `NEXO_ADMIN_TOKEN` 仍存在于容器环境，也不会绕过登录、CSRF 和 Session 吊销。
 pub fn authorize_admin(state: &AppState, headers: &HeaderMap) -> Result<(), ApiError> {
-    admin_tenant_id(state, headers).map(|_| ())
+    let channel = request_channel(headers);
+    let session = load_session(state, headers, channel)
+        .ok_or_else(|| ApiError::new(StatusCode::UNAUTHORIZED, "请先登录管理员账号"))?;
+    if session_is_system_admin(state, &session) {
+        Ok(())
+    } else {
+        Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "当前账号没有系统管理员权限",
+        ))
+    }
 }
 
-/// 返回当前管理员 Session 所属租户。
+/// 返回当前 Session 的工作空间。
 ///
 /// 管理接口不能相信请求体里的 `tenant_id`，必须以登录 Session 的租户作为
 /// 作用域。保留这个独立函数让只读接口也能复用同一条授权边界，避免出现
@@ -328,17 +369,179 @@ pub fn admin_tenant_id(state: &AppState, headers: &HeaderMap) -> Result<String, 
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .optional()
-        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法读取管理员身份"))?;
-    if identity
-        .as_ref()
-        .is_some_and(|(role, tenant_id)| role == "system_admin" && tenant_id == &session.tenant_id)
-    {
-        return Ok(session.tenant_id);
+        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法读取当前账号身份"))?;
+    let Some((role, tenant_id)) = identity else {
+        return Err(ApiError::new(StatusCode::UNAUTHORIZED, "当前账号不存在"));
+    };
+    if tenant_id != session.tenant_id {
+        return Err(ApiError::new(
+            StatusCode::UNAUTHORIZED,
+            "登录空间已失效，请重新登录",
+        ));
     }
-    Err(ApiError::new(
-        StatusCode::UNAUTHORIZED,
-        "请先登录管理员账号",
-    ))
+    if role == "system_admin" {
+        if let Some(workspace) = headers
+            .get("x-nexo-workspace")
+            .and_then(|value| value.to_str().ok())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            let exists: i64 = connection
+                .query_row(
+                    "SELECT COUNT(*) FROM tenants WHERE id = ?1",
+                    [workspace],
+                    |row| row.get(0),
+                )
+                .map_err(|_| {
+                    ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法检查管理空间")
+                })?;
+            if exists == 0 {
+                return Err(ApiError::new(StatusCode::NOT_FOUND, "管理空间不存在"));
+            }
+            return Ok(workspace.to_owned());
+        }
+    }
+    Ok(session.tenant_id)
+}
+
+/// 判断当前 Session 是否属于全局系统管理员；角色读取集中在这里，避免
+/// 普通业务处理器把请求体中的角色或工作空间当成授权依据。
+fn session_is_system_admin(state: &AppState, session: &AuthenticatedSession) -> bool {
+    state
+        .db
+        .lock()
+        .ok()
+        .and_then(|connection| {
+            connection
+                .query_row(
+                    "SELECT role FROM users WHERE id = ?1 AND tenant_id = ?2",
+                    params![session.user_id, session.tenant_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()
+                .ok()
+                .flatten()
+        })
+        .is_some_and(|role| role == "system_admin")
+}
+
+fn user_identity(state: &AppState, user_id: &str, tenant_id: &str) -> Option<(String, String)> {
+    state.db.lock().ok().and_then(|connection| {
+        connection
+            .query_row(
+                "SELECT role, COALESCE(tenant_id, '') FROM users WHERE id = ?1 AND tenant_id = ?2",
+                params![user_id, tenant_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .ok()
+            .flatten()
+    })
+}
+
+/// 这些接口包含实例级 Secret、域名和边缘组件配置，只允许系统管理员。
+/// 设备、穿透和网络互联接口仍由 `admin_tenant_id` 按工作空间隔离。
+fn is_admin_only_path(path: &str) -> bool {
+    path.starts_with("/api/v1/settings/")
+        || path.starts_with("/api/v1/public-domains")
+        || path.starts_with("/api/v1/public-domain-migrations")
+        || path == "/api/v1/users"
+        || path.starts_with("/api/v1/users/")
+}
+
+/// 系统管理员创建普通用户。每个用户同时得到稳定的内部工作空间，
+/// Headscale 用户在第一次官方客户端入网时按需创建。
+pub async fn create_user(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<CreateUserRequest>,
+) -> Result<Json<UserResponse>, ApiError> {
+    authorize_admin(&state, &headers)?;
+    validate_username(&request.username)?;
+    validate_password(&request.password)?;
+    let username = request.username.trim().to_owned();
+    let user_id = uuid::Uuid::new_v4().to_string();
+    let workspace_id = format!("workspace-{user_id}");
+    let password_hash = hash_password(&request.password)
+        .map_err(|error| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    let now = unix_now();
+    let connection = state
+        .db
+        .lock()
+        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "数据库锁不可用"))?;
+    let transaction = connection
+        .unchecked_transaction()
+        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法开始用户创建事务"))?;
+    transaction
+        .execute(
+            "INSERT INTO tenants (id, name) VALUES (?1, ?2)",
+            params![workspace_id, username],
+        )
+        .map_err(|error| {
+            tracing::warn!("创建普通用户工作空间失败：{error}");
+            ApiError::new(StatusCode::CONFLICT, "用户工作空间已存在")
+        })?;
+    transaction
+        .execute(
+            "INSERT INTO users (id, tenant_id, username, role, password_hash)
+             VALUES (?1, ?2, ?3, 'tenant', ?4)",
+            params![user_id, workspace_id, username, password_hash],
+        )
+        .map_err(|error| {
+            tracing::warn!("创建普通用户账号失败：{error}");
+            ApiError::new(StatusCode::CONFLICT, "用户名已存在")
+        })?;
+    transaction
+        .execute(
+            "INSERT INTO audit_events (tenant_id, actor_user_id, event_type, resource_type, resource_id, detail_json)
+             VALUES (?1, NULL, 'user_created', 'user', ?2, '{}')",
+            params![workspace_id, user_id],
+        )
+        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法写入用户审计记录"))?;
+    transaction
+        .commit()
+        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法提交用户创建事务"))?;
+    Ok(Json(UserResponse {
+        id: user_id,
+        username,
+        role: "tenant".to_owned(),
+        workspace_id,
+        created_at: now,
+    }))
+}
+
+/// 管理员查看用户目录；密码摘要、Session 和 Headscale 凭证永不返回。
+pub async fn list_users(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<UserResponse>>, ApiError> {
+    authorize_admin(&state, &headers)?;
+    let connection = state
+        .db
+        .lock()
+        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "数据库锁不可用"))?;
+    let mut statement = connection
+        .prepare(
+            "SELECT id, username, role, COALESCE(tenant_id, ''), created_at
+             FROM users ORDER BY role ASC, username ASC",
+        )
+        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法读取用户列表"))?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok(UserResponse {
+                id: row.get(0)?,
+                username: row.get(1)?,
+                role: row.get(2)?,
+                workspace_id: row.get(3)?,
+                created_at: row.get(4)?,
+            })
+        })
+        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法读取用户列表"))?;
+    rows.map(|row| {
+        row.map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "用户数据格式无效"))
+    })
+    .collect::<Result<Vec<_>, _>>()
+    .map(Json)
 }
 
 pub async fn auth_status(
@@ -376,12 +579,25 @@ pub async fn auth_status(
     } else {
         (None, false)
     };
+    let (session_user_id, session_role, session_workspace) = session
+        .as_ref()
+        .and_then(|session| user_identity(&state, &session.user_id, &session.tenant_id))
+        .map_or((None, None, None), |(role, workspace)| {
+            (
+                session.as_ref().map(|value| value.user_id.clone()),
+                Some(role),
+                Some(workspace),
+            )
+        });
     let mut response = Json(AuthStatusResponse {
         initialized,
         authenticated: session.is_some(),
+        user_id: session_user_id,
         username: session
             .as_ref()
             .and_then(|session| username(&state, &session.user_id)),
+        role: session_role,
+        workspace_id: session_workspace,
         channel: session.map(|session| session.channel.as_str().to_owned()),
         csrf_token: csrf_token.clone(),
         local_http_warning: matches!(channel, SessionChannel::LocalHttp),
@@ -519,6 +735,7 @@ pub async fn initialize(
         session,
         csrf_token,
         request.username.trim(),
+        "system_admin",
         "管理员初始化完成",
     ))
 }
@@ -543,21 +760,22 @@ pub async fn login(
             .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "数据库锁不可用"))?;
         connection
             .query_row(
-                "SELECT id, tenant_id, password_hash FROM users
-                 WHERE username = ?1 AND role = 'system_admin'",
+                "SELECT id, tenant_id, role, password_hash FROM users
+                 WHERE username = ?1",
                 [&request.username],
                 |row| {
                     Ok((
                         row.get::<_, String>(0)?,
                         row.get::<_, String>(1)?,
                         row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
                     ))
                 },
             )
             .optional()
             .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法读取管理员账号"))?
     };
-    let Some((user_id, tenant_id, password_hash)) = record else {
+    let Some((user_id, tenant_id, role, password_hash)) = record else {
         record_login_attempt(&state, &request.username, &source, false)?;
         return Err(ApiError::new(StatusCode::UNAUTHORIZED, "用户名或密码错误"));
     };
@@ -580,6 +798,7 @@ pub async fn login(
         session,
         csrf_token,
         &request.username,
+        &role,
         "登录成功",
     ))
 }
@@ -823,6 +1042,11 @@ fn current_session(
         .ok_or_else(|| ApiError::new(StatusCode::UNAUTHORIZED, "登录状态已失效，请重新登录"))
 }
 
+/// 业务层需要把官方客户端归属到当前账号时使用；不会返回 Cookie 或摘要。
+pub fn current_user_id(state: &AppState, headers: &HeaderMap) -> Result<String, ApiError> {
+    Ok(current_session(state, headers)?.user_id)
+}
+
 fn load_session(
     state: &AppState,
     headers: &HeaderMap,
@@ -914,10 +1138,14 @@ fn auth_response(
     session: AuthenticatedSession,
     csrf_token: String,
     username: &str,
+    role: &str,
     message: &str,
 ) -> Response {
     let mut response = Json(AuthResponse {
+        user_id: session.user_id.clone(),
         username: username.to_owned(),
+        role: role.to_owned(),
+        workspace_id: session.tenant_id.clone(),
         channel: session.channel.as_str().to_owned(),
         csrf_token: csrf_token.clone(),
         message: message.to_owned(),
@@ -1251,7 +1479,7 @@ mod tests {
         )
         .is_none());
 
-        let local_response = auth_response(local, local_csrf, "admin", "ok");
+        let local_response = auth_response(local, local_csrf, "admin", "system_admin", "ok");
         let local_cookies = local_response
             .headers()
             .get_all(SET_COOKIE)
@@ -1267,7 +1495,7 @@ mod tests {
             .iter()
             .any(|value| value.starts_with(LOCAL_CSRF_COOKIE) && !value.contains("HttpOnly")));
 
-        let public_response = auth_response(public, public_csrf, "admin", "ok");
+        let public_response = auth_response(public, public_csrf, "admin", "system_admin", "ok");
         let public_cookies = public_response
             .headers()
             .get_all(SET_COOKIE)

@@ -67,6 +67,10 @@ pub struct HeadscaleNode {
     #[serde(default)]
     pub ip_addresses: Vec<String>,
     #[serde(default)]
+    pub tags: Vec<String>,
+    #[serde(default)]
+    pub expiry: Option<String>,
+    #[serde(default)]
     pub approved_routes: Vec<String>,
     #[serde(default)]
     pub available_routes: Vec<String>,
@@ -86,6 +90,17 @@ pub struct HeadscalePreAuthKey {
     pub used: bool,
     #[serde(default)]
     pub expiration: Option<String>,
+}
+
+/// 官方客户端 Auth Key 的可视化创建参数。Headscale 0.29.x 的字段名
+/// 通过 serde 映射到官方 REST API，Nexo 不在适配器外拼接请求 JSON。
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct HeadscaleAuthKeyOptions {
+    pub reusable: bool,
+    pub ephemeral: bool,
+    pub expiration: String,
+    #[serde(default)]
+    pub acl_tags: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
@@ -180,6 +195,12 @@ struct HealthResponse {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct SetPolicyRequest<'a> {
+    policy: &'a str,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CheckPolicyRequest<'a> {
     policy: &'a str,
 }
 
@@ -371,15 +392,30 @@ impl HeadscaleHttpAdapter {
         user_id: &str,
         expiration: &str,
     ) -> Result<HeadscalePreAuthKey> {
+        self.create_pre_auth_key_with_options(
+            user_id,
+            &HeadscaleAuthKeyOptions {
+                expiration: expiration.to_owned(),
+                ..Default::default()
+            },
+        )
+        .await
+    }
+
+    pub async fn create_pre_auth_key_with_options(
+        &self,
+        user_id: &str,
+        options: &HeadscaleAuthKeyOptions,
+    ) -> Result<HeadscalePreAuthKey> {
         let response: CreatePreAuthKeyResponse = self
             .send_json(
                 self.request(Method::POST, "/api/v1/preauthkey")
                     .json(&CreatePreAuthKeyRequest {
                         user: user_id,
-                        reusable: false,
-                        ephemeral: false,
-                        expiration,
-                        acl_tags: Vec::new(),
+                        reusable: options.reusable,
+                        ephemeral: options.ephemeral,
+                        expiration: &options.expiration,
+                        acl_tags: options.acl_tags.clone(),
                     }),
                 "创建设备入网密钥",
             )
@@ -476,6 +512,19 @@ impl HeadscaleHttpAdapter {
             self.request(Method::PUT, "/api/v1/policy")
                 .json(&SetPolicyRequest { policy }),
             "更新组网策略",
+        )
+        .await
+    }
+
+    /// 使用 Headscale 官方 `policy/check` 端点校验候选策略。
+    ///
+    /// 校验失败只返回可读错误，不会改变当前已经生效的策略；调用方应在
+    /// 保存结构化规则前先执行这一步，避免把无法解析的 Policy 写入状态。
+    pub async fn check_policy(&self, policy: &str) -> Result<()> {
+        self.send_empty(
+            self.request(Method::POST, "/api/v1/policy/check")
+                .json(&CheckPolicyRequest { policy }),
+            "校验组网策略",
         )
         .await
     }
@@ -594,6 +643,14 @@ pub trait HeadscaleControlPlane: Send + Sync {
         Err(anyhow!("Headscale Pre-auth Key API 尚未配置"))
     }
 
+    async fn create_pre_auth_key_with_options(
+        &self,
+        _user_id: &str,
+        _options: &HeadscaleAuthKeyOptions,
+    ) -> Result<HeadscalePreAuthKey> {
+        Err(anyhow!("Headscale Auth Key API 尚未配置"))
+    }
+
     async fn list_pre_auth_keys(&self) -> Result<Vec<HeadscalePreAuthKey>> {
         Err(anyhow!("Headscale Pre-auth Key API 尚未配置"))
     }
@@ -616,6 +673,10 @@ pub trait HeadscaleControlPlane: Send + Sync {
 
     async fn set_policy(&self, _policy: &str) -> Result<()> {
         Err(anyhow!("Headscale Policy API 尚未配置"))
+    }
+
+    async fn check_policy(&self, _policy: &str) -> Result<()> {
+        Err(anyhow!("Headscale Policy 校验 API 尚未配置"))
     }
 }
 
@@ -711,6 +772,14 @@ impl HeadscaleControlPlane for HeadscaleHttpAdapter {
         HeadscaleHttpAdapter::create_pre_auth_key(self, user_id, expiration).await
     }
 
+    async fn create_pre_auth_key_with_options(
+        &self,
+        user_id: &str,
+        options: &HeadscaleAuthKeyOptions,
+    ) -> Result<HeadscalePreAuthKey> {
+        HeadscaleHttpAdapter::create_pre_auth_key_with_options(self, user_id, options).await
+    }
+
     async fn list_pre_auth_keys(&self) -> Result<Vec<HeadscalePreAuthKey>> {
         HeadscaleHttpAdapter::list_pre_auth_keys(self).await
     }
@@ -733,6 +802,10 @@ impl HeadscaleControlPlane for HeadscaleHttpAdapter {
 
     async fn set_policy(&self, policy: &str) -> Result<()> {
         HeadscaleHttpAdapter::set_policy(self, policy).await
+    }
+
+    async fn check_policy(&self, policy: &str) -> Result<()> {
+        HeadscaleHttpAdapter::check_policy(self, policy).await
     }
 }
 
@@ -947,6 +1020,37 @@ mod tests {
             .await
             .expect("官方节点重命名接口应成功");
         assert_eq!(node.name, "tenant-device-42");
+        server.await.expect("测试 HTTP 服务应完成");
+    }
+
+    #[tokio::test]
+    async fn check_policy_uses_official_policy_check_endpoint() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("测试 HTTP 监听器应能启动");
+        let address = listener.local_addr().expect("测试监听器应有地址");
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("应接受策略校验请求");
+            let request = read_http_request(&mut stream).await;
+            assert!(request.starts_with("POST /api/v1/policy/check "));
+            assert!(request
+                .to_ascii_lowercase()
+                .contains("authorization: bearer test-secret"));
+            let body = request.split_once("\r\n\r\n").expect("请求应包含正文").1;
+            let payload: serde_json::Value =
+                serde_json::from_str(body).expect("策略校验正文应为 JSON");
+            assert_eq!(payload["policy"], "{\"grants\":[]}");
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nconnection: close\r\ncontent-length: 0\r\n\r\n")
+                .await
+                .expect("应返回策略校验响应");
+        });
+        let adapter = HeadscaleHttpAdapter::new(format!("http://{address}"), "test-secret")
+            .expect("测试适配器应能创建");
+        adapter
+            .check_policy("{\"grants\":[]}")
+            .await
+            .expect("官方策略校验接口应成功");
         server.await.expect("测试 HTTP 服务应完成");
     }
 

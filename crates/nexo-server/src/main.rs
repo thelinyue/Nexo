@@ -7,7 +7,7 @@ use std::{
     env, fs,
     io::BufReader,
     net::SocketAddr,
-    path::PathBuf,
+    path::{Path as FsPath, PathBuf},
     sync::{Arc, Mutex},
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -35,7 +35,8 @@ use nexo_core::{
     GatewayCapabilityReport,
 };
 use nexo_headscale_adapter::{
-    HeadscaleAdapter, HeadscaleControlPlane, HeadscaleHttpAdapter, HeadscaleNode,
+    HeadscaleAdapter, HeadscaleAuthKeyOptions, HeadscaleControlPlane, HeadscaleHttpAdapter,
+    HeadscaleNode,
 };
 #[cfg(test)]
 use nexo_protocol::GatewayRouteApplyResult;
@@ -115,6 +116,11 @@ const UNASSIGNED_TUNNEL_MIGRATION: &str =
     include_str!("../../../migrations/0013_unassigned_tunnels.sql");
 const SITELINK_MULTI_NETWORK_MIGRATION: &str =
     include_str!("../../../migrations/0014_sitelink_multi_networks.sql");
+const MULTI_PUBLIC_DOMAINS_MIGRATION: &str =
+    include_str!("../../../migrations/0015_multi_public_domains.sql");
+const TAILSCALE_CLIENT_MIGRATION: &str =
+    include_str!("../../../migrations/0016_tailscale_clients.sql");
+const ACCESS_CONTROL_MIGRATION: &str = include_str!("../../../migrations/0017_access_control.sql");
 
 #[derive(Clone)]
 pub(crate) struct AppState {
@@ -282,6 +288,9 @@ struct TunnelResponse {
     applied_revision: i64,
     deletion_pending: bool,
     public_address: Option<String>,
+    /// Web Service 所属的公网域名；TCP Tunnel 没有域名绑定。
+    public_domain_id: Option<String>,
+    public_domain: Option<String>,
 }
 
 /// 删除接口统一返回同步完成或等待外部撤销两种状态。
@@ -342,6 +351,9 @@ struct CreateTunnelRequest {
     #[serde(alias = "custom_ca_pem")]
     origin_ca_pem: Option<String>,
     service_name: Option<String>,
+    /// Web Service 使用的域名资源；为空时使用当前主域名。
+    #[serde(default)]
+    public_domain_id: Option<String>,
 }
 
 type UpdateTunnelRequest = CreateTunnelRequest;
@@ -379,6 +391,114 @@ struct PublicEntrySecretRequest {
     custom_ca_pem: Option<String>,
 }
 
+/// 多域名资源的用户可见状态；任何 Secret 正文都不会通过 API 返回。
+#[derive(Debug, Serialize, Clone)]
+struct PublicDomainResponse {
+    id: String,
+    tenant_id: String,
+    domain: String,
+    is_primary: bool,
+    https_enabled: bool,
+    certificate_mode: String,
+    acme_environment: String,
+    apply_status: String,
+    apply_error: Option<String>,
+    error_code: Option<String>,
+    dns_check: serde_json::Value,
+    root_certificate: CertificateStatusResponse,
+    wildcard_certificate: CertificateStatusResponse,
+    usage_count: i64,
+    desired_revision: i64,
+    applied_revision: i64,
+    retry_after: Option<i64>,
+    attempt_count: i64,
+    next_retry_at: Option<i64>,
+}
+
+#[derive(Debug, Serialize, Clone)]
+struct CertificateStatusResponse {
+    status: String,
+    not_before: Option<i64>,
+    not_after: Option<i64>,
+    /// Caddy 通常在到期前约 30 天进入自动续期窗口；这是预计时间，
+    /// 不是对 CA 或 Caddy 后台调度的硬承诺。
+    renewal_at: Option<i64>,
+    subjects: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CreatePublicDomainRequest {
+    domain: String,
+    #[serde(default = "default_true")]
+    https_enabled: bool,
+    #[serde(default = "default_cloudflare")]
+    certificate_mode: String,
+    #[serde(default)]
+    acme_environment: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct UpdatePublicDomainRequest {
+    #[serde(default)]
+    domain: Option<String>,
+    #[serde(default)]
+    https_enabled: Option<bool>,
+    #[serde(default)]
+    certificate_mode: Option<String>,
+    #[serde(default)]
+    acme_environment: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PublicDomainSecretRequest {
+    #[serde(default)]
+    cloudflare_token: Option<String>,
+    #[serde(default)]
+    certificate_pem: Option<String>,
+    #[serde(default)]
+    private_key_pem: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct MakePrimaryRequest {
+    #[serde(default)]
+    confirm: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct PublicDomainBatchRequest {
+    #[serde(default)]
+    ids: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct PublicDomainBatchResponse {
+    updated: Vec<PublicDomainResponse>,
+    skipped: Vec<BatchSkippedItem>,
+    message: String,
+}
+
+#[derive(Debug, Serialize, Clone)]
+struct PublicDomainMigrationResponse {
+    id: String,
+    from_domain_id: String,
+    to_domain_id: String,
+    status: String,
+    total_devices: i64,
+    acknowledged_devices: i64,
+    last_error: Option<String>,
+    created_at: i64,
+    updated_at: i64,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_cloudflare() -> String {
+    "cloudflare".to_owned()
+}
+
 #[derive(Debug, Deserialize)]
 struct TunnelOriginCaRequest {
     #[serde(alias = "custom_ca_pem", alias = "origin_ca_pem")]
@@ -409,6 +529,17 @@ struct DeviceResponse {
     /// 组网对用户只显示加入进度，不暴露 Headscale Node/API Key。
     mesh_status: String,
     mesh_address: Option<String>,
+    /// 官方客户端与 Nexo Agent 共用一张设备表，但只有 Agent 设备可承载
+    /// Nexo Tunnel 或网关 Desired State。
+    connection_type: String,
+    owner_user_id: Option<String>,
+    owner_username: Option<String>,
+    registration_method: Option<String>,
+    tags: Vec<String>,
+    tailscale_ipv4: Option<String>,
+    tailscale_ipv6: Option<String>,
+    expires_at: Option<i64>,
+    control_plane_state: Option<String>,
     last_seen_at: Option<i64>,
     /// 供删除确认窗说明设备删除后的 Tunnel 处置方式。
     tunnel_count: i64,
@@ -505,6 +636,120 @@ struct RecoverMeshIdentityResponse {
     device_id: String,
     old_node_id: String,
     message: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct CreateTailscaleAuthKeyRequest {
+    label: String,
+    #[serde(default)]
+    reusable: bool,
+    #[serde(default)]
+    ephemeral: bool,
+    ttl_seconds: Option<i64>,
+    #[serde(default)]
+    tags: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct TailscaleAuthKeyResponse {
+    id: String,
+    label: String,
+    key: Option<String>,
+    login_server: String,
+    reusable: bool,
+    ephemeral: bool,
+    expires_at: i64,
+    state: String,
+    created_at: i64,
+}
+
+#[derive(Debug, Serialize)]
+struct TailscaleExternalNodeResponse {
+    node_id: String,
+    name: String,
+    online: bool,
+    addresses: Vec<String>,
+    claim_state: String,
+    discovered_at: i64,
+    last_seen_at: i64,
+}
+
+#[derive(Debug, Serialize)]
+struct TailscaleClientConfigResponse {
+    login_server: String,
+    browser_authorization_url: String,
+    supported_platforms: Vec<String>,
+    notes: Vec<String>,
+}
+
+/// 可视化访问规则的写入参数；用户只提交结构化字段，不能直接提交 HuJSON。
+#[derive(Debug, Deserialize, Clone)]
+struct AccessRuleRequest {
+    name: String,
+    target_type: String,
+    target_id: String,
+    #[serde(default)]
+    protocols: Vec<String>,
+    #[serde(default)]
+    ports: Vec<String>,
+    #[serde(default)]
+    ssh_enabled: bool,
+    #[serde(default = "default_true")]
+    enabled: bool,
+    #[serde(default)]
+    grantee_workspace_ids: Vec<String>,
+}
+
+#[derive(Debug, Serialize, Clone)]
+struct AccessGrantResponse {
+    workspace_id: String,
+    workspace_name: String,
+    status: String,
+    accepted_at: Option<i64>,
+}
+
+#[derive(Debug, Serialize, Clone)]
+struct AccessRuleResponse {
+    id: String,
+    owner_workspace_id: String,
+    owner_username: String,
+    name: String,
+    target_type: String,
+    target_id: String,
+    target_label: String,
+    protocols: Vec<String>,
+    ports: Vec<String>,
+    ssh_enabled: bool,
+    enabled: bool,
+    desired_revision: i64,
+    applied_revision: i64,
+    apply_status: String,
+    apply_error: Option<String>,
+    grants: Vec<AccessGrantResponse>,
+    created_at: i64,
+    updated_at: i64,
+}
+
+#[derive(Debug, Serialize)]
+struct AccessPolicyPreviewResponse {
+    valid: bool,
+    grant_count: usize,
+    ssh_rule_count: usize,
+    affected_targets: Vec<String>,
+    summary: String,
+    error: Option<String>,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Serialize, Clone)]
+struct AccessWorkspaceResponse {
+    id: String,
+    name: String,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct ClaimTailscaleNodeRequest {
+    name: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -827,6 +1072,11 @@ async fn main() -> Result<()> {
     apply_unassigned_tunnel_migration(&connection).context("无法初始化未分配 Tunnel 数据结构")?;
     apply_sitelink_multi_network_migration(&connection)
         .context("无法初始化共享网络和站点互联扩展")?;
+    apply_multi_public_domains_migration(&connection)
+        .context("无法初始化多域名和主域名迁移数据结构")?;
+    apply_tailscale_client_migration(&connection)
+        .context("无法初始化官方客户端和 Auth Key 数据结构")?;
+    apply_access_control_migration(&connection).context("无法初始化可视化访问控制数据结构")?;
     let legacy_tunnel_count = finalize_legacy_pending_tunnel_deletions(&connection)
         .context("无法清理旧版本遗留的待删除穿透服务")?;
     if legacy_tunnel_count > 0 {
@@ -839,6 +1089,8 @@ async fn main() -> Result<()> {
         .parent()
         .map(PathBuf::from)
         .context("Nexo 数据库路径缺少父目录")?;
+    migrate_legacy_public_domain_secrets(&data_dir, &connection)
+        .context("无法迁移旧版公网入口 Secret")?;
     auth::ensure_bootstrap_code(&connection, &data_dir)
         .context("无法初始化管理员 Bootstrap Secret")?;
     let control_tls = build_control_tls_config(&connection).context("无法构建 mTLS 控制通道")?;
@@ -981,6 +1233,10 @@ async fn main() -> Result<()> {
         .route("/api/v1/auth/sessions/{id}", post(auth::revoke_session))
         .route("/api/v1/auth/recover", post(auth::recover))
         .route(
+            "/api/v1/users",
+            get(auth::list_users).post(auth::create_user),
+        )
+        .route(
             "/api/v1/settings/public-entry",
             get(get_public_entry).put(update_public_entry),
         )
@@ -991,6 +1247,42 @@ async fn main() -> Result<()> {
         .route(
             "/api/v1/settings/public-entry/recheck",
             post(recheck_public_entry),
+        )
+        .route(
+            "/api/v1/public-domains",
+            get(list_public_domains).post(create_public_domain),
+        )
+        .route(
+            "/api/v1/public-domains/{id}",
+            put(update_public_domain).delete(delete_public_domain),
+        )
+        .route(
+            "/api/v1/public-domains/{id}/credentials",
+            post(upload_public_domain_credentials),
+        )
+        .route(
+            "/api/v1/public-domains/{id}/recheck",
+            post(recheck_public_domain),
+        )
+        .route(
+            "/api/v1/public-domains/{id}/make-primary",
+            post(make_public_domain_primary),
+        )
+        .route(
+            "/api/v1/public-domains/{id}/renew",
+            post(renew_public_domain),
+        )
+        .route(
+            "/api/v1/public-domains/batch/recheck",
+            post(batch_recheck_public_domains),
+        )
+        .route(
+            "/api/v1/public-domains/batch/renew",
+            post(batch_renew_public_domains),
+        )
+        .route(
+            "/api/v1/public-domain-migrations/{id}",
+            get(get_public_domain_migration),
         )
         .route("/api/v1/tunnels", get(list_tunnels).post(create_tunnel))
         .route(
@@ -1031,6 +1323,39 @@ async fn main() -> Result<()> {
             post(poll_agent_enrollment),
         )
         .route("/api/v1/mesh/status", get(mesh_status))
+        .route(
+            "/api/v1/access-control/rules",
+            get(list_access_rules).post(create_access_rule),
+        )
+        .route(
+            "/api/v1/access-control/workspaces",
+            get(list_access_control_workspaces),
+        )
+        .route(
+            "/api/v1/access-control/rules/{id}",
+            put(update_access_rule).delete(delete_access_rule),
+        )
+        .route(
+            "/api/v1/access-control/policy/preview",
+            post(preview_access_policy),
+        )
+        .route(
+            "/api/v1/mesh/auth-keys",
+            get(list_tailscale_auth_keys).post(create_tailscale_auth_key),
+        )
+        .route("/api/v1/mesh/client-config", get(tailscale_client_config))
+        .route(
+            "/api/v1/mesh/auth-keys/{id}/revoke",
+            post(revoke_tailscale_auth_key),
+        )
+        .route(
+            "/api/v1/mesh/external-nodes",
+            get(list_tailscale_external_nodes),
+        )
+        .route(
+            "/api/v1/mesh/external-nodes/{node_id}/claim",
+            post(claim_tailscale_external_node),
+        )
         .route(
             "/api/v1/devices/{id}/mesh/recover",
             post(recover_mesh_identity),
@@ -1191,8 +1516,13 @@ fn run_cli_command(command: CliCommand) -> Result<()> {
     ensure_phase2_tunnel_columns(&connection)?;
     apply_unassigned_tunnel_migration(&connection)?;
     apply_sitelink_multi_network_migration(&connection)?;
+    apply_multi_public_domains_migration(&connection)?;
+    apply_tailscale_client_migration(&connection)?;
+    apply_access_control_migration(&connection)?;
     ensure_mesh_identity_online_column(&connection)?;
     let data_dir = db_path.parent().context("Nexo 数据库路径缺少父目录")?;
+    migrate_legacy_public_domain_secrets(data_dir, &connection)
+        .context("无法迁移旧版公网入口 Secret")?;
     match command {
         CliCommand::BootstrapCode => {
             // CLI 可能在 Server 首次启动前执行；沿用服务启动的同一初始化路径，
@@ -1261,6 +1591,42 @@ fn ensure_mesh_identity_online_column(connection: &Connection) -> Result<()> {
         "INSERT OR IGNORE INTO schema_migrations (version) VALUES (9)",
         [],
     )?;
+    Ok(())
+}
+
+/// 初始化官方 Tailscale 客户端映射表。表结构全部使用幂等 DDL，
+/// 这样旧版本数据库升级和本地 CLI 迁移可以共享同一条路径。
+fn apply_tailscale_client_migration(connection: &Connection) -> Result<()> {
+    let applied = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version = 16)",
+        [],
+        |row| row.get::<_, bool>(0),
+    )?;
+    if applied {
+        return Ok(());
+    }
+    let transaction = connection.unchecked_transaction()?;
+    transaction.execute_batch(TAILSCALE_CLIENT_MIGRATION)?;
+    transaction.commit()?;
+    Ok(())
+}
+
+/// 初始化结构化访问规则和直接授权关系。
+///
+/// 迁移只写入 Nexo 自有表，不读取 Headscale 数据库；Policy 的最终校验和
+/// 发布仍通过官方 HTTP API 完成。启动与本地维护命令共用这条幂等路径。
+fn apply_access_control_migration(connection: &Connection) -> Result<()> {
+    let applied = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version = 17)",
+        [],
+        |row| row.get::<_, bool>(0),
+    )?;
+    if applied {
+        return Ok(());
+    }
+    let transaction = connection.unchecked_transaction()?;
+    transaction.execute_batch(ACCESS_CONTROL_MIGRATION)?;
+    transaction.commit()?;
     Ok(())
 }
 
@@ -1377,6 +1743,36 @@ fn apply_sitelink_multi_network_migration(connection: &Connection) -> Result<()>
     let mut violations = connection.prepare("PRAGMA foreign_key_check")?;
     if violations.query([])?.next()?.is_some() {
         return Err(anyhow::anyhow!("共享网络扩展迁移后发现数据库外键不一致"));
+    }
+    Ok(())
+}
+
+/// 将单一公网入口升级为可管理的多域名资源。
+///
+/// 迁移脚本只在版本 15 尚未记录时执行，因此旧数据库可以重复启动；
+/// 旧 `public_entry_settings` 保留作为兼容投影；每个租户的已有 Web Service
+/// 会绑定到带租户后缀的稳定 legacy 主域名资源，避免升级时地址被静默清空。
+fn apply_multi_public_domains_migration(connection: &Connection) -> Result<()> {
+    let applied = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version = 15)",
+        [],
+        |row| row.get::<_, bool>(0),
+    )?;
+    if applied {
+        return Ok(());
+    }
+    let migration_result = (|| -> Result<()> {
+        connection.execute_batch("PRAGMA foreign_keys = OFF")?;
+        let transaction = connection.unchecked_transaction()?;
+        transaction.execute_batch(MULTI_PUBLIC_DOMAINS_MIGRATION)?;
+        transaction.commit()?;
+        Ok(())
+    })();
+    connection.execute_batch("PRAGMA foreign_keys = ON")?;
+    migration_result?;
+    let mut violations = connection.prepare("PRAGMA foreign_key_check")?;
+    if violations.query([])?.next()?.is_some() {
+        return Err(anyhow::anyhow!("多域名迁移后发现数据库外键不一致"));
     }
     Ok(())
 }
@@ -1685,11 +2081,11 @@ async fn create_tunnel(
             .execute(
                 "INSERT INTO tunnels
              (id, tenant_id, device_id, name, protocol, local_address, local_port,
-              public_port, hostname, enabled, apply_status, apply_revision,
+             public_port, hostname, enabled, apply_status, apply_revision,
               origin_protocol, origin_tls_server_name, origin_tls_verification,
-               service_name, bridge_socket_path, origin_ca_secret_path)
+               service_name, bridge_socket_path, origin_ca_secret_path, public_domain_id)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 1, 'checking', ?10,
-                     ?11, ?12, ?13, ?14, ?15, ?16)",
+                     ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
                 rusqlite::params![
                     id,
                     normalized.tenant_id,
@@ -1711,6 +2107,7 @@ async fn create_tunnel(
                     origin_ca_path
                         .as_ref()
                         .map(|path| path.to_string_lossy().to_string()),
+                    normalized.public_domain_id,
                 ],
             )
             .map_err(|error| {
@@ -1901,12 +2298,12 @@ async fn update_tunnel(
                 "UPDATE tunnels SET device_id = ?1, name = ?2, protocol = ?3,
                  local_address = ?4, local_port = ?5, public_port = ?6, hostname = ?7,
                   origin_protocol = ?8, origin_tls_server_name = ?9,
-                  origin_tls_verification = ?10, service_name = ?11,
+                   origin_tls_verification = ?10, service_name = ?11,
                    bridge_socket_path = ?12, origin_ca_secret_path = ?13,
-                   enabled = ?14, deletion_requested = 0, deletion_revision = NULL,
-                   apply_status = ?15, apply_error = NULL,
-                  apply_revision = ?16, updated_at = CURRENT_TIMESTAMP
-                  WHERE id = ?17 AND tenant_id = ?18 AND deleted_at IS NULL",
+                   public_domain_id = ?14, enabled = ?15, deletion_requested = 0,
+                   deletion_revision = NULL, apply_status = ?16, apply_error = NULL,
+                  apply_revision = ?17, updated_at = CURRENT_TIMESTAMP
+                  WHERE id = ?18 AND tenant_id = ?19 AND deleted_at IS NULL",
                 rusqlite::params![
                     normalized.device_id,
                     normalized.name,
@@ -1925,6 +2322,7 @@ async fn update_tunnel(
                     origin_ca_path
                         .as_ref()
                         .map(|path| path.to_string_lossy().to_string()),
+                    normalized.public_domain_id,
                     i64::from(was_enabled),
                     if was_enabled { "checking" } else { "disabled" },
                     revision,
@@ -2899,6 +3297,7 @@ struct NormalizedTunnelRequest {
     origin_tls_verification: String,
     origin_ca_pem: Option<String>,
     service_name: Option<String>,
+    public_domain_id: Option<String>,
 }
 
 /// 校验公网访问输入；所有规则在服务端执行，浏览器表单不是真源。
@@ -2952,6 +3351,49 @@ fn normalize_tunnel_request(
             "设备不存在或不属于当前租户",
         ));
     }
+    let public_domain_id = if matches!(protocol.as_str(), "http" | "https") {
+        let requested = request
+            .public_domain_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|id| !id.is_empty());
+        let selected = if let Some(id) = requested {
+            Some(id.to_owned())
+        } else {
+            connection
+                .query_row(
+                    "SELECT id FROM public_domains WHERE tenant_id = ?1 AND is_primary = 1",
+                    [&tenant_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()
+                .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法读取主域名"))?
+        };
+        let Some(id) = selected else {
+            return Err(ApiError::new(
+                StatusCode::CONFLICT,
+                "请先配置一个公网域名，再创建 Web 服务",
+            ));
+        };
+        let exists: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM public_domains WHERE id = ?1 AND tenant_id = ?2",
+                rusqlite::params![id, tenant_id],
+                |row| row.get(0),
+            )
+            .map_err(|_| {
+                ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法检查公网域名归属")
+            })?;
+        if exists == 0 {
+            return Err(ApiError::new(
+                StatusCode::NOT_FOUND,
+                "公网域名不存在或不属于当前租户",
+            ));
+        }
+        Some(id)
+    } else {
+        None
+    };
     drop(connection);
 
     let hostname = request
@@ -3058,6 +3500,7 @@ fn normalize_tunnel_request(
         origin_tls_verification,
         origin_ca_pem,
         service_name,
+        public_domain_id,
     })
 }
 
@@ -3148,8 +3591,10 @@ fn tunnel_query(filter: &str) -> String {
                 t.origin_protocol, t.origin_tls_server_name,
                 COALESCE(t.origin_tls_verification, 'system'), t.service_name,
                 t.enabled, t.apply_status, t.apply_error, t.apply_revision,
-                t.applied_revision, t.deletion_requested, p.base_domain
+                t.applied_revision, t.deletion_requested, t.public_domain_id,
+                COALESCE(pd.domain, p.base_domain)
          FROM tunnels t LEFT JOIN devices d ON d.id = t.device_id
+         LEFT JOIN public_domains pd ON pd.id = t.public_domain_id
          LEFT JOIN public_entry_settings p ON p.id = 1 {filter}"
     )
 }
@@ -3157,7 +3602,8 @@ fn tunnel_query(filter: &str) -> String {
 fn tunnel_response_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TunnelResponse> {
     let local_port: i64 = row.get(7)?;
     let public_port: Option<i64> = row.get(8)?;
-    let base_domain: Option<String> = row.get(20)?;
+    let public_domain_id: Option<String> = row.get(20)?;
+    let base_domain: Option<String> = row.get(21)?;
     let protocol: String = row.get(5)?;
     let hostname: Option<String> = row.get(9)?;
     let public_address = match (
@@ -3193,6 +3639,8 @@ fn tunnel_response_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TunnelR
         applied_revision: row.get(18)?,
         deletion_pending: row.get::<_, i64>(19)? != 0,
         public_address,
+        public_domain_id,
+        public_domain: base_domain,
     })
 }
 
@@ -3262,6 +3710,14 @@ async fn update_public_entry(
             "ACME 环境只能是 staging 或 production",
         ));
     }
+    // 旧接口的 `none` 只属于兼容投影；多域名表始终使用手动或
+    // Cloudflare 两种证书来源，关闭 HTTPS 时统一落为 Cloudflare，
+    // 这样重新开启 HTTPS 不会触发表约束错误。
+    let domain_certificate_mode = if request.https_enabled {
+        mode.clone()
+    } else {
+        "cloudflare".to_owned()
+    };
     {
         let connection = state
             .db
@@ -3280,7 +3736,32 @@ async fn update_public_entry(
                     "无法读取域名与 HTTPS 设置",
                 )
             })?;
-        if current.0 != domain {
+        let primary: Option<(String, String, bool, i64, String, String)> = connection
+            .query_row(
+                "SELECT id, domain, is_primary,
+                        (SELECT COUNT(*) FROM tunnels t
+                         WHERE t.public_domain_id = public_domains.id AND t.deleted_at IS NULL),
+                        certificate_mode, acme_environment
+                 FROM public_domains WHERE tenant_id = ?1 AND is_primary = 1",
+                [&tenant_id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get::<_, i64>(2)? != 0,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法读取主域名资源"))?;
+        let current_domain = primary
+            .as_ref()
+            .map(|item| item.1.clone())
+            .or_else(|| current.0.clone());
+        if current_domain != domain {
             // 根域名一旦被组网身份使用，失败、离线或错配状态仍可能在
             // Headscale 中保留对应节点；因此任何身份记录都必须阻止静默改域名。
             let mesh_dependencies: i64 = connection
@@ -3290,23 +3771,89 @@ async fn update_public_entry(
                     |row| row.get(0),
                 )
                 .unwrap_or_default();
-            let service_dependencies: i64 = connection
-                .query_row(
-                    "SELECT COUNT(*) FROM tunnels
-                     WHERE tenant_id = ?1 AND protocol = 'https'
-                       AND hostname IS NOT NULL AND deleted_at IS NULL",
-                    [&tenant_id],
-                    |row| row.get(0),
-                )
-                .unwrap_or_default();
+            let service_dependencies = primary.as_ref().map_or_else(
+                || {
+                    connection
+                        .query_row(
+                            "SELECT COUNT(*) FROM tunnels
+                             WHERE tenant_id = ?1 AND protocol IN ('http', 'https')
+                               AND hostname IS NOT NULL AND deleted_at IS NULL",
+                            [&tenant_id],
+                            |row| row.get::<_, i64>(0),
+                        )
+                        .unwrap_or_default()
+                },
+                |item| item.3,
+            );
             if mesh_dependencies > 0 || service_dependencies > 0 {
                 return Err(ApiError::new(
                     StatusCode::CONFLICT,
-                    "已有设备或公网服务依赖当前根域名，请先移除依赖后再更换",
+                    "已有设备或公网服务依赖当前根域名，请新建域名后使用主域名迁移流程",
                 ));
             }
         }
         let revision = current.1.saturating_add(1);
+        if let Some((primary_id, old_domain, _is_primary, usage, old_mode, old_environment)) =
+            primary
+        {
+            let reset_certificates = current_domain.as_deref() != domain.as_deref()
+                || domain_certificate_mode != old_mode
+                || environment != old_environment;
+            connection
+                .execute(
+                    "UPDATE public_domains SET domain = ?1, https_enabled = ?2,
+                     certificate_mode = ?3, acme_environment = ?4, desired_revision = ?5,
+                     apply_status = CASE WHEN ?2 = 1 THEN 'checking' ELSE 'ready' END,
+                     apply_error = NULL, error_code = NULL,
+                     root_certificate_status = CASE WHEN ?6 = 1 THEN 'pending' ELSE root_certificate_status END,
+                     wildcard_certificate_status = CASE WHEN ?6 = 1 THEN 'pending' ELSE wildcard_certificate_status END,
+                     root_certificate_not_before = CASE WHEN ?6 = 1 THEN NULL ELSE root_certificate_not_before END,
+                     root_certificate_not_after = CASE WHEN ?6 = 1 THEN NULL ELSE root_certificate_not_after END,
+                     wildcard_certificate_not_before = CASE WHEN ?6 = 1 THEN NULL ELSE wildcard_certificate_not_before END,
+                     wildcard_certificate_not_after = CASE WHEN ?6 = 1 THEN NULL ELSE wildcard_certificate_not_after END,
+                     root_certificate_subjects_json = CASE WHEN ?6 = 1 THEN '[]' ELSE root_certificate_subjects_json END,
+                     wildcard_certificate_subjects_json = CASE WHEN ?6 = 1 THEN '[]' ELSE wildcard_certificate_subjects_json END,
+                     updated_at = unixepoch() WHERE id = ?7 AND tenant_id = ?8",
+                    rusqlite::params![
+                        domain,
+                        i64::from(request.https_enabled),
+                        domain_certificate_mode,
+                        environment,
+                        revision,
+                        i64::from(reset_certificates),
+                        primary_id,
+                        tenant_id
+                    ],
+                )
+                .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法保存主域名设置"))?;
+            tracing::debug!(domain = %old_domain, usage, "旧单例接口已投影到主域名资源");
+        } else if let Some(domain) = domain.as_deref() {
+            let id = Uuid::new_v4().to_string();
+            let secret_dir = domain_secret_dir(&state, &id);
+            connection
+                .execute(
+                    "INSERT INTO public_domains
+                     (id, tenant_id, domain, is_primary, https_enabled, certificate_mode,
+                      acme_environment, secret_dir, desired_revision, apply_status)
+                     VALUES (?1, ?2, ?3, 1, ?4, ?5, ?6, ?7, ?8, ?9)",
+                    rusqlite::params![
+                        id,
+                        tenant_id,
+                        domain,
+                        i64::from(request.https_enabled),
+                        domain_certificate_mode,
+                        environment,
+                        secret_dir.to_string_lossy().to_string(),
+                        revision,
+                        if request.https_enabled {
+                            "checking"
+                        } else {
+                            "ready"
+                        },
+                    ],
+                )
+                .map_err(|_| ApiError::new(StatusCode::CONFLICT, "域名已存在或保存失败"))?;
+        }
         connection
             .execute(
                 "UPDATE public_entry_settings SET base_domain = ?1, https_enabled = ?2,
@@ -3339,6 +3886,25 @@ async fn update_public_entry(
     })
 }
 
+async fn seed_public_domain_migration_offers(state: &AppState) {
+    let device_ids = match state.db.lock() {
+        Ok(connection) => connection
+            .prepare("SELECT id FROM devices WHERE status = 'online'")
+            .and_then(|mut statement| {
+                statement
+                    .query_map([], |row| row.get::<_, String>(0))?
+                    .collect::<rusqlite::Result<Vec<_>>>()
+            })
+            .unwrap_or_default(),
+        Err(_) => Vec::new(),
+    };
+    for device_id in device_ids {
+        if let Err(error) = ensure_mesh_enrollment_for_device(state, &device_id).await {
+            tracing::warn!(device_id = %device_id, "主域名迁移邀请暂未生成，将在设备下次心跳重试：{error:#}");
+        }
+    }
+}
+
 async fn upload_public_entry_secret(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -3351,22 +3917,60 @@ async fn upload_public_entry_secret(
             "自定义 CA 必须绑定到具体 Web 服务，请在该服务设置中上传",
         ));
     }
-    let secrets_dir = state.data_dir.join("secrets").join("public-entry");
     let mut secret_rollbacks = Vec::new();
-    let configured_domain = {
+    let (configured_domain, primary_id, primary_mode) = {
         let connection = state
             .db
             .lock()
             .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "数据库锁不可用"))?;
         ensure_public_entry_scope(&connection, &tenant_id)?;
-        connection
+        let primary: Option<(String, String, String)> = connection
             .query_row(
-                "SELECT base_domain FROM public_entry_settings WHERE id = 1",
-                [],
-                |row| row.get::<_, Option<String>>(0),
+                "SELECT id, domain, certificate_mode FROM public_domains
+                 WHERE tenant_id = ?1 AND is_primary = 1",
+                [&tenant_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
-            .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法读取公网根域名"))?
+            .optional()
+            .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法读取主域名资源"))?;
+        let configured_domain = primary.as_ref().map(|item| item.1.clone()).or_else(|| {
+            connection
+                .query_row(
+                    "SELECT base_domain FROM public_entry_settings WHERE id = 1",
+                    [],
+                    |row| row.get::<_, Option<String>>(0),
+                )
+                .ok()
+                .flatten()
+        });
+        (
+            configured_domain,
+            primary.as_ref().map(|item| item.0.clone()),
+            primary.map(|item| item.2),
+        )
     };
+    let secrets_dir = primary_id
+        .as_deref()
+        .map(|id| domain_secret_dir(&state, id))
+        .unwrap_or_else(|| state.data_dir.join("secrets").join("public-entry"));
+    if primary_mode.as_deref() == Some("cloudflare")
+        && (request.certificate_pem.is_some() || request.private_key_pem.is_some())
+    {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "Cloudflare DNS-01 模式不能上传手动证书",
+        ));
+    }
+    if primary_mode.as_deref() == Some("manual") && request.cloudflare_token.is_some() {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "手动证书模式不能上传 Cloudflare Token",
+        ));
+    }
+    /*
+     * Secret 正文只在文件系统中保留。主域名存在时，旧接口写入与多域名
+     * 接口相同的隔离目录，避免兼容调用把凭据写到已经不再读取的旧路径。
+     */
     let mut certificate_metadata = None;
     if let (Some(certificate), Some(private_key)) = (
         request.certificate_pem.as_deref(),
@@ -3403,12 +4007,31 @@ async fn upload_public_entry_secret(
             .lock()
             .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "数据库锁不可用"))?;
         ensure_public_entry_scope(&connection, &tenant_id)?;
-        if let Some(metadata) = certificate_metadata {
+        if let Some(metadata) = certificate_metadata.as_ref() {
             let subjects_json = serde_json::to_string(&metadata.subjects).map_err(|_| {
                 ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法保存证书域名信息")
             })?;
-            connection
-                .execute(
+            if let Some(primary_id) = primary_id.as_deref() {
+                connection
+                    .execute(
+                        "UPDATE public_domains SET desired_revision = desired_revision + 1,
+                         apply_status = CASE WHEN https_enabled = 1 THEN 'checking' ELSE 'ready' END,
+                         apply_error = NULL, error_code = NULL,
+                         root_certificate_status = 'ready', wildcard_certificate_status = 'ready',
+                         root_certificate_not_before = ?1, root_certificate_not_after = ?2,
+                         wildcard_certificate_not_before = ?1, wildcard_certificate_not_after = ?2,
+                         root_certificate_subjects_json = ?3, wildcard_certificate_subjects_json = ?3,
+                         updated_at = unixepoch() WHERE id = ?4 AND tenant_id = ?5",
+                        rusqlite::params![
+                            metadata.not_before,
+                            metadata.not_after,
+                            subjects_json,
+                            primary_id,
+                            tenant_id
+                        ],
+                    )
+            } else {
+                connection.execute(
                     "UPDATE public_entry_settings SET desired_revision = desired_revision + 1,
                      apply_status = CASE WHEN https_enabled = 1 THEN 'configuring' ELSE apply_status END,
                      apply_error = NULL, certificate_not_before = ?1,
@@ -3416,14 +4039,25 @@ async fn upload_public_entry_secret(
                      updated_at = unixepoch() WHERE id = 1 AND tenant_id = ?4",
                     rusqlite::params![metadata.not_before, metadata.not_after, subjects_json, tenant_id],
                 )
+            }
         } else {
-            connection.execute(
-                "UPDATE public_entry_settings SET desired_revision = desired_revision + 1,
-                 apply_status = CASE WHEN https_enabled = 1 THEN 'configuring' ELSE apply_status END,
-                 apply_error = NULL, updated_at = unixepoch()
-                 WHERE id = 1 AND tenant_id = ?1",
-                [&tenant_id],
-            )
+            if let Some(primary_id) = primary_id.as_deref() {
+                connection.execute(
+                    "UPDATE public_domains SET desired_revision = desired_revision + 1,
+                     apply_status = CASE WHEN https_enabled = 1 THEN 'checking' ELSE 'ready' END,
+                     apply_error = NULL, error_code = NULL, updated_at = unixepoch()
+                     WHERE id = ?1 AND tenant_id = ?2",
+                    rusqlite::params![primary_id, tenant_id],
+                )
+            } else {
+                connection.execute(
+                    "UPDATE public_entry_settings SET desired_revision = desired_revision + 1,
+                     apply_status = CASE WHEN https_enabled = 1 THEN 'configuring' ELSE apply_status END,
+                     apply_error = NULL, updated_at = unixepoch()
+                     WHERE id = 1 AND tenant_id = ?1",
+                    [&tenant_id],
+                )
+            }
         }
             .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法更新证书应用状态"))?;
     }
@@ -3492,11 +4126,15 @@ fn build_dns_check(
     let wildcard_hostname = format!("*.{domain}");
     let wildcard_value = match &wildcard {
         Ok(addresses) => serde_json::json!({
-            "hostname": wildcard_hostname,
+            // DNS 查询不能使用字面 `*.domain`；这里探测一个系统保留的
+            // 一级子域名，用实际解析结果判断通配记录是否覆盖服务入口。
+            "hostname": format!("nexo.{domain}"),
+            "probe": wildcard_hostname,
             "resolved": addresses,
         }),
         Err(error) => serde_json::json!({
-            "hostname": wildcard_hostname,
+            "hostname": format!("nexo.{domain}"),
+            "probe": wildcard_hostname,
             "resolved": [],
             "error": error,
         }),
@@ -3520,11 +4158,64 @@ fn build_dns_check(
     serde_json::Value::Object(result)
 }
 
+/// 只有根域名和泛域名检查都返回解析结果时，才把资源视为可承担主入口。
+/// 兼容旧版只保存顶层 `resolved` 的检查结果；新版本优先使用分项结果。
+fn public_domain_dns_ready(serialized: &str) -> bool {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(serialized) else {
+        return false;
+    };
+    let has_records = |item: Option<&serde_json::Value>| {
+        item.and_then(|value| value.get("resolved"))
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|records| !records.is_empty())
+            && item
+                .and_then(|value| value.get("error"))
+                .is_none_or(serde_json::Value::is_null)
+    };
+    match (value.get("root"), value.get("wildcard")) {
+        (Some(root), Some(wildcard)) => has_records(Some(root)) && has_records(Some(wildcard)),
+        _ => {
+            value
+                .get("resolved")
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|records| !records.is_empty())
+                && value.get("error").is_none()
+        }
+    }
+}
+
 async fn recheck_public_entry(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Json<PublicEntryResponse>, ApiError> {
     let tenant_id = auth::admin_tenant_id(&state, &headers)?;
+    // 多域名版本把旧的单例检测接口投影到主域名资源，避免旧客户端只
+    // 更新 `public_entry_settings` 而漏掉主域名自己的 DNS/证书状态。
+    let primary_id = {
+        let connection = state
+            .db
+            .lock()
+            .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "数据库锁不可用"))?;
+        connection
+            .query_row(
+                "SELECT id FROM public_domains WHERE tenant_id = ?1 AND is_primary = 1",
+                [&tenant_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法读取主域名资源"))?
+    };
+    if let Some(primary_id) = primary_id {
+        let _ =
+            recheck_public_domain(State(state.clone()), headers.clone(), Path(primary_id)).await?;
+        let connection = state
+            .db
+            .lock()
+            .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "数据库锁不可用"))?;
+        return read_public_entry(&connection).map(Json).map_err(|_| {
+            ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法读取主域名检测结果")
+        });
+    }
     let snapshot = {
         let connection = state
             .db
@@ -3593,11 +4284,21 @@ async fn recheck_public_entry(
 
 fn read_public_entry(connection: &Connection) -> rusqlite::Result<PublicEntryResponse> {
     connection.query_row(
-        "SELECT base_domain, https_enabled, certificate_mode, acme_environment,
-                desired_revision, applied_revision, apply_status, apply_error,
-                certificate_not_before, certificate_not_after,
-                certificate_subjects_json, dns_check_json
-         FROM public_entry_settings WHERE id = 1",
+        "SELECT CASE WHEN d.id IS NULL THEN p.base_domain ELSE d.domain END,
+                CASE WHEN d.id IS NULL THEN p.https_enabled ELSE d.https_enabled END,
+                CASE WHEN d.id IS NULL THEN p.certificate_mode ELSE d.certificate_mode END,
+                CASE WHEN d.id IS NULL THEN p.acme_environment ELSE d.acme_environment END,
+                CASE WHEN d.id IS NULL THEN p.desired_revision ELSE d.desired_revision END,
+                CASE WHEN d.id IS NULL THEN p.applied_revision ELSE d.applied_revision END,
+                CASE WHEN d.id IS NULL THEN p.apply_status ELSE d.apply_status END,
+                CASE WHEN d.id IS NULL THEN p.apply_error ELSE d.apply_error END,
+                CASE WHEN d.id IS NULL THEN p.certificate_not_before ELSE d.root_certificate_not_before END,
+                CASE WHEN d.id IS NULL THEN p.certificate_not_after ELSE d.root_certificate_not_after END,
+                CASE WHEN d.id IS NULL THEN p.certificate_subjects_json ELSE d.root_certificate_subjects_json END,
+                CASE WHEN d.id IS NULL THEN p.dns_check_json ELSE d.dns_check_json END
+         FROM public_entry_settings p
+         LEFT JOIN public_domains d ON d.tenant_id = p.tenant_id AND d.is_primary = 1
+         WHERE p.id = 1",
         [],
         |row| {
             let subjects: String = row.get(10)?;
@@ -3652,12 +4353,1218 @@ fn ensure_public_entry_scope(connection: &Connection, tenant_id: &str) -> Result
 fn public_entry_status_label(status: &str) -> String {
     match status {
         "not_configured" => "NOT_CONFIGURED",
-        "configuring" => "CONFIGURING",
+        "pending" | "checking" | "configuring" | "retrying" | "rate_limited" => "CONFIGURING",
         "ready" => "READY",
         "error" => "ERROR",
         _ => "ERROR",
     }
     .to_owned()
+}
+
+/// 规范化用户输入的公网域名。用户只能提供根域名，`nexo`、`mesh` 等
+/// 系统前缀由 Server 保留，绝不从请求中拼接到内部路由。
+fn normalize_public_domain(value: &str) -> Result<String, ApiError> {
+    let domain = value.trim().trim_end_matches('.').to_ascii_lowercase();
+    if !is_dns_name(&domain) || domain == "nexo" || domain == "mesh" {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "根域名不是有效的 DNS 名称",
+        ));
+    }
+    Ok(domain)
+}
+
+fn domain_secret_dir(state: &AppState, id: &str) -> PathBuf {
+    state
+        .data_dir
+        .join("secrets")
+        .join("public-domains")
+        .join(id)
+}
+
+/// 将 v0.1.6 单例入口的 Secret 一次性复制到迁移后的主域名目录。
+///
+/// 迁移只在目标文件不存在时复制，重复启动不会覆盖管理员刚刚更新的
+/// 凭据；源文件也保留，便于回滚旧 Server。复制使用同一套 0600/0700
+/// 写入路径，正文绝不进入日志或 SQLite。
+fn migrate_legacy_public_domain_secrets(data_dir: &FsPath, connection: &Connection) -> Result<()> {
+    let legacy_dir = data_dir.join("secrets").join("public-entry");
+    if !legacy_dir.is_dir() {
+        return Ok(());
+    }
+    let mut statement = connection.prepare(
+        "SELECT id, secret_dir FROM public_domains
+         WHERE is_primary = 1 AND secret_dir IS NOT NULL",
+    )?;
+    let domains = statement
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    for (id, secret_dir) in domains {
+        let target_dir = {
+            let path = PathBuf::from(secret_dir);
+            if path.is_absolute() {
+                path
+            } else {
+                data_dir.join(path)
+            }
+        };
+        for name in ["cloudflare.token", "certificate.pem", "private-key.pem"] {
+            let source = legacy_dir.join(name);
+            let target = target_dir.join(name);
+            if !source.is_file() || target.exists() {
+                continue;
+            }
+            let contents = fs::read(&source)
+                .with_context(|| format!("无法读取旧版公网入口 Secret：{}", source.display()))?;
+            write_secret_bytes(&target, &contents).with_context(|| {
+                format!("无法迁移公网域名 {id} 的 Secret：{}", target.display())
+            })?;
+            tracing::info!(domain_id = %id, secret = name, "已迁移旧版公网入口 Secret");
+        }
+    }
+    Ok(())
+}
+
+fn public_domain_ready_from_row(
+    _apply_status: &str,
+    https_enabled: bool,
+    root_status: &str,
+    wildcard_status: &str,
+) -> bool {
+    !https_enabled
+        || (root_status.eq_ignore_ascii_case("ready")
+            && wildcard_status.eq_ignore_ascii_case("ready"))
+}
+
+fn public_domain_response_from_row(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<PublicDomainResponse> {
+    let root_subjects: String = row.get(12)?;
+    let wildcard_subjects: String = row.get(16)?;
+    let apply_status: String = row.get(7)?;
+    let https_enabled = row.get::<_, i64>(4)? != 0;
+    let automatic_renewal = row.get::<_, String>(5)?.eq_ignore_ascii_case("cloudflare");
+    let root_not_before = row.get(13)?;
+    let root_not_after = row.get(14)?;
+    let wildcard_not_before = row.get(17)?;
+    let wildcard_not_after = row.get(18)?;
+    Ok(PublicDomainResponse {
+        id: row.get(0)?,
+        tenant_id: row.get(1)?,
+        domain: row.get(2)?,
+        is_primary: row.get::<_, i64>(3)? != 0,
+        https_enabled,
+        certificate_mode: row.get(5)?,
+        acme_environment: row.get(6)?,
+        apply_status,
+        apply_error: row.get(8)?,
+        error_code: row.get(9)?,
+        dns_check: serde_json::from_str(&row.get::<_, String>(10)?)
+            .unwrap_or_else(|_| serde_json::json!({})),
+        root_certificate: CertificateStatusResponse {
+            status: row.get(11)?,
+            not_before: root_not_before,
+            not_after: root_not_after,
+            renewal_at: automatic_renewal
+                .then(|| estimated_caddy_renewal(root_not_before, root_not_after))
+                .flatten(),
+            subjects: serde_json::from_str(&root_subjects).unwrap_or_default(),
+        },
+        wildcard_certificate: CertificateStatusResponse {
+            status: row.get(15)?,
+            not_before: wildcard_not_before,
+            not_after: wildcard_not_after,
+            renewal_at: automatic_renewal
+                .then(|| estimated_caddy_renewal(wildcard_not_before, wildcard_not_after))
+                .flatten(),
+            subjects: serde_json::from_str(&wildcard_subjects).unwrap_or_default(),
+        },
+        retry_after: row.get(19)?,
+        attempt_count: row.get(20)?,
+        next_retry_at: row.get(21)?,
+        desired_revision: row.get(22)?,
+        applied_revision: row.get(23)?,
+        usage_count: row.get(24)?,
+    })
+}
+
+/// 计算 Caddy 自动续期窗口的预计开始时间。
+///
+/// Caddy 的自动 HTTPS 维护会在证书生命周期进入最后约三分之一时续期，
+/// 但具体调度仍由 Caddy 和 CA 决定，所以这个时间只用于界面提示，不作为
+/// Server 自建 ACME 重试器的触发点。手动证书由调用方直接返回 `None`。
+fn estimated_caddy_renewal(not_before: Option<i64>, not_after: Option<i64>) -> Option<i64> {
+    let (not_before, not_after) = (not_before?, not_after?);
+    let lifetime = not_after.checked_sub(not_before)?;
+    (lifetime > 0).then(|| not_before.saturating_add(lifetime.saturating_mul(2) / 3))
+}
+
+// SELECT 字段顺序与 public_domain_response_from_row 保持一致；把字段顺序
+// 集中在此处可以避免前端看到错位的证书状态。
+fn public_domain_query_ordered(filter: &str) -> String {
+    format!(
+        "SELECT p.id, p.tenant_id, p.domain, p.is_primary, p.https_enabled,
+                p.certificate_mode, p.acme_environment, p.apply_status,
+                p.apply_error, p.error_code, p.dns_check_json,
+                p.root_certificate_status, p.root_certificate_subjects_json,
+                p.root_certificate_not_before, p.root_certificate_not_after,
+                p.wildcard_certificate_status, p.wildcard_certificate_subjects_json,
+                p.wildcard_certificate_not_before, p.wildcard_certificate_not_after,
+                p.retry_after, p.attempt_count, p.next_retry_at,
+                p.desired_revision, p.applied_revision,
+                (SELECT COUNT(*) FROM tunnels t
+                 WHERE t.public_domain_id = p.id AND t.deleted_at IS NULL
+                   AND t.protocol IN ('http', 'https')) AS usage_count
+         FROM public_domains p {filter}"
+    )
+}
+
+async fn list_public_domains(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<PublicDomainResponse>>, ApiError> {
+    let tenant_id = auth::admin_tenant_id(&state, &headers)?;
+    let connection = state
+        .db
+        .lock()
+        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "数据库锁不可用"))?;
+    let mut statement = connection
+        .prepare(&public_domain_query_ordered(
+            "WHERE p.tenant_id = ?1 ORDER BY p.is_primary DESC, p.domain ASC",
+        ))
+        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法读取域名列表"))?;
+    let rows = statement
+        .query_map([tenant_id], public_domain_response_from_row)
+        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法读取域名列表"))?;
+    rows.map(|row| {
+        row.map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "域名状态数据格式无效"))
+    })
+    .collect::<Result<Vec<_>, _>>()
+    .map(Json)
+}
+
+fn validate_public_domain_options(
+    domain: &str,
+    https_enabled: bool,
+    certificate_mode: &str,
+    acme_environment: &str,
+) -> Result<(), ApiError> {
+    if !https_enabled {
+        return Ok(());
+    }
+    if !matches!(certificate_mode, "manual" | "cloudflare") {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "证书模式只能是 manual 或 cloudflare",
+        ));
+    }
+    if !matches!(acme_environment, "staging" | "production") {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "ACME 环境只能是 staging 或 production",
+        ));
+    }
+    if domain.is_empty() {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "启用 HTTPS 前必须填写根域名",
+        ));
+    }
+    Ok(())
+}
+
+async fn create_public_domain(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<CreatePublicDomainRequest>,
+) -> Result<Json<PublicDomainResponse>, ApiError> {
+    let tenant_id = auth::admin_tenant_id(&state, &headers)?;
+    let domain = normalize_public_domain(&request.domain)?;
+    let mode = request.certificate_mode.trim().to_ascii_lowercase();
+    let environment = request
+        .acme_environment
+        .unwrap_or_else(|| "production".to_owned())
+        .trim()
+        .to_ascii_lowercase();
+    validate_public_domain_options(&domain, request.https_enabled, &mode, &environment)?;
+    let id = Uuid::new_v4().to_string();
+    let secret_dir = domain_secret_dir(&state, &id);
+    let is_primary = {
+        let connection = state
+            .db
+            .lock()
+            .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "数据库锁不可用"))?;
+        let count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM public_domains WHERE tenant_id = ?1",
+                [&tenant_id],
+                |row| row.get(0),
+            )
+            .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法检查现有域名"))?;
+        connection
+            .execute(
+                "INSERT INTO public_domains
+                 (id, tenant_id, domain, is_primary, https_enabled, certificate_mode,
+                  acme_environment, secret_dir, apply_status)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'pending')",
+                rusqlite::params![
+                    id,
+                    tenant_id,
+                    domain,
+                    i64::from(count == 0),
+                    i64::from(request.https_enabled),
+                    mode,
+                    environment,
+                    secret_dir.to_string_lossy().to_string(),
+                ],
+            )
+            .map_err(|error| {
+                tracing::error!("保存公网域名失败：{error}");
+                ApiError::new(StatusCode::CONFLICT, "域名已存在或保存失败")
+            })?;
+        count == 0
+    };
+    if is_primary {
+        tracing::info!(domain = %domain, "已创建首个公网域名并设为主域名");
+    }
+    reconcile_caddy_config_best_effort(&state).await;
+    let connection = state
+        .db
+        .lock()
+        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "数据库锁不可用"))?;
+    connection
+        .query_row(
+            &public_domain_query_ordered("WHERE p.id = ?1 AND p.tenant_id = ?2"),
+            rusqlite::params![id, tenant_id],
+            public_domain_response_from_row,
+        )
+        .map(Json)
+        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法读取新建域名"))
+}
+
+async fn update_public_domain(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(request): Json<UpdatePublicDomainRequest>,
+) -> Result<Json<PublicDomainResponse>, ApiError> {
+    let tenant_id = auth::admin_tenant_id(&state, &headers)?;
+    {
+        let connection = state
+            .db
+            .lock()
+            .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "数据库锁不可用"))?;
+        let current: (String, bool, bool, String, String, i64) = connection
+            .query_row(
+                "SELECT domain, is_primary, https_enabled, certificate_mode,
+                    acme_environment, (SELECT COUNT(*) FROM tunnels t
+                     WHERE t.public_domain_id = public_domains.id AND t.deleted_at IS NULL)
+             FROM public_domains WHERE id = ?1 AND tenant_id = ?2",
+                rusqlite::params![id, tenant_id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get::<_, i64>(1)? != 0,
+                        row.get::<_, i64>(2)? != 0,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                },
+            )
+            .map_err(|_| ApiError::new(StatusCode::NOT_FOUND, "域名不存在"))?;
+        let next_domain = request
+            .domain
+            .as_deref()
+            .map(normalize_public_domain)
+            .transpose()?
+            .unwrap_or_else(|| current.0.clone());
+        if next_domain != current.0 && (current.1 || current.5 > 0) {
+            return Err(ApiError::new(
+                StatusCode::CONFLICT,
+                "主域名或已被服务使用的域名不能直接改名，请新建域名后使用迁移流程",
+            ));
+        }
+        let https_enabled = request.https_enabled.unwrap_or(current.2);
+        let mode = request
+            .certificate_mode
+            .unwrap_or_else(|| current.3.clone())
+            .trim()
+            .to_ascii_lowercase();
+        let environment = request
+            .acme_environment
+            .unwrap_or_else(|| current.4.clone())
+            .trim()
+            .to_ascii_lowercase();
+        validate_public_domain_options(&next_domain, https_enabled, &mode, &environment)?;
+        let reset_certificates =
+            next_domain != current.0 || mode != current.3 || environment != current.4;
+        let revision = connection
+            .query_row(
+                "SELECT desired_revision FROM public_domains WHERE id = ?1",
+                [&id],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap_or_default()
+            .saturating_add(1);
+        connection
+            .execute(
+                "UPDATE public_domains SET domain = ?1, https_enabled = ?2,
+             certificate_mode = ?3, acme_environment = ?4, desired_revision = ?5,
+             apply_status = 'checking', apply_error = NULL, error_code = NULL,
+             root_certificate_status = CASE WHEN ?8 = 1 THEN 'pending' ELSE root_certificate_status END,
+             wildcard_certificate_status = CASE WHEN ?8 = 1 THEN 'pending' ELSE wildcard_certificate_status END,
+             root_certificate_not_before = CASE WHEN ?8 = 1 THEN NULL ELSE root_certificate_not_before END,
+             root_certificate_not_after = CASE WHEN ?8 = 1 THEN NULL ELSE root_certificate_not_after END,
+             wildcard_certificate_not_before = CASE WHEN ?8 = 1 THEN NULL ELSE wildcard_certificate_not_before END,
+             wildcard_certificate_not_after = CASE WHEN ?8 = 1 THEN NULL ELSE wildcard_certificate_not_after END,
+             root_certificate_subjects_json = CASE WHEN ?8 = 1 THEN '[]' ELSE root_certificate_subjects_json END,
+             wildcard_certificate_subjects_json = CASE WHEN ?8 = 1 THEN '[]' ELSE wildcard_certificate_subjects_json END,
+             updated_at = unixepoch() WHERE id = ?6 AND tenant_id = ?7",
+                rusqlite::params![
+                    next_domain,
+                    i64::from(https_enabled),
+                    mode,
+                    environment,
+                    revision,
+                    id,
+                    tenant_id,
+                    i64::from(reset_certificates)
+                ],
+            )
+            .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法保存域名设置"))?;
+        revision
+    };
+    reconcile_caddy_config_best_effort(&state).await;
+    let connection = state
+        .db
+        .lock()
+        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "数据库锁不可用"))?;
+    connection
+        .query_row(
+            &public_domain_query_ordered("WHERE p.id = ?1 AND p.tenant_id = ?2"),
+            rusqlite::params![id, tenant_id],
+            public_domain_response_from_row,
+        )
+        .map(Json)
+        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法读取域名设置"))
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct DeletePublicDomainRequest {
+    replacement_domain_id: Option<String>,
+}
+
+async fn delete_public_domain(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    body: Option<Json<DeletePublicDomainRequest>>,
+) -> Result<Json<DeleteResponse>, ApiError> {
+    let tenant_id = auth::admin_tenant_id(&state, &headers)?;
+    let replacement = body.and_then(|Json(value)| value.replacement_domain_id);
+    let (secret_dir, usage, _is_primary) = {
+        let mut connection = state
+            .db
+            .lock()
+            .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "数据库锁不可用"))?;
+        let transaction = connection.transaction().map_err(|_| {
+            ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法开始域名删除事务")
+        })?;
+        let row: (String, i64, bool) = transaction
+            .query_row(
+                "SELECT secret_dir,
+                        (SELECT COUNT(*) FROM tunnels t WHERE t.public_domain_id = public_domains.id AND t.deleted_at IS NULL),
+                        is_primary FROM public_domains
+                 WHERE id = ?1 AND tenant_id = ?2",
+                rusqlite::params![id, tenant_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get::<_, i64>(2)? != 0)),
+            )
+            .map_err(|_| ApiError::new(StatusCode::NOT_FOUND, "域名不存在"))?;
+        if row.2 {
+            return Err(ApiError::new(
+                StatusCode::CONFLICT,
+                "主域名不能直接删除，请先切换主域名",
+            ));
+        }
+        let active_migration: i64 = transaction
+            .query_row(
+                "SELECT COUNT(*) FROM public_domain_migrations
+                 WHERE (from_domain_id = ?1 OR to_domain_id = ?1)
+                   AND status <> 'completed'",
+                [&id],
+                |migration_row| migration_row.get(0),
+            )
+            .map_err(|_| {
+                ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法检查域名迁移状态")
+            })?;
+        if active_migration > 0 {
+            return Err(ApiError::new(
+                StatusCode::CONFLICT,
+                "域名仍被未完成的主域名迁移依赖，所有设备确认前不能删除",
+            ));
+        }
+        if row.1 > 0 {
+            let Some(target) = replacement.as_deref() else {
+                return Err(ApiError::new(
+                    StatusCode::CONFLICT,
+                    "域名仍被服务使用，请选择替代域名",
+                ));
+            };
+            if target == id {
+                return Err(ApiError::new(
+                    StatusCode::BAD_REQUEST,
+                    "替代域名不能与待删除域名相同",
+                ));
+            }
+            let target_ready: Option<(String, String, String, String, String, i64)> = transaction
+                .query_row(
+                    "SELECT domain, apply_status, root_certificate_status,
+                            wildcard_certificate_status,
+                            dns_check_json,
+                            (SELECT COUNT(*) FROM tunnels t WHERE t.public_domain_id = public_domains.id AND t.deleted_at IS NULL)
+                     FROM public_domains WHERE id = ?1 AND tenant_id = ?2",
+                    rusqlite::params![target, tenant_id],
+                    |row| {
+                        Ok((
+                            row.get(0)?,
+                            row.get(1)?,
+                            row.get(2)?,
+                            row.get(3)?,
+                            row.get(4)?,
+                            row.get(5)?,
+                        ))
+                    },
+                )
+                .optional()
+                .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法检查替代域名"))?;
+            let Some((_, status, root_status, wildcard_status, dns_check, _)) = target_ready else {
+                return Err(ApiError::new(StatusCode::NOT_FOUND, "替代域名不存在"));
+            };
+            if !status.eq_ignore_ascii_case("ready")
+                || !root_status.eq_ignore_ascii_case("ready")
+                || !wildcard_status.eq_ignore_ascii_case("ready")
+            {
+                return Err(ApiError::new(
+                    StatusCode::CONFLICT,
+                    "替代域名尚未 READY，不能迁移服务",
+                ));
+            }
+            if !public_domain_dns_ready(&dns_check) {
+                return Err(ApiError::new(
+                    StatusCode::CONFLICT,
+                    "替代域名的根域名和泛域名 DNS 检查尚未全部通过",
+                ));
+            }
+            let conflict: i64 = transaction
+                .query_row(
+                    "SELECT COUNT(*) FROM tunnels old
+                     JOIN tunnels target ON target.public_domain_id = ?1
+                       AND target.hostname = old.hostname
+                       AND target.deleted_at IS NULL
+                     WHERE old.public_domain_id = ?2 AND old.deleted_at IS NULL
+                       AND old.protocol IN ('http', 'https')",
+                    rusqlite::params![target, id],
+                    |row| row.get(0),
+                )
+                .map_err(|_| {
+                    ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法检查服务名称冲突")
+                })?;
+            if conflict > 0 {
+                return Err(ApiError::new(
+                    StatusCode::CONFLICT,
+                    "替代域名存在同名服务，请先处理冲突",
+                ));
+            }
+            transaction
+                .execute(
+                    "UPDATE tunnels SET public_domain_id = ?1, updated_at = CURRENT_TIMESTAMP
+                     WHERE public_domain_id = ?2 AND deleted_at IS NULL",
+                    rusqlite::params![target, id],
+                )
+                .map_err(|_| {
+                    ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法迁移域名服务")
+                })?;
+        }
+        transaction
+            .execute(
+                "DELETE FROM public_domains WHERE id = ?1 AND tenant_id = ?2",
+                rusqlite::params![id, tenant_id],
+            )
+            .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法删除域名记录"))?;
+        transaction.commit().map_err(|_| {
+            ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法提交域名删除事务")
+        })?;
+        (row.0, row.1, row.2)
+    };
+    if let Err(error) = fs::remove_dir_all(&secret_dir) {
+        if error.kind() != std::io::ErrorKind::NotFound {
+            tracing::warn!(domain_id = %id, "域名 Secret 目录清理失败：{error}");
+        }
+    }
+    reconcile_caddy_config_best_effort(&state).await;
+    tracing::info!(domain_id = %id, usage, "公网域名已删除");
+    Ok(Json(DeleteResponse {
+        deleted: true,
+        pending: false,
+        id,
+        message: "公网域名已删除".to_owned(),
+    }))
+}
+
+async fn upload_public_domain_credentials(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(request): Json<PublicDomainSecretRequest>,
+) -> Result<Json<PublicDomainResponse>, ApiError> {
+    let tenant_id = auth::admin_tenant_id(&state, &headers)?;
+    let (domain, mode) = {
+        let connection = state
+            .db
+            .lock()
+            .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "数据库锁不可用"))?;
+        connection
+            .query_row(
+                "SELECT domain, certificate_mode FROM public_domains WHERE id = ?1 AND tenant_id = ?2",
+                rusqlite::params![id, tenant_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .map_err(|_| ApiError::new(StatusCode::NOT_FOUND, "域名不存在"))?
+    };
+    match mode.as_str() {
+        "cloudflare" => {
+            if request.certificate_pem.is_some() || request.private_key_pem.is_some() {
+                return Err(ApiError::new(
+                    StatusCode::BAD_REQUEST,
+                    "Cloudflare DNS-01 模式不能上传手动证书",
+                ));
+            }
+            if let Some(token) = request.cloudflare_token.as_deref() {
+                write_secret_file(
+                    &domain_secret_dir(&state, &id).join("cloudflare.token"),
+                    token,
+                )?;
+            }
+        }
+        "manual" => {
+            if request.cloudflare_token.is_some() {
+                return Err(ApiError::new(
+                    StatusCode::BAD_REQUEST,
+                    "手动证书模式不能上传 Cloudflare Token",
+                ));
+            }
+            if let (Some(certificate), Some(private_key)) = (
+                request.certificate_pem.as_deref(),
+                request.private_key_pem.as_deref(),
+            ) {
+                let metadata =
+                    validate_certificate_pair_for_domain(certificate, private_key, Some(&domain))?;
+                let directory = domain_secret_dir(&state, &id);
+                write_secret_file(&directory.join("certificate.pem"), certificate)?;
+                write_secret_file(&directory.join("private-key.pem"), private_key)?;
+                let subjects =
+                    serde_json::to_string(&metadata.subjects).unwrap_or_else(|_| "[]".to_owned());
+                let connection = state.db.lock().map_err(|_| {
+                    ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "数据库锁不可用")
+                })?;
+                connection
+                    .execute(
+                        "UPDATE public_domains SET root_certificate_status = 'ready',
+                         wildcard_certificate_status = 'ready', root_certificate_not_before = ?1,
+                         root_certificate_not_after = ?2, wildcard_certificate_not_before = ?1,
+                         wildcard_certificate_not_after = ?2, root_certificate_subjects_json = ?3,
+                         wildcard_certificate_subjects_json = ?3, apply_status = 'checking',
+                         apply_error = NULL, error_code = NULL, desired_revision = desired_revision + 1,
+                         updated_at = unixepoch() WHERE id = ?4 AND tenant_id = ?5",
+                        rusqlite::params![
+                            metadata.not_before,
+                            metadata.not_after,
+                            subjects,
+                            id,
+                            tenant_id
+                        ],
+                    )
+                    .map_err(|_| {
+                        ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法保存证书元数据")
+                    })?;
+            } else if request.certificate_pem.is_some() || request.private_key_pem.is_some() {
+                return Err(ApiError::new(
+                    StatusCode::BAD_REQUEST,
+                    "证书和私钥必须同时提供",
+                ));
+            }
+        }
+        _ => {
+            return Err(ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "证书模式无效，请先保存域名设置",
+            ));
+        }
+    }
+    {
+        let connection = state
+            .db
+            .lock()
+            .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "数据库锁不可用"))?;
+        connection
+            .execute(
+                "UPDATE public_domains SET apply_status = 'checking', apply_error = NULL,
+                 error_code = NULL, desired_revision = desired_revision + 1,
+                 updated_at = unixepoch() WHERE id = ?1 AND tenant_id = ?2",
+                rusqlite::params![id, tenant_id],
+            )
+            .map_err(|_| {
+                ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法更新证书应用状态")
+            })?;
+    }
+    reconcile_caddy_config_best_effort(&state).await;
+    let connection = state
+        .db
+        .lock()
+        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "数据库锁不可用"))?;
+    connection
+        .query_row(
+            &public_domain_query_ordered("WHERE p.id = ?1 AND p.tenant_id = ?2"),
+            rusqlite::params![id, tenant_id],
+            public_domain_response_from_row,
+        )
+        .map(Json)
+        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法读取域名证书状态"))
+}
+
+async fn recheck_public_domain(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<Json<PublicDomainResponse>, ApiError> {
+    let tenant_id = auth::admin_tenant_id(&state, &headers)?;
+    let (domain, https_enabled, is_primary, certificate_mode, previous_retry_after) = {
+        let connection = state
+            .db
+            .lock()
+            .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "数据库锁不可用"))?;
+        connection
+            .query_row(
+                "SELECT domain, https_enabled, is_primary, certificate_mode, retry_after
+                 FROM public_domains WHERE id = ?1 AND tenant_id = ?2",
+                rusqlite::params![id, tenant_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)? != 0,
+                        row.get::<_, i64>(2)? != 0,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, Option<i64>>(4)?,
+                    ))
+                },
+            )
+            .map_err(|_| ApiError::new(StatusCode::NOT_FOUND, "域名不存在"))?
+    };
+    let root = lookup_public_dns(&domain).await;
+    let wildcard = lookup_public_dns(&format!("nexo.{domain}")).await;
+    let dns = build_dns_check(&domain, root, wildcard);
+    let tls_ready = !https_enabled || !is_primary || probe_public_https(&domain).await;
+    let certificate_metadata = if https_enabled {
+        if certificate_mode.eq_ignore_ascii_case("manual") {
+            let certificate_path = domain_secret_dir(&state, &id).join("certificate.pem");
+            let private_key_path = domain_secret_dir(&state, &id).join("private-key.pem");
+            match (
+                fs::read_to_string(certificate_path),
+                fs::read_to_string(private_key_path),
+            ) {
+                (Ok(certificate), Ok(private_key)) => {
+                    validate_certificate_pair_for_domain(&certificate, &private_key, Some(&domain))
+                        .ok()
+                }
+                _ => None,
+            }
+        } else {
+            find_caddy_certificate_metadata(&state.data_dir, &domain)
+        }
+    } else {
+        None
+    };
+    let now = unix_now();
+    let certificate_current = certificate_metadata
+        .as_ref()
+        .is_some_and(|metadata| metadata.not_before <= now && metadata.not_after > now);
+    let certificate_expired = certificate_metadata
+        .as_ref()
+        .is_some_and(|metadata| metadata.not_after <= now);
+    let certificate_ready = !https_enabled || certificate_current;
+    let rate_limited =
+        !certificate_ready && previous_retry_after.is_some_and(|retry_after| retry_after > now);
+    let root_certificate_status = if !https_enabled || certificate_current {
+        "ready"
+    } else if certificate_expired {
+        "expired"
+    } else {
+        "pending"
+    };
+    let wildcard_certificate_status = root_certificate_status;
+    let apply_status = if !https_enabled || (certificate_ready && tls_ready) {
+        "ready"
+    } else if rate_limited {
+        "rate_limited"
+    } else {
+        "retrying"
+    };
+    let apply_error = if apply_status == "ready" {
+        None
+    } else if rate_limited {
+        Some("CA 限流窗口尚未结束，Caddy 将按官方退避自动重试")
+    } else if certificate_expired {
+        Some("证书已过期，Caddy 将按 Automatic HTTPS 规则自动续期")
+    } else if certificate_metadata.is_some() {
+        Some("证书已找到但尚未生效，Caddy 将自动重试")
+    } else {
+        Some("尚未找到同时覆盖根域名和泛域名的证书，Caddy 将自动重试")
+    };
+    let error_code = if apply_status == "ready" {
+        None
+    } else if rate_limited {
+        Some("acme_rate_limited")
+    } else if certificate_expired {
+        Some("certificate_expired")
+    } else {
+        Some("certificate_pending")
+    };
+    // Caddy 自己维护 ACME 指数退避；重新检测只读取当前窗口，不伪造一个
+    // “60 秒后必定重试”的时间，避免 UI 诱导用户反复点击申请。
+    let next_retry_at = (apply_status == "rate_limited")
+        .then(|| previous_retry_after.filter(|retry_after| *retry_after > now))
+        .flatten();
+    let certificate_subjects = certificate_metadata
+        .as_ref()
+        .and_then(|metadata| serde_json::to_string(&metadata.subjects).ok());
+    {
+        let connection = state
+            .db
+            .lock()
+            .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "数据库锁不可用"))?;
+        connection
+            .execute(
+                "UPDATE public_domains SET dns_check_json = ?1,
+             root_certificate_status = ?2, wildcard_certificate_status = ?3,
+             apply_status = ?4, apply_error = ?5, error_code = ?6,
+             root_certificate_not_before = COALESCE(?7, root_certificate_not_before),
+             root_certificate_not_after = COALESCE(?8, root_certificate_not_after),
+             root_certificate_subjects_json = COALESCE(?9, root_certificate_subjects_json),
+             wildcard_certificate_not_before = COALESCE(?7, wildcard_certificate_not_before),
+             wildcard_certificate_not_after = COALESCE(?8, wildcard_certificate_not_after),
+             wildcard_certificate_subjects_json = COALESCE(?9, wildcard_certificate_subjects_json),
+             retry_after = ?10, next_retry_at = ?10,
+             updated_at = unixepoch() WHERE id = ?11 AND tenant_id = ?12",
+                rusqlite::params![
+                    dns.to_string(),
+                    root_certificate_status,
+                    wildcard_certificate_status,
+                    apply_status,
+                    apply_error,
+                    error_code,
+                    certificate_metadata
+                        .as_ref()
+                        .map(|metadata| metadata.not_before),
+                    certificate_metadata
+                        .as_ref()
+                        .map(|metadata| metadata.not_after),
+                    certificate_subjects,
+                    next_retry_at,
+                    id,
+                    tenant_id,
+                ],
+            )
+            .map_err(|_| {
+                ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法保存 DNS 检查结果")
+            })?;
+    }
+    reconcile_caddy_config_best_effort(&state).await;
+    let connection = state
+        .db
+        .lock()
+        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "数据库锁不可用"))?;
+    connection
+        .query_row(
+            &public_domain_query_ordered("WHERE p.id = ?1 AND p.tenant_id = ?2"),
+            rusqlite::params![id, tenant_id],
+            public_domain_response_from_row,
+        )
+        .map(Json)
+        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法读取 DNS 检查结果"))
+}
+
+/// 请求 Caddy 立即重新处理指定域名的自动 HTTPS 配置。
+///
+/// 这不是绕过 CA 限流的自建 ACME 客户端；仍由 Caddy 负责签发、指数退避
+/// 和续期。若服务器记录的 Retry-After 尚未到期，接口明确返回 429，前端
+/// 只展示下一次允许时间。
+async fn renew_public_domain(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<Json<PublicDomainResponse>, ApiError> {
+    let tenant_id = auth::admin_tenant_id(&state, &headers)?;
+    let result = renew_public_domains(&state, &tenant_id, std::slice::from_ref(&id)).await?;
+    result
+        .updated
+        .into_iter()
+        .next()
+        .ok_or_else(|| ApiError::new(StatusCode::CONFLICT, "当前域名暂时不能立即申请证书"))
+        .map(Json)
+}
+
+async fn batch_recheck_public_domains(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<PublicDomainBatchRequest>,
+) -> Result<Json<PublicDomainBatchResponse>, ApiError> {
+    let _tenant_id = auth::admin_tenant_id(&state, &headers)?;
+    let ids = normalize_public_domain_ids(request.ids)?;
+    let mut updated = Vec::new();
+    let mut skipped = Vec::new();
+    for id in ids {
+        match recheck_public_domain(State(state.clone()), headers.clone(), Path(id.clone())).await {
+            Ok(Json(value)) => updated.push(value),
+            Err(error) => skipped.push(BatchSkippedItem {
+                id,
+                reason: error.message,
+            }),
+        }
+    }
+    Ok(Json(PublicDomainBatchResponse {
+        message: format!("已重新检测 {} 个域名", updated.len()),
+        updated,
+        skipped,
+    }))
+}
+
+async fn batch_renew_public_domains(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<PublicDomainBatchRequest>,
+) -> Result<Json<PublicDomainBatchResponse>, ApiError> {
+    let tenant_id = auth::admin_tenant_id(&state, &headers)?;
+    let ids = normalize_public_domain_ids(request.ids)?;
+    let result = renew_public_domains(&state, &tenant_id, &ids).await?;
+    Ok(Json(result))
+}
+
+fn normalize_public_domain_ids(ids: Vec<String>) -> Result<Vec<String>, ApiError> {
+    let mut seen = HashSet::new();
+    let ids = ids
+        .into_iter()
+        .map(|id| id.trim().to_owned())
+        .filter(|id| !id.is_empty())
+        .filter(|id| seen.insert(id.clone()))
+        .collect::<Vec<_>>();
+    if ids.is_empty() {
+        return Err(ApiError::new(StatusCode::BAD_REQUEST, "至少选择一个域名"));
+    }
+    Ok(ids)
+}
+
+async fn renew_public_domains(
+    state: &AppState,
+    tenant_id: &str,
+    ids: &[String],
+) -> Result<PublicDomainBatchResponse, ApiError> {
+    let now = unix_now();
+    let mut skipped = Vec::new();
+    {
+        let connection = state
+            .db
+            .lock()
+            .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "数据库锁不可用"))?;
+        for id in ids {
+            let row: Option<(Option<i64>, String, bool)> = connection
+                .query_row(
+                    "SELECT retry_after, certificate_mode, https_enabled FROM public_domains
+                     WHERE id = ?1 AND tenant_id = ?2",
+                    rusqlite::params![id, tenant_id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get::<_, i64>(2)? != 0)),
+                )
+                .optional()
+                .map_err(|_| {
+                    ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法检查域名续期状态")
+                })?;
+            let Some((retry_after, mode, https_enabled)) = row else {
+                skipped.push(BatchSkippedItem {
+                    id: id.clone(),
+                    reason: "域名不存在".to_owned(),
+                });
+                continue;
+            };
+            if mode.eq_ignore_ascii_case("manual") {
+                skipped.push(BatchSkippedItem {
+                    id: id.clone(),
+                    reason: "手动证书需要上传新的证书和私钥".to_owned(),
+                });
+                continue;
+            }
+            if !https_enabled {
+                skipped.push(BatchSkippedItem {
+                    id: id.clone(),
+                    reason: "该域名未启用 HTTPS，无需申请证书".to_owned(),
+                });
+                continue;
+            }
+            if retry_after.is_some_and(|retry| retry > now) {
+                skipped.push(BatchSkippedItem {
+                    id: id.clone(),
+                    reason: "CA 限流窗口尚未结束，Caddy 会自动重试".to_owned(),
+                });
+                continue;
+            }
+            connection
+                .execute(
+                    "UPDATE public_domains SET apply_status = 'checking', apply_error = NULL,
+                     error_code = NULL, retry_after = NULL, next_retry_at = NULL,
+                     attempt_count = attempt_count + 1, desired_revision = desired_revision + 1,
+                     updated_at = unixepoch() WHERE id = ?1 AND tenant_id = ?2",
+                    rusqlite::params![id, tenant_id],
+                )
+                .map_err(|_| {
+                    ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法更新域名续期任务")
+                })?;
+        }
+    }
+    reconcile_caddy_config_best_effort(state).await;
+    let connection = state
+        .db
+        .lock()
+        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "数据库锁不可用"))?;
+    let mut updated = Vec::new();
+    for id in ids {
+        if skipped.iter().any(|item| item.id == *id) {
+            continue;
+        }
+        if let Ok(domain) = connection.query_row(
+            &public_domain_query_ordered("WHERE p.id = ?1 AND p.tenant_id = ?2"),
+            rusqlite::params![id, tenant_id],
+            public_domain_response_from_row,
+        ) {
+            updated.push(domain);
+        }
+    }
+    Ok(PublicDomainBatchResponse {
+        message: format!(
+            "已请求 Caddy 处理 {} 个域名，限流项将按官方退避自动重试",
+            updated.len()
+        ),
+        updated,
+        skipped,
+    })
+}
+
+async fn make_public_domain_primary(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(request): Json<MakePrimaryRequest>,
+) -> Result<Json<PublicDomainMigrationResponse>, ApiError> {
+    if !request.confirm {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "请确认主域名切换影响后再提交",
+        ));
+    }
+    let tenant_id = auth::admin_tenant_id(&state, &headers)?;
+    let migration = {
+        let mut connection = state
+            .db
+            .lock()
+            .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "数据库锁不可用"))?;
+        let transaction = connection.transaction().map_err(|_| {
+            ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法开始主域名切换事务")
+        })?;
+        let target: (String, bool, String, String, String, String) = transaction
+            .query_row(
+                "SELECT domain, is_primary, apply_status, root_certificate_status,
+                        wildcard_certificate_status, dns_check_json FROM public_domains
+                 WHERE id = ?1 AND tenant_id = ?2",
+                rusqlite::params![id, tenant_id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get::<_, i64>(1)? != 0,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                },
+            )
+            .map_err(|_| ApiError::new(StatusCode::NOT_FOUND, "域名不存在"))?;
+        if target.1 {
+            return Err(ApiError::new(StatusCode::CONFLICT, "该域名已经是主域名"));
+        }
+        if !public_domain_ready_from_row("ready", true, &target.3, &target.4)
+            || !target.2.eq_ignore_ascii_case("ready")
+        {
+            return Err(ApiError::new(
+                StatusCode::CONFLICT,
+                "根域名和泛域名证书必须全部 READY 后才能设为主域名",
+            ));
+        }
+        if !public_domain_dns_ready(&target.5) {
+            return Err(ApiError::new(
+                StatusCode::CONFLICT,
+                "根域名和泛域名 DNS 检查必须全部通过后才能设为主域名",
+            ));
+        }
+        let source: (String, String) = transaction
+            .query_row(
+                "SELECT id, domain FROM public_domains WHERE tenant_id = ?1 AND is_primary = 1",
+                [&tenant_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .map_err(|_| ApiError::new(StatusCode::CONFLICT, "当前没有可迁移的主域名"))?;
+        let conflict: i64 = transaction
+            .query_row(
+                "SELECT COUNT(*) FROM tunnels source
+                 JOIN tunnels target ON target.public_domain_id = ?1
+                    AND target.hostname = source.hostname AND target.deleted_at IS NULL
+                 WHERE source.public_domain_id = ?2 AND source.deleted_at IS NULL
+                   AND source.protocol IN ('http', 'https')",
+                rusqlite::params![id, source.0],
+                |row| row.get(0),
+            )
+            .map_err(|_| {
+                ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法检查服务名称冲突")
+            })?;
+        if conflict > 0 {
+            return Err(ApiError::new(
+                StatusCode::CONFLICT,
+                "目标域名存在同名服务，主域名切换已阻止",
+            ));
+        }
+        let migration_id = Uuid::new_v4().to_string();
+        let total_devices: i64 = transaction
+            .query_row(
+                "SELECT COUNT(*) FROM devices WHERE tenant_id = ?1",
+                [&tenant_id],
+                |row| row.get(0),
+            )
+            .unwrap_or_default();
+        transaction
+            .execute(
+                "UPDATE public_domains SET is_primary = 0 WHERE id = ?1",
+                [&source.0],
+            )
+            .map_err(|_| {
+                ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法更新旧主域名状态")
+            })?;
+        transaction.execute("UPDATE public_domains SET is_primary = 1, desired_revision = desired_revision + 1 WHERE id = ?1", [&id])
+            .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法设置新主域名"))?;
+        transaction
+            .execute(
+                "UPDATE public_entry_settings SET base_domain = ?1,
+                 https_enabled = (SELECT https_enabled FROM public_domains WHERE id = ?2),
+                 certificate_mode = (SELECT certificate_mode FROM public_domains WHERE id = ?2),
+                 acme_environment = (SELECT acme_environment FROM public_domains WHERE id = ?2),
+                 desired_revision = desired_revision + 1,
+                 apply_status = 'configuring', apply_error = NULL, updated_at = unixepoch()
+                 WHERE id = 1 AND tenant_id = ?3",
+                rusqlite::params![target.0, id, tenant_id],
+            )
+            .map_err(|_| {
+                ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法更新兼容域名投影")
+            })?;
+        transaction.execute("UPDATE tunnels SET public_domain_id = ?1, updated_at = CURRENT_TIMESTAMP WHERE public_domain_id = ?2 AND deleted_at IS NULL AND protocol IN ('http', 'https')", rusqlite::params![id, source.0])
+            .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法迁移 Web 服务域名"))?;
+        let migration_status = if total_devices == 0 {
+            "completed"
+        } else {
+            "switching"
+        };
+        transaction.execute("INSERT INTO public_domain_migrations (id, tenant_id, from_domain_id, to_domain_id, status, total_devices, completed_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, CASE WHEN ?5 = 'completed' THEN unixepoch() ELSE NULL END)", rusqlite::params![migration_id, tenant_id, source.0, id, migration_status, total_devices])
+            .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法创建主域名迁移任务"))?;
+        let mut devices = transaction
+            .prepare("SELECT id FROM devices WHERE tenant_id = ?1")
+            .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法读取设备列表"))?;
+        let ids = devices
+            .query_map([&tenant_id], |row| row.get::<_, String>(0))
+            .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法读取设备列表"))?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(|_| {
+                ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "设备列表数据格式无效")
+            })?;
+        drop(devices);
+        for device_id in ids {
+            transaction.execute("INSERT INTO public_domain_migration_devices (migration_id, device_id, status) VALUES (?1, ?2, 'pending')", rusqlite::params![migration_id, device_id])
+                .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法记录设备迁移状态"))?;
+        }
+        transaction
+            .commit()
+            .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法提交主域名切换"))?;
+        (migration_id, source.0, id, total_devices)
+    };
+    sync_headscale_server_url(&state).await;
+    seed_public_domain_migration_offers(&state).await;
+    reconcile_caddy_config_best_effort(&state).await;
+    let connection = state
+        .db
+        .lock()
+        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "数据库锁不可用"))?;
+    connection
+        .query_row(
+            "SELECT id, from_domain_id, to_domain_id, status, total_devices,
+                    acknowledged_devices, last_error, created_at, updated_at
+             FROM public_domain_migrations WHERE id = ?1",
+            [&migration.0],
+            |row| {
+                Ok(PublicDomainMigrationResponse {
+                    id: row.get(0)?,
+                    from_domain_id: row.get(1)?,
+                    to_domain_id: row.get(2)?,
+                    status: row.get(3)?,
+                    total_devices: row.get(4)?,
+                    acknowledged_devices: row.get(5)?,
+                    last_error: row.get(6)?,
+                    created_at: row.get(7)?,
+                    updated_at: row.get(8)?,
+                })
+            },
+        )
+        .map(Json)
+        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法读取主域名迁移任务"))
+}
+
+async fn get_public_domain_migration(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<Json<PublicDomainMigrationResponse>, ApiError> {
+    let tenant_id = auth::admin_tenant_id(&state, &headers)?;
+    let connection = state
+        .db
+        .lock()
+        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "数据库锁不可用"))?;
+    connection
+        .query_row(
+            "SELECT id, from_domain_id, to_domain_id, status, total_devices,
+                    acknowledged_devices, last_error, created_at, updated_at
+             FROM public_domain_migrations WHERE id = ?1 AND tenant_id = ?2",
+            rusqlite::params![id, tenant_id],
+            |row| {
+                Ok(PublicDomainMigrationResponse {
+                    id: row.get(0)?,
+                    from_domain_id: row.get(1)?,
+                    to_domain_id: row.get(2)?,
+                    status: row.get(3)?,
+                    total_devices: row.get(4)?,
+                    acknowledged_devices: row.get(5)?,
+                    last_error: row.get(6)?,
+                    created_at: row.get(7)?,
+                    updated_at: row.get(8)?,
+                })
+            },
+        )
+        .map(Json)
+        .map_err(|_| ApiError::new(StatusCode::NOT_FOUND, "主域名迁移任务不存在"))
 }
 
 /// 读取公网入口和 Web Service Desired State，生成一份完整的 Caddy 配置。
@@ -3686,42 +5593,131 @@ fn load_caddy_desired_config_with_readiness(
         [],
         |row| row.get(0),
     )?;
+    let mut domain_statement = connection.prepare(
+        "SELECT id, domain, is_primary, https_enabled, certificate_mode,
+                acme_environment, secret_dir, apply_status,
+                root_certificate_status, wildcard_certificate_status
+         FROM public_domains WHERE tenant_id = ?1 ORDER BY is_primary DESC, domain ASC",
+    )?;
+    let domains = domain_statement
+        .query_map([tenant_id.clone()], |row| {
+            let id: String = row.get(0)?;
+            let secret_dir: String = row.get(6)?;
+            let is_primary = row.get::<_, i64>(2)? != 0;
+            // “立即就绪”只用于本轮刚刚完成探测的主域名；附加域名仍
+            // 必须依据各自的证书状态，避免一次主域名探测误开全部路由。
+            let ready = if is_primary {
+                https_ready_override.unwrap_or_else(|| {
+                    public_domain_ready_from_row(
+                        &row.get::<_, String>(7).unwrap_or_default(),
+                        row.get::<_, i64>(3).unwrap_or_default() != 0,
+                        &row.get::<_, String>(8).unwrap_or_default(),
+                        &row.get::<_, String>(9).unwrap_or_default(),
+                    )
+                })
+            } else {
+                public_domain_ready_from_row(
+                    &row.get::<_, String>(7).unwrap_or_default(),
+                    row.get::<_, i64>(3).unwrap_or_default() != 0,
+                    &row.get::<_, String>(8).unwrap_or_default(),
+                    &row.get::<_, String>(9).unwrap_or_default(),
+                )
+            };
+            let token_env = (row.get::<_, String>(4)? == "cloudflare")
+                .then(|| format!("{{env.NEXO_CLOUDFLARE_TOKEN_{}}}", caddy_env_suffix(&id)));
+            Ok(caddy::CaddyDomain {
+                id,
+                domain: row.get(1)?,
+                https_enabled: row.get::<_, i64>(3)? != 0,
+                certificate_mode: row.get(4)?,
+                acme_environment: row.get(5)?,
+                secret_dir: if PathBuf::from(&secret_dir).is_absolute() {
+                    PathBuf::from(secret_dir)
+                } else {
+                    state.data_dir.join(secret_dir)
+                },
+                token_env,
+                https_ready: ready,
+                system_entry: is_primary,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
     let mut statement = connection.prepare(
-        "SELECT id, hostname, protocol, bridge_socket_path, enabled
+        "SELECT id, hostname, protocol, bridge_socket_path, enabled, public_domain_id
          FROM tunnels
          WHERE tenant_id = ?1 AND deleted_at IS NULL AND protocol IN ('http', 'https')",
     )?;
-    let secret_dir = state.data_dir.join("secrets").join("public-entry");
-    let tunnels = statement
-        .query_map([tenant_id], |row| {
+    let mut tunnels = statement
+        .query_map([tenant_id.clone()], |row| {
             let tunnel_id: String = row.get(0)?;
             let bridge = row.get::<_, Option<String>>(3)?.unwrap_or_else(|| {
                 tunnel_bridge_socket_path(&state.data_dir, &tunnel_id)
                     .to_string_lossy()
                     .to_string()
             });
-            Ok(caddy::CaddyTunnel {
-                hostname: row.get(1)?,
-                protocol: row.get(2)?,
-                bridge_socket: bridge,
-                enabled: row.get::<_, i64>(4)? != 0,
+            Ok(caddy::CaddyBoundTunnel {
+                domain: row.get::<_, Option<String>>(5)?.unwrap_or_else(|| {
+                    domains
+                        .first()
+                        .map(|domain| domain.domain.clone())
+                        .unwrap_or_default()
+                }),
+                tunnel: caddy::CaddyTunnel {
+                    hostname: row.get(1)?,
+                    protocol: row.get(2)?,
+                    bridge_socket: bridge,
+                    enabled: row.get::<_, i64>(4)? != 0,
+                },
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
-    // 只有数据库已经确认公网入口 READY 时，才生成会把明文请求导向
-    // HTTPS 的跳转规则；CONFIGURING/ERROR 状态仍允许其它服务配置保留。
-    let https_ready = https_ready_override
-        .unwrap_or_else(|| entry.https_enabled && entry.apply_status.eq_ignore_ascii_case("ready"));
-    let config = caddy::build_caddy_config_with_environment_and_readiness(
-        entry.base_domain.as_deref(),
-        entry.https_enabled,
-        &entry.certificate_mode,
-        &entry.acme_environment,
+    // 主域名迁移完成前，旧域名仍需作为服务别名可达。Tunnel 的规范绑定
+    // 已切换到新域名，这里只在 Caddy Desired State 中复制一份路由，
+    // 不改变数据库中的最终归属；所有设备 ACK 后别名自然消失。
+    let mut caddy_domains = domains.clone();
+    let mut migration_statement = connection.prepare(
+        "SELECT from_domain_id, to_domain_id FROM public_domain_migrations
+         WHERE tenant_id = ?1 AND status <> 'completed'",
+    )?;
+    let active_migrations = migration_statement
+        .query_map([tenant_id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    for (from_id, to_id) in active_migrations {
+        let Some(from_domain) = domains.iter().find(|domain| domain.id == from_id) else {
+            continue;
+        };
+        let Some(to_domain) = domains.iter().find(|domain| domain.id == to_id) else {
+            continue;
+        };
+        if let Some(domain) = caddy_domains.iter_mut().find(|domain| domain.id == from_id) {
+            domain.system_entry = true;
+        }
+        let aliases = tunnels
+            .iter()
+            .filter(|tunnel| tunnel.domain == to_domain.domain)
+            .cloned()
+            .map(|mut tunnel| {
+                tunnel.domain = from_domain.domain.clone();
+                tunnel
+            })
+            .collect::<Vec<_>>();
+        tunnels.extend(aliases);
+    }
+    let config = caddy::build_multi_caddy_config(
+        &caddy_domains,
         &tunnels,
-        &secret_dir,
-        https_ready,
+        &state.data_dir.join("caddy-storage"),
     );
     Ok((entry, config))
+}
+
+fn caddy_env_suffix(id: &str) -> String {
+    id.chars()
+        .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '_' })
+        .collect::<String>()
+        .to_ascii_uppercase()
 }
 
 fn update_public_entry_apply_state(
@@ -3777,6 +5773,10 @@ async fn sync_headscale_server_url(state: &AppState) {
 /// Nexo Core、LAN 管理或 TCP Tunnel 的请求。
 async fn reconcile_caddy_config_best_effort(state: &AppState) {
     let result = async {
+        let caddy_events = state.caddy.drain_log_events().await;
+        if !caddy_events.is_empty() {
+            apply_caddy_log_events(state, &caddy_events)?;
+        }
         let (entry, config) = load_caddy_desired_config(state)?;
         if !state.caddy.config().enabled {
             state.caddy.write_startup_config(&config)?;
@@ -3789,6 +5789,8 @@ async fn reconcile_caddy_config_best_effort(state: &AppState) {
             return Ok::<(), anyhow::Error>(());
         }
         state.caddy.apply_json(&config).await?;
+        sync_caddy_certificate_metadata(state)?;
+        update_public_domain_apply_states(state, None)?;
         let certificate_ready = public_certificate_material_ready(state, &entry).await;
         let (status, message) = if !entry.https_enabled {
             ("not_configured", None)
@@ -3821,33 +5823,277 @@ async fn reconcile_caddy_config_best_effort(state: &AppState) {
         ) {
             tracing::warn!("无法保存 Caddy 应用错误：{update_error:#}");
         }
+        if let Err(update_error) =
+            update_public_domain_apply_states(state, Some(&format!("{error:#}")))
+        {
+            tracing::warn!("无法保存多域名 Caddy 错误：{update_error:#}");
+        }
     }
     refresh_all_tunnel_readiness(state).await;
 }
 
+/// 将 Caddy 日志中的 ACME 429 投影为域名级的等待窗口。Server 不会自行
+/// 重新发起 ACME 订单；窗口只用于 UI，真正的指数退避和下一次尝试仍由
+/// Caddy 的自动 HTTPS 维护器决定。
+fn apply_caddy_log_events(state: &AppState, events: &[caddy::CaddyLogEvent]) -> Result<()> {
+    let connection = state
+        .db
+        .lock()
+        .map_err(|_| anyhow::anyhow!("数据库锁不可用"))?;
+    let tenant_id: String = connection
+        .query_row(
+            "SELECT tenant_id FROM public_entry_settings WHERE id = 1",
+            [],
+            |row| row.get(0),
+        )
+        .context("无法读取公网域名租户")?;
+    let domains = connection
+        .prepare("SELECT id, domain FROM public_domains WHERE tenant_id = ?1")?
+        .query_map([&tenant_id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    for event in events.iter().filter(|event| event.is_rate_limited()) {
+        let Some(identifier) = event.identifier.as_deref() else {
+            tracing::warn!("Caddy 报告了未标识域名的 CA 限流：{}", event.message);
+            continue;
+        };
+        let identifier = identifier
+            .trim()
+            .trim_start_matches("*.")
+            .trim_end_matches('.')
+            .to_ascii_lowercase();
+        let retry_after = event
+            .retry_after_secs
+            .map(|seconds| unix_now().saturating_add(i64::try_from(seconds).unwrap_or(i64::MAX)))
+            .unwrap_or_else(|| unix_now().saturating_add(60 * 60));
+        for (id, _domain) in domains.iter().filter(|(_, domain)| {
+            identifier == domain.as_str() || identifier.ends_with(&format!(".{domain}"))
+        }) {
+            connection.execute(
+                "UPDATE public_domains SET apply_status = 'rate_limited',
+                 apply_error = ?1, error_code = 'acme_rate_limited', retry_after = ?2,
+                 next_retry_at = ?2, attempt_count = attempt_count + 1,
+                 updated_at = unixepoch() WHERE id = ?3 AND tenant_id = ?4",
+                rusqlite::params![
+                    truncate_error_message(&event.message),
+                    retry_after,
+                    id,
+                    tenant_id,
+                ],
+            )?;
+        }
+    }
+    Ok(())
+}
+
+/// 将 Caddy 配置应用结果投影到每个域名。429/Retry-After 由 Caddy 自己
+/// 决定，这里只记录可读状态和一个保守的刷新时间，避免 UI 误导用户反复
+/// 立即申请；真正的 ACME 退避仍完全交给 Caddy。
+fn update_public_domain_apply_states(state: &AppState, error: Option<&str>) -> Result<()> {
+    let connection = state
+        .db
+        .lock()
+        .map_err(|_| anyhow::anyhow!("数据库锁不可用"))?;
+    let tenant_id: String = connection
+        .query_row(
+            "SELECT tenant_id FROM public_entry_settings WHERE id = 1",
+            [],
+            |row| row.get(0),
+        )
+        .context("无法读取公网域名租户")?;
+    if let Some(error) = error {
+        let lower = error.to_ascii_lowercase();
+        let rate_limited = lower.contains("429")
+            || lower.contains("rate limit")
+            || lower.contains("too many certificates");
+        let retry_after = rate_limited.then(|| unix_now().saturating_add(60 * 60));
+        connection.execute(
+            "UPDATE public_domains SET apply_status = ?1, apply_error = ?2,
+             error_code = ?3, retry_after = ?4, next_retry_at = ?4,
+             updated_at = unixepoch() WHERE tenant_id = ?5",
+            rusqlite::params![
+                if rate_limited {
+                    "rate_limited"
+                } else {
+                    "error"
+                },
+                truncate_error_message(error),
+                if rate_limited {
+                    Some("acme_rate_limited")
+                } else {
+                    Some("caddy_apply_failed")
+                },
+                retry_after,
+                tenant_id,
+            ],
+        )?;
+        return Ok(());
+    }
+    connection.execute(
+        "UPDATE public_domains SET apply_status = CASE
+             WHEN https_enabled = 0 THEN 'ready'
+             WHEN retry_after IS NOT NULL AND retry_after > unixepoch() THEN 'rate_limited'
+             WHEN root_certificate_status = 'ready' AND wildcard_certificate_status = 'ready' THEN 'ready'
+             WHEN apply_status = 'retrying' THEN 'retrying'
+             ELSE 'configuring' END,
+         apply_error = CASE WHEN root_certificate_status = 'ready'
+             AND wildcard_certificate_status = 'ready' THEN NULL ELSE apply_error END,
+         error_code = CASE WHEN root_certificate_status = 'ready'
+             AND wildcard_certificate_status = 'ready' THEN NULL ELSE error_code END,
+         applied_revision = desired_revision, updated_at = unixepoch()
+         WHERE tenant_id = ?1",
+        [&tenant_id],
+    )?;
+    Ok(())
+}
+
+/// 从 Caddy 持久化 storage 同步自动证书的公开元数据。
+///
+/// Caddy 的 ACME 维护器在后台签发和续期，Server 不另起重试器；每次
+/// 配置协调时只扫描本地 storage 中覆盖根域名与泛域名的叶子证书，更新
+/// 到期时间和 SAN。这样容器重启或页面轮询后，UI 看到的是实际证书状态。
+fn sync_caddy_certificate_metadata(state: &AppState) -> Result<()> {
+    let domains = {
+        let connection = state
+            .db
+            .lock()
+            .map_err(|_| anyhow::anyhow!("数据库锁不可用"))?;
+        let mut statement = connection.prepare(
+            "SELECT id, domain FROM public_domains
+             WHERE https_enabled = 1 AND certificate_mode = 'cloudflare'",
+        )?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        rows
+    };
+    let now = unix_now();
+    let mut updates = Vec::new();
+    for (id, domain) in domains {
+        let Some(metadata) = find_caddy_certificate_metadata(&state.data_dir, &domain) else {
+            // storage 中没有匹配证书时不能保留旧的 READY 状态；否则管理界面
+            // 会把已经被清理的证书误报为可用，手动申请按钮也会失去意义。
+            updates.push((
+                id,
+                "pending",
+                None,
+                None,
+                "[]".to_owned(),
+                "Caddy storage 中尚未找到同时覆盖根域名和泛域名的证书，Caddy 将自动重试".to_owned(),
+                "certificate_pending",
+            ));
+            continue;
+        };
+        let (status, message, error_code) = if metadata.not_before <= now
+            && metadata.not_after > now
+        {
+            ("ready", String::new(), "")
+        } else {
+            (
+                "expired",
+                "Caddy storage 中的证书已过期，Caddy 将按 Automatic HTTPS 规则自动续期".to_owned(),
+                "certificate_expired",
+            )
+        };
+        let subjects =
+            serde_json::to_string(&metadata.subjects).unwrap_or_else(|_| "[]".to_owned());
+        updates.push((
+            id,
+            status,
+            Some(metadata.not_before),
+            Some(metadata.not_after),
+            subjects,
+            message,
+            error_code,
+        ));
+    }
+    if updates.is_empty() {
+        return Ok(());
+    }
+    let connection = state
+        .db
+        .lock()
+        .map_err(|_| anyhow::anyhow!("数据库锁不可用"))?;
+    for (id, status, not_before, not_after, subjects, message, error_code) in updates {
+        connection.execute(
+            "UPDATE public_domains SET
+             root_certificate_status = ?1, wildcard_certificate_status = ?1,
+             root_certificate_not_before = ?2, root_certificate_not_after = ?3,
+             wildcard_certificate_not_before = ?2, wildcard_certificate_not_after = ?3,
+             root_certificate_subjects_json = ?4, wildcard_certificate_subjects_json = ?4,
+             apply_status = CASE WHEN ?1 = 'ready' THEN apply_status
+                 WHEN retry_after IS NOT NULL AND retry_after > unixepoch() THEN 'rate_limited'
+                 ELSE 'retrying' END,
+             apply_error = CASE WHEN ?1 = 'ready' THEN NULL ELSE ?5 END,
+             error_code = CASE WHEN ?1 = 'ready' THEN NULL ELSE ?6 END,
+             updated_at = unixepoch() WHERE id = ?7",
+            rusqlite::params![status, not_before, not_after, subjects, message, error_code, id],
+        )?;
+    }
+    Ok(())
+}
+
 async fn public_certificate_material_ready(state: &AppState, entry: &PublicEntryResponse) -> bool {
-    if !entry.https_enabled {
+    let primary = state.db.lock().ok().and_then(|connection| {
+        connection
+            .query_row(
+                "SELECT id, domain, https_enabled, certificate_mode,
+                        root_certificate_not_after
+                 FROM public_domains WHERE is_primary = 1",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)? != 0,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, Option<i64>>(4)?,
+                    ))
+                },
+            )
+            .optional()
+            .ok()
+            .flatten()
+    });
+    let Some((id, domain, https_enabled, mode, not_after)) = primary else {
+        if !entry.https_enabled {
+            return true;
+        }
+        let secret_dir = state.data_dir.join("secrets").join("public-entry");
+        return match entry.certificate_mode.as_str() {
+            "manual" => {
+                secret_dir.join("certificate.pem").is_file()
+                    && secret_dir.join("private-key.pem").is_file()
+                    && entry
+                        .certificate_not_after
+                        .is_some_and(|timestamp| timestamp > unix_now())
+            }
+            "cloudflare" => {
+                let Some(domain) = entry.base_domain.as_deref() else {
+                    return false;
+                };
+                secret_dir.join("cloudflare.token").is_file() && probe_public_https(domain).await
+            }
+            _ => false,
+        };
+    };
+    if !https_enabled {
         return true;
     }
-    let secret_dir = state.data_dir.join("secrets").join("public-entry");
-    match entry.certificate_mode.as_str() {
+    let secret_dir = domain_secret_dir(state, &id);
+    match mode.as_str() {
         "manual" => {
             secret_dir.join("certificate.pem").is_file()
                 && secret_dir.join("private-key.pem").is_file()
-                && entry
-                    .certificate_not_after
-                    .is_some_and(|not_after| not_after > unix_now())
+                && not_after.is_some_and(|timestamp| timestamp > unix_now())
         }
         // Cloudflare 模式的证书由 Caddy 异步申请；只有实际完成一次
         // HTTPS 握手后才进入 READY，避免“Token 文件存在”被误报为证书已签发。
         "cloudflare" => {
-            let Some(domain) = entry.base_domain.as_deref() else {
-                return false;
-            };
-            if !secret_dir.join("cloudflare.token").is_file() {
-                return false;
-            }
-            probe_public_https(domain).await
+            secret_dir.join("cloudflare.token").is_file() && probe_public_https(&domain).await
         }
         _ => false,
     }
@@ -3904,6 +6150,42 @@ fn validate_certificate_pair_for_domain(
     private_key: &str,
     expected_domain: Option<&str>,
 ) -> Result<CertificateMetadata, ApiError> {
+    let metadata = parse_certificate_metadata(certificate, true)?;
+    let key = KeyPair::from_pem(private_key)
+        .map_err(|_| ApiError::new(StatusCode::BAD_REQUEST, "证书私钥格式无效或无法解析"))?;
+    let (_, pem) = parse_x509_pem(certificate.as_bytes()).map_err(|_| {
+        ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "证书格式无效，请提供 PEM X.509 证书",
+        )
+    })?;
+    let parsed = pem
+        .parse_x509()
+        .map_err(|_| ApiError::new(StatusCode::BAD_REQUEST, "证书内容无法解析"))?;
+    if parsed.subject_pki.subject_public_key.data != key.public_key_raw() {
+        return Err(ApiError::new(StatusCode::BAD_REQUEST, "证书与私钥不匹配"));
+    }
+    if let Some(domain) = expected_domain {
+        let domain = domain.trim().trim_end_matches('.').to_ascii_lowercase();
+        let wildcard = format!("*.{domain}");
+        if !metadata.subjects.iter().any(|subject| subject == &domain)
+            || !metadata.subjects.iter().any(|subject| subject == &wildcard)
+        {
+            return Err(ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "证书必须同时覆盖根域名和泛域名",
+            ));
+        }
+    }
+    Ok(metadata)
+}
+
+/// 读取证书公开元数据。自动申请的证书没有私钥可供 Server 校验，
+/// 因此这里只解析 Caddy storage 中的叶子证书，并由调用方检查 SAN。
+fn parse_certificate_metadata(
+    certificate: &str,
+    require_valid: bool,
+) -> Result<CertificateMetadata, ApiError> {
     let (_, pem) = parse_x509_pem(certificate.as_bytes()).map_err(|_| {
         ApiError::new(
             StatusCode::BAD_REQUEST,
@@ -3916,16 +6198,11 @@ fn validate_certificate_pair_for_domain(
     let parsed = pem
         .parse_x509()
         .map_err(|_| ApiError::new(StatusCode::BAD_REQUEST, "证书内容无法解析"))?;
-    if !parsed.validity().is_valid() {
+    if require_valid && !parsed.validity().is_valid() {
         return Err(ApiError::new(
             StatusCode::BAD_REQUEST,
             "证书已经过期或尚未生效",
         ));
-    }
-    let key = KeyPair::from_pem(private_key)
-        .map_err(|_| ApiError::new(StatusCode::BAD_REQUEST, "证书私钥格式无效或无法解析"))?;
-    if parsed.subject_pki.subject_public_key.data != key.public_key_raw() {
-        return Err(ApiError::new(StatusCode::BAD_REQUEST, "证书与私钥不匹配"));
     }
     let subjects = parsed
         .subject_alternative_name()
@@ -3942,23 +6219,61 @@ fn validate_certificate_pair_for_domain(
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
-    if let Some(domain) = expected_domain {
-        let domain = domain.trim().trim_end_matches('.').to_ascii_lowercase();
-        let wildcard = format!("*.{domain}");
-        if !subjects.iter().any(|subject| subject == &domain)
-            || !subjects.iter().any(|subject| subject == &wildcard)
-        {
-            return Err(ApiError::new(
-                StatusCode::BAD_REQUEST,
-                "证书必须同时覆盖根域名和泛域名",
-            ));
-        }
-    }
     Ok(CertificateMetadata {
         not_before: parsed.validity().not_before.timestamp(),
         not_after: parsed.validity().not_after.timestamp(),
         subjects,
     })
+}
+
+/// 从 Caddy file_system storage 找到覆盖根域名与泛域名的最新证书。
+/// Caddy 的目录布局由发行版维护，因此不依赖固定的文件名，只读取
+/// `.crt`/`.pem` 文件并以 SAN 判断归属；找不到时保留原有状态。
+fn find_caddy_certificate_metadata(data_dir: &FsPath, domain: &str) -> Option<CertificateMetadata> {
+    let mut pending = vec![data_dir.join("caddy-storage")];
+    let mut latest = None;
+    let wildcard = format!(
+        "*.{}",
+        domain.trim().trim_end_matches('.').to_ascii_lowercase()
+    );
+    while let Some(path) = pending.pop() {
+        let Ok(entries) = fs::read_dir(&path) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let entry_path = entry.path();
+            if entry_path.is_dir() {
+                pending.push(entry_path);
+                continue;
+            }
+            let is_certificate = entry_path
+                .extension()
+                .and_then(|extension| extension.to_str())
+                .is_some_and(|extension| {
+                    matches!(extension.to_ascii_lowercase().as_str(), "crt" | "pem")
+                });
+            if !is_certificate {
+                continue;
+            }
+            let Ok(contents) = fs::read_to_string(&entry_path) else {
+                continue;
+            };
+            let Ok(metadata) = parse_certificate_metadata(&contents, false) else {
+                continue;
+            };
+            if metadata.subjects.iter().any(|subject| subject == domain)
+                && metadata.subjects.iter().any(|subject| subject == &wildcard)
+            {
+                let replace = latest.as_ref().is_none_or(|current: &CertificateMetadata| {
+                    metadata.not_after > current.not_after
+                });
+                if replace {
+                    latest = Some(metadata);
+                }
+            }
+        }
+    }
+    latest
 }
 
 /// 覆盖 Secret 前保存的本地快照。
@@ -4025,6 +6340,7 @@ fn write_secret_bytes(path: &std::path::Path, value: &[u8]) -> std::io::Result<(
         .parent()
         .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "Secret 路径无效"))?;
     fs::create_dir_all(parent)?;
+    set_secret_directory_permissions(parent)?;
     let temporary = parent.join(format!(
         ".{}.{}.tmp",
         path.file_name().unwrap_or_default().to_string_lossy(),
@@ -4046,6 +6362,19 @@ fn write_secret_bytes(path: &std::path::Path, value: &[u8]) -> std::io::Result<(
         let _ = fs::remove_file(&temporary);
         return Err(error);
     }
+    Ok(())
+}
+
+/// Secret 目录只允许 Nexo 进程所属用户访问；文件本身由上面的原子写入
+/// 固定为 0600。Windows 沿用 NTFS ACL，不在这里伪造 Unix 权限位。
+fn set_secret_directory_permissions(path: &std::path::Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+    }
+    #[cfg(not(unix))]
+    let _ = path;
     Ok(())
 }
 
@@ -4073,6 +6402,13 @@ async fn list_devices(
         .db
         .lock()
         .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "数据库锁不可用"))?;
+    list_devices_for_tenant(&connection, &tenant_id).map(Json)
+}
+
+fn list_devices_for_tenant(
+    connection: &Connection,
+    tenant_id: &str,
+) -> Result<Vec<DeviceResponse>, ApiError> {
     let mut statement = connection
         .prepare(
             "SELECT d.id, d.tenant_id, d.site_id, d.name, d.os, d.architecture,
@@ -4082,10 +6418,15 @@ async fn list_devices(
                      WHERE a.nexo_device_id = d.id
                      ORDER BY a.created_at DESC LIMIT 1)
                     ,(SELECT COUNT(*) FROM tunnels t
-                      WHERE t.device_id = d.id AND t.deleted_at IS NULL)
+                      WHERE t.device_id = d.id AND t.deleted_at IS NULL),
+                    tm.user_id, tm.registration_method, tm.tags_json,
+                    tm.tailscale_ipv4, tm.tailscale_ipv6, tm.expires_at,
+                    tm.control_plane_state,
+                    (SELECT u.username FROM users u WHERE u.id = tm.user_id)
              FROM devices d
              LEFT JOIN device_capability_reports r ON r.device_id = d.id
              LEFT JOIN mesh_identities m ON m.nexo_device_id = d.id
+             LEFT JOIN tailscale_device_metadata tm ON tm.device_id = d.id
              WHERE d.tenant_id = ?1
              ORDER BY d.updated_at DESC, d.name ASC",
         )
@@ -4102,7 +6443,6 @@ async fn list_devices(
         })
     })
     .collect::<Result<Vec<_>, _>>()
-    .map(Json)
 }
 
 fn device_response_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<DeviceResponse> {
@@ -4112,6 +6452,11 @@ fn device_response_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<DeviceR
     let mesh_online = row.get::<_, Option<i64>>(12)?.unwrap_or_default() != 0;
     let enrollment_state: Option<String> = row.get(14)?;
     let device_status: String = row.get(7)?;
+    let owner_user_id: Option<String> = row.get(16)?;
+    let registration_method: Option<String> = row.get(17)?;
+    let tags_json: String = row
+        .get::<_, Option<String>>(18)?
+        .unwrap_or_else(|| "[]".to_owned());
     Ok(DeviceResponse {
         id: row.get(0)?,
         tenant_id: row.get(1)?,
@@ -4152,6 +6497,27 @@ fn device_response_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<DeviceR
             _ => "not_joined".to_owned(),
         },
         mesh_address: row.get(11)?,
+        connection_type: if registration_method.is_some() {
+            "tailscale_client".to_owned()
+        } else {
+            "nexo_agent".to_owned()
+        },
+        owner_user_id,
+        owner_username: row.get(23)?,
+        registration_method,
+        tags: serde_json::from_str(&tags_json).map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(
+                18,
+                rusqlite::types::Type::Text,
+                Box::new(error),
+            )
+        })?,
+        tailscale_ipv4: row
+            .get::<_, Option<String>>(19)?
+            .or(row.get::<_, Option<String>>(11)?),
+        tailscale_ipv6: row.get(20)?,
+        expires_at: row.get(21)?,
+        control_plane_state: row.get(22)?,
         last_seen_at: row.get(13)?,
         tunnel_count: row.get(15)?,
     })
@@ -4432,10 +6798,15 @@ async fn update_device(
                      WHERE a.nexo_device_id = d.id
                      ORDER BY a.created_at DESC LIMIT 1),
                     (SELECT COUNT(*) FROM tunnels t
-                     WHERE t.device_id = d.id AND t.deleted_at IS NULL)
+                     WHERE t.device_id = d.id AND t.deleted_at IS NULL),
+                     tm.user_id, tm.registration_method, tm.tags_json,
+                     tm.tailscale_ipv4, tm.tailscale_ipv6, tm.expires_at,
+                     tm.control_plane_state,
+                     (SELECT u.username FROM users u WHERE u.id = tm.user_id)
              FROM devices d
              LEFT JOIN device_capability_reports r ON r.device_id = d.id
              LEFT JOIN mesh_identities m ON m.nexo_device_id = d.id
+             LEFT JOIN tailscale_device_metadata tm ON tm.device_id = d.id
              WHERE d.id = ?1 AND d.tenant_id = ?2",
             rusqlite::params![id, tenant_id],
             device_response_from_row,
@@ -5271,6 +7642,12 @@ async fn serve_control_connection(
                         resolved_node_id.as_deref(),
                     )?;
                 }
+                record_public_domain_migration_ack(
+                    &state,
+                    &device_id,
+                    success,
+                    error_message.as_deref(),
+                )?;
                 // 无论绑定是否已完成都移除当前内存邀请。成功但 Headscale
                 // 尚未可查询时，下一次心跳会检查同一把已消费 Key；保留邀请
                 // 会让 Agent 重复执行 Tailscale up，反而把可恢复状态变成失败。
@@ -6935,6 +9312,11 @@ async fn ensure_mesh_enrollment_for_device_locked(state: &AppState, device_id: &
     if current_mesh_offer(state, device_id).await.is_some() {
         return Ok(());
     }
+    // 主域名切换复用同一条 mTLS 控制通道。即使设备已经有旧的 Mesh
+    // 身份，也必须收到一次性新 Key 并 ACK，不能仅修改数据库中的地址。
+    if ensure_public_domain_migration_offer(state, device_id).await? {
+        return Ok(());
+    }
     let details: Option<(String, String)> = {
         let connection = state
             .db
@@ -7078,6 +9460,114 @@ async fn ensure_mesh_enrollment_for_device_locked(state: &AppState, device_id: &
         }
     }
     start_mesh_enrollment_locked(state, device_id, &tenant_id, &device_name, false).await
+}
+
+/// 为尚未确认主域名迁移的设备生成一次性 Headscale Key。
+///
+/// 该流程刻意复用现有 MeshEnrollmentOffer：旧 Agent 可以继续解析消息，
+/// 新 Agent 收到 `reset=true` 后执行完整 `tailscale up`。设备身份仍由
+/// Server 通过 mTLS 证书和 Headscale Key 双向校验。
+async fn ensure_public_domain_migration_offer(state: &AppState, device_id: &str) -> Result<bool> {
+    let details: Option<(String, String, String)> = {
+        let connection = state
+            .db
+            .lock()
+            .map_err(|_| anyhow::anyhow!("数据库锁不可用"))?;
+        connection
+            .query_row(
+                "SELECT m.id, m.tenant_id, d.name
+                 FROM public_domain_migrations m
+                 JOIN public_domain_migration_devices md ON md.migration_id = m.id
+                 JOIN devices d ON d.id = md.device_id
+                 WHERE md.device_id = ?1 AND md.status IN ('pending', 'failed', 'sent')
+                   AND m.status IN ('switching', 'waiting_devices')
+                 ORDER BY m.created_at ASC LIMIT 1",
+                [device_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?
+    };
+    let Some((migration_id, tenant_id, device_name)) = details else {
+        return Ok(false);
+    };
+    if current_mesh_offer(state, device_id).await.is_none() {
+        start_mesh_enrollment_locked(state, device_id, &tenant_id, &device_name, true).await?;
+    }
+    let connection = state
+        .db
+        .lock()
+        .map_err(|_| anyhow::anyhow!("数据库锁不可用"))?;
+    connection.execute(
+        "UPDATE public_domain_migration_devices SET status = 'sent', attempts = attempts + 1,
+         last_error = NULL WHERE migration_id = ?1 AND device_id = ?2
+           AND status IN ('pending', 'failed')",
+        rusqlite::params![migration_id, device_id],
+    )?;
+    Ok(true)
+}
+
+/// Mesh ACK 成功后推进主域名迁移；只有全部设备 ACK 才允许后续删除旧域名。
+fn record_public_domain_migration_ack(
+    state: &AppState,
+    device_id: &str,
+    success: bool,
+    error_message: Option<&str>,
+) -> Result<()> {
+    let connection = state
+        .db
+        .lock()
+        .map_err(|_| anyhow::anyhow!("数据库锁不可用"))?;
+    let status = if success { "acknowledged" } else { "failed" };
+    connection.execute(
+        "UPDATE public_domain_migration_devices
+         SET status = ?1, last_error = ?2,
+             acknowledged_at = CASE WHEN ?3 = 1 THEN unixepoch() ELSE acknowledged_at END
+         WHERE device_id = ?4 AND status IN ('pending', 'sent', 'failed')
+           AND migration_id IN (
+             SELECT id FROM public_domain_migrations
+             WHERE status IN ('switching', 'waiting_devices'))",
+        rusqlite::params![status, error_message, i64::from(success), device_id],
+    )?;
+    let migration_ids = {
+        let mut statement = connection.prepare(
+            "SELECT id FROM public_domain_migrations
+             WHERE status IN ('switching', 'waiting_devices')
+               AND id IN (SELECT migration_id FROM public_domain_migration_devices WHERE device_id = ?1)",
+        )?;
+        let ids = statement
+            .query_map([device_id], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        ids
+    };
+    let mut completed_any = false;
+    for migration_id in migration_ids {
+        let acknowledged: i64 = connection.query_row(
+            "SELECT COUNT(*) FROM public_domain_migration_devices
+             WHERE migration_id = ?1 AND status = 'acknowledged'",
+            [&migration_id],
+            |row| row.get(0),
+        )?;
+        let total: i64 = connection.query_row(
+            "SELECT total_devices FROM public_domain_migrations WHERE id = ?1",
+            [&migration_id],
+            |row| row.get(0),
+        )?;
+        let completed = total > 0 && acknowledged >= total;
+        completed_any |= completed;
+        connection.execute(
+            "UPDATE public_domain_migrations SET acknowledged_devices = ?1,
+             status = ?2, last_error = CASE WHEN ?3 = 1 THEN NULL ELSE ?4 END,
+             updated_at = unixepoch(), completed_at = CASE WHEN ?3 = 1 THEN unixepoch() ELSE completed_at END
+             WHERE id = ?5",
+            rusqlite::params![acknowledged, if completed { "completed" } else { "waiting_devices" }, i64::from(completed), error_message, migration_id],
+        )?;
+    }
+    drop(connection);
+    if completed_any {
+        let state = state.clone();
+        tokio::spawn(async move { reconcile_caddy_config_best_effort(&state).await });
+    }
+    Ok(())
 }
 
 /// 生成只供 Tailscale 使用的稳定 DNS 主机名。
@@ -8078,111 +10568,1091 @@ async fn reconcile_headscale_routes(state: &AppState, device_id: &str) -> Result
     Ok(())
 }
 
+fn tenant_policy_selector(tenant_id: &str) -> String {
+    format!("nexo-{tenant_id}@")
+}
+
+/// 将结构化访问规则解析成 Headscale Grant 目标。
+///
+/// 设备目标优先使用当前已同步的 Tailscale 地址；共享网络使用 Agent
+/// 已确认的期望前缀。地址尚未出现时跳过该条 Grant，保持“已保存但等待
+/// 设备状态”的可见性，而不会错误地放大为整个用户空间。
+fn access_rule_target(
+    connection: &Connection,
+    owner_tenant_id: &str,
+    target_type: &str,
+    target_id: &str,
+) -> Result<(Vec<String>, String)> {
+    match target_type {
+        "device" => {
+            let record: Option<(String, Option<String>, Option<String>)> = connection
+                .query_row(
+                    "SELECT d.name, tm.tailscale_ipv4, tm.tailscale_ipv6
+                     FROM devices d
+                     LEFT JOIN tailscale_device_metadata tm ON tm.device_id = d.id
+                     WHERE d.id = ?1 AND d.tenant_id = ?2",
+                    rusqlite::params![target_id, owner_tenant_id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .optional()?;
+            let Some((name, ipv4, ipv6)) = record else {
+                return Ok((Vec::new(), "设备不存在".to_owned()));
+            };
+            let destinations = [ipv4, ipv6]
+                .into_iter()
+                .flatten()
+                .filter(|value| !value.trim().is_empty())
+                .collect();
+            Ok((destinations, name))
+        }
+        "network" => {
+            let record: Option<(String, Option<String>)> = connection
+                .query_row(
+                    "SELECT n.name, COALESCE(g.desired_prefix, n.current_prefix, n.last_prefix)
+                     FROM site_networks n
+                     LEFT JOIN gateway_network_states g ON g.site_network_id = n.id
+                     WHERE n.id = ?1 AND n.tenant_id = ?2 AND n.enabled = 1",
+                    rusqlite::params![target_id, owner_tenant_id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()?;
+            Ok(record
+                .map(
+                    |(name, prefix)| match prefix.filter(|value| !value.trim().is_empty()) {
+                        Some(prefix) => (vec![prefix], name),
+                        None => (Vec::new(), name),
+                    },
+                )
+                .unwrap_or_else(|| (Vec::new(), "共享网络不存在".to_owned())))
+        }
+        "exit_node" => Ok((vec![target_id.to_owned()], "Exit Node".to_owned())),
+        "file_share" => Ok((vec![target_id.to_owned()], "文件共享".to_owned())),
+        _ => Ok((Vec::new(), "未知目标".to_owned())),
+    }
+}
+
+/// 从旧版共享网络/SiteLink 和 v0.3 访问规则生成同一份显式 Policy。
+///
+/// 受让人只作为直接 Source 写入；这里不会读取其他规则再递归展开，因而
+/// A 授权 B、B 授权 C 不会自动产生 A→C。
+fn build_policy_grants(connection: &Connection) -> Result<Vec<policy::PolicyGrant>> {
+    let mut grants = Vec::new();
+    let mut tenant_users = HashMap::new();
+    let mut statement =
+        connection.prepare("SELECT tenant_id FROM mesh_tenant_mappings WHERE status = 'ready'")?;
+    let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+    for row in rows {
+        let tenant_id = row?;
+        tenant_users.insert(tenant_id.clone(), tenant_policy_selector(&tenant_id));
+    }
+
+    // 同一工作空间的设备默认互联。地址来自 Nexo 自己保存的同步投影，
+    // 不读取 Headscale 数据库；尚未同步地址的设备会在下一次同步后加入。
+    let mut tenant_device_addresses: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    let mut statement = connection.prepare(
+        "SELECT d.tenant_id, tm.tailscale_ipv4, tm.tailscale_ipv6
+         FROM devices d JOIN tailscale_device_metadata tm ON tm.device_id = d.id
+         WHERE tm.control_plane_state = 'ready'",
+    )?;
+    let rows = statement.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, Option<String>>(1)?,
+            row.get::<_, Option<String>>(2)?,
+        ))
+    })?;
+    for row in rows {
+        let (tenant_id, ipv4, ipv6) = row?;
+        let addresses = tenant_device_addresses.entry(tenant_id).or_default();
+        for address in [ipv4, ipv6].into_iter().flatten() {
+            if !address.trim().is_empty() {
+                addresses.insert(address);
+            }
+        }
+    }
+    let mut statement = connection.prepare(
+        "SELECT tenant_id, tailscale_ipv4, tailscale_ipv6
+         FROM mesh_identities WHERE state = 'ready'",
+    )?;
+    let rows = statement.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, Option<String>>(1)?,
+            row.get::<_, Option<String>>(2)?,
+        ))
+    })?;
+    for row in rows {
+        let (tenant_id, ipv4, ipv6) = row?;
+        let addresses = tenant_device_addresses.entry(tenant_id).or_default();
+        for address in [ipv4, ipv6].into_iter().flatten() {
+            if !address.trim().is_empty() {
+                addresses.insert(address);
+            }
+        }
+    }
+    for (tenant_id, addresses) in tenant_device_addresses {
+        if let Some(source) = tenant_users.get(&tenant_id) {
+            if !addresses.is_empty() {
+                grants.push(policy::PolicyGrant {
+                    source_tenant: tenant_id.clone(),
+                    target_tenant: tenant_id,
+                    sources: vec![source.clone()],
+                    destinations: addresses.into_iter().collect(),
+                    protocols: Vec::new(),
+                    ports: vec!["*".to_owned()],
+                    ssh: false,
+                });
+            }
+        }
+    }
+
+    let mut tenant_prefixes: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    let mut statement = connection.prepare(
+        "SELECT tenant_id, desired_prefix FROM site_networks n
+         JOIN gateway_network_states g ON g.site_network_id = n.id
+         WHERE n.enabled = 1",
+    )?;
+    let rows = statement.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })?;
+    for row in rows {
+        let (tenant_id, prefix) = row?;
+        tenant_prefixes.entry(tenant_id).or_default().insert(prefix);
+    }
+    for (tenant_id, prefixes) in tenant_prefixes {
+        if let Some(source) = tenant_users.get(&tenant_id) {
+            for prefix in prefixes {
+                grants.push(policy::PolicyGrant {
+                    source_tenant: tenant_id.clone(),
+                    target_tenant: tenant_id.clone(),
+                    sources: vec![source.clone()],
+                    destinations: vec![prefix],
+                    protocols: Vec::new(),
+                    ports: vec!["*".to_owned()],
+                    ssh: false,
+                });
+            }
+        }
+    }
+
+    let mut link_prefixes: BTreeMap<(String, String), (BTreeSet<String>, BTreeSet<String>)> =
+        BTreeMap::new();
+    let mut statement = connection.prepare(
+        "SELECT l.id, l.tenant_id, ln.side, g.desired_prefix
+         FROM site_links l
+         JOIN site_link_networks ln ON ln.site_link_id = l.id
+         JOIN site_networks n ON n.id = ln.site_network_id AND n.enabled = 1
+         JOIN gateway_network_states g ON g.site_network_id = n.id
+         WHERE l.enabled = 1",
+    )?;
+    let rows = statement.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, String>(3)?,
+        ))
+    })?;
+    for row in rows {
+        let (link_id, tenant_id, side, prefix) = row?;
+        let entry = link_prefixes.entry((tenant_id, link_id)).or_default();
+        if side == "left" {
+            entry.0.insert(prefix);
+        } else {
+            entry.1.insert(prefix);
+        }
+    }
+    for ((tenant_id, _link_id), (left_prefixes, right_prefixes)) in link_prefixes {
+        if !tenant_users.contains_key(&tenant_id) {
+            continue;
+        }
+        let left_prefixes: Vec<String> = left_prefixes.into_iter().collect();
+        let right_prefixes: Vec<String> = right_prefixes.into_iter().collect();
+        grants.push(policy::PolicyGrant {
+            source_tenant: tenant_id.clone(),
+            target_tenant: tenant_id.clone(),
+            sources: left_prefixes.clone(),
+            destinations: right_prefixes.clone(),
+            protocols: Vec::new(),
+            ports: vec!["*".to_owned()],
+            ssh: false,
+        });
+        grants.push(policy::PolicyGrant {
+            source_tenant: tenant_id.clone(),
+            target_tenant: tenant_id,
+            sources: right_prefixes,
+            destinations: left_prefixes,
+            protocols: Vec::new(),
+            ports: vec!["*".to_owned()],
+            ssh: false,
+        });
+    }
+
+    let mut statement = connection.prepare(
+        "SELECT r.owner_tenant_id, r.target_type, r.target_id, r.protocols_json,
+                r.ports_json, r.ssh_enabled, g.grantee_tenant_id
+         FROM mesh_access_rules r
+         JOIN mesh_access_grants g ON g.rule_id = r.id AND g.status = 'accepted'
+         WHERE r.enabled = 1
+         ORDER BY r.id, g.grantee_tenant_id",
+    )?;
+    let rows = statement.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, String>(3)?,
+            row.get::<_, String>(4)?,
+            row.get::<_, i64>(5)? != 0,
+            row.get::<_, String>(6)?,
+        ))
+    })?;
+    for row in rows {
+        let (owner_tenant, target_type, target_id, protocols_json, ports_json, ssh, grantee) = row?;
+        let (destinations, _) =
+            access_rule_target(connection, &owner_tenant, &target_type, &target_id)?;
+        if destinations.is_empty() {
+            continue;
+        }
+        let protocols = serde_json::from_str::<Vec<String>>(&protocols_json).unwrap_or_default();
+        let ports = serde_json::from_str::<Vec<String>>(&ports_json).unwrap_or_default();
+        grants.push(policy::PolicyGrant {
+            source_tenant: grantee.clone(),
+            target_tenant: owner_tenant,
+            sources: vec![tenant_policy_selector(&grantee)],
+            destinations,
+            protocols,
+            ports,
+            ssh,
+        });
+    }
+    Ok(grants)
+}
+
+type AccessRuleNormalized = (String, String, String, Vec<String>, Vec<String>);
+type AccessRuleRecord = (
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    i64,
+    i64,
+    i64,
+    i64,
+    String,
+    Option<String>,
+    i64,
+    i64,
+);
+
+/// 访问控制只保存结构化字段；这里统一做输入归一化，避免前端可以通过
+/// 重复协议、空端口或未知目标类型扩大最终 Headscale Policy。
+fn normalize_access_rule_request(
+    request: &AccessRuleRequest,
+) -> Result<AccessRuleNormalized, ApiError> {
+    let name = request.name.trim();
+    if name.is_empty() || name.len() > 128 {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "访问规则名称不能为空且不能超过 128 个字符",
+        ));
+    }
+    let target_type = request.target_type.trim().to_ascii_lowercase();
+    if !matches!(
+        target_type.as_str(),
+        "device" | "network" | "exit_node" | "file_share"
+    ) {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "访问规则目标类型无效",
+        ));
+    }
+    let target_id = request.target_id.trim();
+    if target_id.is_empty() || target_id.len() > 256 {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "访问规则目标不能为空且不能超过 256 个字符",
+        ));
+    }
+    let protocols = request
+        .protocols
+        .iter()
+        .map(|value| value.trim().to_ascii_lowercase())
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>();
+    if protocols
+        .iter()
+        .any(|protocol| !matches!(protocol.as_str(), "tcp" | "udp" | "icmp"))
+    {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "访问规则协议只能是 TCP、UDP 或 ICMP",
+        ));
+    }
+    let protocols = deduplicate_strings(protocols);
+    let ports = deduplicate_strings(
+        request
+            .ports
+            .iter()
+            .map(|value| value.trim().to_owned())
+            .filter(|value| !value.is_empty())
+            .collect(),
+    );
+    if ports.iter().any(|port| !valid_policy_port(port)) {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "访问规则端口必须是 *、单个端口或端口范围",
+        ));
+    }
+    Ok((
+        name.to_owned(),
+        target_type,
+        target_id.to_owned(),
+        if protocols.is_empty() {
+            vec!["tcp".to_owned(), "udp".to_owned()]
+        } else {
+            protocols
+        },
+        if ports.is_empty() {
+            vec!["*".to_owned()]
+        } else {
+            ports
+        },
+    ))
+}
+
+fn deduplicate_strings(values: Vec<String>) -> Vec<String> {
+    let mut seen = HashSet::new();
+    values
+        .into_iter()
+        .filter(|value| seen.insert(value.clone()))
+        .collect()
+}
+
+fn valid_policy_port(value: &str) -> bool {
+    if value == "*" {
+        return true;
+    }
+    let mut parts = value.split('-');
+    let Some(start) = parts.next() else {
+        return false;
+    };
+    let end = parts.next().unwrap_or(start);
+    if parts.next().is_some() {
+        return false;
+    }
+    let parse = |item: &str| item.parse::<u16>().ok().filter(|port| *port > 0);
+    match (parse(start), parse(end)) {
+        (Some(start), Some(end)) => start <= end,
+        _ => false,
+    }
+}
+
+fn normalized_access_grantees(owner_tenant_id: &str, requested_ids: &[String]) -> Vec<String> {
+    let mut ids = deduplicate_strings(
+        requested_ids
+            .iter()
+            .map(|value| value.trim().to_owned())
+            .filter(|value| !value.is_empty())
+            .collect(),
+    );
+    ids.retain(|id| id != owner_tenant_id);
+    ids
+}
+
+/// 在访问规则落库前生成包含候选规则的完整 Policy，并调用 Headscale
+/// `policy/check`。这里只做语法和语义校验，不改变当前已生效策略。
+#[allow(clippy::too_many_arguments)]
+async fn check_access_rule_candidate(
+    state: &AppState,
+    owner_tenant_id: &str,
+    target_type: &str,
+    target_id: &str,
+    protocols: &[String],
+    ports: &[String],
+    ssh: bool,
+    grantees: &[String],
+) -> Result<(), ApiError> {
+    let document = {
+        let connection = state
+            .db
+            .lock()
+            .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "数据库锁不可用"))?;
+        let (destinations, label) =
+            access_rule_target(&connection, owner_tenant_id, target_type, target_id).map_err(
+                |error| {
+                    ApiError::new(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("无法读取访问规则目标：{error:#}"),
+                    )
+                },
+            )?;
+        if destinations.is_empty() {
+            return Err(ApiError::new(
+                StatusCode::CONFLICT,
+                format!("目标“{label}”尚未提供可写入策略的地址"),
+            ));
+        }
+        let mut grants = build_policy_grants(&connection).map_err(|error| {
+            ApiError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("无法生成当前访问策略：{error:#}"),
+            )
+        })?;
+        let sources = if grantees.is_empty() {
+            vec![tenant_policy_selector(owner_tenant_id)]
+        } else {
+            grantees
+                .iter()
+                .map(|tenant_id| tenant_policy_selector(tenant_id))
+                .collect()
+        };
+        grants.push(policy::PolicyGrant {
+            source_tenant: owner_tenant_id.to_owned(),
+            target_tenant: owner_tenant_id.to_owned(),
+            sources,
+            destinations,
+            protocols: protocols.to_owned(),
+            ports: ports.to_owned(),
+            ssh,
+        });
+        policy::generate_policy(&grants)
+    };
+    state
+        .headscale
+        .check_policy(&document)
+        .await
+        .map_err(|error| {
+            ApiError::new(
+                StatusCode::BAD_GATEWAY,
+                format!("Headscale 策略校验失败：{error:#}"),
+            )
+        })
+}
+
+fn access_rule_response(
+    connection: &Connection,
+    tenant_id: &str,
+    id: &str,
+) -> Result<AccessRuleResponse, ApiError> {
+    let row: Option<AccessRuleRecord> = connection
+        .query_row(
+            "SELECT r.id, r.owner_tenant_id, COALESCE(u.username, ''), r.name,
+                    r.target_type, r.target_id, r.protocols_json, r.ports_json,
+                    r.ssh_enabled, r.enabled, r.desired_revision, r.applied_revision,
+                    r.apply_status, r.apply_error, r.created_at, r.updated_at
+             FROM mesh_access_rules r
+             LEFT JOIN users u ON u.id = r.owner_user_id
+             WHERE r.id = ?1 AND r.owner_tenant_id = ?2",
+            rusqlite::params![id, tenant_id],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                    row.get(8)?,
+                    row.get(9)?,
+                    row.get(10)?,
+                    row.get(11)?,
+                    row.get(12)?,
+                    row.get(13)?,
+                    row.get(14)?,
+                    row.get(15)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法读取访问规则"))?;
+    let Some((
+        id,
+        owner_workspace_id,
+        owner_username,
+        name,
+        target_type,
+        target_id,
+        protocols_json,
+        ports_json,
+        ssh_enabled,
+        enabled,
+        desired_revision,
+        applied_revision,
+        apply_status,
+        apply_error,
+        created_at,
+        updated_at,
+    )) = row
+    else {
+        return Err(ApiError::new(StatusCode::NOT_FOUND, "访问规则不存在"));
+    };
+    let target_label =
+        access_rule_target(connection, &owner_workspace_id, &target_type, &target_id)
+            .map(|(_, label)| label)
+            .unwrap_or_else(|_| target_id.clone());
+    let mut statement = connection
+        .prepare(
+            "SELECT g.grantee_tenant_id, COALESCE(t.name, g.grantee_tenant_id),
+                    g.status, g.accepted_at
+             FROM mesh_access_grants g
+             LEFT JOIN tenants t ON t.id = g.grantee_tenant_id
+             WHERE g.rule_id = ?1 ORDER BY g.grantee_tenant_id",
+        )
+        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法读取访问授权"))?;
+    let grants = statement
+        .query_map([&id], |row| {
+            Ok(AccessGrantResponse {
+                workspace_id: row.get(0)?,
+                workspace_name: row.get(1)?,
+                status: row.get(2)?,
+                accepted_at: row.get(3)?,
+            })
+        })
+        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法读取访问授权"))?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "访问授权数据格式无效"))?;
+    Ok(AccessRuleResponse {
+        id,
+        owner_workspace_id,
+        owner_username,
+        name,
+        target_type,
+        target_id,
+        target_label,
+        protocols: serde_json::from_str(&protocols_json).unwrap_or_default(),
+        ports: serde_json::from_str(&ports_json).unwrap_or_default(),
+        ssh_enabled: ssh_enabled != 0,
+        enabled: enabled != 0,
+        desired_revision,
+        applied_revision,
+        apply_status,
+        apply_error,
+        grants,
+        created_at,
+        updated_at,
+    })
+}
+
+async fn list_access_rules(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<AccessRuleResponse>>, ApiError> {
+    let tenant_id = auth::admin_tenant_id(&state, &headers)?;
+    let connection = state
+        .db
+        .lock()
+        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "数据库锁不可用"))?;
+    let mut statement = connection
+        .prepare(
+            "SELECT id FROM mesh_access_rules
+             WHERE owner_tenant_id = ?1 ORDER BY updated_at DESC, id ASC",
+        )
+        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法读取访问规则列表"))?;
+    let ids = statement
+        .query_map([&tenant_id], |row| row.get::<_, String>(0))
+        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法读取访问规则列表"))?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(|_| {
+            ApiError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "访问规则列表数据格式无效",
+            )
+        })?;
+    ids.iter()
+        .map(|id| access_rule_response(&connection, &tenant_id, id))
+        .collect::<Result<Vec<_>, _>>()
+        .map(Json)
+}
+
+async fn list_access_control_workspaces(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<AccessWorkspaceResponse>>, ApiError> {
+    let tenant_id = auth::admin_tenant_id(&state, &headers)?;
+    let connection = state
+        .db
+        .lock()
+        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "数据库锁不可用"))?;
+    let mut statement = connection
+        .prepare(
+            "SELECT id, name FROM tenants
+             WHERE id <> ?1 ORDER BY name ASC, id ASC",
+        )
+        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法读取工作空间列表"))?;
+    let rows = statement
+        .query_map([&tenant_id], |row| {
+            Ok(AccessWorkspaceResponse {
+                id: row.get(0)?,
+                name: row.get(1)?,
+            })
+        })
+        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法读取工作空间列表"))?;
+    rows.collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "工作空间数据格式无效"))
+        .map(Json)
+}
+
+async fn create_access_rule(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<AccessRuleRequest>,
+) -> Result<Json<AccessRuleResponse>, ApiError> {
+    let tenant_id = auth::admin_tenant_id(&state, &headers)?;
+    let user_id = auth::current_user_id(&state, &headers)?;
+    let (name, target_type, target_id, protocols, ports) = normalize_access_rule_request(&request)?;
+    let grantees = normalized_access_grantees(&tenant_id, &request.grantee_workspace_ids);
+    {
+        let connection = state
+            .db
+            .lock()
+            .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "数据库锁不可用"))?;
+        let (_, target_label) =
+            access_rule_target(&connection, &tenant_id, &target_type, &target_id)
+                .map_err(|error| ApiError::new(StatusCode::BAD_REQUEST, format!("{error:#}")))?;
+        if matches!(target_type.as_str(), "device" | "network")
+            && (target_label == "设备不存在" || target_label == "共享网络不存在")
+        {
+            return Err(ApiError::new(StatusCode::NOT_FOUND, target_label));
+        }
+        for grantee in &grantees {
+            let exists: i64 = connection
+                .query_row(
+                    "SELECT COUNT(*) FROM tenants WHERE id = ?1",
+                    [grantee],
+                    |row| row.get(0),
+                )
+                .map_err(|_| {
+                    ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法检查授权工作空间")
+                })?;
+            if exists == 0 {
+                return Err(ApiError::new(StatusCode::NOT_FOUND, "授权工作空间不存在"));
+            }
+        }
+    }
+    check_access_rule_candidate(
+        &state,
+        &tenant_id,
+        &target_type,
+        &target_id,
+        &protocols,
+        &ports,
+        request.ssh_enabled,
+        &grantees,
+    )
+    .await?;
+    let id = Uuid::new_v4().to_string();
+    {
+        let mut connection = state
+            .db
+            .lock()
+            .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "数据库锁不可用"))?;
+        let (_, target_label) =
+            access_rule_target(&connection, &tenant_id, &target_type, &target_id)
+                .map_err(|error| ApiError::new(StatusCode::BAD_REQUEST, format!("{error:#}")))?;
+        if matches!(target_type.as_str(), "device" | "network")
+            && (target_label == "设备不存在" || target_label == "共享网络不存在")
+        {
+            return Err(ApiError::new(StatusCode::NOT_FOUND, target_label));
+        }
+        let transaction = connection.transaction().map_err(|_| {
+            ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法开始访问规则事务")
+        })?;
+        transaction
+            .execute(
+                "INSERT INTO mesh_access_rules
+                 (id, owner_tenant_id, owner_user_id, name, target_type, target_id,
+                  protocols_json, ports_json, ssh_enabled, enabled, apply_status)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'checking')",
+                rusqlite::params![
+                    id,
+                    tenant_id,
+                    user_id,
+                    name,
+                    target_type,
+                    target_id,
+                    serde_json::to_string(&protocols).unwrap_or_else(|_| "[]".to_owned()),
+                    serde_json::to_string(&ports).unwrap_or_else(|_| "[]".to_owned()),
+                    i64::from(request.ssh_enabled),
+                    i64::from(request.enabled),
+                ],
+            )
+            .map_err(|error| {
+                tracing::error!("保存访问规则失败：{error}");
+                ApiError::new(StatusCode::CONFLICT, "访问规则名称已存在或保存失败")
+            })?;
+        insert_access_rule_grants(&transaction, &id, &tenant_id, &grantees)?;
+        write_audit_event(
+            &transaction,
+            &tenant_id,
+            "ACCESS_RULE_CREATED",
+            "access_rule",
+            &id,
+        )?;
+        transaction.commit().map_err(|_| {
+            ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法提交访问规则事务")
+        })?;
+    }
+    schedule_policy_reconcile(&state);
+    let connection = state
+        .db
+        .lock()
+        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "数据库锁不可用"))?;
+    access_rule_response(&connection, &tenant_id, &id).map(Json)
+}
+
+fn insert_access_rule_grants(
+    transaction: &rusqlite::Transaction<'_>,
+    rule_id: &str,
+    owner_tenant_id: &str,
+    requested_ids: &[String],
+) -> Result<(), ApiError> {
+    let mut ids = deduplicate_strings(
+        requested_ids
+            .iter()
+            .map(|value| value.trim().to_owned())
+            .filter(|value| !value.is_empty())
+            .collect(),
+    );
+    ids.retain(|id| id != owner_tenant_id);
+    for grantee in ids {
+        let exists: i64 = transaction
+            .query_row(
+                "SELECT COUNT(*) FROM tenants WHERE id = ?1",
+                [&grantee],
+                |row| row.get(0),
+            )
+            .map_err(|_| {
+                ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法检查授权工作空间")
+            })?;
+        if exists == 0 {
+            return Err(ApiError::new(
+                StatusCode::NOT_FOUND,
+                format!("授权工作空间 {} 不存在", grantee),
+            ));
+        }
+        transaction
+            .execute(
+                "INSERT INTO mesh_access_grants
+                 (rule_id, grantee_tenant_id, status, accepted_at)
+                 VALUES (?1, ?2, 'accepted', unixepoch())",
+                rusqlite::params![rule_id, grantee],
+            )
+            .map_err(|_| ApiError::new(StatusCode::CONFLICT, "访问授权已存在或保存失败"))?;
+    }
+    Ok(())
+}
+
+async fn update_access_rule(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(request): Json<AccessRuleRequest>,
+) -> Result<Json<AccessRuleResponse>, ApiError> {
+    let tenant_id = auth::admin_tenant_id(&state, &headers)?;
+    let (name, target_type, target_id, protocols, ports) = normalize_access_rule_request(&request)?;
+    let grantees = normalized_access_grantees(&tenant_id, &request.grantee_workspace_ids);
+    {
+        let connection = state
+            .db
+            .lock()
+            .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "数据库锁不可用"))?;
+        let (_, target_label) =
+            access_rule_target(&connection, &tenant_id, &target_type, &target_id)
+                .map_err(|error| ApiError::new(StatusCode::BAD_REQUEST, format!("{error:#}")))?;
+        if matches!(target_type.as_str(), "device" | "network")
+            && (target_label == "设备不存在" || target_label == "共享网络不存在")
+        {
+            return Err(ApiError::new(StatusCode::NOT_FOUND, target_label));
+        }
+        for grantee in &grantees {
+            let exists: i64 = connection
+                .query_row(
+                    "SELECT COUNT(*) FROM tenants WHERE id = ?1",
+                    [grantee],
+                    |row| row.get(0),
+                )
+                .map_err(|_| {
+                    ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法检查授权工作空间")
+                })?;
+            if exists == 0 {
+                return Err(ApiError::new(StatusCode::NOT_FOUND, "授权工作空间不存在"));
+            }
+        }
+    }
+    check_access_rule_candidate(
+        &state,
+        &tenant_id,
+        &target_type,
+        &target_id,
+        &protocols,
+        &ports,
+        request.ssh_enabled,
+        &grantees,
+    )
+    .await?;
+    {
+        let mut connection = state
+            .db
+            .lock()
+            .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "数据库锁不可用"))?;
+        let transaction = connection.transaction().map_err(|_| {
+            ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法开始访问规则事务")
+        })?;
+        let changed = transaction
+            .execute(
+                "UPDATE mesh_access_rules SET name = ?1, target_type = ?2, target_id = ?3,
+                 protocols_json = ?4, ports_json = ?5, ssh_enabled = ?6, enabled = ?7,
+                 desired_revision = desired_revision + 1, apply_status = 'checking',
+                 apply_error = NULL, updated_at = unixepoch()
+                 WHERE id = ?8 AND owner_tenant_id = ?9",
+                rusqlite::params![
+                    name,
+                    target_type,
+                    target_id,
+                    serde_json::to_string(&protocols).unwrap_or_else(|_| "[]".to_owned()),
+                    serde_json::to_string(&ports).unwrap_or_else(|_| "[]".to_owned()),
+                    i64::from(request.ssh_enabled),
+                    i64::from(request.enabled),
+                    id,
+                    tenant_id,
+                ],
+            )
+            .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法更新访问规则"))?;
+        if changed == 0 {
+            return Err(ApiError::new(StatusCode::NOT_FOUND, "访问规则不存在"));
+        }
+        transaction
+            .execute("DELETE FROM mesh_access_grants WHERE rule_id = ?1", [&id])
+            .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法更新访问授权"))?;
+        insert_access_rule_grants(&transaction, &id, &tenant_id, &grantees)?;
+        write_audit_event(
+            &transaction,
+            &tenant_id,
+            "ACCESS_RULE_UPDATED",
+            "access_rule",
+            &id,
+        )?;
+        transaction.commit().map_err(|_| {
+            ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法提交访问规则事务")
+        })?;
+    }
+    schedule_policy_reconcile(&state);
+    let connection = state
+        .db
+        .lock()
+        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "数据库锁不可用"))?;
+    access_rule_response(&connection, &tenant_id, &id).map(Json)
+}
+
+async fn delete_access_rule(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<Json<DeleteResponse>, ApiError> {
+    let tenant_id = auth::admin_tenant_id(&state, &headers)?;
+    let connection = state
+        .db
+        .lock()
+        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "数据库锁不可用"))?;
+    let changed = connection
+        .execute(
+            "UPDATE mesh_access_rules SET enabled = 0, desired_revision = desired_revision + 1,
+             apply_status = 'checking', apply_error = NULL, updated_at = unixepoch()
+             WHERE id = ?1 AND owner_tenant_id = ?2",
+            rusqlite::params![id, tenant_id],
+        )
+        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法撤销访问规则"))?;
+    if changed == 0 {
+        return Err(ApiError::new(StatusCode::NOT_FOUND, "访问规则不存在"));
+    }
+    let transaction = connection.unchecked_transaction().map_err(|_| {
+        ApiError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "无法开始访问规则审计事务",
+        )
+    })?;
+    write_audit_event(
+        &transaction,
+        &tenant_id,
+        "ACCESS_RULE_DELETED",
+        "access_rule",
+        &id,
+    )?;
+    transaction.commit().map_err(|_| {
+        ApiError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "无法提交访问规则审计事务",
+        )
+    })?;
+    schedule_policy_reconcile(&state);
+    Ok(Json(DeleteResponse {
+        deleted: false,
+        pending: true,
+        id,
+        message: "访问规则已撤销，Headscale Policy 将在后台收敛；失败时会保留重试状态".to_owned(),
+    }))
+}
+
+async fn preview_access_policy(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<AccessRuleRequest>,
+) -> Result<Json<AccessPolicyPreviewResponse>, ApiError> {
+    let tenant_id = auth::admin_tenant_id(&state, &headers)?;
+    let (_, target_type, target_id, protocols, ports) = normalize_access_rule_request(&request)?;
+    let grantees = normalized_access_grantees(&tenant_id, &request.grantee_workspace_ids);
+    let (destinations, target_label) = {
+        let connection = state
+            .db
+            .lock()
+            .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "数据库锁不可用"))?;
+        access_rule_target(&connection, &tenant_id, &target_type, &target_id)
+            .map_err(|error| ApiError::new(StatusCode::BAD_REQUEST, format!("{error:#}")))?
+    };
+    if destinations.is_empty() {
+        return Ok(Json(AccessPolicyPreviewResponse {
+            valid: false,
+            grant_count: 0,
+            ssh_rule_count: 0,
+            affected_targets: vec![target_label],
+            summary: "目标尚未提供可写入 Policy 的地址".to_owned(),
+            error: Some("请先让设备或共享网络完成同步".to_owned()),
+        }));
+    }
+    let (document, grant_count, ssh_rule_count) = {
+        let connection = state
+            .db
+            .lock()
+            .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "数据库锁不可用"))?;
+        for grantee in &grantees {
+            let exists: i64 = connection
+                .query_row(
+                    "SELECT COUNT(*) FROM tenants WHERE id = ?1",
+                    [grantee],
+                    |row| row.get(0),
+                )
+                .map_err(|_| {
+                    ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法检查授权工作空间")
+                })?;
+            if exists == 0 {
+                return Err(ApiError::new(StatusCode::NOT_FOUND, "授权工作空间不存在"));
+            }
+        }
+        let mut grants = build_policy_grants(&connection).map_err(|error| {
+            ApiError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("无法生成当前访问策略：{error:#}"),
+            )
+        })?;
+        let sources = if grantees.is_empty() {
+            vec![tenant_policy_selector(&tenant_id)]
+        } else {
+            grantees
+                .iter()
+                .map(|tenant_id| tenant_policy_selector(tenant_id))
+                .collect()
+        };
+        grants.push(policy::PolicyGrant {
+            source_tenant: tenant_id.clone(),
+            target_tenant: tenant_id,
+            sources,
+            destinations: destinations.clone(),
+            protocols,
+            ports,
+            ssh: request.ssh_enabled,
+        });
+        let grant_count = grants.len();
+        let ssh_rule_count = grants.iter().filter(|grant| grant.ssh).count();
+        (
+            policy::generate_policy(&grants),
+            grant_count,
+            ssh_rule_count,
+        )
+    };
+    let check = state.headscale.check_policy(&document).await;
+    let error = check.as_ref().err().map(|error| error.to_string());
+    Ok(Json(AccessPolicyPreviewResponse {
+        valid: error.is_none(),
+        grant_count,
+        ssh_rule_count,
+        affected_targets: destinations,
+        summary: if error.is_none() {
+            "Headscale Policy 校验通过".to_owned()
+        } else {
+            "Headscale Policy 校验未通过".to_owned()
+        },
+        error,
+    }))
+}
+
 /// 从 Nexo Desired State 生成显式 tenant→tenant Grants 并推送 Headscale。
 /// 网络关闭时对应前缀从下一版策略中消失，但 Mesh 连接本身不受影响。
+fn mark_policy_reconcile_error(connection: &Connection, error: &str) -> Result<()> {
+    connection.execute(
+        "UPDATE mesh_access_rules
+         SET apply_status = 'error', apply_error = ?, updated_at = unixepoch()
+         WHERE desired_revision > applied_revision OR apply_status IN ('checking', 'error')",
+        [error],
+    )?;
+    Ok(())
+}
+
 async fn reconcile_headscale_policy(state: &AppState) -> Result<()> {
-    let grants = {
+    let (document, rule_ids) = {
         let connection = state
             .db
             .lock()
             .map_err(|_| anyhow::anyhow!("数据库锁不可用"))?;
-        let mut grants = Vec::new();
-        let mut tenant_users = HashMap::new();
-        {
-            let mut statement = connection.prepare(
-                "SELECT tenant_id, headscale_user_id FROM mesh_tenant_mappings
-                 WHERE status = 'ready'",
-            )?;
-            let rows = statement.query_map([], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-            })?;
-            for row in rows {
-                let (tenant_id, _user_id) = row?;
-                // Headscale Policy 使用用户名称并要求以 `@` 结尾；API 返回的
-                // 数字 ID 只适合数据库关联和 Pre-auth Key，不可直接当策略主体。
-                // 入网时用户名称由同一规则创建，因此这里保持稳定、可审计的选择器。
-                tenant_users.insert(tenant_id.clone(), format!("nexo-{tenant_id}@"));
-            }
-        }
-        // 先按租户聚合共享网络，避免同一 CIDR 在多个关系中重复生成 grant。
-        let mut tenant_prefixes: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+        let grants = build_policy_grants(&connection)?;
         let mut statement = connection.prepare(
-            "SELECT tenant_id, desired_prefix FROM site_networks n
-             JOIN gateway_network_states g ON g.site_network_id = n.id
-             WHERE n.enabled = 1",
+            "SELECT id FROM mesh_access_rules
+             WHERE desired_revision > applied_revision OR apply_status IN ('checking', 'error')",
         )?;
-        let rows = statement.query_map([], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-        })?;
-        for row in rows {
-            let (tenant_id, prefix) = row?;
-            tenant_prefixes.entry(tenant_id).or_default().insert(prefix);
-        }
-        for (tenant_id, prefixes) in tenant_prefixes {
-            if let Some(source) = tenant_users.get(&tenant_id) {
-                for prefix in prefixes {
-                    grants.push(policy::PolicyGrant {
-                        source_tenant: tenant_id.clone(),
-                        target_tenant: tenant_id.clone(),
-                        sources: vec![source.clone()],
-                        destinations: vec![prefix],
-                    });
-                }
-            }
-        }
-
-        // 一条 SiteLink 只允许点对点互联。按 link_id 和 side 收集网段后再
-        // 生成两条方向明确的 grant，完全消除“左侧网段数 × 右侧网段数”重复。
-        let mut link_prefixes: BTreeMap<(String, String), (BTreeSet<String>, BTreeSet<String>)> =
-            BTreeMap::new();
-        let mut statement = connection.prepare(
-            "SELECT l.id, l.tenant_id, ln.side, g.desired_prefix
-             FROM site_links l
-             JOIN site_link_networks ln ON ln.site_link_id = l.id
-             JOIN site_networks n ON n.id = ln.site_network_id AND n.enabled = 1
-             JOIN gateway_network_states g ON g.site_network_id = n.id
-             WHERE l.enabled = 1",
-        )?;
-        let rows = statement.query_map([], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, String>(3)?,
-            ))
-        })?;
-        for row in rows {
-            let (link_id, tenant_id, side, prefix) = row?;
-            let entry = link_prefixes.entry((tenant_id, link_id)).or_default();
-            if side == "left" {
-                entry.0.insert(prefix);
-            } else {
-                entry.1.insert(prefix);
-            }
-        }
-        for ((tenant_id, _link_id), (left_prefixes, right_prefixes)) in link_prefixes {
-            if !tenant_users.contains_key(&tenant_id) {
-                continue;
-            }
-            let left_prefixes: Vec<String> = left_prefixes.into_iter().collect();
-            let right_prefixes: Vec<String> = right_prefixes.into_iter().collect();
-            grants.push(policy::PolicyGrant {
-                source_tenant: tenant_id.clone(),
-                target_tenant: tenant_id.clone(),
-                sources: left_prefixes.clone(),
-                destinations: right_prefixes.clone(),
-            });
-            grants.push(policy::PolicyGrant {
-                source_tenant: tenant_id.clone(),
-                target_tenant: tenant_id,
-                sources: right_prefixes,
-                destinations: left_prefixes,
-            });
-        }
-        grants
+        let rule_ids = statement
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        (policy::generate_policy(&grants), rule_ids)
     };
-    let document = policy::generate_policy(&grants);
-    state.headscale.set_policy(&document).await
+    if let Err(error) = state.headscale.check_policy(&document).await {
+        if let Ok(connection) = state.db.lock() {
+            let _ = mark_policy_reconcile_error(
+                &connection,
+                &format!("Headscale 策略校验失败：{error:#}"),
+            );
+        }
+        return Err(error);
+    }
+    if let Err(error) = state.headscale.set_policy(&document).await {
+        if let Ok(connection) = state.db.lock() {
+            let _ = mark_policy_reconcile_error(
+                &connection,
+                &format!("Headscale 策略发布失败：{error:#}"),
+            );
+        }
+        return Err(error);
+    }
+    let connection = state
+        .db
+        .lock()
+        .map_err(|_| anyhow::anyhow!("数据库锁不可用"))?;
+    for rule_id in rule_ids {
+        connection.execute(
+            "UPDATE mesh_access_rules
+            SET applied_revision = desired_revision,
+                 apply_status = CASE WHEN enabled = 1 THEN 'ready' ELSE 'disabled' END,
+                 apply_error = NULL,
+                 updated_at = unixepoch() WHERE id = ?1",
+            [&rule_id],
+        )?;
+    }
+    Ok(())
 }
 
 fn schedule_policy_reconcile(state: &AppState) {
@@ -8263,14 +11733,6 @@ struct GatewayRouteApplyInput {
     revision: i64,
     enabled: bool,
     local_applied: bool,
-}
-
-/// 当前开发阶段暂用显式 Bootstrap Token 保护管理端点。
-///
-/// 后续接入管理员 Session 后会替换这里，不能因为 Web UI 尚未完成就开放
-/// 未认证的凭证创建和审批接口。
-fn require_admin(state: &AppState, headers: &HeaderMap) -> Result<(), ApiError> {
-    auth::authorize_admin(state, headers)
 }
 
 fn ensure_tenant_scope(requested: &str, session_tenant: &str) -> Result<(), ApiError> {
@@ -8518,7 +11980,9 @@ async fn mesh_status(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Json<MeshStatusResponse>, ApiError> {
-    require_admin(&state, &headers)?;
+    // 普通用户也需要看到自己工作空间的组网组件状态；真正的全局配置
+    // 仍由认证中间件和系统管理员接口边界保护。
+    auth::admin_tenant_id(&state, &headers)?;
     let configured_version = env::var("NEXO_HEADSCALE_VERSION")
         .unwrap_or_else(|_| headscale::HEADSCALE_VERSION.to_owned());
     let tailscale_version = env::var("NEXO_TAILSCALE_VERSION")
@@ -8566,6 +12030,551 @@ async fn mesh_status(
             message: "异地组网服务正在启动或等待连接".to_owned(),
         })),
     }
+}
+
+/// 返回官方客户端所需的登录服务器地址和平台清单。浏览器授权流程由
+/// Headscale 官方注册页面完成，Nexo 只负责提供入口、审批和归属认领。
+async fn tailscale_client_config(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<TailscaleClientConfigResponse>, ApiError> {
+    auth::admin_tenant_id(&state, &headers)?;
+    let login_server = state.headscale_runtime.server_url();
+    Ok(Json(TailscaleClientConfigResponse {
+        browser_authorization_url: format!("{}/register", login_server.trim_end_matches('/')),
+        login_server,
+        supported_platforms: ["Linux", "Windows", "macOS", "iOS", "Android", "tvOS"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect(),
+        notes: vec![
+            "官方客户端首次连接会打开 Headscale 浏览器授权页面".to_owned(),
+            "授权完成后，设备会先进入隔离列表，认领后才加入当前工作空间".to_owned(),
+        ],
+    }))
+}
+
+/// 创建官方 Tailscale Auth Key。明文只在本次响应返回，数据库只保存摘要；
+/// `reusable`、`ephemeral` 和标签原样交给 Headscale 官方 API。
+async fn create_tailscale_auth_key(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<CreateTailscaleAuthKeyRequest>,
+) -> Result<Json<TailscaleAuthKeyResponse>, ApiError> {
+    let tenant_id = auth::admin_tenant_id(&state, &headers)?;
+    let user_id = auth::current_user_id(&state, &headers)?;
+    let label = request.label.trim().to_owned();
+    if label.is_empty() || label.len() > 80 {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "Auth Key 名称不能为空且不能超过 80 个字符",
+        ));
+    }
+    if request
+        .tags
+        .iter()
+        .any(|tag| tag.trim().is_empty() || tag.len() > 128)
+    {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "标签不能为空且不能超过 128 个字符",
+        ));
+    }
+    let ttl_seconds =
+        request
+            .ttl_seconds
+            .unwrap_or(if request.ephemeral { 86_400 } else { 604_800 });
+    if !(60..=2_592_000).contains(&ttl_seconds) {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "Auth Key 有效期必须在 1 分钟到 30 天之间",
+        ));
+    }
+    let expires_at = unix_now().saturating_add(ttl_seconds);
+    let headscale_user_id = {
+        let connection = state
+            .db
+            .lock()
+            .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "数据库锁不可用"))?;
+        connection
+            .query_row(
+                "SELECT headscale_user_id FROM mesh_tenant_mappings WHERE tenant_id = ?1 AND status = 'ready'",
+                [&tenant_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法读取组网用户映射"))?
+    };
+    let headscale_user_id = if let Some(id) = headscale_user_id {
+        id
+    } else {
+        let user = state
+            .headscale
+            .ensure_user(&format!("nexo-{tenant_id}"))
+            .await
+            .map_err(|error| {
+                ApiError::new(
+                    StatusCode::BAD_GATEWAY,
+                    format!("无法创建 Headscale 用户：{error:#}"),
+                )
+            })?;
+        let connection = state
+            .db
+            .lock()
+            .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "数据库锁不可用"))?;
+        connection
+            .execute(
+                "INSERT INTO mesh_tenant_mappings (tenant_id, headscale_user_id, status)
+                 VALUES (?1, ?2, 'ready')
+                 ON CONFLICT(tenant_id) DO UPDATE SET headscale_user_id = excluded.headscale_user_id,
+                 status = 'ready', updated_at = CURRENT_TIMESTAMP",
+                rusqlite::params![tenant_id, user.id],
+            )
+            .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法保存组网用户映射"))?;
+        user.id
+    };
+    let expiration = format_headscale_expiration(expires_at.max(0) as u64);
+    let key = state
+        .headscale
+        .create_pre_auth_key_with_options(
+            &headscale_user_id,
+            &HeadscaleAuthKeyOptions {
+                reusable: request.reusable,
+                ephemeral: request.ephemeral,
+                expiration,
+                acl_tags: request.tags.clone(),
+            },
+        )
+        .await
+        .map_err(|error| {
+            ApiError::new(
+                StatusCode::BAD_GATEWAY,
+                format!("无法创建 Headscale Auth Key：{error:#}"),
+            )
+        })?;
+    let plaintext = key.key.clone().ok_or_else(|| {
+        ApiError::new(
+            StatusCode::BAD_GATEWAY,
+            "Headscale 未返回 Auth Key 明文，已停止发布",
+        )
+    })?;
+    let id = Uuid::new_v4().to_string();
+    let now = unix_now();
+    let key_digest = hex::encode(Sha256::digest(plaintext.as_bytes()));
+    let connection = state
+        .db
+        .lock()
+        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "数据库锁不可用"))?;
+    connection
+        .execute(
+            "INSERT INTO tailscale_auth_keys
+             (id, tenant_id, user_id, headscale_key_id, key_digest, label, reusable, ephemeral, expires_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            rusqlite::params![
+                id,
+                tenant_id,
+                user_id,
+                key.id,
+                key_digest,
+                label,
+                i64::from(request.reusable),
+                i64::from(request.ephemeral),
+                expires_at,
+            ],
+        )
+        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法保存 Auth Key 元数据"))?;
+    tracing::info!("已创建官方客户端 Auth Key（明文仅返回本次响应）");
+    Ok(Json(TailscaleAuthKeyResponse {
+        id,
+        label,
+        key: Some(plaintext),
+        login_server: state.headscale_runtime.server_url(),
+        reusable: request.reusable,
+        ephemeral: request.ephemeral,
+        expires_at,
+        state: "issued".to_owned(),
+        created_at: now,
+    }))
+}
+
+async fn list_tailscale_auth_keys(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<TailscaleAuthKeyResponse>>, ApiError> {
+    let tenant_id = auth::admin_tenant_id(&state, &headers)?;
+    let connection = state
+        .db
+        .lock()
+        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "数据库锁不可用"))?;
+    // 过期状态在读取时惰性收敛，避免 UI 继续把已经不能使用的密钥显示为
+    // issued；Headscale 仍是实际凭证状态的最终来源，Nexo 只维护展示投影。
+    connection
+        .execute(
+            "UPDATE tailscale_auth_keys SET state = 'expired'
+             WHERE tenant_id = ?1 AND state = 'issued' AND expires_at <= unixepoch()",
+            [&tenant_id],
+        )
+        .map_err(|_| {
+            ApiError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "无法更新 Auth Key 过期状态",
+            )
+        })?;
+    let mut statement = connection
+        .prepare(
+            "SELECT id, label, reusable, ephemeral, expires_at, state, created_at
+             FROM tailscale_auth_keys WHERE tenant_id = ?1 ORDER BY created_at DESC",
+        )
+        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法读取 Auth Key 列表"))?;
+    let rows = statement
+        .query_map([tenant_id], |row| {
+            Ok(TailscaleAuthKeyResponse {
+                id: row.get(0)?,
+                label: row.get(1)?,
+                key: None,
+                login_server: String::new(),
+                reusable: row.get::<_, i64>(2)? != 0,
+                ephemeral: row.get::<_, i64>(3)? != 0,
+                expires_at: row.get(4)?,
+                state: row.get(5)?,
+                created_at: row.get(6)?,
+            })
+        })
+        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法读取 Auth Key 列表"))?;
+    rows.map(|row| {
+        row.map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "Auth Key 数据格式无效"))
+    })
+    .collect::<Result<Vec<_>, _>>()
+    .map(Json)
+}
+
+async fn revoke_tailscale_auth_key(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<Json<RecheckResponse>, ApiError> {
+    let tenant_id = auth::admin_tenant_id(&state, &headers)?;
+    let key_id: String = {
+        let connection = state
+            .db
+            .lock()
+            .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "数据库锁不可用"))?;
+        connection
+            .query_row(
+                "SELECT headscale_key_id FROM tailscale_auth_keys WHERE id = ?1 AND tenant_id = ?2",
+                rusqlite::params![id, tenant_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法读取 Auth Key"))?
+            .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "Auth Key 不存在"))?
+    };
+    state
+        .headscale
+        .expire_pre_auth_key(&key_id)
+        .await
+        .map_err(|error| {
+            ApiError::new(
+                StatusCode::BAD_GATEWAY,
+                format!("无法吊销 Auth Key：{error:#}"),
+            )
+        })?;
+    let connection = state
+        .db
+        .lock()
+        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "数据库锁不可用"))?;
+    connection
+        .execute(
+            "UPDATE tailscale_auth_keys SET state = 'revoked' WHERE id = ?1 AND tenant_id = ?2",
+            rusqlite::params![id, tenant_id],
+        )
+        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法保存 Auth Key 状态"))?;
+    Ok(Json(RecheckResponse {
+        accepted: true,
+        message: "Auth Key 已吊销".to_owned(),
+    }))
+}
+
+/// 从 Headscale 官方节点 API 同步未知节点。未知节点只进入隔离表，
+/// 在管理员明确认领前不会得到 Nexo 工作空间访问权限。
+async fn sync_tailscale_external_nodes(state: &AppState) -> Result<()> {
+    let nodes = state.headscale.list_nodes().await?;
+    let connection = state
+        .db
+        .lock()
+        .map_err(|_| anyhow::anyhow!("数据库锁不可用"))?;
+    for node in nodes {
+        let known: Option<String> = connection
+            .query_row(
+                "SELECT nexo_device_id FROM mesh_identities WHERE headscale_node_id = ?1",
+                [&node.id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(device_id) = known {
+            let ipv4 = node
+                .ip_addresses
+                .iter()
+                .find(|value| value.contains('.'))
+                .cloned();
+            let ipv6 = node
+                .ip_addresses
+                .iter()
+                .find(|value| value.contains(':'))
+                .cloned();
+            let tags_json = serde_json::to_string(&node.tags)?;
+            let expires_at = parse_headscale_expiration(node.expiry.as_deref());
+            connection.execute(
+                "UPDATE mesh_identities SET online = ?1,
+                 tailscale_ipv4 = COALESCE(?2, tailscale_ipv4),
+                 tailscale_ipv6 = COALESCE(?3, tailscale_ipv6),
+                 updated_at = CURRENT_TIMESTAMP WHERE nexo_device_id = ?4",
+                rusqlite::params![i64::from(node.online), ipv4, ipv6, device_id],
+            )?;
+            connection.execute(
+                "UPDATE tailscale_device_metadata
+                 SET tags_json = ?1,
+                     tailscale_ipv4 = COALESCE(?2, tailscale_ipv4),
+                     tailscale_ipv6 = COALESCE(?3, tailscale_ipv6),
+                     expires_at = ?4,
+                     updated_at = unixepoch()
+                 WHERE device_id = ?5",
+                rusqlite::params![tags_json, ipv4, ipv6, expires_at, device_id],
+            )?;
+            continue;
+        }
+        let node_json = serde_json::to_string(&node)?;
+        connection.execute(
+            "INSERT INTO tailscale_external_nodes
+             (node_id, node_name, node_json, discovered_at, last_seen_at, claim_state)
+             VALUES (?1, ?2, ?3, unixepoch(), unixepoch(), 'isolated')
+             ON CONFLICT(node_id) DO UPDATE SET node_name = excluded.node_name,
+             node_json = excluded.node_json, last_seen_at = unixepoch()",
+            rusqlite::params![node.id, node.name, node_json],
+        )?;
+    }
+    Ok(())
+}
+
+async fn list_tailscale_external_nodes(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<TailscaleExternalNodeResponse>>, ApiError> {
+    // 未知节点没有工作空间归属，只有全局管理员可以查看并决定认领目标。
+    // 普通用户不能通过这个实例级列表探测其他用户的设备或抢先认领节点。
+    auth::authorize_admin(&state, &headers)?;
+    sync_tailscale_external_nodes(&state)
+        .await
+        .map_err(|error| {
+            ApiError::new(
+                StatusCode::BAD_GATEWAY,
+                format!("同步 Headscale 节点失败：{error:#}"),
+            )
+        })?;
+    let connection = state
+        .db
+        .lock()
+        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "数据库锁不可用"))?;
+    let mut statement = connection
+        .prepare(
+            "SELECT node_id, node_name, node_json, claim_state, discovered_at, last_seen_at
+             FROM tailscale_external_nodes WHERE claim_state = 'isolated'
+             ORDER BY last_seen_at DESC",
+        )
+        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法读取外部节点"))?;
+    let rows = statement
+        .query_map([], |row| {
+            let node_json: String = row.get(2)?;
+            let node: HeadscaleNode = serde_json::from_str(&node_json).map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    2,
+                    rusqlite::types::Type::Text,
+                    Box::new(error),
+                )
+            })?;
+            Ok(TailscaleExternalNodeResponse {
+                node_id: row.get(0)?,
+                name: row.get(1)?,
+                online: node.online,
+                addresses: node.ip_addresses,
+                claim_state: row.get(3)?,
+                discovered_at: row.get(4)?,
+                last_seen_at: row.get(5)?,
+            })
+        })
+        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法读取外部节点"))?;
+    rows.map(|row| {
+        row.map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "外部节点数据格式无效"))
+    })
+    .collect::<Result<Vec<_>, _>>()
+    .map(Json)
+}
+
+async fn claim_tailscale_external_node(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(node_id): Path<String>,
+    body: Option<Json<ClaimTailscaleNodeRequest>>,
+) -> Result<Json<DeviceResponse>, ApiError> {
+    // 认领会把外部节点绑定到当前工作空间，属于全局归属决策，不能由普通
+    // 用户通过伪造请求体或切换 Header 抢占其他工作空间的节点。
+    auth::authorize_admin(&state, &headers)?;
+    let tenant_id = auth::admin_tenant_id(&state, &headers)?;
+    let owner_user_id = auth::current_user_id(&state, &headers)?;
+    let requested_name = body
+        .and_then(|Json(value)| value.name)
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty());
+    let node = state
+        .headscale
+        .list_nodes()
+        .await
+        .map_err(|error| {
+            ApiError::new(
+                StatusCode::BAD_GATEWAY,
+                format!("无法读取 Headscale 节点：{error:#}"),
+            )
+        })?
+        .into_iter()
+        .find(|node| node.id == node_id)
+        .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "Headscale 节点不存在"))?;
+    let mapped_headscale_user_id = {
+        let connection = state
+            .db
+            .lock()
+            .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "数据库锁不可用"))?;
+        connection
+            .query_row(
+                "SELECT headscale_user_id FROM mesh_tenant_mappings
+                 WHERE tenant_id = ?1 AND status = 'ready'",
+                [&tenant_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法读取组网用户映射"))?
+    };
+    let headscale_user_id = if let Some(user_id) = mapped_headscale_user_id {
+        user_id
+    } else {
+        state
+            .headscale
+            .ensure_user(&format!("nexo-{tenant_id}"))
+            .await
+            .map_err(|error| {
+                ApiError::new(
+                    StatusCode::BAD_GATEWAY,
+                    format!("无法创建 Headscale 用户：{error:#}"),
+                )
+            })?
+            .id
+    };
+    let device_id = Uuid::new_v4().to_string();
+    let device_name = requested_name.unwrap_or_else(|| {
+        if node.name.trim().is_empty() {
+            format!("官方客户端-{}", node.id)
+        } else {
+            node.name.clone()
+        }
+    });
+    let ipv4 = node
+        .ip_addresses
+        .iter()
+        .find(|value| value.contains('.'))
+        .cloned();
+    let ipv6 = node
+        .ip_addresses
+        .iter()
+        .find(|value| value.contains(':'))
+        .cloned();
+    let tags_json = serde_json::to_string(&node.tags).map_err(|error| {
+        ApiError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("无法保存官方客户端标签：{error}"),
+        )
+    })?;
+    let expires_at = parse_headscale_expiration(node.expiry.as_deref());
+    let now = unix_now();
+    let connection = state
+        .db
+        .lock()
+        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "数据库锁不可用"))?;
+    let transaction = connection.unchecked_transaction().map_err(|_| {
+        ApiError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "无法开始外部节点认领事务",
+        )
+    })?;
+    let already_claimed: i64 = transaction
+        .query_row(
+            "SELECT COUNT(*) FROM mesh_identities WHERE headscale_node_id = ?1",
+            [&node.id],
+            |row| row.get(0),
+        )
+        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法检查节点归属"))?;
+    if already_claimed > 0 {
+        return Err(ApiError::new(StatusCode::CONFLICT, "该节点已经被认领"));
+    }
+    transaction
+        .execute(
+            "INSERT INTO mesh_tenant_mappings (tenant_id, headscale_user_id, status)
+             VALUES (?1, ?2, 'ready')
+             ON CONFLICT(tenant_id) DO UPDATE SET headscale_user_id = excluded.headscale_user_id,
+             status = 'ready', updated_at = CURRENT_TIMESTAMP",
+            rusqlite::params![tenant_id, headscale_user_id],
+        )
+        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法保存组网用户映射"))?;
+    transaction
+        .execute(
+            "INSERT INTO devices (id, tenant_id, name, os, architecture, status, capabilities_json, enrolled_at, updated_at)
+             VALUES (?1, ?2, ?3, 'unknown', 'unknown', ?4, '[]', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+            rusqlite::params![device_id, tenant_id, device_name, if node.online { "online" } else { "offline" }],
+        )
+        .map_err(|_| ApiError::new(StatusCode::CONFLICT, "无法创建官方客户端设备"))?;
+    transaction
+        .execute(
+            "INSERT INTO tailscale_device_metadata
+             (device_id, user_id, registration_method, tags_json, tailscale_ipv4, tailscale_ipv6,
+              expires_at, control_plane_state, external_node, created_at, updated_at)
+             VALUES (?1, ?2, 'browser', ?3, ?4, ?5, ?6, 'ready', 1, ?7, ?7)",
+            rusqlite::params![
+                device_id,
+                owner_user_id,
+                tags_json,
+                ipv4,
+                ipv6,
+                expires_at,
+                now
+            ],
+        )
+        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法保存官方客户端归属"))?;
+    transaction
+        .execute(
+            "INSERT INTO mesh_identities
+             (nexo_device_id, tenant_id, headscale_node_id, state, tailscale_ipv4, online)
+             VALUES (?1, ?2, ?3, 'ready', ?4, ?5)",
+            rusqlite::params![device_id, tenant_id, node.id, ipv4, i64::from(node.online)],
+        )
+        .map_err(|_| ApiError::new(StatusCode::CONFLICT, "无法绑定官方客户端组网身份"))?;
+    transaction
+        .execute(
+            "UPDATE tailscale_external_nodes SET claimed_device_id = ?1, claim_state = 'claimed', last_seen_at = unixepoch()
+             WHERE node_id = ?2",
+            rusqlite::params![device_id, node.id],
+        )
+        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法更新外部节点认领状态"))?;
+    transaction.commit().map_err(|_| {
+        ApiError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "无法提交外部节点认领事务",
+        )
+    })?;
+    schedule_policy_reconcile(&state);
+    let response = list_devices_for_tenant(&connection, &tenant_id)?;
+    response
+        .into_iter()
+        .find(|device| device.id == device_id)
+        .map(Json)
+        .ok_or_else(|| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "认领成功但无法读取设备"))
 }
 
 /// 管理员批准已提交的 Agent 请求，并为其 CSR 签发客户端证书。
@@ -8863,6 +12872,16 @@ fn format_headscale_expiration(epoch_seconds: u64) -> String {
         .unwrap_or_else(|_| time::OffsetDateTime::now_utc());
     date.format(&time::format_description::well_known::Rfc3339)
         .unwrap_or_else(|_| "2099-01-01T00:00:00Z".to_owned())
+}
+
+/// 将 Headscale 节点的 RFC3339 过期时间投影为 Web 使用的 Unix 秒；
+/// 无效或缺失的值保持为空，不能用猜测时间覆盖真实状态。
+fn parse_headscale_expiration(value: Option<&str>) -> Option<i64> {
+    value
+        .and_then(|value| {
+            time::OffsetDateTime::parse(value, &time::format_description::well_known::Rfc3339).ok()
+        })
+        .map(|date| date.unix_timestamp())
 }
 
 /// Agent 使用一次性 token 提交设备信息；提交后进入待审批状态。
@@ -11611,6 +15630,7 @@ mod tests {
     }
     use axum::http::HeaderValue;
     use nexo_core::{DetectedLocalNetwork, DeviceCapability};
+    use nexo_headscale_adapter::{HeadscalePreAuthKey, HeadscaleUser};
     use tokio::net::TcpStream;
     use tokio_rustls::TlsConnector;
 
@@ -11621,6 +15641,141 @@ mod tests {
             HeaderValue::from_static("nexo_local_session=test-session"),
         );
         headers
+    }
+
+    #[allow(dead_code)]
+    fn tenant_headers() -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::COOKIE,
+            HeaderValue::from_static("nexo_local_session=tenant-session"),
+        );
+        headers
+    }
+
+    /// 为权限测试创建第二个普通用户和独立 Session；测试只依赖 Session
+    /// 摘要，不需要执行真实密码哈希流程。
+    #[allow(dead_code)]
+    fn insert_tenant_session(state: &AppState) {
+        let connection = state.db.lock().expect("数据库锁应可用");
+        connection
+            .execute_batch(
+                "INSERT OR IGNORE INTO tenants (id, name) VALUES ('tenant-2', '第二工作空间');
+                 INSERT OR IGNORE INTO users (id, tenant_id, username, role, password_hash)
+                 VALUES ('user-2', 'tenant-2', 'test-user', 'tenant', 'test-hash');",
+            )
+            .expect("应创建普通用户夹具");
+        let session_digest = hex::encode(Sha256::digest(b"tenant-session"));
+        let csrf_digest = hex::encode(Sha256::digest(b"tenant-csrf"));
+        let session_now = unix_now();
+        connection
+            .execute(
+                "INSERT OR REPLACE INTO auth_sessions
+                 (id, user_id, tenant_id, session_digest, csrf_digest, channel,
+                  created_at, last_seen_at, expires_at, revoked_at)
+                 VALUES ('tenant-session-row', 'user-2', 'tenant-2', ?1, ?2, 'local_http',
+                         ?3, ?3, ?4, NULL)",
+                rusqlite::params![
+                    session_digest,
+                    csrf_digest,
+                    session_now,
+                    session_now + 7 * 24 * 60 * 60
+                ],
+            )
+            .expect("应创建普通用户登录状态");
+    }
+
+    /// 官方客户端测试专用的 Headscale 边界：记录密钥吊销并返回可控节点，
+    /// 用来验证 Nexo 的生命周期和外部节点隔离，而不连接真实服务。
+    #[allow(dead_code)]
+    #[derive(Default)]
+    struct OfficialClientHeadscale {
+        expired_keys: Mutex<Vec<String>>,
+        nodes: Mutex<Vec<HeadscaleNode>>,
+        next_key: Mutex<u64>,
+        checked_policies: Mutex<Vec<String>>,
+        published_policies: Mutex<Vec<String>>,
+        fail_policy_check: Mutex<bool>,
+        fail_policy_set: Mutex<bool>,
+    }
+
+    #[async_trait::async_trait]
+    impl HeadscaleControlPlane for OfficialClientHeadscale {
+        async fn reconcile_routes(
+            &self,
+            routes: &[nexo_headscale_adapter::RouteAdvertisement],
+        ) -> Result<nexo_headscale_adapter::RouteApplyReport> {
+            HeadscaleAdapter.reconcile_routes(routes).await
+        }
+
+        async fn ensure_user(&self, name: &str) -> Result<HeadscaleUser> {
+            Ok(HeadscaleUser {
+                id: format!("hs-{name}"),
+                name: name.to_owned(),
+            })
+        }
+
+        async fn create_pre_auth_key_with_options(
+            &self,
+            _user_id: &str,
+            options: &HeadscaleAuthKeyOptions,
+        ) -> Result<HeadscalePreAuthKey> {
+            let mut next = self.next_key.lock().expect("应分配测试 Auth Key 编号");
+            *next += 1;
+            let id = format!("key-{next}");
+            Ok(HeadscalePreAuthKey {
+                id: id.clone(),
+                key: Some(format!("tskey-auth-{next}")),
+                used: false,
+                expiration: Some(options.expiration.clone()),
+            })
+        }
+
+        async fn expire_pre_auth_key(&self, key_id: &str) -> Result<()> {
+            self.expired_keys
+                .lock()
+                .expect("应记录测试 Auth Key 吊销")
+                .push(key_id.to_owned());
+            Ok(())
+        }
+
+        async fn list_nodes(&self) -> Result<Vec<HeadscaleNode>> {
+            Ok(self
+                .nodes
+                .lock()
+                .expect("应读取测试 Headscale 节点")
+                .clone())
+        }
+
+        async fn check_policy(&self, policy: &str) -> Result<()> {
+            if *self
+                .fail_policy_check
+                .lock()
+                .expect("应读取测试 Policy 校验开关")
+            {
+                anyhow::bail!("测试模拟 Policy 校验失败");
+            }
+            self.checked_policies
+                .lock()
+                .expect("应记录测试 Policy 校验")
+                .push(policy.to_owned());
+            Ok(())
+        }
+
+        async fn set_policy(&self, policy: &str) -> Result<()> {
+            if *self
+                .fail_policy_set
+                .lock()
+                .expect("应读取测试 Policy 发布开关")
+            {
+                anyhow::bail!("测试模拟 Policy 发布失败");
+            }
+            self.published_policies
+                .lock()
+                .expect("应记录测试 Policy 发布")
+                .push(policy.to_owned());
+            Ok(())
+        }
     }
 
     /// 删除测试专用的 Headscale 边界：记录外部撤销调用，并可精确模拟失败。
@@ -11682,12 +15837,486 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn workspace_scope_isolated_and_admin_can_switch_workspace() {
+        let state = test_state();
+        insert_tenant_session(&state);
+        state
+            .db
+            .lock()
+            .expect("数据库锁应可用")
+            .execute_batch(
+                "INSERT INTO devices (id, tenant_id, name, status)
+                 VALUES ('tenant-one-device', 'tenant-1', '管理员设备', 'online'),
+                        ('tenant-two-device', 'tenant-2', '普通用户设备', 'online');",
+            )
+            .expect("应创建跨工作空间设备夹具");
+
+        let own_devices = list_devices(State(state.clone()), tenant_headers())
+            .await
+            .expect("普通用户应能读取自己的设备")
+            .0;
+        assert_eq!(
+            own_devices
+                .iter()
+                .map(|device| device.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["tenant-two-device"]
+        );
+
+        let cross_workspace = update_device(
+            State(state.clone()),
+            tenant_headers(),
+            Path("tenant-one-device".to_owned()),
+            Json(UpdateDeviceRequest {
+                name: "不应修改".to_owned(),
+                site_id: None,
+            }),
+        )
+        .await
+        .expect_err("普通用户不得修改其他工作空间设备");
+        assert_eq!(cross_workspace.status, StatusCode::NOT_FOUND);
+
+        let mut switched_headers = admin_headers();
+        switched_headers.insert("x-nexo-workspace", HeaderValue::from_static("tenant-2"));
+        let switched_devices = list_devices(State(state), switched_headers)
+            .await
+            .expect("系统管理员应能切换工作空间")
+            .0;
+        assert_eq!(switched_devices[0].id, "tenant-two-device");
+    }
+
+    #[tokio::test]
+    async fn tailscale_auth_key_is_one_time_visible_and_expires_on_read() {
+        let headscale = Arc::new(OfficialClientHeadscale::default());
+        let state = test_state_with_headscale(headscale.clone());
+        let created = create_tailscale_auth_key(
+            State(state.clone()),
+            admin_headers(),
+            Json(CreateTailscaleAuthKeyRequest {
+                label: "测试密钥".to_owned(),
+                reusable: true,
+                ephemeral: true,
+                ttl_seconds: Some(600),
+                tags: vec!["tag:team".to_owned()],
+            }),
+        )
+        .await
+        .expect("应创建官方客户端 Auth Key")
+        .0;
+        let plaintext = created.key.clone().expect("创建响应应包含一次性明文");
+        let (digest, stored_state): (String, String) = state
+            .db
+            .lock()
+            .expect("数据库锁应可用")
+            .query_row(
+                "SELECT key_digest, state FROM tailscale_auth_keys WHERE id = ?1",
+                [&created.id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("应读取 Auth Key 摘要");
+        assert_eq!(digest, hex::encode(Sha256::digest(plaintext.as_bytes())));
+        assert_ne!(digest, plaintext);
+        assert_eq!(stored_state, "issued");
+
+        let listed = list_tailscale_auth_keys(State(state.clone()), admin_headers())
+            .await
+            .expect("应读取 Auth Key 列表")
+            .0;
+        assert_eq!(listed[0].key, None);
+
+        state
+            .db
+            .lock()
+            .expect("数据库锁应可用")
+            .execute(
+                "INSERT INTO tailscale_auth_keys
+                 (id, tenant_id, headscale_key_id, key_digest, label, expires_at, state)
+                 VALUES ('expired-key', 'tenant-1', 'expired-headscale-key', 'digest',
+                         '已过期', ?1, 'issued')",
+                [unix_now() - 1],
+            )
+            .expect("应创建过期 Auth Key 夹具");
+        let listed = list_tailscale_auth_keys(State(state.clone()), admin_headers())
+            .await
+            .expect("应惰性收敛过期状态")
+            .0;
+        assert_eq!(
+            listed
+                .iter()
+                .find(|key| key.id == "expired-key")
+                .map(|key| key.state.as_str()),
+            Some("expired")
+        );
+
+        let _revoked = revoke_tailscale_auth_key(
+            State(state.clone()),
+            admin_headers(),
+            Path(created.id.clone()),
+        )
+        .await
+        .expect("应吊销 Auth Key");
+        assert_eq!(
+            *headscale.expired_keys.lock().expect("应读取吊销记录"),
+            vec!["key-1".to_owned()]
+        );
+        let revoked_state: String = state
+            .db
+            .lock()
+            .expect("数据库锁应可用")
+            .query_row(
+                "SELECT state FROM tailscale_auth_keys WHERE id = ?1",
+                [&created.id],
+                |row| row.get(0),
+            )
+            .expect("应读取吊销后的状态");
+        assert_eq!(revoked_state, "revoked");
+    }
+
+    #[tokio::test]
+    async fn external_nodes_are_admin_only_and_claimed_into_selected_workspace() {
+        let headscale = Arc::new(OfficialClientHeadscale {
+            nodes: Mutex::new(vec![HeadscaleNode {
+                id: "external-node-1".to_owned(),
+                name: "外部笔记本".to_owned(),
+                online: true,
+                ip_addresses: vec!["100.64.0.10".to_owned(), "fd7a::10".to_owned()],
+                ..HeadscaleNode::default()
+            }]),
+            ..OfficialClientHeadscale::default()
+        });
+        let state = test_state_with_headscale(headscale);
+        insert_tenant_session(&state);
+
+        let ordinary_list = list_tailscale_external_nodes(State(state.clone()), tenant_headers())
+            .await
+            .expect_err("普通用户不得读取实例级隔离节点");
+        assert_eq!(ordinary_list.status, StatusCode::FORBIDDEN);
+        let admin_list = list_tailscale_external_nodes(State(state.clone()), admin_headers())
+            .await
+            .expect("系统管理员应能同步隔离节点")
+            .0;
+        assert_eq!(admin_list.len(), 1);
+
+        let ordinary_claim = claim_tailscale_external_node(
+            State(state.clone()),
+            tenant_headers(),
+            Path("external-node-1".to_owned()),
+            None,
+        )
+        .await
+        .expect_err("普通用户不得认领隔离节点");
+        assert_eq!(ordinary_claim.status, StatusCode::FORBIDDEN);
+
+        let claimed = claim_tailscale_external_node(
+            State(state.clone()),
+            admin_headers(),
+            Path("external-node-1".to_owned()),
+            Some(Json(ClaimTailscaleNodeRequest {
+                name: Some("已确认笔记本".to_owned()),
+            })),
+        )
+        .await
+        .expect("管理员应能认领隔离节点")
+        .0;
+        assert_eq!(claimed.name, "已确认笔记本");
+        assert_eq!(claimed.connection_type, "tailscale_client");
+        assert_eq!(claimed.owner_username.as_deref(), Some("test-admin"));
+        let ownership: (String, String, String) = state
+            .db
+            .lock()
+            .expect("数据库锁应可用")
+            .query_row(
+                "SELECT d.tenant_id, tm.user_id, e.claim_state
+                 FROM devices d
+                 JOIN tailscale_device_metadata tm ON tm.device_id = d.id
+                 JOIN tailscale_external_nodes e ON e.claimed_device_id = d.id
+                 WHERE d.id = ?1",
+                [&claimed.id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("应保存认领后的所有权");
+        assert_eq!(
+            ownership,
+            (
+                "tenant-1".to_owned(),
+                "user-1".to_owned(),
+                "claimed".to_owned()
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn access_rule_checks_policy_and_keeps_grants_direct() {
+        let headscale = Arc::new(OfficialClientHeadscale::default());
+        let state = test_state_with_headscale(headscale.clone());
+        insert_tenant_session(&state);
+        {
+            let connection = state.db.lock().expect("数据库锁应可用");
+            connection
+                .execute_batch(
+                    "INSERT INTO mesh_tenant_mappings
+                     (tenant_id, headscale_user_id, status)
+                     VALUES ('tenant-1', 'hs-tenant-1', 'ready'),
+                            ('tenant-2', 'hs-tenant-2', 'ready');",
+                )
+                .expect("应创建测试工作空间组网映射");
+            connection
+                .execute(
+                    "INSERT INTO devices (id, tenant_id, name, status)
+                     VALUES ('access-device', 'tenant-1', '共享设备', 'online')",
+                    [],
+                )
+                .expect("应创建访问控制设备");
+            connection
+                .execute(
+                    "INSERT INTO tailscale_device_metadata
+                     (device_id, user_id, registration_method, tailscale_ipv4, control_plane_state)
+                     VALUES ('access-device', 'user-1', 'browser', '100.64.0.8', 'ready')",
+                    [],
+                )
+                .expect("应创建访问控制设备元数据");
+        }
+
+        let created = create_access_rule(
+            State(state.clone()),
+            admin_headers(),
+            Json(AccessRuleRequest {
+                name: "协作者访问设备".to_owned(),
+                target_type: "device".to_owned(),
+                target_id: "access-device".to_owned(),
+                protocols: vec!["tcp".to_owned()],
+                ports: vec!["22".to_owned()],
+                ssh_enabled: true,
+                enabled: true,
+                grantee_workspace_ids: vec!["tenant-2".to_owned()],
+            }),
+        )
+        .await
+        .expect("有效访问规则应保存")
+        .0;
+        assert_eq!(created.grants.len(), 1);
+        assert_eq!(created.grants[0].workspace_id, "tenant-2");
+
+        let checked = headscale
+            .checked_policies
+            .lock()
+            .expect("应读取 Policy 校验记录")
+            .clone();
+        assert!(checked.iter().any(|document| {
+            document.contains("nexo-tenant-2@") && document.contains("100.64.0.8")
+        }));
+
+        let connection = state.db.lock().expect("数据库锁应可用");
+        let document =
+            policy::generate_policy(&build_policy_grants(&connection).expect("应生成访问策略"));
+        let parsed: serde_json::Value =
+            serde_json::from_str(&document).expect("策略应是 JSON 文档");
+        let grant = parsed["grants"]
+            .as_array()
+            .and_then(|grants| {
+                grants
+                    .iter()
+                    .find(|grant| grant["src"][0] == "nexo-tenant-2@")
+            })
+            .expect("应有一条直接授权");
+        assert_eq!(grant["src"][0], "nexo-tenant-2@");
+        assert_eq!(grant["dst"][0], "100.64.0.8");
+        assert!(parsed["grants"].as_array().is_some_and(|grants| {
+            grants
+                .iter()
+                .any(|grant| grant["src"][0] == "nexo-tenant-1@")
+        }));
+        assert!(document.contains("autogroup:nonroot"));
+        assert!(!document.contains("nexo-tenant-3@"));
+    }
+
+    #[tokio::test]
+    async fn access_rule_policy_check_failure_does_not_persist_rule() {
+        let headscale = Arc::new(OfficialClientHeadscale::default());
+        *headscale
+            .fail_policy_check
+            .lock()
+            .expect("应设置测试 Policy 校验开关") = true;
+        let state = test_state_with_headscale(headscale);
+        {
+            let connection = state.db.lock().expect("数据库锁应可用");
+            connection
+                .execute(
+                    "INSERT INTO devices (id, tenant_id, name, status)
+                     VALUES ('check-failure-device', 'tenant-1', '校验失败设备', 'online')",
+                    [],
+                )
+                .expect("应创建校验失败设备");
+            connection
+                .execute(
+                    "INSERT INTO tailscale_device_metadata
+                     (device_id, user_id, registration_method, tailscale_ipv4, control_plane_state)
+                     VALUES ('check-failure-device', 'user-1', 'browser', '100.64.0.9', 'ready')",
+                    [],
+                )
+                .expect("应创建校验失败设备元数据");
+        }
+        let error = create_access_rule(
+            State(state.clone()),
+            admin_headers(),
+            Json(AccessRuleRequest {
+                name: "不应保存".to_owned(),
+                target_type: "device".to_owned(),
+                target_id: "check-failure-device".to_owned(),
+                protocols: vec!["tcp".to_owned()],
+                ports: vec!["443".to_owned()],
+                ssh_enabled: false,
+                enabled: true,
+                grantee_workspace_ids: Vec::new(),
+            }),
+        )
+        .await
+        .expect_err("Policy 校验失败时不应保存规则");
+        assert_eq!(error.status, StatusCode::BAD_GATEWAY);
+        let count: i64 = state
+            .db
+            .lock()
+            .expect("数据库锁应可用")
+            .query_row(
+                "SELECT COUNT(*) FROM mesh_access_rules WHERE name = '不应保存'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("应读取规则数量");
+        assert_eq!(count, 0);
+    }
+
+    #[tokio::test]
+    async fn access_rule_revoke_retains_error_and_retries_to_disabled() {
+        let headscale = Arc::new(OfficialClientHeadscale::default());
+        let state = test_state_with_headscale(headscale.clone());
+        {
+            let connection = state.db.lock().expect("数据库锁应可用");
+            connection
+                .execute(
+                    "INSERT INTO mesh_access_rules
+                     (id, owner_tenant_id, owner_user_id, name, target_type, target_id,
+                      protocols_json, ports_json, enabled, desired_revision, applied_revision,
+                      apply_status)
+                     VALUES ('retry-rule', 'tenant-1', 'user-1', '待重试规则', 'file_share',
+                             '100.64.0.20', '[\"tcp\"]', '[\"22\"]', 0, 2, 1, 'checking')",
+                    [],
+                )
+                .expect("应创建待重试规则");
+        }
+
+        *headscale
+            .fail_policy_set
+            .lock()
+            .expect("应设置测试 Policy 发布开关") = true;
+        let error = reconcile_headscale_policy(&state)
+            .await
+            .expect_err("Policy 发布失败时应返回错误");
+        assert!(error.to_string().contains("测试模拟 Policy 发布失败"));
+        let (status, apply_error): (String, Option<String>) = state
+            .db
+            .lock()
+            .expect("数据库锁应可用")
+            .query_row(
+                "SELECT apply_status, apply_error FROM mesh_access_rules WHERE id = 'retry-rule'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("应读取失败状态");
+        assert_eq!(status, "error");
+        assert!(apply_error.is_some());
+
+        *headscale
+            .fail_policy_set
+            .lock()
+            .expect("应更新测试 Policy 发布开关") = false;
+        reconcile_headscale_policy(&state)
+            .await
+            .expect("修复 Headscale 后应能重试发布");
+        let (status, applied_revision, apply_error): (String, i64, Option<String>) = state
+            .db
+            .lock()
+            .expect("数据库锁应可用")
+            .query_row(
+                "SELECT apply_status, applied_revision, apply_error
+                 FROM mesh_access_rules WHERE id = 'retry-rule'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("应读取重试后的状态");
+        assert_eq!(status, "disabled");
+        assert_eq!(applied_revision, 2);
+        assert_eq!(apply_error, None);
+    }
+
+    #[tokio::test]
+    async fn access_rule_target_is_scoped_to_current_workspace() {
+        let state = test_state();
+        insert_tenant_session(&state);
+        state
+            .db
+            .lock()
+            .expect("数据库锁应可用")
+            .execute(
+                "INSERT INTO devices (id, tenant_id, name, status)
+                 VALUES ('tenant-one-device', 'tenant-1', '管理员设备', 'online')",
+                [],
+            )
+            .expect("应创建其他工作空间设备");
+        let error = create_access_rule(
+            State(state),
+            tenant_headers(),
+            Json(AccessRuleRequest {
+                name: "越权规则".to_owned(),
+                target_type: "device".to_owned(),
+                target_id: "tenant-one-device".to_owned(),
+                protocols: vec!["tcp".to_owned()],
+                ports: vec!["22".to_owned()],
+                ssh_enabled: false,
+                enabled: true,
+                grantee_workspace_ids: Vec::new(),
+            }),
+        )
+        .await
+        .expect_err("普通用户不能把其他工作空间设备作为目标");
+        assert_eq!(error.status, StatusCode::NOT_FOUND);
+    }
+
     #[test]
     fn public_https_probe_keeps_sni_and_targets_local_caddy() {
         let (host, url, address) = public_https_probe_target("nexo-test.example.com");
         assert_eq!(host, "nexo.nexo-test.example.com");
         assert_eq!(url, "https://nexo.nexo-test.example.com/api/v1/auth/status");
         assert_eq!(address, SocketAddr::from(([127, 0, 0, 1], 443)));
+    }
+
+    #[test]
+    fn caddy_renewal_estimate_uses_last_third_of_certificate_lifetime() {
+        let start = 1_000_i64;
+        let end = 91_000_i64;
+        assert_eq!(
+            estimated_caddy_renewal(Some(start), Some(end)),
+            Some(61_000)
+        );
+        assert_eq!(estimated_caddy_renewal(None, Some(end)), None);
+        assert_eq!(estimated_caddy_renewal(Some(end), Some(start)), None);
+    }
+
+    #[test]
+    fn primary_domain_requires_root_and_wildcard_dns_records() {
+        let ready = serde_json::json!({
+            "root": {"resolved": ["192.0.2.10"]},
+            "wildcard": {"resolved": ["192.0.2.10"]}
+        });
+        assert!(public_domain_dns_ready(&ready.to_string()));
+        let missing_wildcard = serde_json::json!({
+            "root": {"resolved": ["192.0.2.10"]},
+            "wildcard": {"resolved": [], "error": "未解析"}
+        });
+        assert!(!public_domain_dns_ready(&missing_wildcard.to_string()));
+        let legacy = serde_json::json!({"resolved": ["192.0.2.10"]});
+        assert!(public_domain_dns_ready(&legacy.to_string()));
     }
 
     fn test_state() -> AppState {
@@ -11729,6 +16358,9 @@ mod tests {
         apply_unassigned_tunnel_migration(&connection).expect("应初始化未分配 Tunnel 数据结构");
         apply_sitelink_multi_network_migration(&connection)
             .expect("应初始化共享网络和站点互联扩展");
+        apply_multi_public_domains_migration(&connection).expect("应初始化多域名和主域名迁移结构");
+        apply_tailscale_client_migration(&connection).expect("应初始化官方客户端和 Auth Key 结构");
+        apply_access_control_migration(&connection).expect("应初始化可视化访问控制结构");
         ensure_mesh_identity_online_column(&connection).expect("应初始化组网在线状态字段");
         ensure_server_ca(&connection).expect("应初始化测试 CA");
         ensure_server_control_identity(&connection).expect("应初始化测试控制证书");
@@ -11960,7 +16592,8 @@ mod tests {
         );
         assert_eq!(report["resolved"], serde_json::json!(["192.0.2.10"]));
         assert_eq!(report["root"]["hostname"], "example.com");
-        assert_eq!(report["wildcard"]["hostname"], "*.example.com");
+        assert_eq!(report["wildcard"]["hostname"], "nexo.example.com");
+        assert_eq!(report["wildcard"]["probe"], "*.example.com");
         assert_eq!(report["wildcard"]["error"], "泛域名未解析");
         assert!(report["error"].as_str().unwrap().contains("泛域名未解析"));
     }
@@ -12880,6 +17513,7 @@ mod tests {
                 origin_tls_verification: Some("system".to_owned()),
                 origin_ca_pem: None,
                 service_name: None,
+                public_domain_id: None,
             }),
         )
         .await
@@ -12920,6 +17554,7 @@ mod tests {
                 origin_tls_verification: Some("system".to_owned()),
                 origin_ca_pem: None,
                 service_name: None,
+                public_domain_id: None,
             }),
         )
         .await

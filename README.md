@@ -3,7 +3,7 @@
 Nexo 是面向个人自托管、NAS/HomeLab 和小型网络环境的设备、异地组网与公网访问管理服务。
 它把设备、共享网络、站点互联、Web 服务和 TCP 端口集中到一个 Web 界面中，正常使用不需要编辑配置文件。
 
-## v0.1.6 快速开始
+## v0.1.7 快速开始
 
 当前版本仅支持 `linux/amd64` Docker。Server 与 Agent 使用独立镜像，
 Agent 可以安装在其他家庭、办公室或 VPS 上并加入任意 Nexo Server。
@@ -18,7 +18,7 @@ name: nexo
 
 services:
   nexo-server:
-    image: ghcr.io/thelinyue/nexo-server:0.1.6
+    image: ghcr.io/thelinyue/nexo-server:0.1.7
     container_name: nexo-server
     network_mode: host
     environment:
@@ -58,7 +58,7 @@ name: nexo-agent
 
 services:
   nexo-agent:
-    image: ghcr.io/thelinyue/nexo-agent:0.1.6
+    image: ghcr.io/thelinyue/nexo-agent:0.1.7
     container_name: nexo-agent
     network_mode: host
     cap_add:
@@ -93,7 +93,8 @@ services:
 - 设备通过一次性入网请求加入 Nexo，批准后自动建立异地组网身份。
 - Subnet Gateway 和 Site Gateway 保留第一阶段的双向 LAN 互联、真实源 IP 和稳定设备身份。
 - “公网访问”下的“内网穿透”支持 TCP 端口以及 HTTP/HTTPS Web Service；每条资源称为“穿透服务”，Web Service 通过受限本地桥接，不暴露 Origin 端口。
-- “域名与 HTTPS”负责根域名、证书来源和生效状态；配置后提供泛域名证书和 `nexo.<domain>` 管理地址、`mesh.<domain>` 组网地址。
+- “域名与 HTTPS”支持一个主域名和多个附加域名；每项独立管理 Cloudflare DNS-01 或手动证书。列表可批量重新检测或申请证书，并展示根/泛域名证书到期时间、Caddy 预计续期窗口和 CA 自动退避状态。
+- 配置后提供泛域名证书和 `nexo.<domain>` 管理地址、`mesh.<domain>` 组网地址；`mesh.<domain>` 必须保持 Cloudflare DNS only。
 - Caddy、Headscale 和 Tailscale 是镜像中的独立组件，由 Nexo 负责协调；普通用户不需要操作它们的配置或命令。
 
 当前阶段明确不包含 Exit Node、默认路由、UDP、TLS passthrough、NAT 转换、跨租户共享或 Caddy 路径路由。
@@ -148,7 +149,7 @@ docker compose -f docker/compose.phase2.yml exec nexo-server nexo admin recover
 ## Docker 部署
 
 正式发布使用仓库根目录的 [`compose.yml`](compose.yml) 和
-[`compose.agent.yml`](compose.agent.yml)，镜像标签固定为 `0.1.6`，不会隐式
+[`compose.agent.yml`](compose.agent.yml)，镜像标签固定为 `0.1.7`，不会隐式
 升级。开发环境的源码构建示例仍保留在 [`docker/compose.phase2.yml`](docker/compose.phase2.yml)。
 它们使用 host network，保留真实 LAN 转发所需的最小权限：Agent 只授予
 `/dev/net/tun` 和 `NET_ADMIN`，不使用 `privileged` 或 Docker Socket。

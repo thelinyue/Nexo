@@ -345,7 +345,7 @@ impl HeadscaleSupervisor {
             &headscale_dir.join("derp_server_private.key"),
         );
         let content = format!(
-            "server_url: {server_url}\nlisten_addr: {listen}\nmetrics_listen_addr: 127.0.0.1:9090\nnoise:\n  private_key_path: {noise}\nprefixes:\n  v4: 100.64.0.0/10\n  v6: fd7a:115c:a1e0::/48\nderp:\n{derp_config}\n  update_frequency: 3h\ndatabase:\n  type: sqlite\n  sqlite:\n    path: {database}\npolicy:\n  # Headscale 0.29.x 只有 database 模式支持通过官方 API 更新策略。\n  mode: database\ndns:\n  magic_dns: true\n  base_domain: {dns_domain}\n  override_local_dns: true\n  nameservers:\n    # Headscale 0.29.x 在 override_local_dns 开启时要求至少一个上游 DNS。\n    # MagicDNS 仍负责 mesh.nexo.internal，其他名称交给这些公共解析器。\n    global:\n      - 1.1.1.1\n      - 1.0.0.1\n      - 2606:4700:4700::1111\n      - 2606:4700:4700::1001\n    split: {{}}\n  search_domains: []\n  extra_records: []\nunix_socket: {unix_socket}\nunix_socket_permission: \"0600\"\nlog:\n  level: info\n",
+            "server_url: {server_url}\nlisten_addr: {listen}\nmetrics_listen_addr: 127.0.0.1:9090\n# Caddy 与 Headscale 在同一容器内，只有回环反代可以提交真实客户端 IP。\ntrusted_proxies:\n  - 127.0.0.1/32\n  - ::1/128\nnoise:\n  private_key_path: {noise}\nprefixes:\n  v4: 100.64.0.0/10\n  v6: fd7a:115c:a1e0::/48\nderp:\n{derp_config}\n  update_frequency: 3h\ndatabase:\n  type: sqlite\n  sqlite:\n    path: {database}\npolicy:\n  # Headscale 0.29.x 只有 database 模式支持通过官方 API 更新策略。\n  mode: database\ndns:\n  magic_dns: true\n  base_domain: {dns_domain}\n  override_local_dns: true\n  nameservers:\n    # Headscale 0.29.x 在 override_local_dns 开启时要求至少一个上游 DNS。\n    # MagicDNS 仍负责 mesh.nexo.internal，其他名称交给这些公共解析器。\n    global:\n      - 1.1.1.1\n      - 1.0.0.1\n      - 2606:4700:4700::1111\n      - 2606:4700:4700::1001\n    split: {{}}\n  search_domains: []\n  extra_records: []\nunix_socket: {unix_socket}\nunix_socket_permission: \"0600\"\nlog:\n  level: info\n",
             server_url = yaml_quote(server_url),
             listen = yaml_quote(&self.config.listen_addr),
             noise = yaml_quote(&noise_key_path.to_string_lossy()),
@@ -690,5 +690,27 @@ mod tests {
         assert!(sources.contains("urls: []"));
         assert!(sources.contains("auto_update_enabled: false"));
         assert!(!sources.contains(DEFAULT_DERP_MAP_URL));
+    }
+
+    #[test]
+    fn generated_config_trusts_only_loopback_reverse_proxy() {
+        let root = std::env::temp_dir().join(format!("nexo-headscale-{}", uuid::Uuid::new_v4()));
+        let config = HeadscaleRuntimeConfig {
+            binary: PathBuf::from("headscale"),
+            data_dir: root.clone(),
+            listen_addr: "127.0.0.1:8281".to_owned(),
+            api_url: "http://127.0.0.1:8281".to_owned(),
+            server_url: "https://mesh.example.com".to_owned(),
+            dns_base_domain: "mesh.nexo.internal".to_owned(),
+            embedded_derp_enabled: false,
+            enabled: false,
+        };
+        HeadscaleSupervisor::new(config)
+            .write_config()
+            .expect("应生成 Headscale 配置");
+        let content =
+            fs::read_to_string(root.join("headscale").join("config.yaml")).expect("应读取配置");
+        assert!(content.contains("trusted_proxies:\n  - 127.0.0.1/32\n  - ::1/128"));
+        let _ = fs::remove_dir_all(root);
     }
 }
