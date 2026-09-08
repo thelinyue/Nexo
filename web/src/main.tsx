@@ -365,6 +365,7 @@ type Device = {
   expires_at?: number | null;
   control_plane_state?: string | null;
   last_seen_at: number | null;
+  needs_name?: boolean;
   tunnel_count?: number;
 };
 
@@ -414,6 +415,7 @@ type TailscaleExternalNode = {
   claim_state: string;
   discovered_at: number;
   last_seen_at: number;
+  needs_name?: boolean;
 };
 
 type MeshStatus = {
@@ -462,10 +464,12 @@ type AccessPolicyPreview = {
 };
 
 type StaticRouteGuide = {
+  purpose?: "site_network" | "mesh_client_return" | string;
   router_site_id: string;
   destination_site_id: string;
   router_site_name: string;
   destination_site_name: string;
+  destination_label?: string;
   destination_prefix: string;
   next_hop: string | null;
   router_confirmed?: boolean;
@@ -1364,7 +1368,7 @@ function DevicesPage({
   request: ApiRequest;
   onRefresh: () => Promise<void>;
   deletingResource: string | null;
-  onEditDevice: (device: Device, trigger: HTMLButtonElement) => void;
+  onEditDevice: (device: Device, trigger: HTMLButtonElement | null) => void;
   onDeleteDevice: (device: Device, trigger: HTMLButtonElement) => void;
 }) {
   const pending = enrollments.filter((item) => item.status === "awaiting_approval");
@@ -1391,11 +1395,13 @@ function DevicesPage({
       {officialView ? (
         <OfficialClientPanel
           isSystemAdmin={auth.role === "system_admin"}
+          devices={devices}
           clientConfig={clientConfig}
           authKeys={authKeys}
           externalNodes={externalNodes}
           request={request}
           onRefresh={onRefresh}
+          onEditDevice={onEditDevice}
         />
       ) : enrollmentView ? (
         <section className="panel page-panel">
@@ -1431,18 +1437,22 @@ function DevicesPage({
  * 和工作空间认领。Auth Key 明文只在创建成功时展示，刷新后不会再次出现。 */
 function OfficialClientPanel({
   isSystemAdmin,
+  devices,
   clientConfig,
   authKeys,
   externalNodes,
   request,
   onRefresh,
+  onEditDevice,
 }: {
   isSystemAdmin: boolean;
+  devices: Device[];
   clientConfig: TailscaleClientConfig | null;
   authKeys: TailscaleAuthKey[];
   externalNodes: TailscaleExternalNode[];
   request: ApiRequest;
   onRefresh: () => Promise<void>;
+  onEditDevice: (device: Device, trigger: HTMLButtonElement | null) => void;
 }) {
   const [label, setLabel] = useState("我的客户端");
   const [ttl, setTtl] = useState("604800");
@@ -1453,6 +1463,9 @@ function OfficialClientPanel({
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [message, setMessage] = useState<string | null>(null);
+  const [claimNames, setClaimNames] = useState<Record<string, string>>({});
+  const [loginServerCopied, setLoginServerCopied] = useState(false);
+  const officialDevices = devices.filter((device) => device.connection_type === "tailscale_client");
   const createKey = async (event: FormEvent) => {
     event.preventDefault();
     setBusy(true); setError(null); setMessage(null); setCreatedKey(null);
@@ -1494,16 +1507,21 @@ function OfficialClientPanel({
     }
   };
   const claimNode = async (node: TailscaleExternalNode) => {
+    const requestedName = (claimNames[node.node_id] ?? node.name).trim();
+    if (!requestedName || isPlaceholderDeviceName(requestedName)) {
+      setError("请先填写可识别的设备名称，不能使用 localhost");
+      return;
+    }
     setBusy(true); setError(null);
     try {
       const response = await request(`/api/v1/mesh/external-nodes/${encodeURIComponent(node.node_id)}/claim`, {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ name: node.name }),
+        body: JSON.stringify({ name: requestedName }),
       });
       const body: unknown = await response.json().catch(() => null);
       if (!response.ok) throw new Error(readApiError(body, "暂时无法认领外部节点"));
-      setMessage(`已认领“${node.name}”，设备已加入当前工作空间`);
+      setMessage(`已认领“${requestedName}”，设备已加入当前工作空间`);
       await onRefresh();
     } catch (requestError) {
       setError(requestError instanceof Error ? requestError.message : "暂时无法认领外部节点");
@@ -1519,11 +1537,26 @@ function OfficialClientPanel({
           <span className="status-pill ready"><i />协议支持</span>
         </div>
         <div className="official-client-facts">
-          <div><span>登录服务器</span><code>{clientConfig?.login_server ?? "正在读取…"}</code></div>
+          <div><span>登录服务器</span><div className="copyable-value"><code>{clientConfig?.login_server ?? "正在读取…"}</code><button className="icon-button" type="button" aria-label={loginServerCopied ? "登录服务器地址已复制" : "复制登录服务器地址"} title={loginServerCopied ? "已复制" : "复制登录服务器地址"} disabled={!clientConfig?.login_server} onClick={async () => { try { await navigator.clipboard.writeText(clientConfig?.login_server ?? ""); setLoginServerCopied(true); window.setTimeout(() => setLoginServerCopied(false), 1600); } catch { setError("浏览器无法访问剪贴板，请手动选择登录服务器地址"); } }}>
+            {loginServerCopied ? <CheckCircle2 size={16} aria-hidden="true" /> : <Copy size={16} aria-hidden="true" />}
+          </button></div></div>
           <div><span>授权方式</span><strong>由客户端发起</strong></div>
           <div><span>平台</span><strong>{clientConfig?.supported_platforms.join("、") ?? "Linux、Windows、macOS、iOS、Android、tvOS"}</strong></div>
         </div>
-        <p className="form-hint">请在官方 Tailscale 客户端填写登录服务器并开始连接，客户端会打开带本次注册上下文的一次性授权页面；授权完成后设备先保持隔离，确认归属后才进入当前工作空间。只有 Nexo Agent 设备可作为穿透或网关。</p>
+        <p className="form-hint">官方客户端完成登录后会先进入隔离状态；确认归属后才进入当前工作空间。只有 Nexo Agent 设备可作为穿透或网关。</p>
+      </section>
+      <section className="panel page-panel official-client-guide">
+        <div className="panel-heading"><div><p className="eyebrow">iPhone / iPad</p><h2>按官方流程连接</h2></div><span className="status-pill ready"><i />登录地址已就绪</span></div>
+        <ol className="official-client-steps">
+          <li><strong>先设置设备名称</strong><span>在 Tailscale 中填写 Device Name，避免 iOS 因隐私限制显示为 localhost。</span></li>
+          <li><strong>打开登录</strong><span>点右上角账户图标，选择“登录…”，再打开右上角选项菜单。</span></li>
+          <li><strong>使用自定义协调服务器</strong><span>选择“使用自定义协调服务器”，粘贴上方登录服务器地址并完成 Nexo 登录。</span></li>
+          <li><strong>回到这里确认三件事</strong><span>确认设备已加入、设备在线；再到“网络互联”页确认路由已配置，最后用真实局域网设备验证共享网段可达。</span></li>
+        </ol>
+      </section>
+      <section className="panel page-panel official-client-status">
+        <div className="panel-heading"><div><p className="eyebrow">连接检查</p><h2>{officialDevices.length} 台官方客户端</h2></div><button className="secondary-button compact-button" type="button" disabled={busy} onClick={() => void onRefresh()}><RefreshCw size={15} aria-hidden="true" />重新检查</button></div>
+        {officialDevices.length === 0 ? <EmptyState icon={MonitorSmartphone} title="登录后设备会出现在这里" detail="完成客户端登录和工作空间确认后，返回此页检查状态。" /> : <div className="official-device-status-list">{officialDevices.map((device) => <div className="official-device-status" key={device.id}><div><strong>{device.name}</strong><span>{device.tailscale_ipv4 ?? device.mesh_address ?? "组网地址待同步"}</span></div><div className="official-device-stages"><span className="status-pill ready"><i />已加入</span><span className={`status-pill ${device.status === "online" ? "ready" : "working"}`}><i />{device.status === "online" ? "设备在线" : "等待上线"}</span><span className="status-pill working"><i />共享网段待实际验证</span></div>{device.needs_name && <button className="secondary-button compact-button" type="button" onClick={() => onEditDevice(device, null)}><Pencil size={15} aria-hidden="true" />设置名称</button>}</div>)}</div>}
       </section>
       <div className="official-client-grid">
         <section className="panel page-panel">
@@ -1549,7 +1582,7 @@ function OfficialClientPanel({
       </div>
       {isSystemAdmin && <section className="panel page-panel">
         <div className="panel-heading"><div><p className="eyebrow">隔离节点</p><h2>等待认领的官方客户端</h2></div><button className="secondary-button compact-button" type="button" disabled={busy} onClick={() => void onRefresh()}><RefreshCw size={15} aria-hidden="true" />同步节点</button></div>
-        {externalNodes.length === 0 ? <EmptyState icon={ShieldCheck} title="没有待认领节点" detail="完成浏览器授权或客户端登录后，节点会在这里等待确认。" /> : <div className="external-node-list">{externalNodes.map((node) => <div className="external-node-row" key={node.node_id}><div><strong>{node.name}</strong><span>{node.addresses.join(" · ") || "地址待同步"}</span></div><span className={`status-pill ${node.online ? "ready" : "disabled"}`}><i />{node.online ? "在线" : "离线"}</span><button className="primary-button compact-button" type="button" disabled={busy} onClick={() => void claimNode(node)}><CheckCircle2 size={15} aria-hidden="true" />认领</button></div>)}</div>}
+        {externalNodes.length === 0 ? <EmptyState icon={ShieldCheck} title="没有待认领节点" detail="完成浏览器授权或客户端登录后，节点会在这里等待确认。" /> : <div className="external-node-list">{externalNodes.map((node) => <div className="external-node-row" key={node.node_id}><div><strong>{node.name}</strong><span>{node.addresses.join(" · ") || "地址待同步"}</span>{node.needs_name && <small className="device-name-warning">Headscale 返回了 localhost，请先填写 Device Name</small>}</div><span className={`status-pill ${node.online ? "ready" : "disabled"}`}><i />{node.online ? "在线" : "离线"}</span>{node.needs_name ? <div className="external-node-claim"><label><span>设备名称</span><input value={claimNames[node.node_id] ?? ""} placeholder="例如：我的 iPhone" onChange={(event) => setClaimNames((current) => ({ ...current, [node.node_id]: event.target.value }))} /></label><button className="primary-button compact-button" type="button" disabled={busy} onClick={() => void claimNode(node)}><CheckCircle2 size={15} aria-hidden="true" />命名并认领</button></div> : <button className="primary-button compact-button" type="button" disabled={busy} onClick={() => void claimNode(node)}><CheckCircle2 size={15} aria-hidden="true" />认领</button>}</div>)}</div>}
       </section>}
     </div>
   );
@@ -2799,6 +2832,7 @@ function NetworksPage({
   const [networkView, setNetworkView] = useState<"topology" | "sites">("topology");
   const [selectedTopologyLink, setSelectedTopologyLink] = useState<SiteLink | null>(null);
   const [selectedMobileLink, setSelectedMobileLink] = useState<SiteLink | null>(null);
+  const [selectedMobileSiteId, setSelectedMobileSiteId] = useState<string | null>(null);
   const networkFormSite = sites.find((site) => site.id === networkFormSiteId);
   const linkFormSite = sites.find((site) => site.id === linkFormSiteId);
   const primaryDomain = publicDomains.find((domain) => domain.is_primary);
@@ -2896,7 +2930,7 @@ function NetworksPage({
                       <section className="network-inline-section" aria-labelledby={`${detailsId}-links`}>
                         <div className="network-inline-heading"><div><h2 id={`${detailsId}-links`}>互联关系</h2><p>本站与其他站点的连接，以及本站需要配置的静态路由。</p></div><button className="secondary-button compact-button" type="button" onClick={() => onOpenLinkForm(site.id)} disabled={!canConnect}><Plus size={15} aria-hidden="true" />连接站点</button></div>
                         {!canConnect && <p className="network-prerequisite">{enabledNetworks.length === 0 ? "请先为本站添加并启用一个共享网络。" : "需要另一个站点具备已启用的共享网络。"}</p>}
-                        {links.length === 0 ? <p className="network-inline-empty">本站还没有连接其他站点。</p> : <div className="link-list">{links.map((link) => <SiteLinkCard key={link.id} link={link} currentSiteId={site.id} actionPending={actionLinkId === link.id || deletingResource === `link:${link.id}`} onToggle={() => void onToggleLink(link)} onRecheck={() => void onRecheckLink(link)} onConfirmRoute={(siteId) => void onConfirmRoute(link, siteId)} onEdit={() => onEditLink(link)} onDelete={() => onDeleteLink(link)} onOpenDetails={() => setSelectedMobileLink(link)} />)}</div>}
+                        {links.length === 0 ? <p className="network-inline-empty">本站还没有连接其他站点。</p> : <div className="link-list">{links.map((link) => <SiteLinkCard key={link.id} link={link} currentSiteId={site.id} actionPending={actionLinkId === link.id || deletingResource === `link:${link.id}`} onToggle={() => void onToggleLink(link)} onRecheck={() => void onRecheckLink(link)} onConfirmRoute={(siteId) => void onConfirmRoute(link, siteId)} onEdit={() => onEditLink(link)} onDelete={() => onDeleteLink(link)} onOpenDetails={() => { setSelectedMobileLink(link); setSelectedMobileSiteId(site.id); }} />)}</div>}
                       </section>
                     </div>
                   )}
@@ -2919,10 +2953,12 @@ function NetworksPage({
       {selectedMobileLink && (
         <MobileSiteLinkDetail
           link={selectedMobileLink}
+          currentSiteId={selectedMobileSiteId ?? selectedMobileLink.left_site_id}
           actionPending={actionLinkId === selectedMobileLink.id || deletingResource === `link:${selectedMobileLink.id}`}
-          onClose={() => setSelectedMobileLink(null)}
+          onClose={() => { setSelectedMobileLink(null); setSelectedMobileSiteId(null); }}
           onToggle={() => void onToggleLink(selectedMobileLink)}
           onRecheck={() => void onRecheckLink(selectedMobileLink)}
+          onConfirmRoute={(siteId) => void onConfirmRoute(selectedMobileLink, siteId)}
           onEdit={() => onEditLink(selectedMobileLink)}
           onDelete={() => onDeleteLink(selectedMobileLink)}
         />
@@ -3267,6 +3303,7 @@ function DeviceRow({ device, sites, deleting, onEdit, onDelete }: { device: Devi
         {device.owner_username && <span className="capability">所有者：{device.owner_username}</span>}
         {registrationLabel && <span className="capability">注册：{registrationLabel}</span>}
         <span className={`capability ${device.mesh_status === "connected" ? "ready" : ""}`}>网络互联：{meshStatusLabel(device.mesh_status)}</span>
+        {device.needs_name && <span className="capability warning">需要设置设备名称</span>}
         {tailscaleAddresses.map((address) => <span className="capability" key={address}>{address}</span>)}
         {device.tags?.length ? <span className="capability">标签：{device.tags.join("、")}</span> : null}
         {device.expires_at && <span className="capability">有效期至 {formatSessionTime(device.expires_at)}</span>}
@@ -3320,6 +3357,10 @@ function EditDeviceDialog({
         event.preventDefault();
         if (!name.trim()) {
           setError("设备名称不能为空");
+          return;
+        }
+        if (isPlaceholderDeviceName(name)) {
+          setError("设备名称不能使用 localhost，请填写可识别的设备名称");
           return;
         }
         setSubmitting(true);
@@ -4535,6 +4576,22 @@ function SiteLinkCard({
   const currentSiteName = link.left_site_id === currentSiteId ? link.left_site_name : link.right_site_name;
   const otherSiteName = link.left_site_id === currentSiteId ? link.right_site_name : link.left_site_name;
   const currentRoutes = link.static_routes.filter((route) => route.router_site_id === currentSiteId);
+  const siteRoutes = currentRoutes.filter((route) => route.purpose !== "mesh_client_return");
+  const clientReturnRoutes = currentRoutes.filter((route) => route.purpose === "mesh_client_return");
+  const allRoutesConfirmed = currentRoutes.length > 0 && currentRoutes.every((route) => route.router_confirmed);
+  const missingNextHop = currentRoutes.some((route) => !route.next_hop);
+  const [copiedRoute, setCopiedRoute] = useState<string | null>(null);
+  const copyRoute = async (route: StaticRouteGuide) => {
+    if (!route.next_hop) return;
+    try {
+      await navigator.clipboard.writeText(`${route.destination_prefix} via ${route.next_hop}`);
+      const key = `${route.router_site_id}-${route.purpose}-${route.destination_prefix}`;
+      setCopiedRoute(key);
+      window.setTimeout(() => setCopiedRoute((current) => current === key ? null : current), 1600);
+    } catch {
+      // 页面仍保留可选择的文本，剪贴板不可用时不阻断路由确认流程。
+    }
+  };
   return (
     <div className="site-link-card">
       <div className="site-link-heading">
@@ -4566,48 +4623,81 @@ function SiteLinkCard({
       {link.apply_error && <p className="link-error">{link.apply_error}</p>}
       {link.health_error && link.health_error !== link.apply_error && <p className="link-health-error">网关状态：{link.health_error}</p>}
       <div className="route-guide-list">
-        {currentRoutes.map((route) => (
-          <div className="route-guide" key={`${route.router_site_id}-${route.destination_site_id}-${route.destination_prefix}`}>
-            <span className="route-site">{route.router_site_name}</span>
-            <span className="route-arrow">→</span>
-            <span className="route-destination">{route.destination_site_name} · {route.destination_prefix}</span>
-            <span className="route-via">下一跳：{route.next_hop ?? "等待设备地址"}</span>
-            {route.router_confirmed ? (
-              <span className="route-confirmed">路由已配置</span>
-            ) : (
-              <button className="route-confirm-button" type="button" disabled={actionsDisabled} onClick={() => onConfirmRoute(route.router_site_id)}>
-                确认路由已配置
-              </button>
-            )}
-          </div>
-        ))}
+        <RouteGuideGroup title="访问另一站点" routes={siteRoutes} copiedRoute={copiedRoute} onCopy={copyRoute} />
+        <RouteGuideGroup title="允许组网设备访问本站" routes={clientReturnRoutes} copiedRoute={copiedRoute} onCopy={copyRoute} />
         {currentRoutes.length === 0 && <p className="network-inline-empty">本站暂时没有需要确认的静态路由。</p>}
+        {currentRoutes.length > 0 && (allRoutesConfirmed ? <span className="route-confirmed">本站全部路由已确认</span> : <div className="route-confirmation-action"><button className="route-confirm-button" type="button" aria-label="确认全部路由已配置（确认路由已配置）" disabled={actionsDisabled || missingNextHop} onClick={() => onConfirmRoute(currentSiteId)}>确认全部路由已配置</button>{missingNextHop && <small>等待 Agent 上报本站对应地址后才能确认。</small>}</div>)}
       </div>
     </div>
   );
 }
 
+function RouteGuideGroup({
+  title,
+  routes,
+  copiedRoute,
+  onCopy,
+}: {
+  title: string;
+  routes: StaticRouteGuide[];
+  copiedRoute: string | null;
+  onCopy: (route: StaticRouteGuide) => Promise<void>;
+}) {
+  if (routes.length === 0) return null;
+  return <section className="route-guide-group"><h3>{title}</h3>{routes.map((route) => {
+    const key = `${route.router_site_id}-${route.purpose}-${route.destination_prefix}`;
+    return <div className="route-guide" key={key}>
+      <span className="route-site">{route.router_site_name}</span>
+      <span className="route-arrow">→</span>
+      <span className="route-destination">{route.destination_label ?? route.destination_site_name} · {route.destination_prefix}</span>
+      <span className="route-via">下一跳：{route.next_hop ?? "等待设备地址"}</span>
+      {route.next_hop && <button className="icon-button route-copy-button" type="button" aria-label={copiedRoute === key ? "路由已复制" : `复制${route.destination_prefix}的路由`} title={copiedRoute === key ? "已复制" : "复制路由"} onClick={() => void onCopy(route)}>{copiedRoute === key ? <CheckCircle2 size={15} aria-hidden="true" /> : <Copy size={15} aria-hidden="true" />}</button>}
+    </div>;
+  })}</section>;
+}
+
 /** 移动端互联详情底部面板；关系列表保留可扫描摘要，详细状态在触发点附近展开。 */
 function MobileSiteLinkDetail({
   link,
+  currentSiteId,
   actionPending,
   onClose,
   onToggle,
   onRecheck,
+  onConfirmRoute,
   onEdit,
   onDelete,
 }: {
   link: SiteLink;
+  currentSiteId: string;
   actionPending: boolean;
   onClose: () => void;
   onToggle: () => void;
   onRecheck: () => void;
+  onConfirmRoute: (siteId: string) => void;
   onEdit: () => void;
   onDelete: () => void;
 }) {
   const status = link.deletion_pending ? { label: "等待删除", kind: "working" } : siteLinkStatus(link.apply_status);
   const health = gatewayHealthStatus(link.health_status, link.left_networks.some((network) => network.source === "manual") || link.right_networks.some((network) => network.source === "manual"));
   const actionsDisabled = actionPending || link.deletion_pending;
+  const currentRoutes = link.static_routes.filter((route) => route.router_site_id === currentSiteId);
+  const siteRoutes = currentRoutes.filter((route) => route.purpose !== "mesh_client_return");
+  const clientReturnRoutes = currentRoutes.filter((route) => route.purpose === "mesh_client_return");
+  const allRoutesConfirmed = currentRoutes.length > 0 && currentRoutes.every((route) => route.router_confirmed);
+  const missingNextHop = currentRoutes.some((route) => !route.next_hop);
+  const [copiedRoute, setCopiedRoute] = useState<string | null>(null);
+  const copyRoute = async (route: StaticRouteGuide) => {
+    if (!route.next_hop) return;
+    try {
+      await navigator.clipboard.writeText(`${route.destination_prefix} via ${route.next_hop}`);
+      const key = `${route.router_site_id}-${route.purpose}-${route.destination_prefix}`;
+      setCopiedRoute(key);
+      window.setTimeout(() => setCopiedRoute((current) => current === key ? null : current), 1600);
+    } catch {
+      // 移动端剪贴板权限可能被系统拒绝，保留可选择文本并继续允许确认。
+    }
+  };
   return (
     <aside className="mobile-site-link-detail" aria-label="互联详情">
       <div className="mobile-detail-heading">
@@ -4634,7 +4724,12 @@ function MobileSiteLinkDetail({
         {link.route_statuses.length === 0 && <p className="network-inline-empty">暂时没有逐路由状态。</p>}
       </div>
       <div className="mobile-detail-route-guide">
-        {link.static_routes.map((route) => <div key={`${route.router_site_id}-${route.destination_site_id}-${route.destination_prefix}`}><span>{route.router_site_name} → {route.destination_site_name}</span><code>{route.destination_prefix}</code><small>下一跳：{route.next_hop ?? "等待设备地址"}</small></div>)}
+        <RouteGuideGroup title="访问另一站点" routes={siteRoutes} copiedRoute={copiedRoute} onCopy={copyRoute} />
+        <RouteGuideGroup title="允许组网设备访问本站" routes={clientReturnRoutes} copiedRoute={copiedRoute} onCopy={copyRoute} />
+        {currentRoutes.length === 0 && <p className="network-inline-empty">本站暂时没有需要确认的静态路由。</p>}
+        {!allRoutesConfirmed && currentRoutes.length > 0 && <button className="secondary-button compact-button" type="button" aria-label="确认本站全部路由已配置（确认路由已配置）" disabled={actionsDisabled || missingNextHop} onClick={() => onConfirmRoute(currentSiteId)}>确认本站全部路由已配置</button>}
+        {missingNextHop && currentRoutes.length > 0 && <small className="route-confirmation-hint">等待 Agent 上报本站对应地址后才能确认。</small>}
+        {allRoutesConfirmed && <span className="route-confirmed">本站全部路由已确认</span>}
       </div>
       <div className="mobile-detail-actions">
         <button className="secondary-button compact-button" type="button" onClick={onEdit} disabled={actionsDisabled}>编辑</button>
@@ -4734,6 +4829,12 @@ function meshStatusLabel(status: Device["mesh_status"]): string {
     default:
       return "未加入";
   }
+}
+
+/** 与 Server 保持一致，只把明确的 localhost 占位名标为需要用户命名。 */
+function isPlaceholderDeviceName(value: string): boolean {
+  const normalized = value.trim().toLocaleLowerCase("en-US");
+  return normalized === "localhost" || /^localhost-\d+$/.test(normalized);
 }
 
 function siteLinkStatus(status: SiteLink["apply_status"]): { label: string; kind: string } {

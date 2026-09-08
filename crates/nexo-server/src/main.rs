@@ -98,6 +98,8 @@ enum AdminCommand {
 // 运行时只执行这一份收敛后的初始结构；已有数据库不会重新执行历史迁移。
 const V012_BASELINE_MIGRATION: &str = include_str!("../../../migrations/v0.1.12_baseline.sql");
 const OIDC_ACCOUNTS_MIGRATION: &str = include_str!("../../../migrations/0020_oidc_accounts.sql");
+const ROUTE_CONFIRMATIONS_MIGRATION: &str =
+    include_str!("../../../migrations/0021_route_confirmations.sql");
 
 #[derive(Clone)]
 pub(crate) struct AppState {
@@ -746,6 +748,8 @@ struct DeviceResponse {
     expires_at: Option<i64>,
     control_plane_state: Option<String>,
     last_seen_at: Option<i64>,
+    /// iOS 等官方客户端可能因系统隐私限制上报 localhost；需要用户补充可识别名称。
+    needs_name: bool,
     /// 供删除确认窗说明设备删除后的 Tunnel 处置方式。
     tunnel_count: i64,
 }
@@ -877,6 +881,8 @@ struct TailscaleExternalNodeResponse {
     claim_state: String,
     discovered_at: i64,
     last_seen_at: i64,
+    /// 隔离节点尚未认领时也要先阻止把 localhost 保存为最终名称。
+    needs_name: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -1147,16 +1153,26 @@ enum GatewayHealthStatus {
 ///
 /// Nexo 只生成引导，不会登录或修改用户路由器；`next_hop` 缺失时表示旧版
 /// Agent 尚未上报本地地址，UI 必须要求用户先确认设备的固定局域网地址。
-#[derive(Debug, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 struct StaticRouteGuide {
+    /// 站点网段路由和组网客户端回程路由都使用同一份确认流程。
+    purpose: StaticRoutePurpose,
     router_site_id: String,
     destination_site_id: String,
     router_site_name: String,
     destination_site_name: String,
+    destination_label: String,
     destination_prefix: String,
     next_hop: Option<String>,
     /// 用户在该站点路由器上完成配置后的持久化确认。
     router_confirmed: bool,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum StaticRoutePurpose {
+    SiteNetwork,
+    MeshClientReturn,
 }
 
 /// 服务端本地 CA 材料。私钥只在服务端内存中短暂使用，绝不通过 API 返回。
@@ -1226,6 +1242,7 @@ async fn main() -> Result<()> {
         .with_context(|| format!("无法打开 Nexo 数据库：{}", db_path.display()))?;
     initialize_v012_database(&connection).context("无法初始化或检查 Nexo 数据库基线")?;
     apply_oidc_accounts_migration(&connection).context("无法初始化 OIDC 账号映射数据结构")?;
+    apply_route_confirmations_migration(&connection).context("无法更新站点路由确认状态")?;
     ensure_server_ca(&connection).context("无法初始化服务端设备身份 CA")?;
     ensure_server_control_identity(&connection).context("无法初始化控制通道服务端证书")?;
     let data_dir = db_path
@@ -1675,6 +1692,7 @@ fn run_cli_command(command: CliCommand) -> Result<()> {
         .with_context(|| format!("无法打开 Nexo 数据库：{}", db_path.display()))?;
     initialize_v012_database(&connection)?;
     apply_oidc_accounts_migration(&connection)?;
+    apply_route_confirmations_migration(&connection)?;
     let data_dir = db_path.parent().context("Nexo 数据库路径缺少父目录")?;
     match command {
         CliCommand::BootstrapCode => {
@@ -1776,6 +1794,33 @@ fn apply_oidc_accounts_migration(connection: &Connection) -> Result<()> {
     }
     let transaction = connection.unchecked_transaction()?;
     transaction.execute_batch(OIDC_ACCOUNTS_MIGRATION)?;
+    transaction.commit()?;
+    Ok(())
+}
+
+/// 新增组网客户端回程路由后，旧的站点级确认不再代表完整配置。
+///
+/// 迁移只清理可重新确认的 UI 状态，保持设备身份、站点拓扑和 Headscale
+/// 数据不变；版本标记保证服务重启时不会重复清理。
+fn apply_route_confirmations_migration(connection: &Connection) -> Result<()> {
+    let applied = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version = 21)",
+        [],
+        |row| row.get::<_, bool>(0),
+    )?;
+    if applied {
+        return Ok(());
+    }
+    let has_oidc_migration: bool = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version = 20)",
+        [],
+        |row| row.get(0),
+    )?;
+    if !has_oidc_migration {
+        anyhow::bail!("数据库版本过旧或未完成迁移；路由确认迁移要求先升级到 OIDC 账号迁移");
+    }
+    let transaction = connection.unchecked_transaction()?;
+    transaction.execute_batch(ROUTE_CONFIRMATIONS_MIGRATION)?;
     transaction.commit()?;
     Ok(())
 }
@@ -7225,8 +7270,10 @@ fn device_response_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<DeviceR
     let mesh_online = row.get::<_, Option<i64>>(12)?.unwrap_or_default() != 0;
     let enrollment_state: Option<String> = row.get(14)?;
     let device_status: String = row.get(7)?;
+    let device_name: String = row.get(3)?;
     let owner_user_id: Option<String> = row.get(16)?;
     let registration_method: Option<String> = row.get(17)?;
+    let needs_name = registration_method.is_some() && is_placeholder_tailscale_name(&device_name);
     let tags_json: String = row
         .get::<_, Option<String>>(18)?
         .unwrap_or_else(|| "[]".to_owned());
@@ -7234,7 +7281,7 @@ fn device_response_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<DeviceR
         id: row.get(0)?,
         tenant_id: row.get(1)?,
         site_id: row.get(2)?,
-        name: row.get(3)?,
+        name: device_name.clone(),
         os: row.get(4)?,
         architecture: row.get(5)?,
         agent_version: row.get(6)?,
@@ -7292,6 +7339,7 @@ fn device_response_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<DeviceR
         expires_at: row.get(21)?,
         control_plane_state: row.get(22)?,
         last_seen_at: row.get(13)?,
+        needs_name,
         tunnel_count: row.get(15)?,
     })
 }
@@ -7385,6 +7433,12 @@ async fn update_device(
     let name = request.name.trim().to_owned();
     if name.is_empty() {
         return Err(ApiError::new(StatusCode::BAD_REQUEST, "设备名称不能为空"));
+    }
+    if is_placeholder_tailscale_name(&name) {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "设备名称不能使用 localhost，请填写可识别的设备名称",
+        ));
     }
     let site_id = request
         .site_id
@@ -10605,6 +10659,18 @@ fn dns_label_slug(value: &str) -> String {
     slug.trim_matches('-').to_owned()
 }
 
+/// 判断官方客户端是否仍使用 Apple 客户端可能上报的占位主机名。
+///
+/// 只识别 localhost 及其数字冲突后缀；用户手动填写的其它名称必须保持稳定，
+/// 不能因为下一次 Headscale 同步而被静默覆盖。
+fn is_placeholder_tailscale_name(value: &str) -> bool {
+    let normalized = value.trim().to_ascii_lowercase();
+    normalized == "localhost"
+        || normalized
+            .strip_prefix("localhost-")
+            .is_some_and(|suffix| !suffix.is_empty() && suffix.chars().all(|c| c.is_ascii_digit()))
+}
+
 /// 将 Headscale 节点投影为 Nexo 可持久化的运行身份；不把底层 Node 模型返回给 Web。
 fn mesh_identity_from_headscale_node(node: &HeadscaleNode) -> MeshIdentityReport {
     MeshIdentityReport {
@@ -13660,6 +13726,26 @@ fn update_headscale_node_projection(
         .find(|value| value.contains(':'))
         .cloned();
     let tags_json = serde_json::to_string(&node.tags).unwrap_or_else(|_| "[]".to_owned());
+    let incoming_name = node.name.trim();
+    if !incoming_name.is_empty() && !is_placeholder_tailscale_name(incoming_name) {
+        let current_name: Option<String> = transaction
+            .query_row(
+                "SELECT name FROM devices WHERE id = ?1",
+                [device_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if current_name
+            .as_deref()
+            .is_some_and(is_placeholder_tailscale_name)
+        {
+            transaction.execute(
+                "UPDATE devices SET name = ?1, updated_at = CURRENT_TIMESTAMP WHERE id = ?2",
+                rusqlite::params![incoming_name, device_id],
+            )?;
+            tracing::info!(device_id = %device_id, "Headscale 已提供有效设备名称，已更新 Nexo 设备资料");
+        }
+    }
     transaction.execute(
         "UPDATE mesh_identities
          SET tailscale_ipv4 = COALESCE(?1, tailscale_ipv4),
@@ -13702,6 +13788,26 @@ async fn sync_tailscale_external_nodes(state: &AppState) -> Result<()> {
             )
             .optional()?;
         if let Some(device_id) = known {
+            let incoming_name = node.name.trim();
+            if !incoming_name.is_empty() && !is_placeholder_tailscale_name(incoming_name) {
+                let current_name: Option<String> = connection
+                    .query_row(
+                        "SELECT name FROM devices WHERE id = ?1",
+                        [&device_id],
+                        |row| row.get(0),
+                    )
+                    .optional()?;
+                if current_name
+                    .as_deref()
+                    .is_some_and(is_placeholder_tailscale_name)
+                {
+                    connection.execute(
+                        "UPDATE devices SET name = ?1, updated_at = CURRENT_TIMESTAMP WHERE id = ?2",
+                        rusqlite::params![incoming_name, device_id],
+                    )?;
+                    tracing::info!(device_id = %device_id, "Headscale 已提供有效设备名称，已更新 Nexo 设备资料");
+                }
+            }
             let ipv4 = node
                 .ip_addresses
                 .iter()
@@ -13718,8 +13824,9 @@ async fn sync_tailscale_external_nodes(state: &AppState) -> Result<()> {
                 "UPDATE mesh_identities SET online = ?1,
                  tailscale_ipv4 = COALESCE(?2, tailscale_ipv4),
                  tailscale_ipv6 = COALESCE(?3, tailscale_ipv6),
-                 updated_at = CURRENT_TIMESTAMP WHERE nexo_device_id = ?4",
-                rusqlite::params![i64::from(node.online), ipv4, ipv6, device_id],
+                 hostname = COALESCE(NULLIF(?4, ''), hostname),
+                 updated_at = CURRENT_TIMESTAMP WHERE nexo_device_id = ?5",
+                rusqlite::params![i64::from(node.online), ipv4, ipv6, node.name, device_id],
             )?;
             connection.execute(
                 "UPDATE tailscale_device_metadata
@@ -13790,6 +13897,7 @@ async fn list_tailscale_external_nodes(
                 claim_state: row.get(3)?,
                 discovered_at: row.get(4)?,
                 last_seen_at: row.get(5)?,
+                needs_name: is_placeholder_tailscale_name(&row.get::<_, String>(1)?),
             })
         })
         .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法读取外部节点"))?;
@@ -13859,13 +13967,52 @@ async fn claim_tailscale_external_node(
             .id
     };
     let device_id = Uuid::new_v4().to_string();
-    let device_name = requested_name.unwrap_or_else(|| {
-        if node.name.trim().is_empty() {
-            format!("官方客户端-{}", node.id)
-        } else {
-            node.name.clone()
+    let device_name = match requested_name.as_deref() {
+        Some(name) if !is_placeholder_tailscale_name(name) => name.to_owned(),
+        Some(_) => {
+            return Err(ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "设备名称不能使用 localhost，请填写可识别的设备名称",
+            ));
         }
-    });
+        None if is_placeholder_tailscale_name(&node.name) => {
+            return Err(ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "Headscale 只返回 localhost，请先在 Tailscale 中设置 Device Name，或在此输入设备名称",
+            ));
+        }
+        None if node.name.trim().is_empty() => format!("官方客户端-{}", node.id),
+        None => node.name.clone(),
+    };
+    // 命名并认领必须与设备编辑使用同一套 Headscale 主机名规则，避免
+    // Nexo 只改本地显示名而官方客户端下一次同步又回到 localhost。
+    let renamed_hostname = if requested_name
+        .as_deref()
+        .is_some_and(|name| name != node.name.trim())
+    {
+        let hostname = mesh_hostname(&tenant_id, &device_name, &device_id);
+        state
+            .headscale
+            .rename_node(&node.id, &hostname)
+            .await
+            .map_err(|error| {
+                tracing::warn!(
+                    node_id = %node.id,
+                    device_name = %device_name,
+                    "认领前无法同步官方客户端名称到 Headscale：{error:#}"
+                );
+                ApiError::new(
+                    StatusCode::BAD_GATEWAY,
+                    "暂时无法同步设备组网名称，设备尚未认领，请稍后重试",
+                )
+            })?;
+        Some(hostname)
+    } else {
+        None
+    };
+    let headscale_hostname = renamed_hostname
+        .clone()
+        .or_else(|| (!node.name.trim().is_empty()).then(|| node.name.clone()));
     let ipv4 = node
         .ip_addresses
         .iter()
@@ -13940,9 +14087,16 @@ async fn claim_tailscale_external_node(
     transaction
         .execute(
             "INSERT INTO mesh_identities
-             (nexo_device_id, tenant_id, headscale_node_id, state, tailscale_ipv4, online)
-             VALUES (?1, ?2, ?3, 'ready', ?4, ?5)",
-            rusqlite::params![device_id, tenant_id, node.id, ipv4, i64::from(node.online)],
+             (nexo_device_id, tenant_id, headscale_node_id, state, tailscale_ipv4, hostname, online)
+             VALUES (?1, ?2, ?3, 'ready', ?4, ?5, ?6)",
+            rusqlite::params![
+                device_id,
+                tenant_id,
+                node.id,
+                ipv4,
+                headscale_hostname,
+                i64::from(node.online)
+            ],
         )
         .map_err(|_| ApiError::new(StatusCode::CONFLICT, "无法绑定官方客户端组网身份"))?;
     transaction
@@ -15937,6 +16091,18 @@ async fn confirm_site_link_router(
         .db
         .lock()
         .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "数据库锁不可用"))?;
+    let route_preview = read_site_link_response(&connection, &id)?;
+    if route_preview
+        .static_routes
+        .iter()
+        .filter(|route| route.router_site_id == site_id)
+        .any(|route| route.next_hop.is_none())
+    {
+        return Err(ApiError::new(
+            StatusCode::CONFLICT,
+            "本站仍缺少可用的 LAN 下一跳，请先让 Agent 上报对应地址",
+        ));
+    }
     let transaction = connection
         .transaction()
         .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法开始路由确认事务"))?;
@@ -16188,10 +16354,12 @@ fn read_site_link_response(
     let mut static_routes = Vec::new();
     for network in &right_networks {
         static_routes.push(StaticRouteGuide {
+            purpose: StaticRoutePurpose::SiteNetwork,
             router_site_id: left_site_id.clone(),
             destination_site_id: right_site_id.clone(),
             router_site_name: left_site_name.clone(),
             destination_site_name: right_site_name.clone(),
+            destination_label: right_site_name.clone(),
             destination_prefix: network.prefix.clone(),
             next_hop: hop_for("left", &network.address_family)
                 .or_else(|| gateway_for_family(&left_networks, &network.address_family)),
@@ -16200,16 +16368,62 @@ fn read_site_link_response(
     }
     for network in &left_networks {
         static_routes.push(StaticRouteGuide {
+            purpose: StaticRoutePurpose::SiteNetwork,
             router_site_id: right_site_id.clone(),
             destination_site_id: left_site_id.clone(),
             router_site_name: right_site_name.clone(),
             destination_site_name: left_site_name.clone(),
+            destination_label: left_site_name.clone(),
             destination_prefix: network.prefix.clone(),
             next_hop: hop_for("right", &network.address_family)
                 .or_else(|| gateway_for_family(&right_networks, &network.address_family)),
             router_confirmed: right_confirmation.is_some(),
         });
     }
+    // SiteLink 关闭 SNAT 后，局域网设备需要知道如何把官方 Tailscale
+    // 客户端地址段返回给本站 Agent；普通未参与 SiteLink 的共享网络仍由
+    // Agent SNAT，不会生成这类额外要求。
+    let mut push_client_return_route = |side: &str,
+                                        site_id: &str,
+                                        site_name: &str,
+                                        networks: &[SiteLinkNetworkSummary],
+                                        confirmed: bool| {
+        for (family, prefix) in [("ipv4", "100.64.0.0/10"), ("ipv6", "fd7a:115c:a1e0::/48")] {
+            if networks
+                .iter()
+                .any(|network| network.address_family == family)
+            {
+                static_routes.push(StaticRouteGuide {
+                    purpose: StaticRoutePurpose::MeshClientReturn,
+                    router_site_id: site_id.to_owned(),
+                    // 组网客户端地址段是全局虚拟目标，不属于另一侧站点；
+                    // 使用空 ID 保留旧字段形状，由 purpose/destination_label 识别它。
+                    destination_site_id: String::new(),
+                    router_site_name: site_name.to_owned(),
+                    destination_site_name: "组网客户端".to_owned(),
+                    destination_label: "组网客户端".to_owned(),
+                    destination_prefix: prefix.to_owned(),
+                    next_hop: hop_for(side, family)
+                        .or_else(|| gateway_for_family(networks, family)),
+                    router_confirmed: confirmed,
+                });
+            }
+        }
+    };
+    push_client_return_route(
+        "left",
+        &left_site_id,
+        &left_site_name,
+        &left_networks,
+        left_confirmation.is_some(),
+    );
+    push_client_return_route(
+        "right",
+        &right_site_id,
+        &right_site_name,
+        &right_networks,
+        right_confirmation.is_some(),
+    );
     let route_statuses = read_site_link_route_statuses(
         connection,
         &id,
@@ -17101,6 +17315,16 @@ mod tests {
                 .clone())
         }
 
+        async fn rename_node(&self, node_id: &str, new_name: &str) -> Result<HeadscaleNode> {
+            let mut nodes = self.nodes.lock().expect("应更新测试 Headscale 节点");
+            let node = nodes
+                .iter_mut()
+                .find(|node| node.id == node_id)
+                .ok_or_else(|| anyhow::anyhow!("测试节点不存在"))?;
+            node.name = new_name.to_owned();
+            Ok(node.clone())
+        }
+
         async fn check_policy(&self, policy: &str) -> std::result::Result<(), PolicyCheckError> {
             if let Some(error) = self
                 .policy_check_error
@@ -17349,7 +17573,7 @@ mod tests {
             }]),
             ..OfficialClientHeadscale::default()
         });
-        let state = test_state_with_headscale(headscale);
+        let state = test_state_with_headscale(headscale.clone());
         insert_tenant_session(&state);
 
         let ordinary_list = list_tailscale_external_nodes(State(state.clone()), tenant_headers())
@@ -17407,6 +17631,51 @@ mod tests {
                 "user-1".to_owned(),
                 "claimed".to_owned()
             )
+        );
+    }
+
+    #[tokio::test]
+    async fn external_localhost_node_requires_a_real_name_before_claim() {
+        let headscale = Arc::new(OfficialClientHeadscale {
+            nodes: Mutex::new(vec![HeadscaleNode {
+                id: "external-localhost".to_owned(),
+                name: "localhost".to_owned(),
+                online: true,
+                ..HeadscaleNode::default()
+            }]),
+            ..OfficialClientHeadscale::default()
+        });
+        let state = test_state_with_headscale(headscale.clone());
+        insert_tenant_session(&state);
+        let nodes = list_tailscale_external_nodes(State(state.clone()), admin_headers())
+            .await
+            .expect("管理员应能读取 localhost 节点")
+            .0;
+        assert!(nodes[0].needs_name);
+        let rejected = claim_tailscale_external_node(
+            State(state.clone()),
+            admin_headers(),
+            Path("external-localhost".to_owned()),
+            None,
+        )
+        .await
+        .expect_err("localhost 节点必须先命名");
+        assert_eq!(rejected.status, StatusCode::BAD_REQUEST);
+        let claimed = claim_tailscale_external_node(
+            State(state),
+            admin_headers(),
+            Path("external-localhost".to_owned()),
+            Some(Json(ClaimTailscaleNodeRequest {
+                name: Some("我的 iPhone".to_owned()),
+            })),
+        )
+        .await
+        .expect("填写名称后应能认领")
+        .0;
+        assert_eq!(claimed.name, "我的 iPhone");
+        assert_ne!(
+            headscale.nodes.lock().expect("应读取认领后的节点名称")[0].name,
+            "localhost"
         );
     }
 
@@ -18224,6 +18493,50 @@ mod tests {
             .expect("应记录 OIDC 迁移版本"));
     }
 
+    #[test]
+    fn route_confirmation_migration_clears_old_state_once() {
+        let connection = Connection::open_in_memory().expect("应打开测试数据库");
+        initialize_v012_database(&connection).expect("应创建 Baseline");
+        apply_oidc_accounts_migration(&connection).expect("应执行 OIDC 迁移");
+        connection
+            .execute_batch(
+                "INSERT INTO tenants (id, name) VALUES ('tenant-route', '路由测试租户');
+                 INSERT INTO sites (id, tenant_id, name) VALUES
+                    ('site-route-a', 'tenant-route', '甲站点'),
+                    ('site-route-b', 'tenant-route', '乙站点');
+                 INSERT INTO site_links (id, tenant_id, left_site_id, right_site_id)
+                    VALUES ('link-route', 'tenant-route', 'site-route-a', 'site-route-b');
+                 INSERT INTO site_link_route_confirmations (site_link_id, site_id, confirmed_at)
+                    VALUES ('link-route', 'site-route-a', CURRENT_TIMESTAMP);",
+            )
+            .expect("应创建旧路由确认");
+        apply_route_confirmations_migration(&connection).expect("应执行路由确认迁移");
+        let count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM site_link_route_confirmations",
+                [],
+                |row| row.get(0),
+            )
+            .expect("应读取清理后的确认");
+        assert_eq!(count, 0);
+        connection
+            .execute(
+                "INSERT INTO site_link_route_confirmations (site_link_id, site_id, confirmed_at)
+                 VALUES ('link-route', 'site-route-a', CURRENT_TIMESTAMP)",
+                [],
+            )
+            .expect("应写入新的确认");
+        apply_route_confirmations_migration(&connection).expect("重复启动不应再次清理");
+        let retained: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM site_link_route_confirmations",
+                [],
+                |row| row.get(0),
+            )
+            .expect("应读取保留的确认");
+        assert_eq!(retained, 1);
+    }
+
     fn test_state() -> AppState {
         test_state_with_headscale(Arc::new(HeadscaleAdapter))
     }
@@ -18234,6 +18547,7 @@ mod tests {
             .execute_batch(V012_BASELINE_MIGRATION)
             .expect("应初始化 v0.1.12 单一 Baseline");
         apply_oidc_accounts_migration(&connection).expect("应初始化 OIDC 账号映射结构");
+        apply_route_confirmations_migration(&connection).expect("应初始化路由确认迁移");
         ensure_server_ca(&connection).expect("应初始化测试 CA");
         ensure_server_control_identity(&connection).expect("应初始化测试控制证书");
         connection
@@ -18456,6 +18770,81 @@ mod tests {
         );
         assert!(long.len() <= 63);
         assert!(long.ends_with("-550e8400e29b41d4a716446655440000"));
+    }
+
+    #[test]
+    fn tailscale_placeholder_name_policy_is_strict() {
+        assert!(is_placeholder_tailscale_name("localhost"));
+        assert!(is_placeholder_tailscale_name("LOCALHOST-2"));
+        assert!(!is_placeholder_tailscale_name("localhost-office"));
+        assert!(!is_placeholder_tailscale_name("iphone-linyue"));
+        assert!(!is_placeholder_tailscale_name("localhost-"));
+    }
+
+    #[test]
+    fn oidc_projection_recovers_placeholder_name_without_overwriting_manual_name() {
+        let connection = Connection::open_in_memory().expect("应打开内存数据库");
+        connection
+            .execute_batch(V012_BASELINE_MIGRATION)
+            .expect("应初始化测试数据库");
+        connection
+            .execute_batch(
+                "INSERT INTO tenants (id, name) VALUES ('tenant-name', '名称测试租户');
+                 INSERT INTO devices (id, tenant_id, name, status)
+                 VALUES ('device-name', 'tenant-name', 'localhost', 'online');
+                 INSERT INTO mesh_identities
+                 (nexo_device_id, tenant_id, headscale_node_id, hostname, online)
+                 VALUES ('device-name', 'tenant-name', 'node-name', 'localhost', 1);",
+            )
+            .expect("应创建占位名称设备");
+        let node = HeadscaleNode {
+            id: "node-name".to_owned(),
+            name: "linyue-iphone".to_owned(),
+            ..HeadscaleNode::default()
+        };
+        {
+            let transaction = connection
+                .unchecked_transaction()
+                .expect("应开始名称投影事务");
+            update_headscale_node_projection(&transaction, "device-name", &node)
+                .expect("占位名称应能恢复");
+            transaction.commit().expect("应提交名称投影事务");
+        }
+        let recovered: String = connection
+            .query_row(
+                "SELECT name FROM devices WHERE id = 'device-name'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("应读取恢复后的名称");
+        assert_eq!(recovered, "linyue-iphone");
+        connection
+            .execute(
+                "UPDATE devices SET name = '我的 iPhone' WHERE id = 'device-name'",
+                [],
+            )
+            .expect("应写入手动名称");
+        let transaction = connection
+            .unchecked_transaction()
+            .expect("应开始手动名称保护事务");
+        update_headscale_node_projection(
+            &transaction,
+            "device-name",
+            &HeadscaleNode {
+                name: "another-headscale-name".to_owned(),
+                ..node
+            },
+        )
+        .expect("手动名称同步应成功");
+        transaction.commit().expect("应提交手动名称保护事务");
+        let preserved: String = connection
+            .query_row(
+                "SELECT name FROM devices WHERE id = 'device-name'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("应读取手动名称");
+        assert_eq!(preserved, "我的 iPhone");
     }
 
     #[test]
@@ -21046,29 +21435,51 @@ mod tests {
         );
         assert_eq!(link.left_gateway_address.as_deref(), Some("192.168.10.2"));
         assert_eq!(link.right_gateway_address.as_deref(), Some("192.168.20.2"));
+        let site_routes = link
+            .static_routes
+            .iter()
+            .filter(|route| route.purpose == StaticRoutePurpose::SiteNetwork)
+            .cloned()
+            .collect::<Vec<_>>();
         assert_eq!(
-            link.static_routes,
+            site_routes,
             vec![
                 StaticRouteGuide {
+                    purpose: StaticRoutePurpose::SiteNetwork,
                     router_site_id: "site-a".to_owned(),
                     destination_site_id: "site-b".to_owned(),
                     router_site_name: "家庭".to_owned(),
                     destination_site_name: "办公室".to_owned(),
+                    destination_label: "办公室".to_owned(),
                     destination_prefix: "192.168.20.0/24".to_owned(),
                     next_hop: Some("192.168.10.2".to_owned()),
                     router_confirmed: false,
                 },
                 StaticRouteGuide {
+                    purpose: StaticRoutePurpose::SiteNetwork,
                     router_site_id: "site-b".to_owned(),
                     destination_site_id: "site-a".to_owned(),
                     router_site_name: "办公室".to_owned(),
                     destination_site_name: "家庭".to_owned(),
+                    destination_label: "家庭".to_owned(),
                     destination_prefix: "192.168.10.0/24".to_owned(),
                     next_hop: Some("192.168.20.2".to_owned()),
                     router_confirmed: false,
                 },
             ]
         );
+        let client_return_routes = link
+            .static_routes
+            .iter()
+            .filter(|route| route.purpose == StaticRoutePurpose::MeshClientReturn)
+            .cloned()
+            .collect::<Vec<_>>();
+        assert_eq!(client_return_routes.len(), 2);
+        assert!(client_return_routes.iter().all(|route| {
+            route.destination_prefix == "100.64.0.0/10"
+                && route.destination_label == "组网客户端"
+                && route.next_hop.is_some()
+        }));
         {
             let connection = state.db.lock().expect("数据库锁应可用");
             connection
