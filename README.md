@@ -3,9 +3,9 @@
 Nexo 是面向个人自托管、NAS/HomeLab 和小型网络环境的设备、异地组网与公网访问管理服务。
 它把设备、共享网络、站点互联、Web 服务和 TCP 端口集中到一个 Web 界面中，正常使用不需要编辑配置文件。
 
-## v0.1.15 Server 快速开始
+## v0.1.17 快速开始
 
-当前 Server 版本为 `0.1.15`，Agent 版本仍为 `0.1.14`；本次只发布 Server。
+当前 Server 与 Agent 版本均为 `0.1.17`，本次需要共同升级。
 当前版本仅支持 `linux/amd64` Docker。Server 与 Agent 使用独立镜像，Agent
 可以安装在其他家庭、办公室或 VPS 上并加入任意 Nexo Server。
 
@@ -19,7 +19,7 @@ name: nexo
 
 services:
   nexo-server:
-    image: ghcr.io/thelinyue/nexo-server:0.1.15
+    image: ghcr.io/thelinyue/nexo-server:0.1.17
     container_name: nexo-server
     network_mode: host
     environment:
@@ -59,7 +59,7 @@ name: nexo-agent
 
 services:
   nexo-agent:
-    image: ghcr.io/thelinyue/nexo-agent:0.1.14
+    image: ghcr.io/thelinyue/nexo-agent:0.1.17
     container_name: nexo-agent
     network_mode: host
     cap_add:
@@ -84,7 +84,7 @@ services:
 | `NEXO_SERVER_URL` | Agent 首次联系的 Nexo 管理地址，并用于自动推导同一主机的 `9890/9891` | `http://192.168.1.10:8280` 或 `https://nexo.example.com` | 必填；必须能从 Agent 所在网络访问 |
 | `NEXO_ENROLLMENT_TOKEN` | 授权一台设备提交入网请求 | Web 生成的短时字符串 | 首次入网必填且属于敏感信息；领取设备身份后失效，可从 Compose 或 `.env` 删除 |
 
-设备名称、所属站点、域名与 HTTPS、共享网络和穿透服务都在 Web 中管理。
+设备名称、所属站点、域名与 HTTPS、私网访问和公网服务都在 Web 中管理。
 官方镜像内的组件路径、监听地址、能力开关和数据目录不需要用户设置。Agent
 身份保存在 `./data/nexo-agent`，容器重启后不会再次使用已经失效的 Token。
 
@@ -93,7 +93,7 @@ services:
 - 首次打开 LAN 管理入口完成管理员初始化，之后使用 Argon2id 密码和服务端 Session 登录。
 - 设备通过一次性入网请求加入 Nexo，批准后自动建立异地组网身份。
 - Subnet Gateway 和 Site Gateway 保留第一阶段的双向 LAN 互联、真实源 IP 和稳定设备身份。
-- “公网访问”下的“内网穿透”支持 TCP 端口以及 HTTP/HTTPS Web Service；每条资源称为“穿透服务”，Web Service 通过受限本地桥接，不暴露 Origin 端口。
+- “网络 > 公网服务”统一管理 TCP 端口以及 HTTP/HTTPS Web 服务；Web 服务通过受限本地桥接，不暴露源站端口。
 - “域名与 HTTPS”支持一个主域名和多个附加域名；每项独立管理 Cloudflare DNS-01 或手动证书。列表可批量重新检测或申请证书，并展示根/泛域名证书到期时间、Caddy 预计续期窗口和 CA 自动退避状态。
 - 配置后提供泛域名证书和 `nexo.<domain>` 管理地址、`mesh.<domain>` 组网地址；`mesh.<domain>` 必须保持 Cloudflare DNS only。
 - Caddy、Headscale 和 Tailscale 是镜像中的独立组件，由 Nexo 负责协调；普通用户不需要操作它们的配置或命令。
@@ -150,8 +150,8 @@ docker compose -f docker/compose.phase2.yml exec nexo-server nexo admin recover
 ## Docker 部署
 
 正式发布使用仓库根目录的 [`compose.yml`](compose.yml) 和
-[`compose.agent.yml`](compose.agent.yml)，Agent 镜像标签固定为 `0.1.14`，不会隐式
-升级；Server 与 Agent 不要求使用相同标签。开发环境的源码构建示例仍保留在
+[`compose.agent.yml`](compose.agent.yml)，当前两端镜像标签均固定为 `0.1.17`，不会隐式
+升级。后续版本仍按组件实际代码变化独立发布。开发环境的源码构建示例保留在
 [`docker/compose.phase2.yml`](docker/compose.phase2.yml)。
 它们使用 host network，保留真实 LAN 转发所需的最小权限：Agent 只授予
 `/dev/net/tun` 和 `NET_ADMIN`，不使用 `privileged` 或 Docker Socket。
@@ -210,26 +210,30 @@ v0.1.12 将历史 0001–0019 及在线结构补丁收敛为单一初始 Baselin
 直接创建该 Baseline；已有数据库必须已经记录迁移版本 19，低于 v0.1.12 的数据库
 会以中文错误拒绝启动，不能由当前版本自动补齐历史结构。
 
-## 穿透服务
+## 公网服务
 
-管理员登录后，在“公网访问 > 内网穿透”页面添加穿透服务：
+管理员登录后，在“网络 > 公网服务”页面添加服务：
 
 - **Web 服务**：填写访问名称、本地地址和端口，选择 HTTP 或 HTTPS Origin。HTTP 服务只走 80；HTTPS 服务走 443，80 对同名主机返回 308 跳转。
 - **TCP 端口**：选择自动分配或手动填写 `20000-29999` 中的端口。端口占用会在保存前由 Server 和宿主机同时检查。
 
-修改流程始终显示“配置生效中 / 已生效 / 配置失败”，失败时保留上一份 Applied 配置。证书私钥、Cloudflare Token 和自定义 CA 只保存为 `0600` Secret 文件，不会进入数据库导出、日志或 API 响应。
+修改流程统一显示“正常 / 处理中 / 需处理 / 已关闭”，技术阶段在详情中查看。失败时保留上一份已应用配置。证书私钥、Cloudflare Token 和自定义 CA 只保存为 `0600` Secret 文件，不会进入数据库导出、日志或 API 响应。
 
 ## Web PWA
 
-Nexo Web 可从支持 PWA 的桌面或移动浏览器安装，启动地址为 `/#/overview`。Service Worker 只预缓存应用壳和带版本的静态资源；`/api/` 请求始终联网，账户、设备、穿透服务和网络数据不会写入离线缓存。断网时页面会显示“无法连接 Nexo”并提供重试，新版本也只在用户确认后刷新。
+Nexo Web 可从支持 PWA 的桌面或移动浏览器安装，启动地址为 `/#/overview`。Service Worker 只预缓存应用壳和带版本的静态资源；`/api/` 请求始终联网，账户、设备、公网服务和网络数据不会写入离线缓存。断网时页面会显示“无法连接 Nexo”并提供重试，新版本也只在用户确认后刷新。
 
 普通控制台发现新版本时需要用户确认刷新；带 OIDC 登录票据的页面会自动接管旧版 Service Worker，避免组网登录停留在旧应用壳。浏览器设备模拟用于验证响应式布局与 Service Worker 行为，不能替代真实 iOS Safari 主屏幕模式或 Android 安装后的验收。
 
 ## 组网
 
-设备、共享本地网络和站点互联均通过 Web Desired State 管理。Nexo 会拒绝默认路由、重叠网段和错误租户；Site Gateway 使用不改写源地址的策略。关闭站点互联只撤销两侧路由，组网设备本身仍保持连接。
+设备、私网访问和站点互联均通过 Web Desired State 管理。在“网络 > 私网访问”中选择 Agent 检测到的家庭网段并确认后，Nexo 会一次完成路由创建、Agent 广告、控制面批准和同工作空间授权。普通共享网段默认启用 SNAT，不要求家庭路由器配置回程路由；无 SNAT 的 SiteLink 位于“站点互联 · 高级”。Nexo 会拒绝默认路由、重叠网段和错误租户。
 
-公网域名配置完成前，已有设备信息仍可查看，但新的公网组网入口和新的网关应用会保持受限状态。更换已经被设备或 Web Service 使用的根域名前，必须先移除这些依赖。
+Tailscale 的 `--snat-subnet-routes` 是节点级开关，无法按单条路由分别设置。同一 Agent 一旦承担 SiteLink，其普通共享网段也会随节点切换为无 SNAT；需要同时保留普通共享网段默认 SNAT 时，应让 SiteLink 使用独立 Agent。
+
+官方 Tailscale 客户端从“网络 > 设备 > 添加设备”加入，可使用浏览器登录或“网络设置 > 客户端密钥”签发的短期密钥。OIDC 和 Nexo 签发密钥加入的节点自动归属对应工作空间；未知来源节点保持隔离。连接详情只展示 P2P、节点中继、DERP 中继、空闲或未知，不上传公网端点和中继区域。
+
+公网域名配置完成前，已有设备信息仍可查看，但新的公网组网入口和新的网关应用会保持受限状态。更换已经被设备或 Web 服务使用的根域名前，必须先移除这些依赖。
 
 ## 开发检查
 

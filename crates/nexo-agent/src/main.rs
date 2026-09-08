@@ -24,7 +24,8 @@ use nexo_core::{
 use nexo_protocol::{
     AgentControlMessage, AgentEnrollmentPollRequest, AgentEnrollmentPollResponse,
     AgentEnrollmentRequest, AgentEnrollmentResponse, GatewayApplyAck, GatewayDesiredState,
-    GatewayRouteApplyReport, GatewayRouteApplyResult, MeshEnrollmentOffer, MeshIdentityReport,
+    GatewayRouteApplyReport, GatewayRouteApplyResult, MeshConnectionCheckResult,
+    MeshConnectionCheckTask, MeshConnectionObservation, MeshEnrollmentOffer, MeshIdentityReport,
     ServerControlMessage, TunnelApplyResult, TunnelDesiredState,
 };
 use nexo_tunnel::{
@@ -747,6 +748,7 @@ async fn control_session(
     .await?;
     let response = read_control_response(&mut reader).await?;
     apply_server_tunnel_endpoint(tunnel_endpoint, &response).await;
+    let connection_checks = server_connection_checks(&response);
     let mut last_gateway_state = None;
     let mut last_gateway_status = None;
     let mut gateway_confirmation_pending = false;
@@ -835,11 +837,16 @@ async fn control_session(
         ServerControlMessage::TunnelApplyAccepted { .. } => {
             anyhow::bail!("服务端在身份声明前返回了 Tunnel 确认")
         }
+        ServerControlMessage::MeshConnectionCheckAccepted { .. } => {
+            anyhow::bail!("服务端在身份声明前返回了连接检测确认")
+        }
     }
+    execute_mesh_connection_checks(&mut reader, config, &connection_checks).await?;
     loop {
         tokio::time::sleep(std::time::Duration::from_secs(15)).await;
         let heartbeat_gateway_report = detect_gateway_capabilities();
         let heartbeat_mesh_identity = query_optional_mesh_identity(config).await;
+        let heartbeat_mesh_connections = query_optional_mesh_connections(config).await;
         write_agent_message(
             reader.get_mut(),
             &AgentControlMessage::Heartbeat {
@@ -847,11 +854,13 @@ async fn control_session(
                 agent_version: env!("CARGO_PKG_VERSION").to_owned(),
                 gateway_report: Some(heartbeat_gateway_report.clone()),
                 mesh_identity: heartbeat_mesh_identity,
+                mesh_connections: heartbeat_mesh_connections,
             },
         )
         .await?;
         let heartbeat_response = read_control_response(&mut reader).await?;
         apply_server_tunnel_endpoint(tunnel_endpoint, &heartbeat_response).await;
+        let connection_checks = server_connection_checks(&heartbeat_response);
         match heartbeat_response {
             ServerControlMessage::HeartbeatAck {
                 gateway_state: Some(gateway_state),
@@ -961,7 +970,11 @@ async fn control_session(
             ServerControlMessage::TunnelApplyAccepted { .. } => {
                 anyhow::bail!("服务端在心跳期间返回了 Tunnel 确认")
             }
+            ServerControlMessage::MeshConnectionCheckAccepted { .. } => {
+                anyhow::bail!("服务端在心跳期间返回了连接检测确认")
+            }
         }
+        execute_mesh_connection_checks(&mut reader, config, &connection_checks).await?;
         last_gateway_report = Some(heartbeat_gateway_report);
     }
 }
@@ -1520,9 +1533,9 @@ async fn apply_mesh_enrollment_offer(
 
 /// 生成首次组网加入命令的固定参数。
 ///
-/// `tailscale up` 会同时建立普通 Mesh 和站点网关所需的基础策略。关闭
-/// Subnet Route SNAT 可以保留真实 LAN 源地址；Subnet Gateway 在收到实际
-/// Desired State 后会通过 `tailscale set` 恢复适合自身能力的策略。
+/// `tailscale up` 默认启用 Subnet Route SNAT，让手机等普通客户端无需家庭
+/// 路由器回程配置即可访问共享网段；SiteLink 收到 Desired State 后仍会由
+/// 路由计划切换为无 SNAT。
 fn mesh_enrollment_command_args(offer: &MeshEnrollmentOffer) -> Vec<String> {
     vec![
         "up".to_owned(),
@@ -1534,7 +1547,7 @@ fn mesh_enrollment_command_args(offer: &MeshEnrollmentOffer) -> Vec<String> {
         offer.hostname.clone(),
         "--accept-dns=true".to_owned(),
         "--accept-routes=true".to_owned(),
-        "--snat-subnet-routes=false".to_owned(),
+        "--snat-subnet-routes=true".to_owned(),
     ]
 }
 
@@ -1641,6 +1654,190 @@ async fn query_optional_mesh_identity(config: &AgentRuntimeConfig) -> Option<Mes
                 || identity.ipv6.is_some()
                 || identity.hostname.is_some()
         })
+}
+
+/// 每次心跳读取一次 Tailscale Peer 状态并立即压缩为脱敏路径类别。
+/// 原始 CurAddr、PeerRelay、Relay 值只参与本地分类，不进入协议消息或日志。
+async fn query_optional_mesh_connections(
+    config: &AgentRuntimeConfig,
+) -> Vec<MeshConnectionObservation> {
+    if !config.tailscale_apply_enabled || !config.tailscaled_enabled {
+        return Vec::new();
+    }
+    let socket = config.state_dir.join("tailscaled.sock");
+    let output = TokioCommand::new(&config.tailscale_bin)
+        .env("TS_SOCKET", &socket)
+        .arg(tailscale_socket_arg(&socket))
+        .args(["status", "--json"])
+        .output()
+        .await;
+    let Some(json) = output
+        .ok()
+        .filter(|output| output.status.success())
+        .and_then(|output| serde_json::from_slice::<serde_json::Value>(&output.stdout).ok())
+    else {
+        return Vec::new();
+    };
+    parse_tailscale_peer_observations(&json, unix_timestamp())
+}
+
+fn parse_tailscale_peer_observations(
+    status: &serde_json::Value,
+    observed_at: i64,
+) -> Vec<MeshConnectionObservation> {
+    let Some(peers) = status.get("Peer").and_then(serde_json::Value::as_object) else {
+        return Vec::new();
+    };
+    peers
+        .values()
+        .filter_map(|peer| {
+            let peer_node_id = peer
+                .get("NodeID")
+                .and_then(parse_tailscale_node_id)
+                .or_else(|| peer.get("ID").and_then(parse_tailscale_node_id))?;
+            let active = peer
+                .get("Active")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
+            Some(MeshConnectionObservation {
+                peer_node_id,
+                active,
+                connection_type: classify_tailscale_peer(peer, active).to_owned(),
+                observed_at,
+            })
+        })
+        .collect()
+}
+
+fn classify_tailscale_peer(peer: &serde_json::Value, active: bool) -> &'static str {
+    if !active {
+        return "idle";
+    }
+    let populated = |field: &str| {
+        peer.get(field)
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|value| !value.trim().is_empty())
+    };
+    if populated("CurAddr") {
+        "direct"
+    } else if populated("PeerRelay") {
+        "peer_relay"
+    } else if populated("Relay") {
+        "derp"
+    } else {
+        "unknown"
+    }
+}
+
+fn unix_timestamp() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64
+}
+
+fn server_connection_checks(response: &ServerControlMessage) -> Vec<MeshConnectionCheckTask> {
+    match response {
+        ServerControlMessage::HelloAccepted {
+            connection_checks, ..
+        }
+        | ServerControlMessage::HeartbeatAck {
+            connection_checks, ..
+        } => connection_checks.clone(),
+        _ => Vec::new(),
+    }
+}
+
+/// 只执行 Server 下发的已解析目标，固定次数和超时，且不回传命令原始输出。
+async fn execute_mesh_connection_checks(
+    reader: &mut AsyncBufReader<tokio_rustls::client::TlsStream<TcpStream>>,
+    config: &AgentRuntimeConfig,
+    tasks: &[MeshConnectionCheckTask],
+) -> Result<()> {
+    if tasks.is_empty() {
+        return Ok(());
+    }
+    let socket = config.state_dir.join("tailscaled.sock");
+    let mut results = Vec::with_capacity(tasks.len());
+    for task in tasks {
+        let valid_target = task.target_ip.parse::<std::net::IpAddr>().is_ok();
+        let output = if config.tailscale_apply_enabled && valid_target {
+            TokioCommand::new(&config.tailscale_bin)
+                .env("TS_SOCKET", &socket)
+                .arg(tailscale_socket_arg(&socket))
+                .args([
+                    "ping",
+                    "--c=3",
+                    "--timeout=2s",
+                    "--until-direct=false",
+                    &task.target_ip,
+                ])
+                .output()
+                .await
+                .ok()
+        } else {
+            None
+        };
+        let (success, connection_type, error_message) = match output {
+            Some(output) if output.status.success() => {
+                let text = String::from_utf8_lossy(&output.stdout).to_ascii_lowercase();
+                let connection_type = if text.contains("peer-relay") || text.contains("peer relay")
+                {
+                    "peer_relay"
+                } else if text.contains("via derp(") {
+                    "derp"
+                } else if text.contains("pong from") && text.contains(" via ") {
+                    "direct"
+                } else {
+                    "unknown"
+                };
+                (true, connection_type, None)
+            }
+            Some(output) => (
+                false,
+                "unknown",
+                Some(format!(
+                    "Tailscale 连接检测失败（退出码 {:?}）",
+                    output.status.code()
+                )),
+            ),
+            None if !valid_target => (
+                false,
+                "unknown",
+                Some("服务端下发的连接检测目标不是有效 IP".to_owned()),
+            ),
+            None => (
+                false,
+                "unknown",
+                Some("无法执行 Tailscale 连接检测".to_owned()),
+            ),
+        };
+        results.push(MeshConnectionCheckResult {
+            id: task.id.clone(),
+            success,
+            connection_type: connection_type.to_owned(),
+            observed_at: unix_timestamp(),
+            error_message,
+        });
+    }
+    write_agent_message(
+        reader.get_mut(),
+        &AgentControlMessage::MeshConnectionCheckReport {
+            results: results.clone(),
+        },
+    )
+    .await?;
+    match read_control_response(reader).await? {
+        ServerControlMessage::MeshConnectionCheckAccepted { check_ids }
+            if check_ids.len() == results.len() =>
+        {
+            Ok(())
+        }
+        ServerControlMessage::Error { message } => {
+            anyhow::bail!("服务端拒绝连接检测结果：{message}")
+        }
+        _ => anyhow::bail!("服务端返回了无效的连接检测确认"),
+    }
 }
 
 async fn query_tailscale_value(
@@ -2721,7 +2918,7 @@ mod tests {
     }
 
     #[test]
-    fn mesh_enrollment_disables_subnet_route_snat() {
+    fn mesh_enrollment_enables_subnet_route_snat() {
         let offer = MeshEnrollmentOffer {
             endpoint: "https://mesh.example.com".to_owned(),
             auth_key: "one-time-key".to_owned(),
@@ -2742,7 +2939,7 @@ mod tests {
                 "default-gateway-ab12",
                 "--accept-dns=true",
                 "--accept-routes=true",
-                "--snat-subnet-routes=false",
+                "--snat-subnet-routes=true",
             ]
         );
     }
@@ -2753,6 +2950,35 @@ mod tests {
             tailscale_socket_arg(std::path::Path::new("/data/nexo-agent/tailscaled.sock")),
             "--socket=/data/nexo-agent/tailscaled.sock"
         );
+    }
+
+    #[test]
+    fn tailscale_peer_classification_prefers_direct_then_peer_relay_then_derp() {
+        let status = serde_json::json!({
+            "Peer": {
+                "a": { "NodeID": 1, "Active": true, "CurAddr": "198.51.100.1:41641", "PeerRelay": "relay-a", "Relay": "hk" },
+                "b": { "NodeID": 2, "Active": true, "CurAddr": "", "PeerRelay": "relay-b", "Relay": "hk" },
+                "c": { "NodeID": 3, "Active": true, "Relay": "hk" },
+                "d": { "NodeID": 4, "Active": false, "CurAddr": "198.51.100.4:41641" },
+                "e": { "NodeID": 5, "Active": true }
+            }
+        });
+        let observations = parse_tailscale_peer_observations(&status, 100);
+        let paths = observations
+            .iter()
+            .map(|item| (item.peer_node_id.as_str(), item.connection_type.as_str()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            paths,
+            vec![
+                ("1", "direct"),
+                ("2", "peer_relay"),
+                ("3", "derp"),
+                ("4", "idle"),
+                ("5", "unknown"),
+            ]
+        );
+        assert!(observations.iter().all(|item| item.observed_at == 100));
     }
 
     #[test]

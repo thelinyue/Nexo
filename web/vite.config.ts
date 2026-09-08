@@ -14,7 +14,7 @@ export default defineConfig({
         name: "Nexo 联巢",
         short_name: "Nexo",
         lang: "zh-CN",
-        description: "设备、穿透服务与网络互联管理",
+        description: "设备、私网访问与公网服务管理",
         start_url: "/#/overview",
         scope: "/",
         display: "standalone",

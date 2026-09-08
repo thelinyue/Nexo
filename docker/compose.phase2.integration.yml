@@ -8,6 +8,14 @@ services:
     build:
       context: ..
       dockerfile: docker/Dockerfile.server
+    # Headscale 启用 OIDC 后会从公网管理入口读取发现文档。测试域名使用
+    # 临时 CA，因此 Server 整体重启前也必须把该 CA 安装到系统信任库。
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - >-
+        cp /run/nexo-phase2-certs/mesh-ca.crt /usr/local/share/ca-certificates/nexo-phase2.crt
+        && update-ca-certificates >/dev/null
+        && exec /usr/local/bin/nexo-server
     environment:
       NEXO_HTTP_ADDR: 0.0.0.0:8280
       NEXO_PUBLIC_BACKEND_ADDR: 127.0.0.1:9888
@@ -48,6 +56,7 @@ services:
       control:
         ipv4_address: 172.29.0.2
     volumes:
+      - ${NEXO_PHASE2_CERT_DIR:?NEXO_PHASE2_CERT_DIR 未设置}:/run/nexo-phase2-certs:ro
       - nexo-phase2-data:/data/nexo
 
   home-gateway:

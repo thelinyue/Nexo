@@ -129,6 +129,19 @@ wait_for() {
   return 1
 }
 
+# Headscale 策略和客户端路由通过长轮询异步下发。控制面进入 disabled 后，
+# 数据面仍可能短暂保留旧路径，因此在明确上限内等待双向新连接都失败。
+site_link_data_plane_is_closed() {
+  if dc exec -T office-terminal curl --fail --silent --show-error --noproxy '*' \
+    --connect-timeout 2 --max-time 4 http://192.168.10.100:8800/source >/dev/null 2>&1; then
+    return 1
+  fi
+  if dc exec -T home-terminal curl --fail --silent --show-error --noproxy '*' \
+    --connect-timeout 2 --max-time 4 http://192.168.20.100:8800/source >/dev/null 2>&1; then
+    return 1
+  fi
+}
+
 generate_test_certificate() {
   local ext_file="$CERT_DIR/server.ext"
   openssl req -x509 -newkey rsa:2048 -nodes -days 2 \
@@ -577,16 +590,7 @@ echo "关闭 Site Link，确认 LAN 中断但 Mesh 保持连接"
 post_json "$HTTP_URL/api/v1/site-links/$link/disable" '{}' >/dev/null
 wait_for "Site Link 关闭" \
   "api '$HTTP_URL/api/v1/site-links/$link' | jq -e '.apply_status == \"disabled\"'" 120
-if dc exec -T office-terminal curl --fail --silent --show-error --noproxy '*' \
-  --connect-timeout 3 --max-time 8 http://192.168.10.100:8800/source >/dev/null 2>&1; then
-  echo "关闭 Site Link 后仍可访问家庭 LAN" >&2
-  exit 1
-fi
-if dc exec -T home-terminal curl --fail --silent --show-error --noproxy '*' \
-  --connect-timeout 3 --max-time 8 http://192.168.20.100:8800/source >/dev/null 2>&1; then
-  echo "关闭 Site Link 后仍可访问办公室 LAN" >&2
-  exit 1
-fi
+wait_for "关闭 Site Link 后双向 LAN 已中断" "site_link_data_plane_is_closed" 60
 wait_for "关闭 Link 后两台设备 Mesh 仍连接" \
   "api '$HTTP_URL/api/v1/devices' | jq -e '[.[] | select((.name == \"家庭网关\" or .name == \"办公网关\") and .mesh_status == \"connected\")] | length == 2'" 120
 

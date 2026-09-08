@@ -100,6 +100,37 @@ pub struct MeshIdentityReport {
     pub online: bool,
 }
 
+/// Agent 从本机 Tailscale 状态中提取的一条脱敏连接观测。
+///
+/// 只上报对端 Node ID 和路径类别；公网端点、DERP 区域及原始命令输出
+/// 都留在设备本地，避免网络诊断数据扩大服务端的隐私边界。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MeshConnectionObservation {
+    pub peer_node_id: String,
+    pub active: bool,
+    pub connection_type: String,
+    pub observed_at: i64,
+}
+
+/// Server 下发给承载共享网段 Agent 的受限连接检测任务。
+/// 目标地址由 Server 从同工作空间设备身份中选择，Web 不能提交任意地址。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MeshConnectionCheckTask {
+    pub id: String,
+    pub target_ip: String,
+}
+
+/// Agent 执行受限 `tailscale ping` 后返回的结果。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MeshConnectionCheckResult {
+    pub id: String,
+    pub success: bool,
+    pub connection_type: String,
+    pub observed_at: i64,
+    #[serde(default)]
+    pub error_message: Option<String>,
+}
+
 /// 一条 Desired Route 的真实本地/远端应用结果。
 ///
 /// `local_applied` 只有 Agent 实际执行 Tailscale 命令成功后才能为 true；
@@ -227,6 +258,8 @@ pub enum AgentControlMessage {
         gateway_report: Option<GatewayCapabilityReport>,
         #[serde(default)]
         mesh_identity: Option<MeshIdentityReport>,
+        #[serde(default)]
+        mesh_connections: Vec<MeshConnectionObservation>,
     },
     /// 组网入网结果；字段全部可选/可空以便服务端安全处理旧 Agent。
     MeshEnrollmentAck {
@@ -248,6 +281,10 @@ pub enum AgentControlMessage {
     TunnelApplyReport {
         results: Vec<TunnelApplyResult>,
     },
+    /// 被动状态报告与主动检测分开传输，避免一次检测阻塞 15 秒心跳。
+    MeshConnectionCheckReport {
+        results: Vec<MeshConnectionCheckResult>,
+    },
 }
 
 /// 服务端对控制通道消息的响应。
@@ -265,6 +302,8 @@ pub enum ServerControlMessage {
         tunnels: Vec<TunnelDesiredState>,
         #[serde(default)]
         tunnel_endpoint: Option<TunnelDataEndpoint>,
+        #[serde(default)]
+        connection_checks: Vec<MeshConnectionCheckTask>,
     },
     HeartbeatAck {
         server_time: i64,
@@ -277,6 +316,8 @@ pub enum ServerControlMessage {
         tunnels: Vec<TunnelDesiredState>,
         #[serde(default)]
         tunnel_endpoint: Option<TunnelDataEndpoint>,
+        #[serde(default)]
+        connection_checks: Vec<MeshConnectionCheckTask>,
     },
     GatewayApplyAccepted {
         revision: i64,
@@ -284,6 +325,10 @@ pub enum ServerControlMessage {
     TunnelApplyAccepted {
         #[serde(default)]
         tunnel_ids: Vec<String>,
+    },
+    MeshConnectionCheckAccepted {
+        #[serde(default)]
+        check_ids: Vec<String>,
     },
     Error {
         message: String,
@@ -369,6 +414,7 @@ mod tests {
             protocol_features: Vec::new(),
             tunnels: Vec::new(),
             tunnel_endpoint: None,
+            connection_checks: Vec::new(),
         };
         let encoded = serde_json::to_string(&response).expect("控制响应应能序列化");
         let decoded: ServerControlMessage =
@@ -409,8 +455,9 @@ mod tests {
             message,
             AgentControlMessage::Heartbeat {
                 gateway_report: None,
+                mesh_connections,
                 ..
-            }
+            } if mesh_connections.is_empty()
         ));
     }
 
@@ -425,8 +472,9 @@ mod tests {
             ServerControlMessage::HelloAccepted {
                 mesh_enrollment: None,
                 protocol_features,
+                connection_checks,
                 ..
-            } if protocol_features.is_empty()
+            } if protocol_features.is_empty() && connection_checks.is_empty()
         ));
     }
 

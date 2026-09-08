@@ -167,17 +167,18 @@ async function installTailscaleMocks(page: Page, role: Role) {
   };
 }
 
-test("管理员官方客户端页支持 Auth Key 和隔离节点认领", async ({ page }) => {
+test("管理员客户端密钥页支持密钥和隔离节点认领", async ({ page }) => {
   const mock = await installTailscaleMocks(page, "system_admin");
-  await page.goto("/#/devices/official");
-  await expect(page.getByRole("heading", { name: "官方客户端" }).first()).toBeVisible();
+  await page.goto("/#/network/settings/keys");
+  await expect(page.getByRole("heading", { name: "客户端密钥" }).first()).toBeVisible();
+  await expect(page.getByRole("heading", { name: "使用同一套网络入口连接设备" })).toBeVisible();
   await expect(page.getByText("由客户端发起", { exact: true })).toBeVisible();
   await expect(page.getByRole("link", { name: "打开授权入口" })).toHaveCount(0);
   await expect(page.getByText("Linux、Windows、macOS、iOS、Android、tvOS", { exact: true })).toBeVisible();
   await expect(page.getByText("外部笔记本", { exact: true })).toBeVisible();
 
   await page.getByLabel("名称").fill("演示客户端");
-  await page.getByRole("button", { name: "生成 Auth Key" }).click();
+  await page.getByRole("button", { name: "生成密钥" }).click();
   await expect(page.getByText("tskey-auth-test-only-once", { exact: true })).toBeVisible();
   await expect(page.getByText("只显示这一次", { exact: true })).toBeVisible();
 
@@ -188,21 +189,21 @@ test("管理员官方客户端页支持 Auth Key 和隔离节点认领", async (
 
 test("普通用户不读取隔离节点且不能进入实例域名设置", async ({ page }) => {
   const mock = await installTailscaleMocks(page, "tenant");
-  await page.goto("/#/devices/official");
-  await expect(page.getByRole("heading", { name: "官方客户端" }).first()).toBeVisible();
+  await page.goto("/#/network/settings/keys");
+  await expect(page.getByRole("heading", { name: "客户端密钥" }).first()).toBeVisible();
   await expect(page.getByText("隔离节点", { exact: true })).toHaveCount(0);
   expect(mock.externalRequestCount()).toBe(0);
 
-  await page.goto("/#/public-access/domain");
-  await expect(page).toHaveURL(/#\/public-access\/tunnels$/);
-  await expect(page.getByRole("heading", { name: "内网穿透" })).toBeVisible();
+  await page.goto("/#/network/settings/domains");
+  await expect(page).toHaveURL(/#\/network\/settings\/service$/);
+  await expect(page.getByRole("heading", { name: "组网服务", exact: true })).toBeVisible();
   await expect(page.getByRole("link", { name: "域名与 HTTPS", exact: true })).toHaveCount(0);
 });
 
 test("管理员访问控制页支持结构化规则和移动窄屏布局", async ({ page }) => {
   const mock = await installTailscaleMocks(page, "system_admin");
-  await page.goto("/#/access-control");
-  await expect(page.getByRole("heading", { name: "访问控制" }).first()).toBeVisible();
+  await page.goto("/#/network/access");
+  await expect(page.getByRole("heading", { name: "访问策略" }).first()).toBeVisible();
   await expect(page.getByText("当前结构化策略", { exact: true })).toBeVisible();
   await expect.poll(() => mock.policyPreviewGetRequestCount()).toBe(1);
   expect(mock.policyPreviewPostRequestCount()).toBe(0);
@@ -220,7 +221,7 @@ test("管理员访问控制页支持结构化规则和移动窄屏布局", async
 
 test("访问控制分别显示策略错误、服务不可用并支持恢复校验", async ({ page }) => {
   const mock = await installTailscaleMocks(page, "system_admin");
-  await page.goto("/#/access-control");
+  await page.goto("/#/network/access");
   await expect(page.getByText("校验通过", { exact: true })).toBeVisible();
 
   mock.setPolicyState("invalid");
@@ -240,7 +241,7 @@ test("访问控制分别显示策略错误、服务不可用并支持恢复校�
 
 test("设备列表对重复组网地址去重并保留双栈地址", async ({ page }) => {
   await installTailscaleMocks(page, "system_admin");
-  await page.goto("/#/devices/list");
+  await page.goto("/#/network/devices");
   const row = page.locator(".device-row").filter({ hasText: "共享设备" });
   await expect(row.getByText("100.64.0.8", { exact: true })).toHaveCount(1);
   await expect(row.getByText("fd7a:115c:a1e0::8", { exact: true })).toHaveCount(1);

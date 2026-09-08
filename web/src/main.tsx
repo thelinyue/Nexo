@@ -4,6 +4,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import type { FormEvent, ReactNode } from "react";
 import {
   AlertTriangle,
+  ArrowLeft,
   ArrowRight,
   Building2,
   CheckCircle2,
@@ -44,17 +45,16 @@ import "./styles.css";
 
 type AppRoute =
   | "#/overview"
-  | "#/devices/list"
-  | "#/devices/enrollments"
-  | "#/devices/official"
-  | "#/access-control"
-  | "#/domains"
-  | "#/public-access/tunnels"
-  | "#/public-access/domain"
-  | "#/networks"
+  | "#/network/devices"
+  | "#/network/private"
+  | "#/network/public"
+  | "#/network/access"
+  | "#/network/settings/domains"
+  | "#/network/settings/keys"
+  | "#/network/settings/service"
   | "#/settings";
 
-type PrimaryRoute = "overview" | "devices" | "access-control" | "domains" | "public-access" | "networks" | "settings";
+type PrimaryRoute = "overview" | "network" | "settings";
 
 type NavigationItem = {
   id: PrimaryRoute;
@@ -66,42 +66,32 @@ type NavigationItem = {
 
 const navigationItems: NavigationItem[] = [
   { id: "overview", label: "概览", href: "#/overview", icon: LayoutDashboard },
-  { id: "devices", label: "设备", href: "#/devices/list", icon: MonitorSmartphone },
-  { id: "access-control", label: "访问控制", href: "#/access-control", icon: ShieldCheck },
-  { id: "domains", label: "域名与 HTTPS", href: "#/domains", icon: LockKeyhole, systemOnly: true },
-  { id: "public-access", label: "公网访问", href: "#/public-access/tunnels", icon: Globe2 },
-  { id: "networks", label: "网络互联", href: "#/networks", icon: Network },
   { id: "settings", label: "设置", href: "#/settings", icon: Settings },
+];
+
+const networkNavigationItems: Omit<NavigationItem, "id">[] = [
+  { label: "设备", href: "#/network/devices", icon: MonitorSmartphone },
+  { label: "私网访问", href: "#/network/private", icon: Network },
+  { label: "公网服务", href: "#/network/public", icon: Globe2 },
+  { label: "访问策略", href: "#/network/access", icon: ShieldCheck },
+  { label: "网络设置", href: "#/network/settings/service", icon: Settings },
 ];
 
 const validRoutes = new Set<AppRoute>([
   "#/overview",
-  "#/devices/list",
-  "#/devices/enrollments",
-  "#/devices/official",
-  "#/access-control",
-  "#/domains",
-  "#/public-access/tunnels",
-  "#/public-access/domain",
-  "#/networks",
+  "#/network/devices",
+  "#/network/private",
+  "#/network/public",
+  "#/network/access",
+  "#/network/settings/domains",
+  "#/network/settings/keys",
+  "#/network/settings/service",
   "#/settings",
 ]);
 
 /** Hash 路由避免改变服务端静态托管，同时让每个管理页面可以刷新和前进后退。 */
 function readRoute(): AppRoute {
   const hash = window.location.hash;
-  if (hash === "#/public-access/domain") {
-    window.history.replaceState(null, "", `${window.location.pathname}${window.location.search}#/domains`);
-    return "#/domains";
-  }
-  if (hash === "#/public-access") {
-    window.history.replaceState(null, "", `${window.location.pathname}${window.location.search}#/public-access/tunnels`);
-    return "#/public-access/tunnels";
-  }
-  if (["#/networks/sites", "#/networks/shared", "#/networks/links"].includes(hash)) {
-    window.history.replaceState(null, "", `${window.location.pathname}${window.location.search}#/networks`);
-    return "#/networks";
-  }
   const route = hash as AppRoute;
   if (validRoutes.has(route)) return route;
   window.history.replaceState(null, "", `${window.location.pathname}${window.location.search}#/overview`);
@@ -109,25 +99,20 @@ function readRoute(): AppRoute {
 }
 
 function primaryRoute(route: AppRoute): PrimaryRoute {
-  if (route.startsWith("#/devices/")) return "devices";
-  if (route === "#/access-control") return "access-control";
-  if (route === "#/domains") return "domains";
-  if (route.startsWith("#/public-access/")) return "public-access";
-  if (route === "#/networks") return "networks";
+  if (route.startsWith("#/network/")) return "network";
   if (route === "#/settings") return "settings";
   return "overview";
 }
 
 /** 子页面标题直接描述当前位置，一级导航只负责标识所属能力。 */
 function routeTitle(route: AppRoute): string {
-  if (route === "#/devices/list") return "设备";
-  if (route === "#/devices/enrollments") return "入网请求";
-  if (route === "#/devices/official") return "官方客户端";
-  if (route === "#/access-control") return "访问控制";
-  if (route === "#/domains") return "域名与 HTTPS";
-  if (route === "#/public-access/tunnels") return "内网穿透";
-  if (route === "#/public-access/domain") return "域名与 HTTPS";
-  if (route === "#/networks") return "网络互联";
+  if (route === "#/network/devices") return "设备";
+  if (route === "#/network/private") return "私网访问";
+  if (route === "#/network/public") return "公网服务";
+  if (route === "#/network/access") return "访问策略";
+  if (route === "#/network/settings/domains") return "域名与 HTTPS";
+  if (route === "#/network/settings/keys") return "客户端密钥";
+  if (route === "#/network/settings/service") return "组网服务";
   if (route === "#/settings") return "设置";
   return "概览";
 }
@@ -541,6 +526,17 @@ type SiteNetwork = {
   deletion_pending: boolean;
 };
 
+type MeshConnection = {
+  client_device_id: string;
+  client_device_name: string;
+  gateway_device_id: string;
+  gateway_device_name: string;
+  site_network_id: string;
+  site_network_prefix: string;
+  connection_type: "direct" | "peer_relay" | "derp" | "idle" | "unknown" | string;
+  updated_at: number | null;
+};
+
 const emptyOverview: Overview = {
   devices: 0,
   running_tunnels: 0,
@@ -566,6 +562,7 @@ function Dashboard({
   const [sites, setSites] = useState<Site[]>([]);
   const [siteNetworks, setSiteNetworks] = useState<SiteNetwork[]>([]);
   const [siteLinks, setSiteLinks] = useState<SiteLink[]>([]);
+  const [meshConnections, setMeshConnections] = useState<MeshConnection[]>([]);
   const [accessRules, setAccessRules] = useState<AccessRule[]>([]);
   const [accessWorkspaces, setAccessWorkspaces] = useState<AccessWorkspace[]>([]);
   const [accessPolicyPreview, setAccessPolicyPreview] = useState<AccessPolicyPreview | null>(null);
@@ -610,12 +607,12 @@ function Dashboard({
     window.requestAnimationFrame(() => document.querySelector<HTMLElement>("#main-content h1")?.focus());
   }, [route]);
 
-  // 公网域名是实例级设置，只对系统管理员开放；普通用户直接打开旧链接时
-  // 回到自己的穿透列表，避免先渲染一个必然 403 的空页面。
+  // 域名和全局证书仍是系统级设置；普通工作空间保留公网服务状态查看，
+  // 直接打开设置地址时回到组网服务页，不短暂渲染无权限内容。
   useEffect(() => {
-    if (auth.role === "tenant" && route === "#/domains") {
-      window.history.replaceState(null, "", `${window.location.pathname}${window.location.search}#/public-access/tunnels`);
-      setRoute("#/public-access/tunnels");
+    if (auth.role === "tenant" && route === "#/network/settings/domains") {
+      window.history.replaceState(null, "", `${window.location.pathname}${window.location.search}#/network/settings/service`);
+      setRoute("#/network/settings/service");
     }
   }, [auth.role, route]);
 
@@ -630,46 +627,38 @@ function Dashboard({
         if (!response.ok) throw new Error(readApiError(body, fallback));
         return body as T;
       };
-      const page = primaryRoute(route);
-      if (page === "overview") {
+      if (route === "#/overview") {
         const [nextOverview, nextEnrollments, nextTunnels, nextNetworks, nextLinks] = await Promise.all([
           read<Overview>("/api/v1/overview", "暂时无法读取概览"),
           read<Enrollment[]>("/api/v1/enrollments", "暂时无法读取入网请求"),
-          read<Tunnel[]>("/api/v1/tunnels", "暂时无法读取穿透服务"),
+          read<Tunnel[]>("/api/v1/tunnels", "暂时无法读取公网服务"),
           read<SiteNetwork[]>("/api/v1/site-networks", "暂时无法读取共享网络"),
           read<SiteLink[]>("/api/v1/site-links", "暂时无法读取站点互联"),
         ]);
         setOverview(nextOverview); setEnrollments(nextEnrollments); setTunnels(nextTunnels);
         setSiteNetworks(nextNetworks); setSiteLinks(nextLinks);
-      } else if (page === "devices") {
-        const [nextDevices, nextSites, nextEnrollments, nextMeshStatus] = await Promise.all([
+      } else if (route === "#/network/devices") {
+        const [nextDevices, nextSites, nextEnrollments, nextMeshStatus, nextNetworks, nextTunnels] = await Promise.all([
           read<Device[]>("/api/v1/devices", "暂时无法读取设备"),
           read<Site[]>("/api/v1/sites", "暂时无法读取站点"),
           read<Enrollment[]>("/api/v1/enrollments", "暂时无法读取入网请求"),
           read<MeshStatus>("/api/v1/mesh/status", "暂时无法读取设备互联状态"),
+          read<SiteNetwork[]>("/api/v1/site-networks", "暂时无法读取共享网段"),
+          read<Tunnel[]>("/api/v1/tunnels", "暂时无法读取公网服务"),
         ]);
         setDevices(nextDevices); setSites(nextSites); setEnrollments(nextEnrollments); setMeshStatus(nextMeshStatus);
-        if (route === "#/devices/official") {
-          const [clientConfigResponse, authKeysResponse] = await Promise.all([
-            request("/api/v1/mesh/client-config"),
-            request("/api/v1/mesh/auth-keys"),
-          ]);
-          const clientConfigBody: unknown = await clientConfigResponse.json().catch(() => null);
-          const authKeysBody: unknown = await authKeysResponse.json().catch(() => null);
-          if (!clientConfigResponse.ok) throw new Error(readApiError(clientConfigBody, "暂时无法读取官方客户端配置"));
-          if (!authKeysResponse.ok) throw new Error(readApiError(authKeysBody, "暂时无法读取 Auth Key"));
-          setTailscaleClientConfig(clientConfigBody as TailscaleClientConfig);
-          setTailscaleAuthKeys(authKeysBody as TailscaleAuthKey[]);
-          if (auth.role === "system_admin") {
-            const externalNodesResponse = await request("/api/v1/mesh/external-nodes");
-            const externalNodesBody: unknown = await externalNodesResponse.json().catch(() => null);
-            if (!externalNodesResponse.ok) throw new Error(readApiError(externalNodesBody, "暂时无法同步外部节点"));
-            setTailscaleExternalNodes(externalNodesBody as TailscaleExternalNode[]);
-          } else {
-            setTailscaleExternalNodes([]);
-          }
+        setSiteNetworks(nextNetworks); setTunnels(nextTunnels);
+        const clientConfigResponse = await request("/api/v1/mesh/client-config");
+        const clientConfigBody: unknown = await clientConfigResponse.json().catch(() => null);
+        if (!clientConfigResponse.ok) throw new Error(readApiError(clientConfigBody, "暂时无法读取客户端配置"));
+        setTailscaleClientConfig(clientConfigBody as TailscaleClientConfig);
+        if (auth.role === "system_admin") {
+          const externalNodesResponse = await request("/api/v1/mesh/external-nodes");
+          const externalNodesBody: unknown = await externalNodesResponse.json().catch(() => null);
+          if (!externalNodesResponse.ok) throw new Error(readApiError(externalNodesBody, "暂时无法同步隔离设备"));
+          setTailscaleExternalNodes(externalNodesBody as TailscaleExternalNode[]);
         }
-      } else if (page === "access-control") {
+      } else if (route === "#/network/access") {
         const [nextDevices, nextNetworks, nextRules, nextWorkspaces] = await Promise.all([
           read<Device[]>("/api/v1/devices", "暂时无法读取设备"),
           read<SiteNetwork[]>("/api/v1/site-networks", "暂时无法读取共享网络"),
@@ -680,7 +669,7 @@ function Dashboard({
         const previewResponse = await request("/api/v1/access-control/policy/preview");
         const previewBody: unknown = await previewResponse.json().catch(() => null);
         if (previewResponse.ok) setAccessPolicyPreview(previewBody as AccessPolicyPreview);
-      } else if (page === "domains") {
+      } else if (route === "#/network/settings/domains") {
         const domainsResponse = await request("/api/v1/public-domains");
         const domainsBody: unknown = await domainsResponse.json().catch(() => null);
         if (domainsResponse.ok) {
@@ -689,30 +678,54 @@ function Dashboard({
           setPublicDomains([]);
           throw new Error(readApiError(domainsBody, "暂时无法读取域名与 HTTPS 配置"));
         }
-      } else if (page === "public-access") {
+      } else if (route === "#/network/public") {
         const [nextTunnels, nextDevices] = await Promise.all([
-          read<Tunnel[]>("/api/v1/tunnels", "暂时无法读取穿透服务"),
+          read<Tunnel[]>("/api/v1/tunnels", "暂时无法读取公网服务"),
           read<Device[]>("/api/v1/devices", "暂时无法读取设备"),
         ]);
         setTunnels(nextTunnels); setDevices(nextDevices);
         const domainsResponse = await request("/api/v1/public-domains");
         const domainsBody: unknown = await domainsResponse.json().catch(() => null);
         if (domainsResponse.ok) setPublicDomains(Array.isArray(domainsBody) ? domainsBody as PublicDomain[] : []);
-      } else if (page === "networks") {
-        const [nextSites, nextDevices, nextNetworks, nextLinks] = await Promise.all([
+      } else if (route === "#/network/private") {
+        const [nextSites, nextDevices, nextNetworks, nextLinks, nextConnections] = await Promise.all([
           read<Site[]>("/api/v1/sites", "暂时无法读取站点"),
           read<Device[]>("/api/v1/devices", "暂时无法读取设备"),
           read<SiteNetwork[]>("/api/v1/site-networks", "暂时无法读取共享网络"),
           read<SiteLink[]>("/api/v1/site-links", "暂时无法读取站点互联"),
+          read<MeshConnection[]>("/api/v1/mesh/connections", "暂时无法读取连接路径"),
         ]);
         setSites(nextSites); setDevices(nextDevices); setSiteNetworks(nextNetworks); setSiteLinks(nextLinks);
+        setMeshConnections(nextConnections);
+      } else if (route === "#/network/settings/keys") {
+        const [clientConfigResponse, authKeysResponse, nextDevices] = await Promise.all([
+          request("/api/v1/mesh/client-config"),
+          request("/api/v1/mesh/auth-keys"),
+          read<Device[]>("/api/v1/devices", "暂时无法读取设备"),
+        ]);
+        const clientConfigBody: unknown = await clientConfigResponse.json().catch(() => null);
+        const authKeysBody: unknown = await authKeysResponse.json().catch(() => null);
+        if (!clientConfigResponse.ok) throw new Error(readApiError(clientConfigBody, "暂时无法读取客户端配置"));
+        if (!authKeysResponse.ok) throw new Error(readApiError(authKeysBody, "暂时无法读取客户端密钥"));
+        setTailscaleClientConfig(clientConfigBody as TailscaleClientConfig);
+        setTailscaleAuthKeys(authKeysBody as TailscaleAuthKey[]);
+        setDevices(nextDevices);
+        if (auth.role === "system_admin") {
+          const externalNodesResponse = await request("/api/v1/mesh/external-nodes");
+          const externalNodesBody: unknown = await externalNodesResponse.json().catch(() => null);
+          if (!externalNodesResponse.ok) throw new Error(readApiError(externalNodesBody, "暂时无法同步隔离设备"));
+          setTailscaleExternalNodes(externalNodesBody as TailscaleExternalNode[]);
+        }
+      } else if (route === "#/network/settings/service") {
+        const nextMeshStatus = await read<MeshStatus>("/api/v1/mesh/status", "暂时无法读取组网服务状态");
+        setMeshStatus(nextMeshStatus);
       }
     } catch (requestError) {
       setError(requestError instanceof Error ? requestError.message : "暂时无法读取页面数据");
     } finally {
       setLoading(false);
     }
-  }, [request, route]);
+  }, [auth.role, request, route]);
 
   const approveEnrollment = useCallback(async (enrollment: Enrollment) => {
     setError(null);
@@ -839,7 +852,7 @@ function Dashboard({
     item.apply_status === "checking" || item.apply_status === "applying" || item.apply_status === "retrying",
   );
   useEffect(() => {
-    if (!hasPendingGatewayChanges || route !== "#/networks") {
+    if (!hasPendingGatewayChanges || route !== "#/network/private") {
       return;
     }
     const timer = window.setInterval(() => {
@@ -852,7 +865,7 @@ function Dashboard({
     ["pending", "checking", "configuring", "retrying", "rate_limited"].includes(domain.apply_status.toLowerCase()),
   );
   useEffect(() => {
-    if (!hasPendingPublicDomainChanges || route !== "#/domains") {
+    if (!hasPendingPublicDomainChanges || route !== "#/network/settings/domains") {
       return;
     }
     const timer = window.setInterval(() => void refreshCurrentPage(), 5000);
@@ -864,7 +877,7 @@ function Dashboard({
     ...siteLinks.filter((item) => item.deletion_pending).map((item) => `link:${item.id}`),
   ];
   const hasVisiblePendingDeletion = pendingDeletionIds.length > 0
-    && (route === "#/overview" || route === "#/networks" || route === "#/public-access/tunnels");
+    && (route === "#/overview" || route === "#/network/private" || route === "#/network/public");
   useEffect(() => {
     if (!hasVisiblePendingDeletion) return;
     const timer = window.setInterval(() => void refreshCurrentPage(), 4000);
@@ -937,16 +950,16 @@ function Dashboard({
               onRefresh={refreshCurrentPage}
             />
           )}
-          {route.startsWith("#/devices/") && (
+          {route === "#/network/devices" && (
             <DevicesPage
               auth={auth}
-              route={route}
               devices={devices}
               sites={sites}
+              siteNetworks={siteNetworks}
+              tunnels={tunnels}
               enrollments={enrollments}
               meshStatus={meshStatus}
               clientConfig={tailscaleClientConfig}
-              authKeys={tailscaleAuthKeys}
               externalNodes={tailscaleExternalNodes}
               error={error}
               showEnrollmentForm={showEnrollmentForm}
@@ -960,7 +973,7 @@ function Dashboard({
               onDeleteDevice={(device, trigger) => { setDeletingDevice(device); setDeleteDeviceTrigger(trigger); }}
             />
           )}
-          {route === "#/access-control" && (
+          {route === "#/network/access" && (
             <AccessControlPage
               devices={devices}
               siteNetworks={siteNetworks}
@@ -972,16 +985,9 @@ function Dashboard({
               onRefresh={refreshCurrentPage}
             />
           )}
-          {route === "#/domains" && (
-            <DomainsPage
-              domains={publicDomains}
-              error={error}
-              request={request}
-              onRefresh={refreshCurrentPage}
-            />
-          )}
-          {route.startsWith("#/public-access/") && (
+          {route === "#/network/public" && (
             <PublicAccessPage
+              auth={auth}
               publicDomains={publicDomains}
               tunnels={tunnels}
               devices={devices}
@@ -999,13 +1005,14 @@ function Dashboard({
               }}
             />
           )}
-          {route === "#/networks" && (
-            <NetworksPage
+          {route === "#/network/private" && (
+            <PrivateAccessPage
               sites={sites}
               devices={devices}
               publicDomains={publicDomains}
               siteNetworks={siteNetworks}
               siteLinks={siteLinks}
+              meshConnections={meshConnections}
               error={error}
               request={request}
               showSiteForm={showSiteForm}
@@ -1044,6 +1051,22 @@ function Dashboard({
                 "暂时无法删除站点互联",
               )}
               onRefresh={refreshCurrentPage}
+            />
+          )}
+          {route.startsWith("#/network/settings/") && (
+            <NetworkSettingsPage
+              route={route}
+              auth={auth}
+              domains={publicDomains}
+              meshStatus={meshStatus}
+              devices={devices}
+              clientConfig={tailscaleClientConfig}
+              authKeys={tailscaleAuthKeys}
+              externalNodes={tailscaleExternalNodes}
+              error={error}
+              request={request}
+              onRefresh={refreshCurrentPage}
+              onEditDevice={(device, trigger) => { setEditingDevice(device); setEditDeviceTrigger(trigger); }}
             />
           )}
           {route === "#/settings" && (
@@ -1108,7 +1131,7 @@ function NavigationLinks({ route, role, onNavigate }: { route: AppRoute; role: s
   const active = primaryRoute(route);
   return (
     <nav className="primary-navigation" aria-label="主导航">
-      {navigationItems.filter((item) => !item.systemOnly || role === "system_admin").map((item) => {
+      {navigationItems.filter((item) => item.id === "overview").map((item) => {
         const Icon = item.icon;
         return (
           <a
@@ -1120,6 +1143,28 @@ function NavigationLinks({ route, role, onNavigate }: { route: AppRoute; role: s
           >
             <Icon size={18} strokeWidth={1.8} aria-hidden="true" />
             <span>{item.label}</span>
+          </a>
+        );
+      })}
+      <div className={`nav-group${active === "network" ? " active" : ""}`}>
+        <div className="nav-group-label"><Network size={18} strokeWidth={1.8} aria-hidden="true" /><span>网络</span></div>
+        <div className="nav-group-links">
+          {networkNavigationItems.filter((item) => !item.systemOnly || role === "system_admin").map((item) => {
+            const Icon = item.icon;
+            const current = route === item.href || (item.href === "#/network/settings/service" && route.startsWith("#/network/settings/"));
+            return (
+              <a className={`nav-subitem${current ? " active" : ""}`} href={item.href} aria-current={current ? "page" : undefined} onClick={onNavigate} key={item.href}>
+                <Icon size={16} strokeWidth={1.8} aria-hidden="true" /><span>{item.label}</span>
+              </a>
+            );
+          })}
+        </div>
+      </div>
+      {navigationItems.filter((item) => item.id === "settings" && (!item.systemOnly || role === "system_admin")).map((item) => {
+        const Icon = item.icon;
+        return (
+          <a className={`nav-item ${active === item.id ? "active" : ""}`} href={item.href} aria-current={active === item.id ? "page" : undefined} onClick={onNavigate} key={item.id}>
+            <Icon size={18} strokeWidth={1.8} aria-hidden="true" /><span>{item.label}</span>
           </a>
         );
       })}
@@ -1268,15 +1313,15 @@ function OverviewPage({
   const applyingNetworks = siteNetworks.filter((item) => ["checking", "applying", "retrying"].includes(item.apply_status)).length;
   const applyingLinks = siteLinks.filter((item) => ["checking", "applying", "retrying"].includes(item.apply_status)).length;
   const applyingResources = applyingTunnels + applyingNetworks + applyingLinks;
-  const failedHref: AppRoute = failedTunnels ? "#/public-access/tunnels" : failedNetworks || failedLinks ? "#/networks" : "#/overview";
-  const applyingHref: AppRoute = applyingTunnels ? "#/public-access/tunnels" : "#/networks";
+  const failedHref: AppRoute = failedTunnels ? "#/network/public" : failedNetworks || failedLinks ? "#/network/private" : "#/overview";
+  const applyingHref: AppRoute = applyingTunnels ? "#/network/public" : "#/network/private";
   return (
     <>
       <PageHeader eyebrow="运行状态" title="概览" subtitle="先处理异常，再进入具体页面完成配置。" />
       <section className="metric-grid" aria-label="系统概览">
         <Metric label="设备" value={overview.devices} hint="已加入 Nexo" />
-        <Metric label="已生效穿透服务" value={overview.running_tunnels} hint="公网地址可用" />
-        <Metric label="互联设备" value={overview.mesh_devices} hint="已加入网络互联" />
+        <Metric label="正常公网服务" value={overview.running_tunnels} hint="公网地址可用" />
+        <Metric label="组网设备" value={overview.mesh_devices} hint="已加入 Nexo 网络" />
         <Metric label="在线设备" value={overview.current_connections} hint="当前与服务端连接" />
       </section>
       <PageError error={error} onRetry={onRefresh} />
@@ -1284,24 +1329,24 @@ function OverviewPage({
         <div className="notice warning" role="status">
           <AlertTriangle size={18} aria-hidden="true" />
           <div><strong>当前为未加密 HTTP</strong><span>仅在可信局域网使用；需要远程管理时，请先配置公网 HTTPS。</span></div>
-          <a className="notice-action" href="#/public-access/domain">前往配置</a>
+          <a className="notice-action" href="#/network/settings/domains">前往配置</a>
         </div>
       )}
       <section className="overview-grid">
         <article className="panel attention-panel">
           <div className="panel-heading"><div><p className="eyebrow">待处理</p><h2>需要你关注</h2></div></div>
           <div className="attention-list">
-            <AttentionRow icon={UserPlus} label="待批准设备" count={pendingEnrollments} href="#/devices/enrollments" />
+            <AttentionRow icon={UserPlus} label="待批准设备" count={pendingEnrollments} href="#/network/devices" />
             <AttentionRow icon={CircleAlert} label="配置生效失败" count={failedResources} href={failedHref} />
-            <AttentionRow icon={RefreshCw} label="配置生效中" count={applyingResources} href={applyingHref} />
+            <AttentionRow icon={RefreshCw} label="处理中" count={applyingResources} href={applyingHref} />
           </div>
         </article>
         <article className="panel quick-panel">
           <div className="panel-heading"><div><p className="eyebrow">快速前往</p><h2>继续管理</h2></div></div>
           <div className="quick-links">
-            <QuickLink icon={MonitorSmartphone} title="设备与入网" detail="查看在线状态或添加设备" href="#/devices/list" />
-            <QuickLink icon={Globe2} title="内网穿透" detail="管理 Web 服务与 TCP 端口" href="#/public-access/tunnels" />
-            <QuickLink icon={Network} title="网络互联" detail="配置站点、共享网络与互联" href="#/networks" />
+            <QuickLink icon={MonitorSmartphone} title="设备" detail="加入和管理所有组网设备" href="#/network/devices" />
+            <QuickLink icon={Globe2} title="公网服务" detail="管理 Web 服务与 TCP 端口" href="#/network/public" />
+            <QuickLink icon={Network} title="私网访问" detail="共享家庭网段或配置站点互联" href="#/network/private" />
           </div>
         </article>
       </section>
@@ -1332,13 +1377,13 @@ function QuickLink({ icon: Icon, title, detail, href }: { icon: LucideIcon; titl
 
 function DevicesPage({
   auth,
-  route,
   devices,
   sites,
+  siteNetworks,
+  tunnels,
   enrollments,
   meshStatus,
   clientConfig,
-  authKeys,
   externalNodes,
   error,
   showEnrollmentForm,
@@ -1352,13 +1397,13 @@ function DevicesPage({
   onDeleteDevice,
 }: {
   auth: AuthStatus;
-  route: AppRoute;
   devices: Device[];
   sites: Site[];
+  siteNetworks: SiteNetwork[];
+  tunnels: Tunnel[];
   enrollments: Enrollment[];
   meshStatus: MeshStatus | null;
   clientConfig: TailscaleClientConfig | null;
-  authKeys: TailscaleAuthKey[];
   externalNodes: TailscaleExternalNode[];
   error: string | null;
   showEnrollmentForm: boolean;
@@ -1372,64 +1417,50 @@ function DevicesPage({
   onDeleteDevice: (device: Device, trigger: HTMLButtonElement) => void;
 }) {
   const pending = enrollments.filter((item) => item.status === "awaiting_approval");
-  const enrollmentView = route === "#/devices/enrollments";
-  const officialView = route === "#/devices/official";
   return (
     <>
       <PageHeader
-        eyebrow="设备管理"
-        title={officialView ? "官方客户端" : enrollmentView ? "入网请求" : "设备"}
-        subtitle={officialView ? "连接官方 Tailscale 客户端，完成浏览器授权或使用 Auth Key。" : enrollmentView ? "生成一次性配置，并批准可信设备加入。" : "查看设备在线状态、地址与网关能力。"}
-        action={enrollmentView ? (
+        eyebrow="网络"
+        title="设备"
+        subtitle="Agent 和 Tailscale 客户端在同一处加入、查看和管理。"
+        action={(
           <button className="primary-button" type="button" onClick={onToggleEnrollmentForm} aria-expanded={showEnrollmentForm}>
             <Plus size={16} aria-hidden="true" />添加设备
           </button>
-        ) : undefined}
+        )}
       />
-      <SectionTabs label="设备页面" route={route} items={[
-        { href: "#/devices/list", label: "设备列表", icon: MonitorSmartphone },
-        { href: "#/devices/enrollments", label: `入网请求${pending.length ? ` (${pending.length})` : ""}`, icon: UserPlus },
-        { href: "#/devices/official", label: "官方客户端", icon: KeyRound },
-      ]} />
       <PageError error={error} onRetry={onRefresh} />
-      {officialView ? (
-        <OfficialClientPanel
-          isSystemAdmin={auth.role === "system_admin"}
-          devices={devices}
-          clientConfig={clientConfig}
-          authKeys={authKeys}
-          externalNodes={externalNodes}
-          request={request}
-          onRefresh={onRefresh}
-          onEditDevice={onEditDevice}
-        />
-      ) : enrollmentView ? (
-        <section className="panel page-panel">
-          <div className="panel-heading">
-            <div><p className="eyebrow">设备互联状态</p><h2>{meshStatus?.message ?? "正在检查"}</h2></div>
-            <span className={`status-pill ${meshStatus?.status === "normal" ? "ready" : "working"}`}><i />{pending.length} 个待批准</span>
-          </div>
-          {showEnrollmentForm && <CreateEnrollmentForm sites={sites} request={request} onCreated={onRefresh} onDone={onCloseEnrollmentForm} />}
-          {pending.length === 0 ? (
-            <EmptyState icon={ShieldCheck} title="没有待批准设备" detail="设备发起的入网请求会显示在这里。" />
-          ) : (
-            <div className="enrollment-list">
-              {pending.map((item) => (
-                <div className="enrollment-row" key={item.enrollment_id}>
-                  <div><strong>{item.device_name ?? "未命名设备"}</strong><span>{[item.os, item.architecture, item.agent_version].filter(Boolean).join(" · ") || "设备信息待上报"}</span></div>
-                  <button className="primary-button" type="button" onClick={() => void onApprove(item)}><CheckCircle2 size={16} aria-hidden="true" />批准设备</button>
-                </div>
-              ))}
-            </div>
-          )}
-        </section>
-      ) : (
-        <section className="panel page-panel">
-          <div className="panel-heading"><div><p className="eyebrow">设备状态</p><h2 id="device-list-heading" tabIndex={-1}>{devices.length} 台设备</h2></div><span className="status-pill ready"><i />当前状态</span></div>
-          {devices.length === 0 ? <EmptyState icon={Server} title="还没有加入设备" detail="请从入网请求页面添加第一台设备。" /> : <div className="device-list">{devices.map((device) => <DeviceRow key={device.id} device={device} sites={sites} deleting={deletingResource === `device:${device.id}`} onEdit={(trigger) => onEditDevice(device, trigger)} onDelete={(trigger) => onDeleteDevice(device, trigger)} />)}</div>}
-        </section>
-      )}
+      <section className="panel page-panel">
+        <div className="panel-heading"><div><p className="eyebrow">所有设备</p><h2 id="device-list-heading" tabIndex={-1}>{devices.length} 台设备</h2></div><span className={`status-pill ${meshStatus?.status === "normal" ? "ready" : "working"}`}><i />{meshStatus?.status === "normal" ? "组网正常" : "组网处理中"}</span></div>
+        {devices.length === 0 ? <EmptyState icon={Server} title="还没有设备" detail="添加 Nexo Agent 或 Tailscale 客户端开始组网。" /> : <div className="device-list">{devices.map((device) => <DeviceRow key={device.id} device={device} sites={sites} networkCount={siteNetworks.filter((network) => network.publisher_device_id === device.id).length} publicServiceCount={tunnels.filter((tunnel) => tunnel.device_id === device.id).length} deleting={deletingResource === `device:${device.id}`} onEdit={(trigger) => onEditDevice(device, trigger)} onDelete={(trigger) => onDeleteDevice(device, trigger)} />)}</div>}
+      </section>
+      {pending.length > 0 && <section className="panel page-panel">
+        <div className="panel-heading"><div><p className="eyebrow">需要确认</p><h2>{pending.length} 个 Agent 入网请求</h2></div></div>
+        <div className="enrollment-list">{pending.map((item) => <div className="enrollment-row" key={item.enrollment_id}><div><strong>{item.device_name ?? "未命名设备"}</strong><span>{[item.os, item.architecture, item.agent_version].filter(Boolean).join(" · ") || "设备信息待上报"}</span></div><button className="primary-button" type="button" onClick={() => void onApprove(item)}><CheckCircle2 size={16} aria-hidden="true" />批准设备</button></div>)}</div>
+      </section>}
+      {auth.role === "system_admin" && externalNodes.length > 0 && <div className="notice warning" role="status"><AlertTriangle size={18} aria-hidden="true" /><div><strong>{externalNodes.length} 台设备尚未归属工作空间</strong><span>请在“网络设置 → 客户端密钥”的高级诊断中处理隔离设备。</span></div><a className="notice-action" href="#/network/settings/keys">查看</a></div>}
+      {showEnrollmentForm && <AddDeviceSheet sites={sites} clientConfig={clientConfig} request={request} onCreated={onRefresh} onClose={onCloseEnrollmentForm} />}
     </>
+  );
+}
+
+/** 添加设备保持为一个连续 Sheet；切换类型不会关闭面板，已填写内容由各自
+ * 子表单保留，关闭后焦点由 FormDialog 返回到“添加设备”触发按钮。 */
+function AddDeviceSheet({ sites, clientConfig, request, onCreated, onClose }: { sites: Site[]; clientConfig: TailscaleClientConfig | null; request: ApiRequest; onCreated: () => Promise<void>; onClose: () => void }) {
+  const [kind, setKind] = useState<"agent" | "tailscale">("agent");
+  const [copied, setCopied] = useState(false);
+  return (
+    <FormDialog eyebrow="添加设备" title={kind === "agent" ? "添加 Nexo Agent" : "添加 Tailscale 客户端"} description="选择设备类型，并按对应流程加入当前工作空间。" onClose={onClose} variant="sheet">
+      <div className="device-kind-switch" role="tablist" aria-label="设备类型">
+        <button type="button" role="tab" aria-selected={kind === "agent"} className={kind === "agent" ? "selected" : ""} onClick={() => setKind("agent")}><Server size={16} aria-hidden="true" />Nexo Agent</button>
+        <button type="button" role="tab" aria-selected={kind === "tailscale"} className={kind === "tailscale" ? "selected" : ""} onClick={() => setKind("tailscale")}><MonitorSmartphone size={16} aria-hidden="true" />Tailscale 客户端</button>
+      </div>
+      {kind === "agent" ? <CreateEnrollmentForm sites={sites} request={request} onCreated={onCreated} onDone={onClose} /> : <div className="tailscale-enrollment-guide">
+        <div className="copyable-value"><code>{clientConfig?.login_server ?? "正在读取组网入口…"}</code><button className="icon-button" type="button" aria-label={copied ? "组网入口已复制" : "复制组网入口"} disabled={!clientConfig?.login_server} onClick={async () => { await navigator.clipboard.writeText(clientConfig?.login_server ?? ""); setCopied(true); window.setTimeout(() => setCopied(false), 1600); }}>{copied ? <CheckCircle2 size={16} aria-hidden="true" /> : <Copy size={16} aria-hidden="true" />}</button></div>
+        <ol className="official-client-steps"><li><strong>在 Tailscale 中设置设备名称</strong><span>使用可识别的名称，避免系统隐私设置显示为 localhost。</span></li><li><strong>选择自定义协调服务器</strong><span>粘贴上方组网入口并完成 Nexo 登录。</span></li><li><strong>返回设备列表</strong><span>OIDC 和客户端密钥加入的设备会自动归属签发工作空间。</span></li></ol>
+        <a className="secondary-button" href="#/network/settings/keys">使用客户端密钥</a>
+      </div>}
+    </FormDialog>
   );
 }
 
@@ -1482,11 +1513,11 @@ function OfficialClientPanel({
         }),
       });
       const body: unknown = await response.json().catch(() => null);
-      if (!response.ok) throw new Error(readApiError(body, "暂时无法创建 Auth Key"));
+      if (!response.ok) throw new Error(readApiError(body, "暂时无法创建客户端密钥"));
       setCreatedKey(body as TailscaleAuthKey);
       await onRefresh();
     } catch (requestError) {
-      setError(requestError instanceof Error ? requestError.message : "暂时无法创建 Auth Key");
+      setError(requestError instanceof Error ? requestError.message : "暂时无法创建客户端密钥");
     } finally {
       setBusy(false);
     }
@@ -1497,11 +1528,11 @@ function OfficialClientPanel({
     try {
       const response = await request(`/api/v1/mesh/auth-keys/${encodeURIComponent(key.id)}/revoke`, { method: "POST" });
       const body: unknown = await response.json().catch(() => null);
-      if (!response.ok) throw new Error(readApiError(body, "暂时无法吊销 Auth Key"));
-      setMessage("Auth Key 已吊销");
+      if (!response.ok) throw new Error(readApiError(body, "暂时无法吊销客户端密钥"));
+      setMessage("客户端密钥已吊销");
       await onRefresh();
     } catch (requestError) {
-      setError(requestError instanceof Error ? requestError.message : "暂时无法吊销 Auth Key");
+      setError(requestError instanceof Error ? requestError.message : "暂时无法吊销客户端密钥");
     } finally {
       setBusy(false);
     }
@@ -1533,7 +1564,7 @@ function OfficialClientPanel({
     <div className="official-client-layout">
       <section className="panel page-panel official-client-hero">
         <div className="panel-heading">
-          <div><p className="eyebrow">官方客户端</p><h2>使用同一套网络入口连接设备</h2></div>
+          <div><p className="eyebrow">Tailscale 客户端</p><h2>使用同一套网络入口连接设备</h2></div>
           <span className="status-pill ready"><i />协议支持</span>
         </div>
         <div className="official-client-facts">
@@ -1543,24 +1574,24 @@ function OfficialClientPanel({
           <div><span>授权方式</span><strong>由客户端发起</strong></div>
           <div><span>平台</span><strong>{clientConfig?.supported_platforms.join("、") ?? "Linux、Windows、macOS、iOS、Android、tvOS"}</strong></div>
         </div>
-        <p className="form-hint">官方客户端完成登录后会先进入隔离状态；确认归属后才进入当前工作空间。只有 Nexo Agent 设备可作为穿透或网关。</p>
+        <p className="form-hint">Tailscale 客户端完成登录后会先进入隔离状态；确认归属后才进入当前工作空间。只有 Nexo Agent 设备可承载共享网段或公网服务。</p>
       </section>
       <section className="panel page-panel official-client-guide">
         <div className="panel-heading"><div><p className="eyebrow">iPhone / iPad</p><h2>按官方流程连接</h2></div><span className="status-pill ready"><i />登录地址已就绪</span></div>
         <ol className="official-client-steps">
-          <li><strong>先设置设备名称</strong><span>在 Tailscale 中填写 Device Name，避免 iOS 因隐私限制显示为 localhost。</span></li>
+          <li><strong>先设置设备名称</strong><span>在 Tailscale 中填写设备名称，避免 iOS 因隐私限制显示为 localhost。</span></li>
           <li><strong>打开登录</strong><span>点右上角账户图标，选择“登录…”，再打开右上角选项菜单。</span></li>
           <li><strong>使用自定义协调服务器</strong><span>选择“使用自定义协调服务器”，粘贴上方登录服务器地址并完成 Nexo 登录。</span></li>
-          <li><strong>回到这里确认三件事</strong><span>确认设备已加入、设备在线；再到“网络互联”页确认路由已配置，最后用真实局域网设备验证共享网段可达。</span></li>
+          <li><strong>回到这里确认三件事</strong><span>确认设备已加入、设备在线；再到“私网访问”确认共享网段，最后用真实局域网服务验证可达。</span></li>
         </ol>
       </section>
       <section className="panel page-panel official-client-status">
-        <div className="panel-heading"><div><p className="eyebrow">连接检查</p><h2>{officialDevices.length} 台官方客户端</h2></div><button className="secondary-button compact-button" type="button" disabled={busy} onClick={() => void onRefresh()}><RefreshCw size={15} aria-hidden="true" />重新检查</button></div>
+        <div className="panel-heading"><div><p className="eyebrow">连接检查</p><h2>{officialDevices.length} 台 Tailscale 客户端</h2></div><button className="secondary-button compact-button" type="button" disabled={busy} onClick={() => void onRefresh()}><RefreshCw size={15} aria-hidden="true" />重新检查</button></div>
         {officialDevices.length === 0 ? <EmptyState icon={MonitorSmartphone} title="登录后设备会出现在这里" detail="完成客户端登录和工作空间确认后，返回此页检查状态。" /> : <div className="official-device-status-list">{officialDevices.map((device) => <div className="official-device-status" key={device.id}><div><strong>{device.name}</strong><span>{device.tailscale_ipv4 ?? device.mesh_address ?? "组网地址待同步"}</span></div><div className="official-device-stages"><span className="status-pill ready"><i />已加入</span><span className={`status-pill ${device.status === "online" ? "ready" : "working"}`}><i />{device.status === "online" ? "设备在线" : "等待上线"}</span><span className="status-pill working"><i />共享网段待实际验证</span></div>{device.needs_name && <button className="secondary-button compact-button" type="button" onClick={() => onEditDevice(device, null)}><Pencil size={15} aria-hidden="true" />设置名称</button>}</div>)}</div>}
       </section>
       <div className="official-client-grid">
         <section className="panel page-panel">
-          <div className="panel-heading"><div><p className="eyebrow">Auth Key</p><h2>生成客户端密钥</h2></div></div>
+          <div className="panel-heading"><div><p className="eyebrow">客户端密钥</p><h2>生成客户端密钥</h2></div></div>
           <form className="inline-form" onSubmit={(event) => void createKey(event)} aria-busy={busy}>
             <label><span>名称</span><input value={label} onChange={(event) => setLabel(event.target.value)} required /></label>
             <div className="form-grid official-key-options">
@@ -1569,20 +1600,20 @@ function OfficialClientPanel({
               <label className="checkbox-field"><input type="checkbox" checked={ephemeral} onChange={(event) => setEphemeral(event.target.checked)} /><span>临时设备</span></label>
             </div>
             <label><span>标签（逗号分隔）</span><input value={tags} onChange={(event) => setTags(event.target.value)} placeholder="tag:team" /></label>
-            <button className="primary-button" type="submit" disabled={busy}><KeyRound size={16} aria-hidden="true" />{busy ? "正在创建…" : "生成 Auth Key"}</button>
+            <button className="primary-button" type="submit" disabled={busy}><KeyRound size={16} aria-hidden="true" />{busy ? "正在创建…" : "生成密钥"}</button>
           </form>
           {createdKey?.key && <div className="secret-reveal" role="status"><strong>只显示这一次</strong><code>{createdKey.key}</code><button className="secondary-button compact-button" type="button" onClick={() => void navigator.clipboard.writeText(createdKey.key ?? "")}><Copy size={15} aria-hidden="true" />复制密钥</button></div>}
           {error && <p className="form-error" role="alert">{error}</p>}
           {message && <p className="form-success" role="status">{message}</p>}
         </section>
         <section className="panel page-panel">
-          <div className="panel-heading"><div><p className="eyebrow">已发布密钥</p><h2>{authKeys.length} 个 Auth Key</h2></div></div>
-          {authKeys.length === 0 ? <EmptyState icon={KeyRound} title="还没有 Auth Key" detail="生成一个短时密钥后，在官方客户端中粘贴使用。" /> : <div className="auth-key-list">{authKeys.map((key) => <div className="auth-key-row" key={key.id}><div><strong>{key.label}</strong><span>{key.reusable ? "可重复使用" : "单次使用"} · {key.ephemeral ? "临时设备" : "持久设备"}</span></div><span className={`status-pill ${key.state === "issued" ? "working" : "disabled"}`}><i />{key.state}</span><button className="icon-button" type="button" aria-label={`吊销${key.label}`} title="吊销 Auth Key" disabled={busy || key.state !== "issued"} onClick={() => void revokeKey(key)}><Trash2 size={16} aria-hidden="true" /></button></div>)}</div>}
+          <div className="panel-heading"><div><p className="eyebrow">已发布密钥</p><h2>{authKeys.length} 个客户端密钥</h2></div></div>
+          {authKeys.length === 0 ? <EmptyState icon={KeyRound} title="还没有客户端密钥" detail="生成一个短时密钥后，在 Tailscale 客户端中粘贴使用。" /> : <div className="auth-key-list">{authKeys.map((key) => <div className="auth-key-row" key={key.id}><div><strong>{key.label}</strong><span>{key.reusable ? "可重复使用" : "单次使用"} · {key.ephemeral ? "临时设备" : "持久设备"}</span></div><span className={`status-pill ${key.state === "issued" ? "ready" : "disabled"}`}><i />{key.state === "issued" ? "正常" : "已关闭"}</span><button className="icon-button" type="button" aria-label={`吊销${key.label}`} title="吊销客户端密钥" disabled={busy || key.state !== "issued"} onClick={() => void revokeKey(key)}><Trash2 size={16} aria-hidden="true" /></button></div>)}</div>}
         </section>
       </div>
       {isSystemAdmin && <section className="panel page-panel">
-        <div className="panel-heading"><div><p className="eyebrow">隔离节点</p><h2>等待认领的官方客户端</h2></div><button className="secondary-button compact-button" type="button" disabled={busy} onClick={() => void onRefresh()}><RefreshCw size={15} aria-hidden="true" />同步节点</button></div>
-        {externalNodes.length === 0 ? <EmptyState icon={ShieldCheck} title="没有待认领节点" detail="完成浏览器授权或客户端登录后，节点会在这里等待确认。" /> : <div className="external-node-list">{externalNodes.map((node) => <div className="external-node-row" key={node.node_id}><div><strong>{node.name}</strong><span>{node.addresses.join(" · ") || "地址待同步"}</span>{node.needs_name && <small className="device-name-warning">Headscale 返回了 localhost，请先填写 Device Name</small>}</div><span className={`status-pill ${node.online ? "ready" : "disabled"}`}><i />{node.online ? "在线" : "离线"}</span>{node.needs_name ? <div className="external-node-claim"><label><span>设备名称</span><input value={claimNames[node.node_id] ?? ""} placeholder="例如：我的 iPhone" onChange={(event) => setClaimNames((current) => ({ ...current, [node.node_id]: event.target.value }))} /></label><button className="primary-button compact-button" type="button" disabled={busy} onClick={() => void claimNode(node)}><CheckCircle2 size={15} aria-hidden="true" />命名并认领</button></div> : <button className="primary-button compact-button" type="button" disabled={busy} onClick={() => void claimNode(node)}><CheckCircle2 size={15} aria-hidden="true" />认领</button>}</div>)}</div>}
+        <div className="panel-heading"><div><p className="eyebrow">隔离节点</p><h2>等待认领的 Tailscale 客户端</h2></div><button className="secondary-button compact-button" type="button" disabled={busy} onClick={() => void onRefresh()}><RefreshCw size={15} aria-hidden="true" />同步节点</button></div>
+        {externalNodes.length === 0 ? <EmptyState icon={ShieldCheck} title="没有待认领节点" detail="完成浏览器授权或客户端登录后，节点会在这里等待确认。" /> : <div className="external-node-list">{externalNodes.map((node) => <div className="external-node-row" key={node.node_id}><div><strong>{node.name}</strong><span>{node.addresses.join(" · ") || "地址待同步"}</span>{node.needs_name && <small className="device-name-warning">Headscale 返回了 localhost，请先填写设备名称</small>}</div><span className={`status-pill ${node.online ? "ready" : "disabled"}`}><i />{node.online ? "在线" : "离线"}</span>{node.needs_name ? <div className="external-node-claim"><label><span>设备名称</span><input value={claimNames[node.node_id] ?? ""} placeholder="例如：我的 iPhone" onChange={(event) => setClaimNames((current) => ({ ...current, [node.node_id]: event.target.value }))} /></label><button className="primary-button compact-button" type="button" disabled={busy} onClick={() => void claimNode(node)}><CheckCircle2 size={15} aria-hidden="true" />命名并认领</button></div> : <button className="primary-button compact-button" type="button" disabled={busy} onClick={() => void claimNode(node)}><CheckCircle2 size={15} aria-hidden="true" />认领</button>}</div>)}</div>}
       </section>}
     </div>
   );
@@ -1714,11 +1745,11 @@ function AccessControlPage({
 
   return (
     <>
-      <PageHeader eyebrow="策略与共享" title="访问控制" subtitle="按资源所有权建立直接授权，策略由 Nexo 生成并交给 Headscale 校验。" action={<button className="secondary-button" type="button" onClick={() => void onRefresh()}><RefreshCw size={15} aria-hidden="true" />刷新</button>} />
+      <PageHeader eyebrow="网络" title="访问策略" subtitle="按资源所有权建立直接授权，策略由 Nexo 校验并应用到组网服务。" action={<button className="secondary-button" type="button" onClick={() => void onRefresh()}><RefreshCw size={15} aria-hidden="true" />刷新</button>} />
       <PageError error={error} onRetry={onRefresh} />
       <section className="panel access-policy-preview" aria-labelledby="access-policy-preview-heading">
         <div className="panel-heading"><div><p className="eyebrow">影响预览</p><h2 id="access-policy-preview-heading">当前结构化策略</h2></div><div className="panel-heading-actions"><span className={`status-pill ${preview ? previewStatusClass : "working"}`}><i />{preview ? previewStatusLabel : "等待校验"}</span><button className="secondary-button compact-button" type="button" onClick={() => void onRefresh()}><RefreshCw size={15} aria-hidden="true" />重新校验</button></div></div>
-        <p className="panel-note">{preview?.summary ?? "先创建或校验一条规则，页面会显示受影响目标和 Headscale 校验结果。"}</p>
+        <p className="panel-note">{preview?.summary ?? "先创建或校验一条规则，页面会显示受影响目标和组网服务校验结果。"}</p>
         {preview?.error && <p className="form-error" role="alert">{preview.error}</p>}
         {preview && <div className="access-policy-facts"><span>Grant {preview.grant_count}</span><span>SSH {preview.ssh_rule_count}</span><span>目标 {preview.affected_targets.length}</span></div>}
       </section>
@@ -1739,10 +1770,24 @@ function AccessControlPage({
       </section>
       <section className="panel access-rule-list-panel" aria-labelledby="access-rule-list-heading">
         <div className="panel-heading"><div><p className="eyebrow">已保存规则</p><h2 id="access-rule-list-heading">资源授权</h2></div><span className="status-pill"><i />{rules.length} 条</span></div>
-        {rules.length === 0 ? <EmptyState icon={ShieldCheck} title="还没有访问规则" detail="保存一条规则后，直接授权会出现在这里。" /> : <div className="access-rule-table" role="table" aria-label="访问规则列表"><div className="access-rule-table-head" role="row"><span role="columnheader">规则</span><span role="columnheader">目标</span><span role="columnheader">直接授权</span><span role="columnheader">状态</span><span role="columnheader">操作</span></div>{rules.map((rule) => <div className="access-rule-table-row" role="row" key={rule.id}><div role="cell"><strong>{rule.name}</strong><small>{rule.protocols.join(" / ").toUpperCase()} · {rule.ports.join(", ")}{rule.ssh_enabled ? " · SSH" : ""}</small></div><div role="cell"><strong>{rule.target_label}</strong><small>{rule.target_type === "device" ? "设备" : rule.target_type === "network" ? "共享网络" : rule.target_type}</small></div><div role="cell"><span>{rule.grants.length > 0 ? rule.grants.map((grant) => grant.workspace_name).join("、") : "未授权"}</span></div><div role="cell"><span className={`entry-state ${rule.apply_status === "ready" ? "ready" : rule.apply_status === "error" ? "error" : "applying"}`}><i />{rule.apply_status === "ready" ? (rule.enabled ? "已生效" : "已撤销") : rule.apply_status === "error" ? "需要重试" : "处理中"}</span>{rule.apply_error && <small className="access-rule-error">{rule.apply_error}</small>}</div><div role="cell" className="access-rule-row-actions"><button className="icon-button" type="button" aria-label={`编辑${rule.name}`} title="编辑" onClick={() => setEditing(rule)}><Pencil size={16} aria-hidden="true" /></button>{rule.enabled && <button className="delete-icon-button" type="button" aria-label={`撤销${rule.name}`} title="撤销" disabled={busy} onClick={() => void revoke(rule)}><PowerOff size={16} aria-hidden="true" /></button>}</div></div>)}</div>}
+        {rules.length === 0 ? <EmptyState icon={ShieldCheck} title="还没有访问规则" detail="保存一条规则后，直接授权会出现在这里。" /> : <div className="access-rule-table" role="table" aria-label="访问规则列表"><div className="access-rule-table-head" role="row"><span role="columnheader">规则</span><span role="columnheader">目标</span><span role="columnheader">直接授权</span><span role="columnheader">状态</span><span role="columnheader">操作</span></div>{rules.map((rule) => <div className="access-rule-table-row" role="row" key={rule.id}><div role="cell"><strong>{rule.name}</strong><small>{rule.protocols.join(" / ").toUpperCase()} · {rule.ports.join(", ")}{rule.ssh_enabled ? " · SSH" : ""}</small></div><div role="cell"><strong>{rule.target_label}</strong><small>{rule.target_type === "device" ? "设备" : rule.target_type === "network" ? "共享网络" : rule.target_type}</small></div><div role="cell"><span>{rule.grants.length > 0 ? rule.grants.map((grant) => grant.workspace_name).join("、") : "未授权"}</span></div><div role="cell"><span className={`entry-state ${rule.apply_status === "ready" ? "ready" : rule.apply_status === "error" ? "error" : "applying"}`}><i />{rule.apply_status === "ready" ? (rule.enabled ? "正常" : "已关闭") : rule.apply_status === "error" ? "需处理" : "处理中"}</span>{rule.apply_error && <small className="access-rule-error">{rule.apply_error}</small>}</div><div role="cell" className="access-rule-row-actions"><button className="icon-button" type="button" aria-label={`编辑${rule.name}`} title="编辑" onClick={() => setEditing(rule)}><Pencil size={16} aria-hidden="true" /></button>{rule.enabled && <button className="delete-icon-button" type="button" aria-label={`撤销${rule.name}`} title="撤销" disabled={busy} onClick={() => void revoke(rule)}><PowerOff size={16} aria-hidden="true" /></button>}</div></div>)}</div>}
       </section>
     </>
   );
+}
+
+function NetworkSettingsPage({ route, auth, domains, meshStatus, devices, clientConfig, authKeys, externalNodes, error, request, onRefresh, onEditDevice }: { route: AppRoute; auth: AuthStatus; domains: PublicDomain[]; meshStatus: MeshStatus | null; devices: Device[]; clientConfig: TailscaleClientConfig | null; authKeys: TailscaleAuthKey[]; externalNodes: TailscaleExternalNode[]; error: string | null; request: ApiRequest; onRefresh: () => Promise<void>; onEditDevice: (device: Device, trigger: HTMLButtonElement | null) => void }) {
+  const tabs = [
+    ...(auth.role === "system_admin" ? [{ href: "#/network/settings/domains" as AppRoute, label: "域名与 HTTPS", icon: LockKeyhole }] : []),
+    { href: "#/network/settings/keys" as AppRoute, label: "客户端密钥", icon: KeyRound },
+    { href: "#/network/settings/service" as AppRoute, label: "组网服务", icon: Network },
+  ];
+  return <>
+    <SectionTabs label="网络设置" route={route} items={tabs} />
+    {route === "#/network/settings/domains" && <DomainsPage domains={domains} error={error} request={request} onRefresh={onRefresh} />}
+    {route === "#/network/settings/keys" && <><PageHeader eyebrow="网络设置" title="客户端密钥" subtitle="管理 Tailscale 客户端加入入口和短期密钥。" /><PageError error={error} onRetry={onRefresh} /><OfficialClientPanel isSystemAdmin={auth.role === "system_admin"} devices={devices} clientConfig={clientConfig} authKeys={authKeys} externalNodes={externalNodes} request={request} onRefresh={onRefresh} onEditDevice={onEditDevice} /></>}
+    {route === "#/network/settings/service" && <><PageHeader eyebrow="网络设置" title="组网服务" subtitle="查看设备协调服务状态和客户端入口。" /><PageError error={error} onRetry={onRefresh} /><section className="panel page-panel"><div className="panel-heading"><div><p className="eyebrow">运行状态</p><h2>{meshStatus?.message ?? "正在检查组网服务"}</h2></div><span className={`status-pill ${meshStatus?.status === "normal" ? "ready" : "working"}`}><i />{meshStatus?.status === "normal" ? "正常" : "需处理"}</span></div></section>{auth.role === "system_admin" && <details className="advanced-network panel page-panel"><summary><span><strong>高级诊断</strong><small>Headscale 组件状态与故障排查入口</small></span><ChevronDown size={18} aria-hidden="true" /></summary><div className="advanced-network-body"><p className="panel-note">Headscale 仅作为底层组网组件显示在系统管理员诊断中。</p><button className="secondary-button" type="button" onClick={() => void onRefresh()}><RefreshCw size={16} aria-hidden="true" />重新检查</button></div></details>}</>}
+  </>;
 }
 
 function DomainsPage({ domains, error, request, onRefresh }: {
@@ -1752,13 +1797,14 @@ function DomainsPage({ domains, error, request, onRefresh }: {
   onRefresh: () => Promise<void>;
 }) {
   return <>
-    <PageHeader eyebrow="公网基础设施" title="域名与 HTTPS" subtitle="统一管理公网入口、网络互联地址和 Web 服务使用的域名。" />
+    <PageHeader eyebrow="网络设置" title="域名与 HTTPS" subtitle="统一管理系统入口、组网入口和 Web 服务使用的域名。" />
     <PageError error={error} onRetry={onRefresh} />
     <PublicDomainsPanel domains={domains} request={request} onRefresh={onRefresh} />
   </>;
 }
 
 function PublicAccessPage({
+  auth,
   publicDomains,
   tunnels,
   devices,
@@ -1772,6 +1818,7 @@ function PublicAccessPage({
   onEdit,
   onDeleteTunnel,
 }: {
+  auth: AuthStatus;
   publicDomains: PublicDomain[];
   tunnels: Tunnel[];
   devices: Device[];
@@ -1833,13 +1880,13 @@ function PublicAccessPage({
         body: JSON.stringify({ tunnel_ids: selectedTunnelIds }),
       });
       const body: unknown = await response.json().catch(() => null);
-      if (!response.ok) throw new Error(readApiError(body, enabled ? "暂时无法批量启用穿透服务" : "暂时无法批量停用穿透服务"));
+      if (!response.ok) throw new Error(readApiError(body, enabled ? "暂时无法批量启用公网服务" : "暂时无法批量停用公网服务"));
       const result = body as BatchTunnelResponse;
       setBatchMessage(result.message);
       setSelectedTunnelIds(enabled ? result.skipped.map((item) => item.id) : []);
       await onRefresh();
     } catch (requestError) {
-      setBatchError(requestError instanceof Error ? requestError.message : "暂时无法批量更新穿透服务");
+      setBatchError(requestError instanceof Error ? requestError.message : "暂时无法批量更新公网服务");
     } finally {
       setBatchBusy(false);
     }
@@ -1873,20 +1920,20 @@ function PublicAccessPage({
   return (
     <>
       <PageHeader
-        eyebrow="公网访问"
-        title="内网穿透"
+        eyebrow="网络"
+        title="公网服务"
         subtitle="将设备上的 Web 服务或 TCP 端口安全开放到公网。"
-        action={<button className="primary-button" type="button" onClick={onOpenCreate}><Plus size={16} aria-hidden="true" />添加穿透服务</button>}
+        action={<button className="primary-button" type="button" onClick={onOpenCreate}><Plus size={16} aria-hidden="true" />添加服务</button>}
       />
       <PageError error={error} onRetry={onRefresh} />
       <section className={`domain-dependency-notice ${publicDomainReady ? "ready" : "warning"}`}>
-        <div><strong>{publicDomainReady ? `Web 服务默认使用 ${primaryDomain?.domain}` : "Web 服务域名尚未就绪"}</strong><span>{publicDomainReady ? "域名证书与路由由系统统一管理。" : "TCP 穿透不受影响；创建或启用 Web 穿透前需要可用的主域名。"}</span></div>
-        <a className="secondary-button compact-button" href="#/domains">管理域名</a>
+        <div><strong>{publicDomainReady ? `Web 服务默认使用 ${primaryDomain?.domain}` : "Web 服务域名尚未就绪"}</strong><span>{publicDomainReady ? "域名证书与路由由系统统一管理。" : "TCP 服务不受影响；创建或启用 Web 服务前需要可用的主域名。"}</span></div>
+        {auth.role === "system_admin" && <a className="secondary-button compact-button" href="#/network/settings/domains">管理域名</a>}
       </section>
       <section className="panel page-panel">
         <div className="panel-heading tunnel-panel-heading">
-          <div><p className="eyebrow">穿透服务</p><h2 id="tunnel-list-heading" tabIndex={-1}>{tunnels.length} 个穿透服务</h2></div>
-          {selectedTunnelIds.length > 0 && <div className="batch-toolbar" role="toolbar" aria-label="穿透服务批量操作">
+          <div><p className="eyebrow">公网服务</p><h2 id="tunnel-list-heading" tabIndex={-1}>{tunnels.length} 个公网服务</h2></div>
+          {selectedTunnelIds.length > 0 && <div className="batch-toolbar" role="toolbar" aria-label="公网服务批量操作">
             <span className="batch-selection-count">已选 {selectedTunnelIds.length} 项</span>
             <button className="secondary-button compact-button" type="button" disabled={batchBusy} onClick={() => void runBatchToggle(true)}><Power size={15} aria-hidden="true" />启用</button>
             <button className="secondary-button compact-button" type="button" disabled={batchBusy} onClick={() => void runBatchToggle(false)}><PowerOff size={15} aria-hidden="true" />停用</button>
@@ -1896,11 +1943,11 @@ function PublicAccessPage({
         </div>
         {(batchMessage || batchError) && <p className={batchError ? "network-error batch-feedback" : "action-status batch-feedback"} role={batchError ? "alert" : "status"}>{batchError ?? batchMessage}</p>}
         {tunnels.length === 0 ? (
-          <EmptyState icon={Globe2} title="还没有穿透服务" detail="添加 Web 服务或 TCP 端口后，配置生效状态会显示在这里。" />
+          <EmptyState icon={Globe2} title="还没有公网服务" detail="添加 Web 服务或 TCP 端口后，配置生效状态会显示在这里。" />
         ) : (
           <div className="tunnel-list">
             <div className="tunnel-list-header">
-              <label className="selection-control"><input ref={selectAllRef} type="checkbox" checked={allTunnelsSelected} onChange={(event) => toggleAllTunnels(event.target.checked)} aria-label="全选穿透服务" disabled={selectableTunnels.length === 0} /><span>全选</span></label>
+              <label className="selection-control"><input ref={selectAllRef} type="checkbox" checked={allTunnelsSelected} onChange={(event) => toggleAllTunnels(event.target.checked)} aria-label="全选公网服务" disabled={selectableTunnels.length === 0} /><span>全选</span></label>
               <span>{selectedTunnelIds.length ? `已选择 ${selectedTunnelIds.length} 项` : "选择服务后可批量操作"}</span>
             </div>
             {tunnels.map((tunnel) => (
@@ -1919,8 +1966,8 @@ function PublicAccessPage({
         )}
       </section>
       {showCreate && (
-        <FormDialog eyebrow="内网穿透" title="添加穿透服务" description="选择设备和本地服务，将 Web 服务或 TCP 端口开放到公网。" onClose={onCloseCreate}>
-          <CreateTunnelForm devices={devices} publicDomains={publicDomains} request={request} onCancel={onCloseCreate} onCreated={async () => { onCloseCreate(); await onRefresh(); }} />
+        <FormDialog eyebrow="公网服务" title="添加服务" description="选择设备和本地服务，将 Web 服务或 TCP 端口开放到公网。" onClose={onCloseCreate} variant="sheet">
+          <CreateTunnelForm auth={auth} devices={devices} publicDomains={publicDomains} request={request} onDomainsChanged={onRefresh} onCancel={onCloseCreate} onCreated={async () => { onCloseCreate(); await onRefresh(); }} />
         </FormDialog>
       )}
       {batchDeviceDialog && (
@@ -1961,7 +2008,7 @@ function formatDomainTimestamp(timestamp: number | null, empty = "未签发") {
 
 function publicDomainStatus(status: string): { kind: "ready" | "error" | "working"; label: string } {
   switch (status.toLowerCase()) {
-    case "ready": return { kind: "ready", label: "READY" };
+    case "ready": return { kind: "ready", label: "正常" };
     case "error": return { kind: "error", label: "需要处理" };
     case "rate_limited": return { kind: "working", label: "CA 限流" };
     case "retrying": return { kind: "working", label: "自动重试中" };
@@ -1974,7 +2021,7 @@ function publicDomainStatus(status: string): { kind: "ready" | "error" | "workin
 
 function certificateStatusLabel(status: string): string {
   switch (status.toLowerCase()) {
-    case "ready": return "READY";
+    case "ready": return "正常";
     case "error": return "失败";
     case "rate_limited": return "CA 限流";
     case "expired": return "已过期";
@@ -2192,7 +2239,7 @@ function PublicDomainsPanel({
       </div>
       {(batchMessage || batchError) && <p className={batchError ? "network-error batch-feedback" : "action-status batch-feedback"} role={batchError ? "alert" : "status"}>{batchError ?? batchMessage}</p>}
       {domains.length === 0 ? (
-        <EmptyState icon={Globe2} title="还没有公网域名" detail="添加根域名后，可以配置公网入口、网络互联地址和 Web 服务。" />
+        <EmptyState icon={Globe2} title="还没有公网域名" detail="添加根域名后，可以配置系统入口、组网入口和 Web 服务。" />
       ) : (
         <div className="domain-table" role="table" aria-label="域名与 HTTPS 列表">
           <div className="domain-table-head" role="row">
@@ -2211,7 +2258,7 @@ function PublicDomainsPanel({
               <div className={`domain-table-item${expanded ? " expanded" : ""}`} key={domain.id} role="rowgroup">
                 <div className="domain-table-row" role="row">
                   <span role="cell"><input type="checkbox" checked={selectedSet.has(domain.id)} onChange={(event) => setSelectedIds((current) => event.target.checked ? (current.includes(domain.id) ? current : [...current, domain.id]) : current.filter((id) => id !== domain.id))} aria-label={`选择 ${domain.domain}`} /></span>
-                  <div className="domain-identity" role="cell"><div className="domain-title"><strong>{domain.domain}</strong>{domain.is_primary && <span className="domain-primary-badge">主域名</span>}</div><span>{domain.usage_count} 个 Web 服务{domain.is_primary ? " · 网络互联" : ""}</span></div>
+                  <div className="domain-identity" role="cell"><div className="domain-title"><strong>{domain.domain}</strong>{domain.is_primary && <span className="domain-primary-badge">主域名</span>}</div><span>{domain.usage_count} 个 Web 服务{domain.is_primary ? " · 组网入口" : ""}</span></div>
                   <div className="domain-certificate-summary" role="cell"><strong>{sourceLabel}</strong><span>{domain.certificate_mode === "cloudflare" ? "DNS-01 自动申请与续期" : "自动申请已停止"}</span></div>
                   <div className="domain-combined-status" role="cell">
                     <strong className={`status-pill ${state.kind}`}><i />{state.label}</strong>
@@ -2694,7 +2741,7 @@ function PublicDomainDeleteDialog({
     event.preventDefault();
     if (!confirmed) { setError("请确认删除影响后再继续"); return; }
     if (deletingPrimaryWithAlternatives) { setError("存在其他域名时，请先将一个已就绪域名设为主域名"); return; }
-    if (!deletingOnlyPrimary && domain.usage_count > 0 && !replacement) { setError("该域名仍被服务使用，请先选择已 READY 的替代域名"); return; }
+    if (!deletingOnlyPrimary && domain.usage_count > 0 && !replacement) { setError("该域名仍被服务使用，请先选择状态正常的替代域名"); return; }
     setBusy(true); setError(null);
     try {
       const response = await request(`/api/v1/public-domains/${encodeURIComponent(domain.id)}`, {
@@ -2712,9 +2759,9 @@ function PublicDomainDeleteDialog({
     } finally { setBusy(false); }
   };
   const description = deletingOnlyPrimary
-    ? "删除唯一主域名会关闭公网域名入口，但保留穿透服务配置和启用状态。"
+    ? "删除唯一主域名会关闭公网域名入口，但保留公网服务配置和启用状态。"
     : "删除会清理该域名的凭据目录；已绑定服务必须先迁移到另一个已就绪域名。";
-  return <FormDialog eyebrow="域名与 HTTPS" title={`删除 ${domain.domain}`} description={description} onClose={onClose} returnFocus={returnFocus} role="alertdialog" compact initialFocusSelector="input[type=checkbox]"><form className="domain-delete-form" aria-busy={busy} onSubmit={submit}>{deletingOnlyPrimary ? <div className="domain-delete-impact"><strong>将关闭以下公网能力</strong><p>Nexo 管理入口、Mesh 公网入口和全部 Web 穿透公网路由会停止生成。</p><p>{domain.usage_count} 个 Web 穿透服务会保留并解除域名绑定；添加新的首个主域名后，未显式绑定的服务会重新使用它。</p><p>Cloudflare DNS 默认保留，Headscale 地址回退到内部地址，设备不会被自动要求重新认证。</p></div> : <p>{deletingPrimaryWithAlternatives ? "请先从更多操作中把一个已就绪域名设为主域名。未完成的主域名迁移仍会阻止删除。" : "此操作不可撤销。未完成的主域名迁移仍会阻止删除。"}</p>}{!deletingOnlyPrimary && domain.usage_count > 0 && <label><span>替代域名</span><select value={replacement} onChange={(event) => setReplacement(event.target.value)}><option value="">选择已就绪的域名</option>{candidates.map((item) => <option key={item.id} value={item.id}>{item.domain}</option>)}</select></label>}<label className="confirmation-check"><input type="checkbox" checked={confirmed} onChange={(event) => setConfirmed(event.target.checked)} /><span>{deletingOnlyPrimary ? "我确认关闭公网域名入口并删除该域名及凭据" : "我确认删除该域名及其凭据"}</span></label>{error && <p className="form-error" role="alert">{error}</p>}<div className="dialog-actions"><button className="secondary-button" type="button" onClick={onClose} disabled={busy}>取消</button><button className="danger-button" type="submit" disabled={busy || deletingPrimaryWithAlternatives}>{busy ? "删除中…" : "确认删除"}</button></div></form></FormDialog>;
+  return <FormDialog eyebrow="域名与 HTTPS" title={`删除 ${domain.domain}`} description={description} onClose={onClose} returnFocus={returnFocus} role="alertdialog" compact initialFocusSelector="input[type=checkbox]"><form className="domain-delete-form" aria-busy={busy} onSubmit={submit}>{deletingOnlyPrimary ? <div className="domain-delete-impact"><strong>将关闭以下公网能力</strong><p>Nexo 管理入口、组网入口和全部 Web 服务公网路由会停止生成。</p><p>{domain.usage_count} 个 Web 服务会保留并解除域名绑定；添加新的首个主域名后，未显式绑定的服务会重新使用它。</p><p>Cloudflare DNS 默认保留，组网入口回退到内部地址，设备不会被自动要求重新认证。</p></div> : <p>{deletingPrimaryWithAlternatives ? "请先从更多操作中把一个已就绪域名设为主域名。未完成的主域名迁移仍会阻止删除。" : "此操作不可撤销。未完成的主域名迁移仍会阻止删除。"}</p>}{!deletingOnlyPrimary && domain.usage_count > 0 && <label><span>替代域名</span><select value={replacement} onChange={(event) => setReplacement(event.target.value)}><option value="">选择已就绪的域名</option>{candidates.map((item) => <option key={item.id} value={item.id}>{item.domain}</option>)}</select></label>}<label className="confirmation-check"><input type="checkbox" checked={confirmed} onChange={(event) => setConfirmed(event.target.checked)} /><span>{deletingOnlyPrimary ? "我确认关闭公网域名入口并删除该域名及凭据" : "我确认删除该域名及其凭据"}</span></label>{error && <p className="form-error" role="alert">{error}</p>}<div className="dialog-actions"><button className="secondary-button" type="button" onClick={onClose} disabled={busy}>取消</button><button className="danger-button" type="submit" disabled={busy || deletingPrimaryWithAlternatives}>{busy ? "删除中…" : "确认删除"}</button></div></form></FormDialog>;
 }
 
 function PublicDomainPrimaryDialog({
@@ -2766,7 +2813,7 @@ function PublicDomainPrimaryDialog({
   };
 
   const statusLabel = migration ? ({ preparing: "准备中", switching: "切换中", waiting_devices: "等待设备确认", completed: "已完成", failed: "失败" } as Record<string, string>)[migration.status] ?? migration.status : null;
-  return <FormDialog eyebrow="主域名迁移" title={`将 ${domain.domain} 设为主域名`} description="切换会保留旧域名和别名，直到所有设备完成 ACK；迁移激活后不能取消。" onClose={() => { if (!active && !busy) onClose(); }} returnFocus={returnFocus} role="alertdialog"><form className="domain-primary-form" aria-busy={busy || active} onSubmit={submit}><div className="migration-impact"><strong>切换前检查</strong><p>目标域名的根证书和泛域名证书已 READY。Web Service 会迁移到新主域名，在线设备立即处理，离线设备上线后继续。</p><p>mesh.{domain.domain} 必须 DNS only；Nexo 会保留旧入口，直到设备逐台确认。</p></div>{migration && <div className="migration-progress" role="status" aria-live="polite"><div><span>{statusLabel}</span><strong>{migration.acknowledged_devices}/{migration.total_devices} 台设备已确认</strong></div><progress max={Math.max(migration.total_devices, 1)} value={migration.acknowledged_devices} /><small>{migration.last_error ?? "任务可恢复，页面轮询会在离开时停止。"}</small></div>}{!migration && <label className="confirmation-check"><input type="checkbox" checked={confirmed} onChange={(event) => setConfirmed(event.target.checked)} /><span>我已阅读影响并确认启动不可取消的迁移</span></label>}{error && <p className="form-error" role="alert">{error}</p>}<div className="dialog-actions"><button className="secondary-button" type="button" onClick={onClose} disabled={active || busy}>取消</button>{!migration && <button className="primary-button" type="submit" disabled={busy}>{busy ? "启动中…" : "开始迁移"}</button>}{migration && !active && <button className="primary-button" type="button" onClick={onClose}>关闭</button>}</div></form></FormDialog>;
+  return <FormDialog eyebrow="主域名迁移" title={`将 ${domain.domain} 设为主域名`} description="切换会保留旧域名和别名，直到所有设备完成确认；迁移激活后不能取消。" onClose={() => { if (!active && !busy) onClose(); }} returnFocus={returnFocus} role="alertdialog"><form className="domain-primary-form" aria-busy={busy || active} onSubmit={submit}><div className="migration-impact"><strong>切换前检查</strong><p>目标域名的根证书和泛域名证书状态正常。Web 服务会迁移到新主域名，在线设备立即处理，离线设备上线后继续。</p><p>mesh.{domain.domain} 必须保持仅 DNS；Nexo 会保留旧入口，直到设备逐台确认。</p></div>{migration && <div className="migration-progress" role="status" aria-live="polite"><div><span>{statusLabel}</span><strong>{migration.acknowledged_devices}/{migration.total_devices} 台设备已确认</strong></div><progress max={Math.max(migration.total_devices, 1)} value={migration.acknowledged_devices} /><small>{migration.last_error ?? "任务可恢复，页面轮询会在离开时停止。"}</small></div>}{!migration && <label className="confirmation-check"><input type="checkbox" checked={confirmed} onChange={(event) => setConfirmed(event.target.checked)} /><span>我已阅读影响并确认启动不可取消的迁移</span></label>}{error && <p className="form-error" role="alert">{error}</p>}<div className="dialog-actions"><button className="secondary-button" type="button" onClick={onClose} disabled={active || busy}>取消</button>{!migration && <button className="primary-button" type="submit" disabled={busy}>{busy ? "启动中…" : "开始迁移"}</button>}{migration && !active && <button className="primary-button" type="button" onClick={onClose}>关闭</button>}</div></form></FormDialog>;
 }
 
 function NetworksPage({
@@ -2798,6 +2845,7 @@ function NetworksPage({
   onDeleteNetwork,
   onDeleteLink,
   onRefresh,
+  embedded = false,
 }: {
   sites: Site[];
   devices: Device[];
@@ -2827,6 +2875,7 @@ function NetworksPage({
   onDeleteNetwork: (network: SiteNetwork) => void;
   onDeleteLink: (link: SiteLink) => void;
   onRefresh: () => Promise<void>;
+  embedded?: boolean;
 }) {
   const [expandedSiteIds, setExpandedSiteIds] = useState<Set<string>>(() => new Set());
   const [networkView, setNetworkView] = useState<"topology" | "sites">("topology");
@@ -2855,13 +2904,13 @@ function NetworksPage({
   );
   return (
     <>
-      <PageHeader eyebrow="局域网互联" title="网络互联" subtitle="按站点管理网关、共享网络、互联关系和本站静态路由。" action={action} />
-      <PageError error={error} onRetry={onRefresh} />
+      {!embedded && <PageHeader eyebrow="私网访问" title="站点互联" subtitle="按站点管理高级网关、共享网络、互联关系和静态路由。" action={action} />}
+      {!embedded && <PageError error={error} onRetry={onRefresh} />}
       <section className={`domain-dependency-notice ${meshEntryReady ? "ready" : "warning"}`}>
-        <div><strong>{meshEntryReady ? `网络入口 mesh.${primaryDomain?.domain} 已就绪` : "网络互联公网入口尚未就绪"}</strong><span>{meshEntryReady ? "设备继续使用统一的安全控制地址。" : "现有局域网路由配置会保留；新增设备公网接入前请完成主域名和 HTTPS 配置。"}</span></div>
-        <a className="secondary-button compact-button" href="#/domains">管理域名</a>
+        <div><strong>{meshEntryReady ? `组网入口 mesh.${primaryDomain?.domain} 已就绪` : "组网公网入口尚未就绪"}</strong><span>{meshEntryReady ? "设备继续使用统一的安全控制地址。" : "现有局域网路由配置会保留；新增设备公网接入前请完成主域名和 HTTPS 配置。"}</span></div>
+        <a className="secondary-button compact-button" href="#/network/settings/domains">管理域名</a>
       </section>
-      <div className="network-view-switch" role="tablist" aria-label="网络互联视图">
+      <div className="network-view-switch" role="tablist" aria-label="站点互联视图">
         <button type="button" role="tab" aria-selected={networkView === "topology"} className={networkView === "topology" ? "selected" : ""} onClick={() => setNetworkView("topology")}><Network size={15} aria-hidden="true" />互联拓扑</button>
         <button type="button" role="tab" aria-selected={networkView === "sites"} className={networkView === "sites" ? "selected" : ""} onClick={() => setNetworkView("sites")}><Building2 size={15} aria-hidden="true" />站点与网段</button>
       </div>
@@ -2967,6 +3016,104 @@ function NetworksPage({
   );
 }
 
+function PrivateAccessPage({ meshConnections, ...networkProps }: Parameters<typeof NetworksPage>[0] & { meshConnections: MeshConnection[] }) {
+  const [selectedNetwork, setSelectedNetwork] = useState<SiteNetwork | null>(null);
+  const [detailTrigger, setDetailTrigger] = useState<HTMLButtonElement | null>(null);
+  const enabled = networkProps.siteNetworks.filter((network) => network.enabled && !network.deletion_pending);
+  return (
+    <>
+      <PageHeader eyebrow="网络" title="私网访问" subtitle="选择 Agent 检测到的家庭或办公网段，确认一次即可供当前工作空间设备访问。" />
+      <PageError error={networkProps.error} onRetry={networkProps.onRefresh} />
+      <DetectedNetworksPanel devices={networkProps.devices} siteNetworks={networkProps.siteNetworks} request={networkProps.request} onRefresh={networkProps.onRefresh} />
+      <section className="panel page-panel">
+        <div className="panel-heading"><div><p className="eyebrow">已共享网段</p><h2>{enabled.length} 个可访问网段</h2></div><span className="status-pill ready"><i />默认启用 SNAT</span></div>
+        {enabled.length === 0 ? <EmptyState icon={Network} title="还没有共享网段" detail="从上方选择 Agent 检测到的私有网段。" /> : <div className="private-network-list">{enabled.map((network) => {
+          const connections = meshConnections.filter((item) => item.site_network_id === network.id);
+          const summary = summarizeConnectionTypes(connections);
+          return <div className="private-network-row" key={network.id}><div><strong>{network.name}</strong><span>{network.desired_prefix} · {network.publisher_device_name}</span></div><span className={`status-pill ${connectionStatusKind(summary.type)}`}><i />{summary.label}</span><button className="secondary-button compact-button" type="button" onClick={(event) => { setDetailTrigger(event.currentTarget); setSelectedNetwork(network); }}>查看</button></div>;
+        })}</div>}
+      </section>
+      <details className="advanced-network panel page-panel">
+        <summary><span><strong>站点互联 · 高级</strong><small>无 SNAT、静态回程路由和多站点拓扑</small></span><ChevronDown size={18} aria-hidden="true" /></summary>
+        <div className="advanced-network-body"><button className="secondary-button" type="button" onClick={networkProps.onToggleSiteForm}><Plus size={16} aria-hidden="true" />新建站点</button><NetworksPage {...networkProps} embedded /></div>
+      </details>
+      {selectedNetwork && <NetworkDetailSheet network={selectedNetwork} connections={meshConnections.filter((item) => item.site_network_id === selectedNetwork.id)} request={networkProps.request} returnFocus={detailTrigger} onRefresh={networkProps.onRefresh} onClose={() => { setSelectedNetwork(null); setDetailTrigger(null); }} />}
+    </>
+  );
+}
+
+function DetectedNetworksPanel({ devices, siteNetworks, request, onRefresh }: { devices: Device[]; siteNetworks: SiteNetwork[]; request: ApiRequest; onRefresh: () => Promise<void> }) {
+  const agents = devices.filter((device) => device.connection_type === "nexo_agent" && device.site_id && (device.gateway_report?.local_networks?.length ?? 0) > 0);
+  const [deviceId, setDeviceId] = useState("");
+  const [selected, setSelected] = useState<Set<string>>(new Set());
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  useEffect(() => {
+    if (!agents.some((device) => device.id === deviceId)) setDeviceId(agents[0]?.id ?? "");
+  }, [agents, deviceId]);
+  const device = agents.find((item) => item.id === deviceId);
+  const detected = (device?.gateway_report?.local_networks ?? []).filter((network) => !siteNetworks.some((item) => item.publisher_device_id === deviceId && item.desired_prefix === network.prefix));
+  const toggle = (key: string) => setSelected((current) => { const next = new Set(current); if (next.has(key)) next.delete(key); else next.add(key); return next; });
+  const enable = async () => {
+    if (!device || selected.size === 0) return;
+    const networks = detected.filter((item) => selected.has(`${item.interface_id}:${item.prefix}`));
+    if (!window.confirm(`启用 ${networks.length} 个共享网段，并允许当前工作空间设备访问？`)) return;
+    setBusy(true); setError(null);
+    try {
+      const response = await request("/api/v1/site-networks/enable-detected", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ device_id: device.id, networks }) });
+      const body: unknown = await response.json().catch(() => null);
+      if (!response.ok) throw new Error(readApiError(body, "暂时无法启用共享网段"));
+      setSelected(new Set());
+      await onRefresh();
+    } catch (requestError) {
+      setError(requestError instanceof Error ? requestError.message : "暂时无法启用共享网段");
+    } finally { setBusy(false); }
+  };
+  return <section className="panel page-panel detected-networks"><div className="panel-heading"><div><p className="eyebrow">检测到的私有网段</p><h2>选择并启用</h2></div></div>{agents.length === 0 ? <EmptyState icon={WifiOff} title="没有可用的 Agent 网段" detail="Agent 归属站点并上报私有网段后会显示在这里。" /> : <><label className="detected-agent"><span>承载 Agent</span><select value={deviceId} onChange={(event) => { setDeviceId(event.target.value); setSelected(new Set()); }}>{agents.map((agent) => <option value={agent.id} key={agent.id}>{agent.name}</option>)}</select></label><fieldset className="network-checklist"><legend>可共享网段</legend>{detected.length === 0 ? <p className="network-inline-empty">该 Agent 检测到的网段均已启用。</p> : detected.map((network) => { const key = `${network.interface_id}:${network.prefix}`; const blocked = forwardingRequirement(device!.gateway_report!, network.prefix); return <label key={key}><input type="checkbox" checked={selected.has(key)} disabled={Boolean(blocked)} onChange={() => toggle(key)} /><span><strong>{network.prefix}</strong><small>{network.interface_id}{blocked ? ` · ${blocked}` : " · 可直接共享"}</small></span></label>; })}</fieldset><div className="detected-actions"><span>普通共享网段使用 SNAT，无需配置家庭路由器回程。</span><button className="primary-button" type="button" disabled={busy || selected.size === 0} onClick={() => void enable()}><CheckCircle2 size={16} aria-hidden="true" />{busy ? "启用中" : "启用所选网段"}</button></div></>}{error && <p className="form-error" role="alert">{error}</p>}</section>;
+}
+
+function summarizeConnectionTypes(connections: MeshConnection[]): { type: string; label: string } {
+  const priority = ["direct", "peer_relay", "derp", "idle", "unknown"];
+  const type = priority.find((candidate) => connections.some((item) => item.connection_type === candidate)) ?? "unknown";
+  return { type, label: connections.length ? connectionTypeLabel(type) : "未知" };
+}
+
+function connectionTypeLabel(type: string): string {
+  if (type === "direct") return "P2P 直连";
+  if (type === "peer_relay") return "节点中继";
+  if (type === "derp") return "DERP 中继";
+  if (type === "idle") return "空闲";
+  return "未知";
+}
+
+function connectionStatusKind(type: string): string {
+  return type === "direct" ? "ready" : type === "unknown" ? "working" : "disabled";
+}
+
+function NetworkDetailSheet({ network, connections, request, returnFocus, onRefresh, onClose }: { network: SiteNetwork; connections: MeshConnection[]; request: ApiRequest; returnFocus: HTMLButtonElement | null; onRefresh: () => Promise<void>; onClose: () => void }) {
+  const [checkingId, setCheckingId] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const check = async (clientDeviceId: string) => {
+    setCheckingId(clientDeviceId); setError(null);
+    try {
+      const response = await request("/api/v1/mesh/connection-checks", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ client_device_id: clientDeviceId, site_network_id: network.id }) });
+      const body = await response.json().catch(() => null) as { id?: string; error?: string } | null;
+      if (!response.ok || !body?.id) throw new Error(body?.error ?? "暂时无法开始连接检测");
+      for (let attempt = 0; attempt < 12; attempt += 1) {
+        await new Promise((resolve) => window.setTimeout(resolve, 1000));
+        const poll = await request(`/api/v1/mesh/connection-checks/${encodeURIComponent(body.id)}`);
+        const result = await poll.json().catch(() => null) as { status?: string; error_message?: string } | null;
+        if (!poll.ok) throw new Error("暂时无法读取连接检测结果");
+        if (result?.status === "succeeded") { await onRefresh(); return; }
+        if (result?.status === "failed") throw new Error(result.error_message ?? "连接检测失败");
+      }
+      throw new Error("检测仍在进行，请稍后刷新");
+    } catch (requestError) { setError(requestError instanceof Error ? requestError.message : "连接检测失败"); }
+    finally { setCheckingId(null); }
+  };
+  return <FormDialog eyebrow="共享网段" title={network.name} description={`${network.desired_prefix} · 由 ${network.publisher_device_name} 承载`} variant="sheet" returnFocus={returnFocus} onClose={onClose}><div className="connection-detail-list">{connections.length === 0 ? <EmptyState icon={Network} title="尚无连接观测" detail="客户端产生流量后，路径状态会在 15 秒内更新。" /> : connections.map((connection) => <div className="connection-detail-row" key={connection.client_device_id}><div><strong>{connection.client_device_name}</strong><span>到 {connection.gateway_device_name}</span></div><span className={`status-pill ${connectionStatusKind(connection.connection_type)}`}><i />{connectionTypeLabel(connection.connection_type)}</span><button className="secondary-button compact-button" type="button" disabled={checkingId === connection.client_device_id} onClick={() => void check(connection.client_device_id)}><RefreshCw size={15} aria-hidden="true" />{checkingId === connection.client_device_id ? "检测中" : "检测"}</button></div>)}</div>{error && <p className="form-error" role="alert">{error}</p>}</FormDialog>;
+}
+
 function hasGatewayIssue(item: SiteNetwork | SiteLink): boolean {
   return item.apply_status === "failed" || item.health_status === "failed" || item.health_status === "degraded";
 }
@@ -3066,7 +3213,7 @@ function FormDialog({
   role,
   compact = false,
   wide = false,
-  variant = "modal",
+  variant = "sheet",
   initialFocusSelector,
 }: {
   eyebrow: string;
@@ -3277,7 +3424,7 @@ function Metric({ label, value, hint }: { label: string; value: number; hint: st
   );
 }
 
-function DeviceRow({ device, sites, deleting, onEdit, onDelete }: { device: Device; sites: Site[]; deleting: boolean; onEdit: (trigger: HTMLButtonElement) => void; onDelete: (trigger: HTMLButtonElement) => void }) {
+function DeviceRow({ device, sites, networkCount, publicServiceCount, deleting, onEdit, onDelete }: { device: Device; sites: Site[]; networkCount: number; publicServiceCount: number; deleting: boolean; onEdit: (trigger: HTMLButtonElement) => void; onDelete: (trigger: HTMLButtonElement) => void }) {
   const online = device.status === "online";
   const subnetReady = device.gateway_report?.subnet_gateway === "ready";
   const siteReady = device.gateway_report?.site_gateway === "ready";
@@ -3288,8 +3435,8 @@ function DeviceRow({ device, sites, deleting, onEdit, onDelete }: { device: Devi
     device.tailscale_ipv6,
     device.mesh_address,
   ].filter((address): address is string => Boolean(address))));
-  const connectionLabel = device.connection_type === "tailscale_client" ? "官方 Tailscale" : "Nexo Agent";
-  const registrationLabel = device.registration_method === "auth_key" ? "Auth Key" : device.registration_method === "oidc" ? "OIDC" : device.registration_method === "browser" ? "浏览器授权" : null;
+  const connectionLabel = device.connection_type === "tailscale_client" ? "Tailscale 客户端" : "Nexo Agent";
+  const registrationLabel = device.registration_method === "auth_key" ? "客户端密钥" : device.registration_method === "oidc" ? "OIDC" : device.registration_method === "browser" ? "浏览器授权" : null;
   return (
     <div className="device-row">
       <span className={`device-avatar ${online ? "online" : ""}`}>{device.name.slice(0, 1).toUpperCase()}</span>
@@ -3302,12 +3449,13 @@ function DeviceRow({ device, sites, deleting, onEdit, onDelete }: { device: Devi
         <span className="capability">{connectionLabel}</span>
         {device.owner_username && <span className="capability">所有者：{device.owner_username}</span>}
         {registrationLabel && <span className="capability">注册：{registrationLabel}</span>}
-        <span className={`capability ${device.mesh_status === "connected" ? "ready" : ""}`}>网络互联：{meshStatusLabel(device.mesh_status)}</span>
+        <span className={`capability ${device.mesh_status === "connected" ? "ready" : ""}`}>组网：{meshStatusLabel(device.mesh_status)}</span>
         {device.needs_name && <span className="capability warning">需要设置设备名称</span>}
         {tailscaleAddresses.map((address) => <span className="capability" key={address}>{address}</span>)}
         {device.tags?.length ? <span className="capability">标签：{device.tags.join("、")}</span> : null}
         {device.expires_at && <span className="capability">有效期至 {formatSessionTime(device.expires_at)}</span>}
-        {device.control_plane_state && <span className="capability">控制面：{device.control_plane_state}</span>}
+        <span className="capability">共享网段 {networkCount}</span>
+        <span className="capability">公网服务 {publicServiceCount}</span>
         {device.gateway_report && (
           <span className={`capability ${subnetReady ? "ready" : ""}`}>共享网络 {subnetReady && familyAvailability ? familyAvailability : "待检查"}</span>
         )}
@@ -3416,7 +3564,7 @@ function DeleteDeviceDialog({
     <FormDialog
       eyebrow="危险操作"
       title="删除设备"
-      description={`设备“${device.name}”的身份和组网节点会立即撤销。${tunnelCount} 个穿透服务将保留为未分配并关闭。`}
+      description={`设备“${device.name}”的身份和组网节点会立即撤销。${tunnelCount} 个公网服务将保留为未分配并关闭。`}
       role="alertdialog"
       compact
       initialFocusSelector="[data-delete-cancel]"
@@ -3443,7 +3591,7 @@ function DeleteDeviceDialog({
       }}>
         <div className="delete-confirmation-copy">
           <AlertTriangle size={20} aria-hidden="true" />
-          <p>删除设备不会删除穿透服务，它们会立即停止公网入口。若设备仍承载共享网络或活动站点网关，服务端仍会阻止删除。</p>
+          <p>删除设备不会删除公网服务，它们会立即停止公网入口。若设备仍承载共享网络或活动站点网关，服务端仍会阻止删除。</p>
         </div>
         {error && <p className="form-error" role="alert">{error}</p>}
         <div className="dialog-actions">
@@ -3856,7 +4004,7 @@ function CreateSiteLinkForm({
   );
 }
 
-const RELEASE_AGENT_IMAGE = "ghcr.io/thelinyue/nexo-agent:0.1.14";
+const RELEASE_AGENT_IMAGE = "ghcr.io/thelinyue/nexo-agent:0.1.17";
 
 function buildAgentCompose(serverUrl: string, token: string): string {
   return `name: nexo-agent
@@ -4040,44 +4188,57 @@ function validateTunnelPorts(localPortValue: string, publicPortValue: string) {
   return { localPort, publicPort } as const;
 }
 
-/** 穿透服务创建表单：仅展示设备、本地服务和用户可理解的访问模式。 */
+/** 公网服务创建表单：仅展示设备、本地服务和用户可理解的访问模式。 */
 function CreateTunnelForm({
+  auth,
   devices,
   publicDomains,
   request,
+  onDomainsChanged,
   onCancel,
   onCreated,
 }: {
+  auth: AuthStatus;
   devices: Device[];
   publicDomains: PublicDomain[];
   request: ApiRequest;
+  onDomainsChanged: () => Promise<void>;
   onCancel: () => void;
   onCreated: () => Promise<void>;
 }) {
+  const readyDomains = publicDomains.filter((item) => publicDomainStatus(item.apply_status).kind === "ready");
   const [deviceId, setDeviceId] = useState(devices[0]?.id ?? "");
   const [name, setName] = useState("");
   const [protocol, setProtocol] = useState<Tunnel["protocol"]>("http");
   const [localAddress, setLocalAddress] = useState("127.0.0.1");
   const [localPort, setLocalPort] = useState("8800");
   const [hostname, setHostname] = useState("");
-  const [publicDomainId, setPublicDomainId] = useState(publicDomains.find((item) => item.is_primary)?.id ?? publicDomains[0]?.id ?? "");
+  const [publicDomainId, setPublicDomainId] = useState(readyDomains.find((item) => item.is_primary)?.id ?? readyDomains[0]?.id ?? "");
   const [publicPort, setPublicPort] = useState("");
   const [originProtocol, setOriginProtocol] = useState<"http" | "https">("http");
   const [submitting, setSubmitting] = useState(false);
+  const [configuringDomain, setConfiguringDomain] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [validation, setValidation] = useState<{ field: "device" | "localPort" | "publicPort"; message: string } | null>(null);
+  const [validation, setValidation] = useState<{ field: "device" | "domain" | "localPort" | "publicPort"; message: string } | null>(null);
   const device = devices.find((item) => item.id === deviceId);
   useEffect(() => {
     if (!deviceId || !devices.some((item) => item.id === deviceId)) setDeviceId(devices[0]?.id ?? "");
   }, [deviceId, devices]);
   useEffect(() => {
-    if (publicDomainId && publicDomains.some((item) => item.id === publicDomainId)) return;
-    setPublicDomainId(publicDomains.find((item) => item.is_primary)?.id ?? publicDomains[0]?.id ?? "");
-  }, [publicDomainId, publicDomains]);
+    if (publicDomainId && readyDomains.some((item) => item.id === publicDomainId)) return;
+    setPublicDomainId(readyDomains.find((item) => item.is_primary)?.id ?? readyDomains[0]?.id ?? "");
+  }, [publicDomainId, readyDomains]);
+  if (configuringDomain) {
+    return <div className="inline-domain-setup">
+      <div className="inline-domain-heading"><button className="secondary-button compact-button" type="button" onClick={() => setConfiguringDomain(false)}><ArrowLeft size={15} aria-hidden="true" />返回服务</button><div><strong>配置域名与 HTTPS</strong><span>保存后返回，已填写的服务信息会保留。</span></div></div>
+      <PublicDomainEditor domain={null} request={request} onCancel={() => setConfiguringDomain(false)} onSaved={async () => { await onDomainsChanged(); setConfiguringDomain(false); }} />
+    </div>;
+  }
   return (
     <form className="inline-form network-form-table" aria-busy={submitting} onSubmit={async (event) => {
       event.preventDefault();
       if (!device) { setValidation({ field: "device", message: "请先选择设备" }); return; }
+      if (protocol !== "tcp" && !publicDomainId) { setValidation({ field: "domain", message: "Web 服务需要一个状态正常的域名" }); return; }
       const ports = validateTunnelPorts(localPort, publicPort);
       if ("error" in ports) {
         setValidation({ field: ports.error.startsWith("本地") ? "localPort" : "publicPort", message: ports.error });
@@ -4102,14 +4263,14 @@ function CreateTunnelForm({
           }),
         });
         const body: unknown = await response.json().catch(() => null);
-        if (!response.ok) throw new Error(readApiError(body, "暂时无法添加穿透服务"));
+        if (!response.ok) throw new Error(readApiError(body, "暂时无法添加公网服务"));
         setName(""); setHostname(""); setPublicPort(""); await onCreated();
       } catch (requestError) {
-        setError(requestError instanceof Error ? requestError.message : "暂时无法添加穿透服务");
+        setError(requestError instanceof Error ? requestError.message : "暂时无法添加公网服务");
       } finally { setSubmitting(false); }
     }}>
       <fieldset className="form-grid tunnel-form-grid" disabled={submitting}>
-        <legend className="sr-only">穿透服务信息</legend>
+        <legend className="sr-only">公网服务信息</legend>
         <label><span>显示名称（可选）</span><input value={name} onChange={(event) => setName(event.target.value)} placeholder="例如：家庭媒体库" /></label>
         <label><span>设备</span><select value={deviceId} onChange={(event) => setDeviceId(event.target.value)} required><option value="">选择设备</option>{devices.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</select>{validation?.field === "device" && <small className="field-error" role="alert">{validation.message}</small>}</label>
         <label><span>公网协议</span><select value={protocol} onChange={(event) => { const value = event.target.value as Tunnel["protocol"]; setProtocol(value); if (value === "https") setOriginProtocol("https"); }}><option value="http">HTTP</option><option value="https">HTTPS</option><option value="tcp">TCP</option></select></label>
@@ -4126,21 +4287,22 @@ function CreateTunnelForm({
         )}
         <label><span>本地端口</span><input inputMode="numeric" value={localPort} onChange={(event) => setLocalPort(event.target.value)} required />{validation?.field === "localPort" && <small className="field-error" role="alert">{validation.message}</small>}</label>
         {protocol === "tcp" ? <label><span>公网端口（可选）</span><input inputMode="numeric" value={publicPort} onChange={(event) => setPublicPort(event.target.value)} placeholder="自动分配" />{validation?.field === "publicPort" && <small className="field-error" role="alert">{validation.message}</small>}</label> : <label><span>子域名前缀</span><input value={hostname} onChange={(event) => setHostname(event.target.value)} placeholder="例如：media" required /></label>}
-        {protocol !== "tcp" && <label><span>公网域名</span><select value={publicDomainId} onChange={(event) => setPublicDomainId(event.target.value)} disabled={publicDomains.length === 0}><option value="">使用主域名</option>{publicDomains.map((item) => <option key={item.id} value={item.id}>{item.domain}{item.is_primary ? "（主域名）" : ""}</option>)}</select></label>}
+        {protocol !== "tcp" && <label><span>公网域名</span><select value={publicDomainId} onChange={(event) => setPublicDomainId(event.target.value)} disabled={readyDomains.length === 0}><option value="">选择可用域名</option>{readyDomains.map((item) => <option key={item.id} value={item.id}>{item.domain}{item.is_primary ? "（主域名）" : ""}</option>)}</select>{validation?.field === "domain" && <small className="field-error" role="alert">{validation.message}</small>}</label>}
       </fieldset>
+      {protocol !== "tcp" && readyDomains.length === 0 && <div className="inline-domain-required" role="status"><AlertTriangle size={18} aria-hidden="true" /><div><strong>Web 服务需要可用域名</strong><span>{auth.role === "system_admin" ? "先在此处完成域名与 HTTPS 配置，返回后服务草稿会继续保留。" : "请联系系统管理员完成域名与 HTTPS 配置。TCP 服务仍可直接创建。"}</span></div>{auth.role === "system_admin" && <button className="secondary-button" type="button" onClick={() => setConfiguringDomain(true)}>配置域名</button>}</div>}
       {error && <p className="form-error" role="alert">{error}</p>}
       <div className="form-footer">
         <span className="form-hint">{protocol === "tcp" ? "公网端口范围：20000-29999。" : "子域名前缀会与入口域名组合为完整访问地址。"}</span>
         <div className="form-actions">
           <button className="secondary-button" type="button" onClick={onCancel} disabled={submitting}>取消</button>
-          <button className="primary-button" type="submit" disabled={submitting || !device}>{submitting ? "添加中…" : "添加穿透服务"}</button>
+          <button className="primary-button" type="submit" disabled={submitting || !device || (protocol !== "tcp" && readyDomains.length === 0)}>{submitting ? "添加中…" : "添加服务"}</button>
         </div>
       </div>
     </form>
   );
 }
 
-/** 穿透服务编辑弹窗：基础字段可修改，未展示的 TLS 元数据按适用性原样保留。 */
+/** 公网服务编辑弹窗：基础字段可修改，未展示的 TLS 元数据按适用性原样保留。 */
 function EditTunnelDialog({
   tunnel,
   devices,
@@ -4173,8 +4335,8 @@ function EditTunnelDialog({
 
   return (
     <FormDialog
-      eyebrow="内网穿透"
-      title="编辑穿透服务"
+      eyebrow="公网服务"
+      title="编辑服务"
       description="修改公网地址与设备本地服务之间的连接信息。"
       onClose={onClose}
       returnFocus={returnFocus}
@@ -4215,17 +4377,17 @@ function EditTunnelDialog({
             }),
           });
           const body: unknown = await response.json().catch(() => null);
-          if (!response.ok) throw new Error(readApiError(body, "暂时无法保存穿透服务"));
+          if (!response.ok) throw new Error(readApiError(body, "暂时无法保存公网服务"));
           onUpdated(body as Tunnel);
           onClose();
         } catch (requestError) {
-          setError(requestError instanceof Error ? requestError.message : "暂时无法保存穿透服务");
+          setError(requestError instanceof Error ? requestError.message : "暂时无法保存公网服务");
         } finally {
           setSubmitting(false);
         }
       }}>
         <fieldset className="form-grid tunnel-edit-grid" disabled={submitting}>
-          <legend className="sr-only">穿透服务编辑信息</legend>
+          <legend className="sr-only">公网服务编辑信息</legend>
           <label><span>显示名称</span><input autoFocus value={name} onChange={(event) => setName(event.target.value)} required />{validation?.field === "name" && <small className="field-error" role="alert">{validation.message}</small>}</label>
           <label><span>设备</span><select value={deviceId} onChange={(event) => setDeviceId(event.target.value)} required>{devices.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</select>{validation?.field === "device" && <small className="field-error" role="alert">{validation.message}</small>}</label>
           <label><span>公网协议</span><select value={protocol} onChange={(event) => { const value = event.target.value as Tunnel["protocol"]; setProtocol(value); if (value === "https") setOriginProtocol("https"); }}><option value="http">HTTP</option><option value="https">HTTPS</option><option value="tcp">TCP</option></select></label>
@@ -4266,7 +4428,7 @@ function navigableWebAddress(publicAddress: string | null): string | null {
   }
 }
 
-/** 穿透服务永久删除使用独立确认窗，避免与可恢复的开关操作混淆。 */
+/** 公网服务永久删除使用独立确认窗，避免与可恢复的开关操作混淆。 */
 function DeleteTunnelDialog({
   tunnel,
   request,
@@ -4286,7 +4448,7 @@ function DeleteTunnelDialog({
   return (
     <FormDialog
       eyebrow="危险操作"
-      title="删除穿透服务"
+      title="删除公网服务"
       description={`“${tunnel.name}”的公网入口和服务端配置将立即永久删除。`}
       role="alertdialog"
       compact
@@ -4301,14 +4463,14 @@ function DeleteTunnelDialog({
         try {
           const response = await request(`/api/v1/tunnels/${encodeURIComponent(tunnel.id)}`, { method: "DELETE" });
           const body: unknown = await response.json().catch(() => null);
-          if (!response.ok) throw new Error(readApiError(body, "暂时无法删除穿透服务"));
+          if (!response.ok) throw new Error(readApiError(body, "暂时无法删除公网服务"));
           const deletion = body as DeleteResponse | null;
           if (!deletion || deletion.deleted !== true || deletion.pending !== false || deletion.id !== tunnel.id) {
-            throw new Error("服务端未确认穿透服务已永久删除");
+            throw new Error("服务端未确认公网服务已永久删除");
           }
           onDeleted(deletion);
         } catch (requestError) {
-          setError(requestError instanceof Error ? requestError.message : "暂时无法删除穿透服务");
+          setError(requestError instanceof Error ? requestError.message : "暂时无法删除公网服务");
           setSubmitting(false);
         }
       }}>
@@ -4349,9 +4511,9 @@ function BatchTunnelDeviceDialog({
   const [error, setError] = useState<string | null>(null);
   return (
     <FormDialog
-      eyebrow="内网穿透"
+      eyebrow="公网服务"
       title="批量更换设备"
-      description={`为选中的 ${tunnels.length} 个穿透服务选择新设备；原有启停状态会保留，运行中的连接会立即关闭。`}
+      description={`为选中的 ${tunnels.length} 个公网服务选择新设备；原有启停状态会保留，运行中的连接会立即关闭。`}
       returnFocus={returnFocus}
       onClose={onClose}
     >
@@ -4412,8 +4574,8 @@ function BatchTunnelDeleteDialog({
   return (
     <FormDialog
       eyebrow="危险操作"
-      title="批量删除穿透服务"
-      description={`将永久删除 ${tunnels.length} 个穿透服务及其公网入口，此操作无法恢复。`}
+      title="批量删除公网服务"
+      description={`将永久删除 ${tunnels.length} 个公网服务及其公网入口，此操作无法恢复。`}
       role="alertdialog"
       compact
       initialFocusSelector="[data-delete-cancel]"
@@ -4431,12 +4593,12 @@ function BatchTunnelDeleteDialog({
             body: JSON.stringify({ tunnel_ids: tunnels.map((tunnel) => tunnel.id) }),
           });
           const body: unknown = await response.json().catch(() => null);
-          if (!response.ok) throw new Error(readApiError(body, "暂时无法批量删除穿透服务"));
+          if (!response.ok) throw new Error(readApiError(body, "暂时无法批量删除公网服务"));
           const result = body as BatchTunnelDeleteResponse | null;
-          if (!result || result.deleted_ids.length !== tunnels.length) throw new Error("服务端未确认所有穿透服务已删除");
+          if (!result || result.deleted_ids.length !== tunnels.length) throw new Error("服务端未确认所有公网服务已删除");
           onDeleted(result);
         } catch (requestError) {
-          setError(requestError instanceof Error ? requestError.message : "暂时无法批量删除穿透服务");
+          setError(requestError instanceof Error ? requestError.message : "暂时无法批量删除公网服务");
           setSubmitting(false);
         }
       }}>
@@ -4488,7 +4650,7 @@ function TunnelRow({
 
   return (
     <div className={`tunnel-row${selected ? " selected" : ""}`}>
-      <label className="selection-control tunnel-selection"><input type="checkbox" checked={selected} onChange={(event) => onSelect(event.target.checked)} disabled={tunnel.deletion_pending} aria-label={`选择穿透服务${tunnel.name}`} /><span className="sr-only">选择 {tunnel.name}</span></label>
+      <label className="selection-control tunnel-selection"><input type="checkbox" checked={selected} onChange={(event) => onSelect(event.target.checked)} disabled={tunnel.deletion_pending} aria-label={`选择公网服务${tunnel.name}`} /><span className="sr-only">选择 {tunnel.name}</span></label>
       <div className="tunnel-identity"><strong>{tunnel.name}</strong><span>{tunnel.device_name ?? "未分配设备"} · {tunnel.local_address}:{tunnel.local_port}</span>{tunnel.public_domain && <small className="tunnel-domain-binding">域名：{tunnel.public_domain}</small>}</div>
       <div className="tunnel-address">
         <span>访问地址</span>
@@ -4521,7 +4683,7 @@ function TunnelRow({
         </div>
       </div>
       <div className="network-actions">
-        <span className={`link-status ${statusKind}`}><i />{tunnel.deletion_pending ? "等待删除" : !assigned ? "未分配" : tunnel.enabled ? (tunnel.apply_status === "ready" ? "已生效" : tunnel.apply_status === "failed" ? "配置失败" : "配置生效中") : "已关闭"}</span>
+        <span className={`link-status ${statusKind}`}><i />{tunnel.deletion_pending ? "处理中" : !assigned ? "需处理" : tunnel.enabled ? (tunnel.apply_status === "ready" ? "正常" : tunnel.apply_status === "failed" ? "需处理" : "处理中") : "已关闭"}</span>
         <button className="link-action" type="button" disabled={actionDisabled} onClick={(event) => onEdit(event.currentTarget)}>编辑</button>
         <button className="link-action" type="button" disabled={actionDisabled || !assigned} title={!assigned ? "请先选择设备" : undefined} onClick={async () => {
           setPending(true);
@@ -4529,15 +4691,15 @@ function TunnelRow({
           try {
             const response = await request(`/api/v1/tunnels/${encodeURIComponent(tunnel.id)}/${tunnel.enabled ? "disable" : "enable"}`, { method: "POST" });
             const body: unknown = await response.json().catch(() => null);
-            if (!response.ok) throw new Error(readApiError(body, tunnel.enabled ? "暂时无法关闭穿透服务" : "暂时无法启用穿透服务"));
+            if (!response.ok) throw new Error(readApiError(body, tunnel.enabled ? "暂时无法关闭公网服务" : "暂时无法启用公网服务"));
             onChanged(body as Tunnel);
           } catch (requestError) {
-            setError(requestError instanceof Error ? requestError.message : "暂时无法更新穿透服务");
+            setError(requestError instanceof Error ? requestError.message : "暂时无法更新公网服务");
           } finally {
             setPending(false);
           }
         }}>{pending ? "处理中…" : tunnel.deletion_pending ? "等待删除" : !assigned ? "需先选择设备" : tunnel.enabled ? "关闭" : "启用"}</button>
-        <button className="delete-icon-button" type="button" aria-label={`删除穿透服务${tunnel.name}`} title={tunnel.deletion_pending ? "等待删除" : "删除穿透服务"} disabled={actionDisabled} onClick={(event) => onDelete(event.currentTarget)}>
+        <button className="delete-icon-button" type="button" aria-label={`删除公网服务${tunnel.name}`} title={tunnel.deletion_pending ? "等待删除" : "删除公网服务"} disabled={actionDisabled} onClick={(event) => onDelete(event.currentTarget)}>
           <Trash2 size={17} aria-hidden="true" />
         </button>
       </div>
@@ -4570,7 +4732,7 @@ function SiteLinkCard({
   onDelete: () => void;
   onOpenDetails: () => void;
 }) {
-  const status = link.deletion_pending ? { label: "等待删除", kind: "working" } : siteLinkStatus(link.apply_status);
+  const status = link.deletion_pending ? { label: "处理中", kind: "working" } : siteLinkStatus(link.apply_status);
   const actionsDisabled = actionPending || link.deletion_pending;
   const health = gatewayHealthStatus(link.health_status, link.left_networks.some((network) => network.source === "manual") || link.right_networks.some((network) => network.source === "manual"));
   const currentSiteName = link.left_site_id === currentSiteId ? link.left_site_name : link.right_site_name;
@@ -4678,7 +4840,7 @@ function MobileSiteLinkDetail({
   onEdit: () => void;
   onDelete: () => void;
 }) {
-  const status = link.deletion_pending ? { label: "等待删除", kind: "working" } : siteLinkStatus(link.apply_status);
+  const status = link.deletion_pending ? { label: "处理中", kind: "working" } : siteLinkStatus(link.apply_status);
   const health = gatewayHealthStatus(link.health_status, link.left_networks.some((network) => network.source === "manual") || link.right_networks.some((network) => network.source === "manual"));
   const actionsDisabled = actionPending || link.deletion_pending;
   const currentRoutes = link.static_routes.filter((route) => route.router_site_id === currentSiteId);
@@ -4753,7 +4915,7 @@ function SiteNetworkRow({
   onToggle: () => void;
   onDelete: () => void;
 }) {
-  const status = network.deletion_pending ? { label: "等待删除", kind: "working" } : siteLinkStatus(network.apply_status);
+  const status = network.deletion_pending ? { label: "处理中", kind: "working" } : siteLinkStatus(network.apply_status);
   const actionsDisabled = actionPending || network.deletion_pending;
   const health = gatewayHealthStatus(network.health_status, network.source === "manual");
   return (
@@ -4840,19 +5002,19 @@ function isPlaceholderDeviceName(value: string): boolean {
 function siteLinkStatus(status: SiteLink["apply_status"]): { label: string; kind: string } {
   switch (status) {
     case "ready":
-      return { label: "已生效", kind: "ready" };
+      return { label: "正常", kind: "ready" };
     case "checking":
-      return { label: "等待设备确认", kind: "working" };
+      return { label: "处理中", kind: "working" };
     case "applying":
-      return { label: "配置生效中", kind: "working" };
+      return { label: "处理中", kind: "working" };
     case "retrying":
-      return { label: "自动重试中", kind: "working" };
+      return { label: "处理中", kind: "working" };
     case "failed":
-      return { label: "配置失败", kind: "failed" };
+      return { label: "需处理", kind: "failed" };
     case "disabled":
       return { label: "已关闭", kind: "disabled" };
     default:
-      return { label: "配置生效中", kind: "working" };
+      return { label: "处理中", kind: "working" };
   }
 }
 
@@ -4935,7 +5097,7 @@ function LoginScreen({ onDone, notice }: { onDone: (body: AuthStatus & { csrf_to
   const [busy, setBusy] = useState(false);
   const [recovery, setRecovery] = useState(false);
   if (recovery) return <RecoveryScreen onBack={() => setRecovery(false)} />;
-  return <AuthShell><p className="eyebrow">安全登录</p><h1>欢迎回来</h1><p className="auth-copy">登录后管理公网访问、设备和网络互联。</p>{notice && <p className="form-success login-notice" role="status">{notice}</p>}<form className="auth-form" onSubmit={async (event) => { event.preventDefault(); setBusy(true); setError(null); try { const response = await fetch("/api/v1/auth/login", { method: "POST", credentials: "same-origin", headers: { "content-type": "application/json" }, body: JSON.stringify({ username, password }) }); const body = await response.json().catch(() => null) as { user_id?: string; role?: string; workspace_id?: string; csrf_token?: string | null; error?: string; channel?: string }; if (!response.ok) throw new Error(body.error ?? "用户名或密码错误"); onDone({ initialized: true, authenticated: true, user_id: body.user_id ?? null, username, role: body.role ?? "tenant", workspace_id: body.workspace_id ?? null, channel: body.channel ?? "local_http", csrf_token: body.csrf_token ?? null, local_http_warning: body.channel !== "public_https" }); } catch (requestError) { setError(requestError instanceof Error ? requestError.message : "登录失败"); } finally { setBusy(false); } }}><label><span>用户名</span><input value={username} onChange={(event) => setUsername(event.target.value)} autoComplete="username" required /></label><label><span>密码</span><input value={password} onChange={(event) => setPassword(event.target.value)} type="password" autoComplete="current-password" required /></label><button className="primary-button" type="submit" disabled={busy}>{busy ? "正在登录…" : "登录"}</button>{error && <p className="form-error" role="alert">{error}</p>}</form><button className="text-button" type="button" onClick={() => setRecovery(true)}>使用恢复码</button></AuthShell>;
+  return <AuthShell><p className="eyebrow">安全登录</p><h1>欢迎回来</h1><p className="auth-copy">登录后统一管理设备、私网访问和公网服务。</p>{notice && <p className="form-success login-notice" role="status">{notice}</p>}<form className="auth-form" onSubmit={async (event) => { event.preventDefault(); setBusy(true); setError(null); try { const response = await fetch("/api/v1/auth/login", { method: "POST", credentials: "same-origin", headers: { "content-type": "application/json" }, body: JSON.stringify({ username, password }) }); const body = await response.json().catch(() => null) as { user_id?: string; role?: string; workspace_id?: string; csrf_token?: string | null; error?: string; channel?: string }; if (!response.ok) throw new Error(body.error ?? "用户名或密码错误"); onDone({ initialized: true, authenticated: true, user_id: body.user_id ?? null, username, role: body.role ?? "tenant", workspace_id: body.workspace_id ?? null, channel: body.channel ?? "local_http", csrf_token: body.csrf_token ?? null, local_http_warning: body.channel !== "public_https" }); } catch (requestError) { setError(requestError instanceof Error ? requestError.message : "登录失败"); } finally { setBusy(false); } }}><label><span>用户名</span><input value={username} onChange={(event) => setUsername(event.target.value)} autoComplete="username" required /></label><label><span>密码</span><input value={password} onChange={(event) => setPassword(event.target.value)} type="password" autoComplete="current-password" required /></label><button className="primary-button" type="submit" disabled={busy}>{busy ? "正在登录…" : "登录"}</button>{error && <p className="form-error" role="alert">{error}</p>}</form><button className="text-button" type="button" onClick={() => setRecovery(true)}>使用恢复码</button></AuthShell>;
 }
 
 function RecoveryScreen({ onBack }: { onBack: () => void }) {

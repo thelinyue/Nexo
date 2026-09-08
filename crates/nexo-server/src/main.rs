@@ -44,7 +44,8 @@ use nexo_protocol::GatewayRouteApplyResult;
 use nexo_protocol::{
     AgentControlMessage, AgentEnrollmentPollRequest, AgentEnrollmentPollResponse,
     AgentEnrollmentRequest, AgentEnrollmentResponse, GatewayApplyAck, GatewayDesiredRoute,
-    GatewayDesiredState, GatewayRouteApplyReport, MeshEnrollmentOffer, MeshIdentityReport,
+    GatewayDesiredState, GatewayRouteApplyReport, MeshConnectionCheckResult,
+    MeshConnectionCheckTask, MeshConnectionObservation, MeshEnrollmentOffer, MeshIdentityReport,
     ServerControlMessage, TunnelApplyResult, TunnelDataEndpoint, TunnelDesiredState,
 };
 use nexo_tunnel::{
@@ -100,6 +101,8 @@ const V012_BASELINE_MIGRATION: &str = include_str!("../../../migrations/v0.1.12_
 const OIDC_ACCOUNTS_MIGRATION: &str = include_str!("../../../migrations/0020_oidc_accounts.sql");
 const ROUTE_CONFIRMATIONS_MIGRATION: &str =
     include_str!("../../../migrations/0021_route_confirmations.sql");
+const MESH_CONNECTIONS_MIGRATION: &str =
+    include_str!("../../../migrations/0022_mesh_connections.sql");
 
 #[derive(Clone)]
 pub(crate) struct AppState {
@@ -829,6 +832,39 @@ struct RecheckResponse {
     message: String,
 }
 
+/// 路由详情使用的连接路径投影。状态只描述客户端到网关 Agent 的当前路径，
+/// 超过 45 秒未更新时统一返回 unknown，不能把历史直连误当作当前状态。
+#[derive(Debug, Serialize)]
+struct MeshConnectionResponse {
+    client_device_id: String,
+    client_device_name: String,
+    gateway_device_id: String,
+    gateway_device_name: String,
+    site_network_id: String,
+    site_network_prefix: String,
+    connection_type: String,
+    updated_at: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CreateMeshConnectionCheckRequest {
+    client_device_id: String,
+    site_network_id: String,
+}
+
+#[derive(Debug, Serialize)]
+struct MeshConnectionCheckResponse {
+    id: String,
+    client_device_id: String,
+    gateway_device_id: String,
+    site_network_id: String,
+    status: String,
+    connection_type: Option<String>,
+    error_message: Option<String>,
+    requested_at: i64,
+    completed_at: Option<i64>,
+}
+
 /// 身份错配后的显式恢复请求；必须同时提供当前预期 Node ID 和确认标志。
 ///
 /// 该接口不会根据 Agent 当前上报的身份自动改绑，避免被替换的设备静默接管
@@ -995,6 +1031,21 @@ struct CreateSiteNetworkRequest {
     /// API 使用 detected/manual；数据库沿用 direct_interface/manual。
     #[serde(default)]
     source: SiteNetworkSourceRequest,
+}
+
+/// 一键启用只接受 Agent 最近能力报告中存在的网卡和前缀。
+#[derive(Debug, Deserialize)]
+struct EnableDetectedNetworksRequest {
+    device_id: String,
+    networks: Vec<DetectedNetworkSelection>,
+}
+
+#[derive(Debug, Deserialize)]
+struct DetectedNetworkSelection {
+    interface_id: String,
+    prefix: String,
+    #[serde(default)]
+    name: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Default, PartialEq, Eq)]
@@ -1243,6 +1294,7 @@ async fn main() -> Result<()> {
     initialize_v012_database(&connection).context("无法初始化或检查 Nexo 数据库基线")?;
     apply_oidc_accounts_migration(&connection).context("无法初始化 OIDC 账号映射数据结构")?;
     apply_route_confirmations_migration(&connection).context("无法更新站点路由确认状态")?;
+    apply_mesh_connections_migration(&connection).context("无法初始化连接观测数据结构")?;
     ensure_server_ca(&connection).context("无法初始化服务端设备身份 CA")?;
     ensure_server_control_identity(&connection).context("无法初始化控制通道服务端证书")?;
     let data_dir = db_path
@@ -1511,6 +1563,15 @@ async fn main() -> Result<()> {
             post(poll_agent_enrollment),
         )
         .route("/api/v1/mesh/status", get(mesh_status))
+        .route("/api/v1/mesh/connections", get(list_mesh_connections))
+        .route(
+            "/api/v1/mesh/connection-checks",
+            post(create_mesh_connection_check),
+        )
+        .route(
+            "/api/v1/mesh/connection-checks/{id}",
+            get(get_mesh_connection_check),
+        )
         .route(
             "/api/v1/access-control/rules",
             get(list_access_rules).post(create_access_rule),
@@ -1551,6 +1612,10 @@ async fn main() -> Result<()> {
         .route(
             "/api/v1/site-networks",
             get(list_site_networks).post(create_site_network),
+        )
+        .route(
+            "/api/v1/site-networks/enable-detected",
+            post(enable_detected_site_networks),
         )
         .route(
             "/api/v1/site-networks/{id}",
@@ -1693,6 +1758,7 @@ fn run_cli_command(command: CliCommand) -> Result<()> {
     initialize_v012_database(&connection)?;
     apply_oidc_accounts_migration(&connection)?;
     apply_route_confirmations_migration(&connection)?;
+    apply_mesh_connections_migration(&connection)?;
     let data_dir = db_path.parent().context("Nexo 数据库路径缺少父目录")?;
     match command {
         CliCommand::BootstrapCode => {
@@ -1825,6 +1891,31 @@ fn apply_route_confirmations_migration(connection: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// 建立脱敏连接观测和异步检测任务表。迁移只增加新表，不改写已有设备、
+/// 路由或身份数据，因此升级失败时不会留下部分业务状态。
+fn apply_mesh_connections_migration(connection: &Connection) -> Result<()> {
+    let applied = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version = 22)",
+        [],
+        |row| row.get::<_, bool>(0),
+    )?;
+    if applied {
+        return Ok(());
+    }
+    let has_previous: bool = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version = 21)",
+        [],
+        |row| row.get(0),
+    )?;
+    if !has_previous {
+        anyhow::bail!("数据库版本过旧或未完成迁移；连接观测迁移要求先完成路由确认迁移");
+    }
+    let transaction = connection.unchecked_transaction()?;
+    transaction.execute_batch(MESH_CONNECTIONS_MIGRATION)?;
+    transaction.commit()?;
+    Ok(())
+}
+
 /// 在 Server 持续运行期间定期检查并轮换 Headscale API Key。
 ///
 /// 轮换器只拿到内存中的适配器句柄；新 Key 通过健康 API 自检后才由
@@ -1924,12 +2015,12 @@ async fn list_tunnels(
             "WHERE t.deleted_at IS NULL AND t.tenant_id = ?1
              ORDER BY t.updated_at DESC, t.name ASC",
         ))
-        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法读取穿透服务列表"))?;
+        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法读取公网服务列表"))?;
     let rows = statement
         .query_map([tenant_id], tunnel_response_from_row)
-        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法读取穿透服务列表"))?;
+        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法读取公网服务列表"))?;
     rows.map(|row| {
-        row.map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "穿透服务数据格式无效"))
+        row.map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "公网服务数据格式无效"))
     })
     .collect::<Result<Vec<_>, _>>()
     .map(Json)
@@ -1952,7 +2043,7 @@ async fn get_tunnel(
             tunnel_response_from_row,
         )
         .map(Json)
-        .map_err(|_| ApiError::new(StatusCode::NOT_FOUND, "穿透服务不存在"))
+        .map_err(|_| ApiError::new(StatusCode::NOT_FOUND, "公网服务不存在"))
 }
 
 async fn create_tunnel(
@@ -2034,7 +2125,7 @@ async fn create_tunnel(
             )
             .map_err(|error| {
                 tracing::error!("保存公网访问配置失败：{error}");
-                ApiError::new(StatusCode::CONFLICT, "穿透服务与现有记录冲突")
+                ApiError::new(StatusCode::CONFLICT, "公网服务与现有记录冲突")
             })?;
         connection
             .execute(
@@ -2046,7 +2137,7 @@ async fn create_tunnel(
             .map_err(|_| {
                 ApiError::new(
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    "无法创建穿透服务应用状态",
+                    "无法创建公网服务应用状态",
                 )
             })?;
         (public_port, audit_tenant, audit_protocol)
@@ -2077,7 +2168,7 @@ async fn create_tunnel(
             .map_err(|_| {
                 ApiError::new(
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    "无法写入穿透服务审计记录",
+                    "无法写入公网服务审计记录",
                 )
             })?;
     }
@@ -2094,7 +2185,7 @@ async fn create_tunnel(
                 tunnel_response_from_row,
             )
             .map(Json)
-            .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法读取新建穿透服务"))
+            .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法读取新建公网服务"))
     };
     if response.is_ok() {
         for rollback in &mut secret_rollbacks {
@@ -2142,17 +2233,17 @@ async fn update_tunnel(
                     ))
                 },
             )
-            .map_err(|_| ApiError::new(StatusCode::NOT_FOUND, "穿透服务不存在"))?;
+            .map_err(|_| ApiError::new(StatusCode::NOT_FOUND, "公网服务不存在"))?;
         if old.1 != normalized.tenant_id {
             return Err(ApiError::new(
                 StatusCode::FORBIDDEN,
-                "穿透服务不属于当前租户",
+                "公网服务不属于当前租户",
             ));
         }
         if old.6 != 0 {
             return Err(ApiError::new(
                 StatusCode::CONFLICT,
-                "穿透服务正在等待删除，不能再编辑",
+                "公网服务正在等待删除，不能再编辑",
             ));
         }
         let requested_port = normalized.public_port.or_else(|| {
@@ -2252,7 +2343,7 @@ async fn update_tunnel(
                     tenant_id,
                 ],
             )
-            .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法更新穿透服务"))?;
+            .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法更新公网服务"))?;
     }
     if let Some(old_path) = old_origin_ca_path.as_deref() {
         let keep_old_path = origin_ca_path
@@ -2291,7 +2382,7 @@ async fn update_tunnel(
             .map_err(|_| {
                 ApiError::new(
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    "无法读取更新后的穿透服务",
+                    "无法读取更新后的公网服务",
                 )
             })
     };
@@ -2401,7 +2492,7 @@ async fn delete_tunnel(
         let transaction = connection.transaction().map_err(|_| {
             ApiError::new(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                "无法开始穿透服务删除事务",
+                "无法开始公网服务删除事务",
             )
         })?;
         let paths = transaction
@@ -2412,8 +2503,8 @@ async fn delete_tunnel(
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .optional()
-            .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法读取穿透服务"))?
-            .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "穿透服务不存在"))?;
+            .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法读取公网服务"))?
+            .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "公网服务不存在"))?;
         transaction
             .execute(
                 "DELETE FROM tunnel_applied_states WHERE tunnel_id = ?1",
@@ -2422,7 +2513,7 @@ async fn delete_tunnel(
             .map_err(|_| {
                 ApiError::new(
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    "无法删除穿透服务应用状态",
+                    "无法删除公网服务应用状态",
                 )
             })?;
         write_audit_event(&transaction, &tenant_id, "TUNNEL_DELETED", "tunnel", &id)?;
@@ -2433,18 +2524,18 @@ async fn delete_tunnel(
                 rusqlite::params![id, tenant_id],
             )
             .map_err(|_| {
-                ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法删除穿透服务记录")
+                ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法删除公网服务记录")
             })?;
         if deleted != 1 {
             return Err(ApiError::new(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                "穿透服务删除结果不一致",
+                "公网服务删除结果不一致",
             ));
         }
         transaction.commit().map_err(|_| {
             ApiError::new(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                "无法提交穿透服务删除事务",
+                "无法提交公网服务删除事务",
             )
         })?;
         paths
@@ -2455,12 +2546,12 @@ async fn delete_tunnel(
     stop_active_tunnel_connections(&state, &id);
     cleanup_tunnel_files(&id, origin_ca_path, bridge_socket_path);
     reconcile_caddy_config_best_effort(&state).await;
-    tracing::info!(tunnel_id = %id, "穿透服务已永久删除");
+    tracing::info!(tunnel_id = %id, "公网服务已永久删除");
     Ok(Json(DeleteResponse {
         deleted: true,
         pending: false,
         id,
-        message: "穿透服务已永久删除".to_owned(),
+        message: "公网服务已永久删除".to_owned(),
     }))
 }
 
@@ -2474,7 +2565,7 @@ fn normalize_batch_tunnel_ids(ids: Vec<String>) -> Result<Vec<String>, ApiError>
         if id.is_empty() {
             return Err(ApiError::new(
                 StatusCode::BAD_REQUEST,
-                "穿透服务 ID 不能为空",
+                "公网服务 ID 不能为空",
             ));
         }
         if seen.insert(id.clone()) {
@@ -2484,7 +2575,7 @@ fn normalize_batch_tunnel_ids(ids: Vec<String>) -> Result<Vec<String>, ApiError>
     if normalized.is_empty() {
         return Err(ApiError::new(
             StatusCode::BAD_REQUEST,
-            "至少选择一个穿透服务",
+            "至少选择一个公网服务",
         ));
     }
     Ok(normalized)
@@ -2546,7 +2637,7 @@ fn load_batch_tunnel_records(
                 },
             )
             .optional()
-            .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法读取穿透服务"))?;
+            .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法读取公网服务"))?;
         let Some((
             record_tenant_id,
             device_id,
@@ -2561,25 +2652,25 @@ fn load_batch_tunnel_records(
         else {
             return Err(ApiError::new(
                 StatusCode::NOT_FOUND,
-                format!("穿透服务 {id} 不存在"),
+                format!("公网服务 {id} 不存在"),
             ));
         };
         if record_tenant_id != tenant_id {
             return Err(ApiError::new(
                 StatusCode::FORBIDDEN,
-                "穿透服务不属于当前租户",
+                "公网服务不属于当前租户",
             ));
         }
         if deleted_at.is_some() {
             return Err(ApiError::new(
                 StatusCode::CONFLICT,
-                format!("穿透服务 {id} 已删除，不能批量操作"),
+                format!("公网服务 {id} 已删除，不能批量操作"),
             ));
         }
         if deletion_requested != 0 {
             return Err(ApiError::new(
                 StatusCode::CONFLICT,
-                format!("穿透服务 {id} 正在等待删除，不能批量操作"),
+                format!("公网服务 {id} 正在等待删除，不能批量操作"),
             ));
         }
         records.push(BatchTunnelRecord {
@@ -2609,7 +2700,7 @@ fn read_tunnel_response(
         .map_err(|_| {
             ApiError::new(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                "无法读取更新后的穿透服务",
+                "无法读取更新后的公网服务",
             )
         })
 }
@@ -2696,7 +2787,7 @@ async fn batch_update_tunnel_device(
                     ],
                 )
                 .map_err(|_| {
-                    ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法更换穿透服务设备")
+                    ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法更换公网服务设备")
                 })?;
             transaction
                 .execute(
@@ -2708,7 +2799,7 @@ async fn batch_update_tunnel_device(
                 .map_err(|_| {
                     ApiError::new(
                         StatusCode::INTERNAL_SERVER_ERROR,
-                        "无法更新穿透服务应用状态",
+                        "无法更新公网服务应用状态",
                     )
                 })?;
             write_audit_event(
@@ -2766,7 +2857,7 @@ async fn batch_update_tunnel_device(
         batch_response_tunnels(&connection, &tenant_id, &updated_ids)?
     };
     let message = format!(
-        "已更换 {} 个穿透服务的设备，跳过 {} 项",
+        "已更换 {} 个公网服务的设备，跳过 {} 项",
         updated.len(),
         skipped.len()
     );
@@ -2812,7 +2903,7 @@ async fn batch_set_tunnels_enabled(
         let transaction = connection.transaction().map_err(|_| {
             ApiError::new(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                "无法开始批量切换穿透服务事务",
+                "无法开始批量切换公网服务事务",
             )
         })?;
         let records = load_batch_tunnel_records(&transaction, &tenant_id, &tunnel_ids)?;
@@ -2852,7 +2943,7 @@ async fn batch_set_tunnels_enabled(
                     ],
                 )
                 .map_err(|_| {
-                    ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法更新穿透服务开关")
+                    ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法更新公网服务开关")
                 })?;
             transaction
                 .execute(
@@ -2864,7 +2955,7 @@ async fn batch_set_tunnels_enabled(
                 .map_err(|_| {
                     ApiError::new(
                         StatusCode::INTERNAL_SERVER_ERROR,
-                        "无法更新穿透服务应用状态",
+                        "无法更新公网服务应用状态",
                     )
                 })?;
             write_audit_event(
@@ -2883,7 +2974,7 @@ async fn batch_set_tunnels_enabled(
         transaction.commit().map_err(|_| {
             ApiError::new(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                "无法提交批量切换穿透服务事务",
+                "无法提交批量切换公网服务事务",
             )
         })?;
         (records, updated_ids, skipped)
@@ -2927,7 +3018,7 @@ async fn batch_set_tunnels_enabled(
     };
     let operation = if enabled { "启用" } else { "停用" };
     let message = format!(
-        "已{} {} 个穿透服务，跳过 {} 项",
+        "已{} {} 个公网服务，跳过 {} 项",
         operation,
         updated.len(),
         skipped.len()
@@ -2957,7 +3048,7 @@ async fn batch_delete_tunnels(
         let transaction = connection.transaction().map_err(|_| {
             ApiError::new(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                "无法开始批量删除穿透服务事务",
+                "无法开始批量删除公网服务事务",
             )
         })?;
         let records = load_batch_tunnel_records(&transaction, &tenant_id, &tunnel_ids)?;
@@ -2970,7 +3061,7 @@ async fn batch_delete_tunnels(
                 .map_err(|_| {
                     ApiError::new(
                         StatusCode::INTERNAL_SERVER_ERROR,
-                        "无法删除穿透服务应用状态",
+                        "无法删除公网服务应用状态",
                     )
                 })?;
             write_audit_event(
@@ -2987,19 +3078,19 @@ async fn batch_delete_tunnels(
                     rusqlite::params![record.id, tenant_id],
                 )
                 .map_err(|_| {
-                    ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法删除穿透服务记录")
+                    ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法删除公网服务记录")
                 })?;
             if deleted != 1 {
                 return Err(ApiError::new(
                     StatusCode::CONFLICT,
-                    format!("穿透服务 {} 删除结果不一致", record.id),
+                    format!("公网服务 {} 删除结果不一致", record.id),
                 ));
             }
         }
         transaction.commit().map_err(|_| {
             ApiError::new(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                "无法提交批量删除穿透服务事务",
+                "无法提交批量删除公网服务事务",
             )
         })?;
         let cleanups = records
@@ -3021,11 +3112,11 @@ async fn batch_delete_tunnels(
         cleanup_tunnel_files(&tunnel_id, origin_ca_path, bridge_socket_path);
     }
     reconcile_caddy_config_best_effort(&state).await;
-    tracing::info!(deleted_count = deleted_ids.len(), "批量删除穿透服务已完成");
+    tracing::info!(deleted_count = deleted_ids.len(), "批量删除公网服务已完成");
     Ok(Json(BatchTunnelDeleteResponse {
         affected_count: deleted_ids.len(),
         message: format!(
-            "已永久删除 {} 个穿透服务，公网入口已停止",
+            "已永久删除 {} 个公网服务，公网入口已停止",
             deleted_ids.len()
         ),
         deleted_ids,
@@ -3068,10 +3159,10 @@ async fn recheck_tunnel(
                 rusqlite::params![id, tenant_id],
             )
             .map_err(|_| {
-                ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法重新检测穿透服务")
+                ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法重新检测公网服务")
             })?;
         if changed == 0 {
-            return Err(ApiError::new(StatusCode::NOT_FOUND, "穿透服务不存在"));
+            return Err(ApiError::new(StatusCode::NOT_FOUND, "公网服务不存在"));
         }
     }
     reconcile_caddy_config_best_effort(&state).await;
@@ -3086,7 +3177,7 @@ async fn recheck_tunnel(
             tunnel_response_from_row,
         )
         .map(Json)
-        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法读取穿透服务状态"))
+        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法读取公网服务状态"))
 }
 
 fn ensure_tunnel_not_deleting(
@@ -3102,12 +3193,12 @@ fn ensure_tunnel_not_deleting(
             |row| row.get::<_, i64>(0),
         )
         .optional()
-        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法读取穿透服务"))?
-        .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "穿透服务不存在"))?;
+        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法读取公网服务"))?
+        .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "公网服务不存在"))?;
     if deletion_requested != 0 {
         return Err(ApiError::new(
             StatusCode::CONFLICT,
-            "穿透服务正在等待删除，不能重复操作",
+            "公网服务正在等待删除，不能重复操作",
         ));
     }
     Ok(())
@@ -3138,18 +3229,18 @@ async fn set_tunnel_enabled(
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
             )
             .optional()
-            .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法读取穿透服务"))?
-            .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "穿透服务不存在"))?;
+            .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法读取公网服务"))?
+            .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "公网服务不存在"))?;
         if deletion_requested != 0 {
             return Err(ApiError::new(
                 StatusCode::CONFLICT,
-                "穿透服务正在等待删除，不能再修改开关",
+                "公网服务正在等待删除，不能再修改开关",
             ));
         }
         if enabled && device_id.is_none() {
             return Err(ApiError::new(
                 StatusCode::CONFLICT,
-                "穿透服务尚未分配设备，请先选择设备后再启用",
+                "公网服务尚未分配设备，请先选择设备后再启用",
             ));
         }
         let changed = connection
@@ -3167,10 +3258,10 @@ async fn set_tunnel_enabled(
                 ],
             )
             .map_err(|_| {
-                ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法更新穿透服务开关")
+                ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法更新公网服务开关")
             })?;
         if changed == 0 {
-            return Err(ApiError::new(StatusCode::NOT_FOUND, "穿透服务不存在"));
+            return Err(ApiError::new(StatusCode::NOT_FOUND, "公网服务不存在"));
         }
         (protocol, public_port)
     };
@@ -3202,7 +3293,7 @@ async fn set_tunnel_enabled(
             tunnel_response_from_row,
         )
         .map(Json)
-        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法读取穿透服务状态"))
+        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法读取公网服务状态"))
 }
 
 struct NormalizedTunnelRequest {
@@ -3241,7 +3332,7 @@ fn normalize_tunnel_request(
     if !matches!(protocol.as_str(), "tcp" | "http" | "https") {
         return Err(ApiError::new(
             StatusCode::BAD_REQUEST,
-            "穿透服务类型只能是 TCP、HTTP 或 HTTPS",
+            "公网服务类型只能是 TCP、HTTP 或 HTTPS",
         ));
     }
     if request.local_port == 0 {
@@ -3771,7 +3862,7 @@ fn primary_domain_status_label(status: &str) -> String {
     match status {
         "not_configured" => "NOT_CONFIGURED",
         "pending" | "checking" | "configuring" | "retrying" | "rate_limited" => "CONFIGURING",
-        "ready" => "READY",
+        "ready" => "正常",
         "error" => "ERROR",
         _ => "ERROR",
     }
@@ -5017,7 +5108,7 @@ async fn delete_public_domain(
             {
                 return Err(ApiError::new(
                     StatusCode::CONFLICT,
-                    "替代域名尚未 READY，不能迁移服务",
+                    "替代域名状态尚未正常，不能迁移服务",
                 ));
             }
             if !public_domain_dns_ready(&dns_check) {
@@ -5928,7 +6019,7 @@ async fn make_public_domain_primary(
         {
             return Err(ApiError::new(
                 StatusCode::CONFLICT,
-                "根域名和泛域名证书必须全部 READY 后才能设为主域名",
+                "根域名和泛域名证书状态必须全部正常后才能设为主域名",
             ));
         }
         if !public_domain_dns_ready(&target.5) {
@@ -7769,14 +7860,14 @@ async fn delete_device(
                  WHERE device_id = ?1 AND deleted_at IS NULL",
             )
             .map_err(|_| {
-                ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法读取设备穿透服务")
+                ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法读取设备公网服务")
             })?;
         let tunnel_ids = tunnel_statement
             .query_map([&id], |row| row.get::<_, String>(0))
-            .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法读取设备穿透服务"))?
+            .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法读取设备公网服务"))?
             .collect::<rusqlite::Result<Vec<_>>>()
             .map_err(|_| {
-                ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "设备穿透服务数据无效")
+                ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "设备公网服务数据无效")
             })?;
         (name, node_id, pre_auth_key_ids, tunnel_ids)
     };
@@ -7888,7 +7979,7 @@ async fn delete_device(
                 .map_err(|_| {
                     ApiError::new(
                         StatusCode::INTERNAL_SERVER_ERROR,
-                        "无法解除设备与穿透服务的关联",
+                        "无法解除设备与公网服务的关联",
                     )
                 })?;
             transaction
@@ -7903,7 +7994,7 @@ async fn delete_device(
                 .map_err(|_| {
                     ApiError::new(
                         StatusCode::INTERNAL_SERVER_ERROR,
-                        "无法更新穿透服务应用状态",
+                        "无法更新公网服务应用状态",
                     )
                 })?;
             write_audit_event(
@@ -7949,7 +8040,7 @@ async fn delete_device(
             "设备已删除，原 Agent 需要重新入网才能连接".to_owned()
         } else {
             format!(
-                "设备已删除，{} 个穿透服务已保留为未分配并关闭；原 Agent 需要重新入网才能连接",
+                "设备已删除，{} 个公网服务已保留为未分配并关闭；原 Agent 需要重新入网才能连接",
                 tunnel_ids.len()
             )
         },
@@ -7964,7 +8055,7 @@ fn delete_dependency_message(subject: &str, dependencies: &[(&str, i64)]) -> Opt
         .collect::<Vec<_>>();
     (!details.is_empty()).then(|| {
         format!(
-            "{subject}仍关联{}，请按互联关系、共享网络、穿透服务的顺序先完成删除",
+            "{subject}仍关联{}，请按互联关系、共享网络、公网服务的顺序先完成删除",
             details.join("、")
         )
     })
@@ -8214,6 +8305,171 @@ async fn serve_control_listener(
     }
 }
 
+/// 保存 Agent 的脱敏连接观测。连接类别在协议边界再次归一化，避免异常
+/// Agent 把任意字符串写入数据库；接收端从不记录端点或中继区域。
+fn record_mesh_connection_observations(
+    state: &AppState,
+    gateway_device_id: &str,
+    observations: &[MeshConnectionObservation],
+) -> Result<()> {
+    if observations.is_empty() {
+        return Ok(());
+    }
+    let connection = state
+        .db
+        .lock()
+        .map_err(|_| anyhow::anyhow!("数据库锁不可用"))?;
+    let transaction = connection.unchecked_transaction()?;
+    let received_at = unix_now();
+    for observation in observations {
+        let peer_node_id = observation.peer_node_id.trim();
+        if peer_node_id.is_empty() {
+            continue;
+        }
+        let connection_type = if observation.active {
+            normalized_connection_type(&observation.connection_type)
+        } else {
+            "idle"
+        };
+        let observed_at = observation.observed_at.min(received_at);
+        transaction.execute(
+            "INSERT INTO mesh_connection_observations
+             (gateway_device_id, peer_node_id, connection_type, active, observed_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, unixepoch())
+             ON CONFLICT(gateway_device_id, peer_node_id) DO UPDATE SET
+             connection_type = excluded.connection_type, active = excluded.active,
+             observed_at = excluded.observed_at, updated_at = unixepoch()",
+            rusqlite::params![
+                gateway_device_id,
+                peer_node_id,
+                connection_type,
+                i64::from(observation.active),
+                observed_at
+            ],
+        )?;
+    }
+    transaction.commit()?;
+    Ok(())
+}
+
+fn normalized_connection_type(value: &str) -> &'static str {
+    match value {
+        "direct" => "direct",
+        "peer_relay" => "peer_relay",
+        "derp" => "derp",
+        "idle" => "idle",
+        _ => "unknown",
+    }
+}
+
+/// 领取当前 Agent 的待检测任务。超时的 running 任务可重新投递，保证
+/// Agent 在收到任务后断线时不会让检测永久卡住。
+fn take_mesh_connection_checks(
+    state: &AppState,
+    gateway_device_id: &str,
+) -> Result<Vec<MeshConnectionCheckTask>> {
+    let connection = state
+        .db
+        .lock()
+        .map_err(|_| anyhow::anyhow!("数据库锁不可用"))?;
+    let transaction = connection.unchecked_transaction()?;
+    transaction.execute(
+        "UPDATE mesh_connection_checks SET status = 'pending', started_at = NULL
+         WHERE gateway_device_id = ?1 AND status = 'running'
+           AND started_at < unixepoch() - 30",
+        [gateway_device_id],
+    )?;
+    let tasks = {
+        let mut statement = transaction.prepare(
+            "SELECT id, target_ip FROM mesh_connection_checks
+             WHERE gateway_device_id = ?1 AND status = 'pending'
+             ORDER BY requested_at ASC LIMIT 8",
+        )?;
+        let rows = statement
+            .query_map([gateway_device_id], |row| {
+                Ok(MeshConnectionCheckTask {
+                    id: row.get(0)?,
+                    target_ip: row.get(1)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        rows
+    };
+    for task in &tasks {
+        transaction.execute(
+            "UPDATE mesh_connection_checks SET status = 'running', started_at = unixepoch()
+             WHERE id = ?1 AND gateway_device_id = ?2 AND status = 'pending'",
+            rusqlite::params![task.id, gateway_device_id],
+        )?;
+    }
+    transaction.commit()?;
+    Ok(tasks)
+}
+
+fn apply_mesh_connection_check_results(
+    state: &AppState,
+    gateway_device_id: &str,
+    results: &[MeshConnectionCheckResult],
+) -> Result<()> {
+    let connection = state
+        .db
+        .lock()
+        .map_err(|_| anyhow::anyhow!("数据库锁不可用"))?;
+    let transaction = connection.unchecked_transaction()?;
+    for result in results {
+        let connection_type = normalized_connection_type(&result.connection_type);
+        let status = if result.success {
+            "succeeded"
+        } else {
+            "failed"
+        };
+        let changed = transaction.execute(
+            "UPDATE mesh_connection_checks
+             SET status = ?1, connection_type = ?2, error_message = ?3,
+                 completed_at = unixepoch()
+             WHERE id = ?4 AND gateway_device_id = ?5 AND status = 'running'",
+            rusqlite::params![
+                status,
+                connection_type,
+                result.error_message,
+                result.id,
+                gateway_device_id
+            ],
+        )?;
+        if changed == 0 || !result.success {
+            continue;
+        }
+        let peer_node_id: Option<String> = transaction
+            .query_row(
+                "SELECT mesh.headscale_node_id
+                 FROM mesh_connection_checks check_job
+                 JOIN mesh_identities mesh ON mesh.nexo_device_id = check_job.client_device_id
+                 WHERE check_job.id = ?1 AND check_job.gateway_device_id = ?2",
+                rusqlite::params![result.id, gateway_device_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(peer_node_id) = peer_node_id {
+            transaction.execute(
+                "INSERT INTO mesh_connection_observations
+                 (gateway_device_id, peer_node_id, connection_type, active, observed_at, updated_at)
+                 VALUES (?1, ?2, ?3, 1, ?4, unixepoch())
+                 ON CONFLICT(gateway_device_id, peer_node_id) DO UPDATE SET
+                 connection_type = excluded.connection_type, active = 1,
+                 observed_at = excluded.observed_at, updated_at = unixepoch()",
+                rusqlite::params![
+                    gateway_device_id,
+                    peer_node_id,
+                    connection_type,
+                    result.observed_at.min(unix_now())
+                ],
+            )?;
+        }
+    }
+    transaction.commit()?;
+    Ok(())
+}
+
 /// 校验证书指纹与设备声明的一致性，并处理心跳更新。
 async fn serve_control_connection(
     acceptor: TlsAcceptor,
@@ -8255,7 +8511,8 @@ async fn serve_control_connection(
         AgentControlMessage::Heartbeat { .. } => anyhow::bail!("设备必须先发送身份声明"),
         AgentControlMessage::MeshEnrollmentAck { .. }
         | AgentControlMessage::GatewayRouteApplyReport { .. }
-        | AgentControlMessage::TunnelApplyReport { .. } => {
+        | AgentControlMessage::TunnelApplyReport { .. }
+        | AgentControlMessage::MeshConnectionCheckReport { .. } => {
             anyhow::bail!("设备必须先发送身份声明")
         }
         AgentControlMessage::GatewayApplyAck { .. } => anyhow::bail!("设备必须先发送身份声明"),
@@ -8325,6 +8582,7 @@ async fn serve_control_connection(
             ],
             tunnels: load_tunnel_desired_state(&state, &device_id)?,
             tunnel_endpoint: tunnel_endpoint_from_env(),
+            connection_checks: take_mesh_connection_checks(&state, &device_id)?,
         },
     )
     .await?;
@@ -8342,6 +8600,7 @@ async fn serve_control_connection(
                 agent_version: heartbeat_version,
                 gateway_report,
                 mesh_identity,
+                mesh_connections,
             } if heartbeat_device_id == device_id => {
                 {
                     let connection = state
@@ -8380,6 +8639,7 @@ async fn serve_control_connection(
                 if let Some(identity) = mesh_identity.as_ref() {
                     record_mesh_identity_report(&state, &device_id, identity)?;
                 }
+                record_mesh_connection_observations(&state, &device_id, &mesh_connections)?;
                 let runtime_mesh_allowed = mesh_application_allowed(&state).await;
                 let gateway_state = {
                     let connection = state
@@ -8409,6 +8669,7 @@ async fn serve_control_connection(
                         ],
                         tunnels: load_tunnel_desired_state(&state, &device_id)?,
                         tunnel_endpoint: tunnel_endpoint_from_env(),
+                        connection_checks: take_mesh_connection_checks(&state, &device_id)?,
                     },
                 )
                 .await?;
@@ -8507,6 +8768,7 @@ async fn serve_control_connection(
                         ],
                         tunnels: load_tunnel_desired_state(&state, &device_id)?,
                         tunnel_endpoint: tunnel_endpoint_from_env(),
+                        connection_checks: take_mesh_connection_checks(&state, &device_id)?,
                     },
                 )
                 .await?;
@@ -8564,6 +8826,16 @@ async fn serve_control_connection(
                     reader.get_mut(),
                     &ServerControlMessage::TunnelApplyAccepted {
                         tunnel_ids: results.into_iter().map(|result| result.tunnel_id).collect(),
+                    },
+                )
+                .await?;
+            }
+            AgentControlMessage::MeshConnectionCheckReport { results } => {
+                apply_mesh_connection_check_results(&state, &device_id, &results)?;
+                write_control_message(
+                    reader.get_mut(),
+                    &ServerControlMessage::MeshConnectionCheckAccepted {
+                        check_ids: results.into_iter().map(|result| result.id).collect(),
                     },
                 )
                 .await?;
@@ -9173,7 +9445,7 @@ fn remove_active_tunnel_connection(state: &AppState, tunnel_id: &str, token: Uui
     }
 }
 
-/// 永久删除穿透服务时取消该服务的全部活动转发，不影响同设备其他服务。
+/// 永久删除公网服务时取消该服务的全部活动转发，不影响同设备其他服务。
 fn stop_active_tunnel_connections(state: &AppState, tunnel_id: &str) {
     let entries = state
         .active_tunnel_connections
@@ -9188,7 +9460,7 @@ fn stop_active_tunnel_connections(state: &AppState, tunnel_id: &str) {
     }
 }
 
-/// 删除穿透服务关联的 CA 与 Unix Socket；记录已经提交删除时不再回滚，
+/// 删除公网服务关联的 CA 与 Unix Socket；记录已经提交删除时不再回滚，
 /// 但保留明确中文日志，便于部署者定位数据目录权限或文件占用问题。
 fn cleanup_tunnel_files(
     tunnel_id: &str,
@@ -9198,7 +9470,7 @@ fn cleanup_tunnel_files(
     for path in [origin_ca_path, bridge_socket_path].into_iter().flatten() {
         if let Err(error) = fs::remove_file(&path) {
             if error.kind() != std::io::ErrorKind::NotFound {
-                tracing::warn!(tunnel_id, path, "删除穿透服务 CA 或 Socket 失败：{error}");
+                tracing::warn!(tunnel_id, path, "删除公网服务 CA 或 Socket 失败：{error}");
             }
         }
     }
@@ -9618,7 +9890,7 @@ fn evaluate_tunnel_public_readiness(
     if public_domain.domain.is_none() {
         return Some((
             "checking".to_owned(),
-            "穿透服务尚未绑定可用公网域名".to_owned(),
+            "公网服务尚未绑定可用公网域名".to_owned(),
         ));
     }
 
@@ -9941,13 +10213,13 @@ async fn refresh_tunnel_readiness(state: &AppState, device_id: &str) {
         } else if !listener_ids.contains(&tunnel_id) {
             (
                 "checking".to_owned(),
-                Some("穿透服务监听尚未生效".to_owned()),
+                Some("公网服务监听尚未生效".to_owned()),
                 false,
             )
         } else if !caddy_healthy && matches!(protocol.as_str(), "http" | "https") {
             (
                 "retrying".to_owned(),
-                Some("Web 穿透服务暂时不可用".to_owned()),
+                Some("Web 公网服务暂时不可用".to_owned()),
                 false,
             )
         } else if matches!(protocol.as_str(), "http" | "https") {
@@ -13276,6 +13548,196 @@ async fn mesh_status(
     }
 }
 
+/// 返回当前工作空间内“客户端 -> 共享网段 Agent”的连接路径。
+///
+/// 查询会为每个可访问客户端和共享网段生成一条关系；没有观测或观测超过
+/// 45 秒时返回 unknown，避免把旧的直连状态继续展示为实时结果。
+async fn list_mesh_connections(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<MeshConnectionResponse>>, ApiError> {
+    let tenant_id = auth::admin_tenant_id(&state, &headers)?;
+    let now = unix_now();
+    let connection = state
+        .db
+        .lock()
+        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "数据库锁不可用"))?;
+    let mut statement = connection
+        .prepare(
+            "SELECT client.id, client.name, gateway.id, gateway.name,
+                    network.id, network_state.desired_prefix,
+                    observation.connection_type, observation.observed_at
+             FROM site_networks network
+             JOIN gateway_network_states network_state
+               ON network_state.site_network_id = network.id
+             JOIN devices gateway ON gateway.id = network.publisher_device_id
+             JOIN devices client ON client.tenant_id = network.tenant_id
+             JOIN mesh_identities client_mesh ON client_mesh.nexo_device_id = client.id
+             LEFT JOIN mesh_connection_observations observation
+               ON observation.gateway_device_id = gateway.id
+              AND observation.peer_node_id = client_mesh.headscale_node_id
+             WHERE network.tenant_id = ?1 AND network.enabled = 1
+               AND network.deletion_requested = 0 AND client.id <> gateway.id
+             ORDER BY network.updated_at DESC, client.name ASC",
+        )
+        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法读取组网连接"))?;
+    let rows = statement
+        .query_map([tenant_id], |row| {
+            let observed_type: Option<String> = row.get(6)?;
+            let observed_at: Option<i64> = row.get(7)?;
+            Ok(MeshConnectionResponse {
+                client_device_id: row.get(0)?,
+                client_device_name: row.get(1)?,
+                gateway_device_id: row.get(2)?,
+                gateway_device_name: row.get(3)?,
+                site_network_id: row.get(4)?,
+                site_network_prefix: row.get(5)?,
+                connection_type: project_connection_type(
+                    observed_type.as_deref(),
+                    observed_at,
+                    now,
+                ),
+                updated_at: observed_at,
+            })
+        })
+        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法读取组网连接"))?;
+    rows.map(|row| {
+        row.map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "组网连接数据格式无效"))
+    })
+    .collect::<Result<Vec<_>, _>>()
+    .map(Json)
+}
+
+fn project_connection_type(value: Option<&str>, observed_at: Option<i64>, now: i64) -> String {
+    if !observed_at.is_some_and(|timestamp| timestamp <= now && now.saturating_sub(timestamp) <= 45)
+    {
+        return "unknown".to_owned();
+    }
+    match value {
+        Some(value @ ("direct" | "peer_relay" | "derp" | "idle")) => value.to_owned(),
+        _ => "unknown".to_owned(),
+    }
+}
+
+/// 创建异步路径检测。调用方只提交资源 ID；真正的目标 IP 从同工作空间
+/// Mesh 身份中解析，并固定由该网段的 Nexo Agent 执行。
+async fn create_mesh_connection_check(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<CreateMeshConnectionCheckRequest>,
+) -> Result<(StatusCode, Json<MeshConnectionCheckResponse>), ApiError> {
+    let tenant_id = auth::admin_tenant_id(&state, &headers)?;
+    let client_id = request.client_device_id.trim();
+    let network_id = request.site_network_id.trim();
+    if client_id.is_empty() || network_id.is_empty() {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "客户端设备和共享网段不能为空",
+        ));
+    }
+    let connection = state
+        .db
+        .lock()
+        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "数据库锁不可用"))?;
+    let (gateway_device_id, target_ipv4, target_ipv6): (String, Option<String>, Option<String>) =
+        connection
+            .query_row(
+                "SELECT network.publisher_device_id, client_mesh.tailscale_ipv4,
+                        client_mesh.tailscale_ipv6
+                 FROM site_networks network
+                 JOIN devices gateway ON gateway.id = network.publisher_device_id
+                 JOIN devices client ON client.id = ?1 AND client.tenant_id = network.tenant_id
+                 JOIN mesh_identities client_mesh ON client_mesh.nexo_device_id = client.id
+                 LEFT JOIN tailscale_device_metadata gateway_meta ON gateway_meta.device_id = gateway.id
+                 WHERE network.id = ?2 AND network.tenant_id = ?3 AND network.enabled = 1
+                   AND network.deletion_requested = 0 AND gateway_meta.device_id IS NULL",
+                rusqlite::params![client_id, network_id, tenant_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()
+            .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法解析连接检测目标"))?
+            .ok_or_else(|| {
+                ApiError::new(
+                    StatusCode::NOT_FOUND,
+                    "客户端或共享网段不存在，或承载设备不是 Nexo Agent",
+                )
+            })?;
+    let target_ip = [target_ipv4, target_ipv6]
+        .into_iter()
+        .flatten()
+        .find(|value| value.parse::<std::net::IpAddr>().is_ok())
+        .ok_or_else(|| ApiError::new(StatusCode::CONFLICT, "客户端尚无可信的组网地址"))?;
+    let id = Uuid::new_v4().to_string();
+    let requested_at = unix_now();
+    connection
+        .execute(
+            "INSERT INTO mesh_connection_checks
+             (id, tenant_id, client_device_id, gateway_device_id, site_network_id,
+              target_ip, status, requested_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'pending', ?7)",
+            rusqlite::params![
+                id,
+                tenant_id,
+                client_id,
+                gateway_device_id,
+                network_id,
+                target_ip,
+                requested_at
+            ],
+        )
+        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法创建连接检测任务"))?;
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(MeshConnectionCheckResponse {
+            id,
+            client_device_id: client_id.to_owned(),
+            gateway_device_id,
+            site_network_id: network_id.to_owned(),
+            status: "pending".to_owned(),
+            connection_type: None,
+            error_message: None,
+            requested_at,
+            completed_at: None,
+        }),
+    ))
+}
+
+async fn get_mesh_connection_check(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<Json<MeshConnectionCheckResponse>, ApiError> {
+    let tenant_id = auth::admin_tenant_id(&state, &headers)?;
+    let connection = state
+        .db
+        .lock()
+        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "数据库锁不可用"))?;
+    connection
+        .query_row(
+            "SELECT id, client_device_id, gateway_device_id, site_network_id,
+                    status, connection_type, error_message, requested_at, completed_at
+             FROM mesh_connection_checks WHERE id = ?1 AND tenant_id = ?2",
+            rusqlite::params![id, tenant_id],
+            |row| {
+                Ok(MeshConnectionCheckResponse {
+                    id: row.get(0)?,
+                    client_device_id: row.get(1)?,
+                    gateway_device_id: row.get(2)?,
+                    site_network_id: row.get(3)?,
+                    status: row.get(4)?,
+                    connection_type: row.get(5)?,
+                    error_message: row.get(6)?,
+                    requested_at: row.get(7)?,
+                    completed_at: row.get(8)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法读取连接检测任务"))?
+        .map(Json)
+        .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "连接检测任务不存在"))
+}
+
 /// 返回官方客户端所需的登录服务器地址和平台清单。浏览器授权流程由
 /// Tailscale 客户端发起，Headscale 会根据本次登录生成带上下文的授权地址。
 async fn tailscale_client_config(
@@ -13710,6 +14172,159 @@ async fn sync_oidc_nodes(state: &AppState) -> Result<()> {
     Ok(())
 }
 
+/// 使用 Headscale 节点携带的 PreAuthKey ID 自动恢复 Auth Key 签发归属。
+///
+/// Nexo 只匹配已保存的 `headscale_key_id`、签发用户和工作空间，不读取也不
+/// 保存密钥明文；找不到匹配键的节点仍由外部节点流程保持隔离。
+async fn sync_auth_key_nodes(state: &AppState) -> Result<()> {
+    let nodes = state.headscale.list_nodes().await?;
+    let mut changed = false;
+    for node in nodes {
+        let Some(headscale_key_id) = node
+            .pre_auth_key
+            .as_ref()
+            .map(|key| key.id.trim())
+            .filter(|id| !id.is_empty())
+        else {
+            continue;
+        };
+        let ownership: Option<(String, Option<String>)> = {
+            let connection = state
+                .db
+                .lock()
+                .map_err(|_| anyhow::anyhow!("数据库锁不可用"))?;
+            connection
+                .query_row(
+                    "SELECT tenant_id, user_id FROM tailscale_auth_keys
+                     WHERE headscale_key_id = ?1 AND state IN ('issued', 'used')",
+                    [headscale_key_id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()?
+        };
+        let Some((workspace_id, user_id)) = ownership else {
+            continue;
+        };
+        let connection = state
+            .db
+            .lock()
+            .map_err(|_| anyhow::anyhow!("数据库锁不可用"))?;
+        let transaction = connection.unchecked_transaction()?;
+        let existing: Option<(String, String)> = transaction
+            .query_row(
+                "SELECT nexo_device_id, tenant_id FROM mesh_identities
+                 WHERE headscale_node_id = ?1",
+                [&node.id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        if let Some((device_id, existing_workspace_id)) = existing {
+            if existing_workspace_id != workspace_id {
+                tracing::error!(
+                    node_id = %node.id,
+                    workspace_id = %workspace_id,
+                    existing_workspace_id = %existing_workspace_id,
+                    "Auth Key 节点已绑定其他工作空间，拒绝静默改绑"
+                );
+                continue;
+            }
+            update_headscale_node_projection(&transaction, &device_id, &node)?;
+            transaction.execute(
+                "UPDATE tailscale_auth_keys SET state = 'used'
+                 WHERE headscale_key_id = ?1 AND state = 'issued'",
+                [headscale_key_id],
+            )?;
+            transaction.commit()?;
+            changed = true;
+            continue;
+        }
+
+        let device_id = Uuid::new_v4().to_string();
+        let device_name = if node.name.trim().is_empty() {
+            format!("tailscale-node-{}", node.id)
+        } else {
+            node.name.clone()
+        };
+        let ipv4 = node
+            .ip_addresses
+            .iter()
+            .find(|value| value.contains('.'))
+            .cloned();
+        let ipv6 = node
+            .ip_addresses
+            .iter()
+            .find(|value| value.contains(':'))
+            .cloned();
+        let tags_json = serde_json::to_string(&node.tags)?;
+        transaction.execute(
+            "INSERT INTO devices
+             (id, tenant_id, name, os, architecture, status, capabilities_json,
+              enrolled_at, created_at, updated_at)
+             VALUES (?1, ?2, ?3, 'unknown', 'unknown', ?4, '[]', CURRENT_TIMESTAMP,
+                     CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+            rusqlite::params![
+                device_id,
+                workspace_id,
+                device_name,
+                if node.online { "online" } else { "offline" }
+            ],
+        )?;
+        transaction.execute(
+            "INSERT INTO tailscale_device_metadata
+             (device_id, user_id, registration_method, tags_json, tailscale_ipv4,
+              tailscale_ipv6, expires_at, control_plane_state, external_node,
+              created_at, updated_at)
+             VALUES (?1, ?2, 'auth_key', ?3, ?4, ?5, ?6, 'ready', 0,
+                     unixepoch(), unixepoch())",
+            rusqlite::params![
+                device_id,
+                user_id,
+                tags_json,
+                ipv4,
+                ipv6,
+                parse_headscale_expiration(node.expiry.as_deref())
+            ],
+        )?;
+        transaction.execute(
+            "INSERT INTO mesh_identities
+             (nexo_device_id, tenant_id, headscale_node_id, state, tailscale_ipv4,
+              tailscale_ipv6, hostname, online, last_verified_at, updated_at)
+             VALUES (?1, ?2, ?3, 'ready', ?4, ?5, ?6, ?7, unixepoch(), unixepoch())",
+            rusqlite::params![
+                device_id,
+                workspace_id,
+                node.id,
+                ipv4,
+                ipv6,
+                node.name,
+                i64::from(node.online)
+            ],
+        )?;
+        transaction.execute(
+            "UPDATE tailscale_auth_keys SET state = 'used'
+             WHERE headscale_key_id = ?1 AND state = 'issued'",
+            [headscale_key_id],
+        )?;
+        transaction.execute(
+            "UPDATE tailscale_external_nodes
+             SET claimed_device_id = ?1, claim_state = 'claimed', last_seen_at = unixepoch()
+             WHERE node_id = ?2",
+            rusqlite::params![device_id, node.id],
+        )?;
+        transaction.commit()?;
+        tracing::info!(
+            node_id = %node.id,
+            workspace_id = %workspace_id,
+            "Auth Key 节点已自动归属签发工作空间"
+        );
+        changed = true;
+    }
+    if changed {
+        schedule_policy_reconcile(state);
+    }
+    Ok(())
+}
+
 fn update_headscale_node_projection(
     transaction: &rusqlite::Transaction<'_>,
     device_id: &str,
@@ -13760,7 +14375,7 @@ fn update_headscale_node_projection(
          SET tags_json = ?1, tailscale_ipv4 = COALESCE(?2, tailscale_ipv4),
              tailscale_ipv6 = COALESCE(?3, tailscale_ipv6), expires_at = ?4,
              control_plane_state = 'ready', updated_at = unixepoch()
-         WHERE device_id = ?5 AND registration_method = 'oidc'",
+         WHERE device_id = ?5",
         rusqlite::params![
             tags_json,
             ipv4,
@@ -13773,6 +14388,7 @@ fn update_headscale_node_projection(
 }
 
 async fn sync_tailscale_external_nodes(state: &AppState) -> Result<()> {
+    sync_auth_key_nodes(state).await?;
     sync_oidc_nodes(state).await?;
     let nodes = state.headscale.list_nodes().await?;
     let connection = state
@@ -13978,7 +14594,7 @@ async fn claim_tailscale_external_node(
         None if is_placeholder_tailscale_name(&node.name) => {
             return Err(ApiError::new(
                 StatusCode::BAD_REQUEST,
-                "Headscale 只返回 localhost，请先在 Tailscale 中设置 Device Name，或在此输入设备名称",
+                "Headscale 只返回 localhost，请先在 Tailscale 中设置设备名称，或在此输入设备名称",
             ));
         }
         None if node.name.trim().is_empty() => format!("官方客户端-{}", node.id),
@@ -14628,6 +15244,211 @@ async fn poll_agent_enrollment(
         "revoked" => Err(ApiError::new(StatusCode::FORBIDDEN, "入网请求已撤销")),
         _ => Err(ApiError::new(StatusCode::CONFLICT, "入网请求状态无效")),
     }
+}
+
+/// 批量启用 Agent 最近检测到的私有网段。全部输入先完成归属、能力、地址族
+/// 转发和重叠校验，随后才在一个事务内写入；任一项失败都不会留下部分路由。
+async fn enable_detected_site_networks(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<EnableDetectedNetworksRequest>,
+) -> Result<(StatusCode, Json<Vec<SiteNetworkResponse>>), ApiError> {
+    let tenant_id = auth::admin_tenant_id(&state, &headers)?;
+    let device_id = request.device_id.trim().to_owned();
+    if device_id.is_empty() || request.networks.is_empty() {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "设备和至少一个待启用网段不能为空",
+        ));
+    }
+    let mut connection = state
+        .db
+        .lock()
+        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "数据库锁不可用"))?;
+    let (site_id, report_json, official_client): (Option<String>, Option<String>, i64) = connection
+        .query_row(
+            "SELECT d.site_id, report.report_json,
+                    EXISTS(SELECT 1 FROM tailscale_device_metadata meta WHERE meta.device_id = d.id)
+             FROM devices d
+             LEFT JOIN device_capability_reports report ON report.device_id = d.id
+             WHERE d.id = ?1 AND d.tenant_id = ?2",
+            rusqlite::params![device_id, tenant_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()
+        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法读取设备能力"))?
+        .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "设备不存在"))?;
+    if official_client != 0 {
+        return Err(ApiError::new(
+            StatusCode::CONFLICT,
+            "Tailscale 客户端不能承载共享网段，请选择 Nexo Agent",
+        ));
+    }
+    let site_id = site_id.ok_or_else(|| {
+        ApiError::new(
+            StatusCode::CONFLICT,
+            "Agent 尚未归属站点，请先在设备详情中选择站点",
+        )
+    })?;
+    let report: GatewayCapabilityReport = serde_json::from_str(
+        report_json
+            .as_deref()
+            .ok_or_else(|| ApiError::new(StatusCode::CONFLICT, "等待 Agent 上报本地网段"))?,
+    )
+    .map_err(|_| ApiError::new(StatusCode::CONFLICT, "Agent 网关能力报告格式无效"))?;
+
+    let mut selected = Vec::<(String, IpNet, String)>::new();
+    for item in request.networks {
+        let interface_id = item.interface_id.trim().to_owned();
+        let prefix = item
+            .prefix
+            .trim()
+            .parse::<IpNet>()
+            .map_err(|_| ApiError::new(StatusCode::BAD_REQUEST, "检测网段不是有效 CIDR"))?
+            .trunc();
+        validate_published_network(prefix).map_err(|error| {
+            ApiError::new(
+                StatusCode::BAD_REQUEST,
+                format!("本地网络不能共享：{error}"),
+            )
+        })?;
+        if interface_id.is_empty()
+            || !report.local_networks.iter().any(|network| {
+                network.interface_id == interface_id
+                    && network
+                        .prefix
+                        .parse::<IpNet>()
+                        .map(|value| value.trunc() == prefix)
+                        .unwrap_or(false)
+            })
+        {
+            return Err(ApiError::new(
+                StatusCode::CONFLICT,
+                "选择的网段不在 Agent 最近检测结果中",
+            ));
+        }
+        if let Some(message) = gateway_forwarding_error(&report, prefix) {
+            return Err(ApiError::new(StatusCode::CONFLICT, message));
+        }
+        if selected
+            .iter()
+            .any(|(_, existing, _)| networks_overlap(*existing, prefix))
+        {
+            return Err(ApiError::new(
+                StatusCode::CONFLICT,
+                "选择的网段重复或互相重叠",
+            ));
+        }
+        let name = item
+            .name
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| item.prefix.trim())
+            .to_owned();
+        selected.push((interface_id, prefix, name));
+    }
+
+    let existing_prefixes = {
+        let mut statement = connection
+            .prepare(
+                "SELECT state.desired_prefix FROM site_networks network
+                 JOIN gateway_network_states state ON state.site_network_id = network.id
+                 WHERE network.tenant_id = ?1 AND network.deletion_requested = 0",
+            )
+            .map_err(|_| {
+                ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法检查现有共享网段")
+            })?;
+        let prefixes = statement
+            .query_map([&tenant_id], |row| row.get::<_, String>(0))
+            .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法检查现有共享网段"))?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(|_| {
+                ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "现有共享网段格式无效")
+            })?;
+        prefixes
+    };
+    for (_, prefix, _) in &selected {
+        if existing_prefixes.iter().any(|value| {
+            value
+                .parse::<IpNet>()
+                .map(|existing| networks_overlap(existing.trunc(), *prefix))
+                .unwrap_or(false)
+        }) {
+            return Err(ApiError::new(
+                StatusCode::CONFLICT,
+                "选择的网段与现有共享网段重复或重叠",
+            ));
+        }
+    }
+
+    let transaction = connection
+        .transaction()
+        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法开始批量启用事务"))?;
+    let mut ids = Vec::with_capacity(selected.len());
+    for (interface_id, prefix, name) in selected {
+        let id = Uuid::new_v4().to_string();
+        transaction
+            .execute(
+                "INSERT INTO site_networks
+                 (id, tenant_id, site_id, name, publisher_device_id, interface_id,
+                  address_family, source, enabled, apply_status)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'direct_interface', 1, 'checking')",
+                rusqlite::params![
+                    id,
+                    tenant_id,
+                    site_id,
+                    name,
+                    device_id,
+                    interface_id,
+                    if matches!(prefix, IpNet::V4(_)) {
+                        "ipv4"
+                    } else {
+                        "ipv6"
+                    }
+                ],
+            )
+            .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法保存共享网段"))?;
+        transaction
+            .execute(
+                "INSERT INTO gateway_network_states
+                 (site_network_id, desired_prefix, apply_status, desired_revision)
+                 VALUES (?1, ?2, 'checking', 1)",
+                rusqlite::params![id, prefix.to_string()],
+            )
+            .map_err(|_| {
+                ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法保存网关期望状态")
+            })?;
+        transaction
+            .execute(
+                "INSERT INTO subnet_access (id, tenant_id, site_network_id, scope, enabled)
+                 VALUES (?1, ?2, ?3, 'tenant_mesh', 1)",
+                rusqlite::params![Uuid::new_v4().to_string(), tenant_id, id],
+            )
+            .map_err(|_| {
+                ApiError::new(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "无法保存工作空间访问权限",
+                )
+            })?;
+        write_audit_event(
+            &transaction,
+            &tenant_id,
+            "SUBNET_PUBLISHED",
+            "site_network",
+            &id,
+        )?;
+        ids.push(id);
+    }
+    transaction
+        .commit()
+        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法提交批量启用事务"))?;
+    schedule_policy_reconcile(&state);
+    let responses = ids
+        .iter()
+        .map(|id| read_site_network_response(&connection, id))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok((StatusCode::CREATED, Json(responses)))
 }
 
 /// 创建共享本地网络的 Desired State；不会在 Agent 未确认前伪造 Applied State。
@@ -18204,7 +19025,7 @@ mod tests {
                      public_domain_id = 'domain-primary' WHERE id = 'tunnel-1'",
                     [],
                 )
-                .expect("应绑定 Web 穿透服务");
+                .expect("应绑定 Web 公网服务");
         }
         let secret_dir = root.join("secrets/public-domains/domain-primary");
         write_secret_file(&secret_dir.join("certificate.pem"), "certificate")
@@ -18240,7 +19061,7 @@ mod tests {
                     [],
                     |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Option<String>>(1)?)),
                 )
-                .expect("Web 穿透服务应保留"),
+                .expect("Web 公网服务应保留"),
             (1, None)
         );
         assert_eq!(
@@ -18548,6 +19369,7 @@ mod tests {
             .expect("应初始化 v0.1.12 单一 Baseline");
         apply_oidc_accounts_migration(&connection).expect("应初始化 OIDC 账号映射结构");
         apply_route_confirmations_migration(&connection).expect("应初始化路由确认迁移");
+        apply_mesh_connections_migration(&connection).expect("应初始化连接观测迁移");
         ensure_server_ca(&connection).expect("应初始化测试 CA");
         ensure_server_control_identity(&connection).expect("应初始化测试控制证书");
         connection
@@ -19316,7 +20138,7 @@ mod tests {
     async fn deleting_tunnel_is_immediate_when_device_is_offline() {
         let mut state = test_state();
         let data_dir = std::env::temp_dir().join(format!("nexo-tunnel-delete-{}", Uuid::new_v4()));
-        fs::create_dir_all(&data_dir).expect("应创建穿透服务删除测试目录");
+        fs::create_dir_all(&data_dir).expect("应创建公网服务删除测试目录");
         state.data_dir = data_dir.clone();
         insert_test_tunnel(&state, true);
 
@@ -19357,12 +20179,12 @@ mod tests {
             Path("tunnel-1".to_owned()),
         )
         .await
-        .expect("离线设备上的穿透服务也应立即删除")
+        .expect("离线设备上的公网服务也应立即删除")
         .0;
 
         assert!(response.deleted);
         assert!(!response.pending);
-        assert_eq!(response.message, "穿透服务已永久删除");
+        assert_eq!(response.message, "公网服务已永久删除");
         let connection = state.db.lock().expect("数据库锁应可用");
         let tunnel_count: i64 = connection
             .query_row(
@@ -19519,7 +20341,7 @@ mod tests {
             Path("tunnel-1".to_owned()),
         )
         .await
-        .expect("穿透服务应立即永久删除");
+        .expect("公网服务应立即永久删除");
         let repeated = delete_tunnel(
             State(state.clone()),
             admin_headers(),
@@ -19535,7 +20357,7 @@ mod tests {
             Path("tunnel-device".to_owned()),
         )
         .await
-        .expect("穿透服务删除完成后应立即允许删除设备");
+        .expect("公网服务删除完成后应立即允许删除设备");
     }
 
     #[tokio::test]
@@ -19764,7 +20586,7 @@ mod tests {
         .await
         .expect("设备删除不应被 Tunnel 阻止")
         .0;
-        assert!(response.message.contains("1 个穿透服务"));
+        assert!(response.message.contains("1 个公网服务"));
         type RetainedTunnel = (
             Option<String>,
             i64,
@@ -21232,6 +22054,7 @@ mod tests {
             agent_version: "0.1.0".to_owned(),
             gateway_report: None,
             mesh_identity: None,
+            mesh_connections: Vec::new(),
         };
         reader
             .get_mut()
@@ -21548,5 +22371,297 @@ mod tests {
         .expect_err("重叠网段不应建立站点互联");
         assert_eq!(error.status, StatusCode::CONFLICT);
         assert!(error.message.contains("网络地址冲突"));
+    }
+
+    fn insert_connection_fixture(state: &AppState) {
+        let connection = state.db.lock().expect("数据库锁应可用");
+        connection
+            .execute_batch(
+                "INSERT INTO sites (id, tenant_id, name) VALUES ('site-home', 'tenant-1', '家庭');
+                 INSERT INTO devices
+                 (id, tenant_id, site_id, name, status, capabilities_json)
+                 VALUES ('gateway-home', 'tenant-1', 'site-home', '家庭网关', 'online',
+                         '[\"mesh\",\"subnet_gateway\"]');
+                 INSERT INTO devices
+                 (id, tenant_id, name, status, capabilities_json)
+                 VALUES ('phone', 'tenant-1', '手机', 'online', '[]');
+                 INSERT INTO mesh_identities
+                 (nexo_device_id, tenant_id, headscale_node_id, state, tailscale_ipv4, online)
+                 VALUES ('gateway-home', 'tenant-1', '101', 'ready', '100.64.0.1', 1),
+                        ('phone', 'tenant-1', '202', 'ready', '100.64.0.2', 1);
+                 INSERT INTO site_networks
+                 (id, tenant_id, site_id, name, publisher_device_id, interface_id,
+                  address_family, source, enabled)
+                 VALUES ('home-lan', 'tenant-1', 'site-home', '家庭网络', 'gateway-home',
+                         'eth0', 'ipv4', 'direct_interface', 1);
+                 INSERT INTO gateway_network_states
+                 (site_network_id, desired_prefix, desired_revision, apply_status)
+                 VALUES ('home-lan', '10.0.0.0/24', 1, 'ready');",
+            )
+            .expect("应创建连接观测夹具");
+    }
+
+    #[tokio::test]
+    async fn mesh_connections_expire_after_45_seconds_and_checks_use_trusted_address() {
+        let state = test_state();
+        insert_connection_fixture(&state);
+        let now = unix_now();
+        record_mesh_connection_observations(
+            &state,
+            "gateway-home",
+            &[MeshConnectionObservation {
+                peer_node_id: "202".to_owned(),
+                active: true,
+                connection_type: "direct".to_owned(),
+                observed_at: now,
+            }],
+        )
+        .expect("应保存连接观测");
+        let fresh = list_mesh_connections(State(state.clone()), admin_headers())
+            .await
+            .expect("应读取连接观测")
+            .0;
+        assert_eq!(fresh.len(), 1);
+        assert_eq!(fresh[0].connection_type, "direct");
+        assert_eq!(
+            project_connection_type(Some("direct"), Some(now + 60), now),
+            "unknown"
+        );
+
+        record_mesh_connection_observations(
+            &state,
+            "gateway-home",
+            &[MeshConnectionObservation {
+                peer_node_id: "202".to_owned(),
+                active: false,
+                connection_type: "direct".to_owned(),
+                observed_at: now,
+            }],
+        )
+        .expect("非活动观测应保存为空闲");
+        let idle = list_mesh_connections(State(state.clone()), admin_headers())
+            .await
+            .expect("应读取空闲观测")
+            .0;
+        assert_eq!(idle[0].connection_type, "idle");
+
+        record_mesh_connection_observations(
+            &state,
+            "gateway-home",
+            &[MeshConnectionObservation {
+                peer_node_id: "202".to_owned(),
+                active: false,
+                connection_type: "idle".to_owned(),
+                observed_at: now - 46,
+            }],
+        )
+        .expect("应保存过期观测");
+        let stale = list_mesh_connections(State(state.clone()), admin_headers())
+            .await
+            .expect("应读取过期观测")
+            .0;
+        assert_eq!(stale[0].connection_type, "unknown");
+
+        let (_, created) = create_mesh_connection_check(
+            State(state.clone()),
+            admin_headers(),
+            Json(CreateMeshConnectionCheckRequest {
+                client_device_id: "phone".to_owned(),
+                site_network_id: "home-lan".to_owned(),
+            }),
+        )
+        .await
+        .expect("应创建连接检测");
+        let tasks = take_mesh_connection_checks(&state, "gateway-home").expect("Agent 应领取检测");
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].target_ip, "100.64.0.2");
+        apply_mesh_connection_check_results(
+            &state,
+            "gateway-home",
+            &[MeshConnectionCheckResult {
+                id: created.0.id.clone(),
+                success: true,
+                connection_type: "peer_relay".to_owned(),
+                observed_at: now,
+                error_message: None,
+            }],
+        )
+        .expect("应保存检测结果");
+        let completed =
+            get_mesh_connection_check(State(state), admin_headers(), Path(created.0.id))
+                .await
+                .expect("应读取检测结果")
+                .0;
+        assert_eq!(completed.status, "succeeded");
+        assert_eq!(completed.connection_type.as_deref(), Some("peer_relay"));
+    }
+
+    #[tokio::test]
+    async fn detected_network_batch_is_atomic_and_respects_address_family_forwarding() {
+        let state = test_state();
+        let report = GatewayCapabilityReport {
+            platform: "linux".to_owned(),
+            tun_available: true,
+            net_admin_available: true,
+            ipv4_forwarding: true,
+            ipv6_forwarding: false,
+            local_networks: vec![
+                DetectedLocalNetwork {
+                    interface_id: "eth0".to_owned(),
+                    prefix: "10.10.0.0/24".to_owned(),
+                    gateway_address: Some("10.10.0.2".to_owned()),
+                },
+                DetectedLocalNetwork {
+                    interface_id: "eth1".to_owned(),
+                    prefix: "fd00:10::/64".to_owned(),
+                    gateway_address: Some("fd00:10::2".to_owned()),
+                },
+            ],
+            subnet_gateway: CapabilityState::Ready,
+            subnet_gateway_reason: None,
+            site_gateway: CapabilityState::Ready,
+            site_gateway_reason: None,
+        };
+        {
+            let connection = state.db.lock().expect("数据库锁应可用");
+            connection
+                .execute_batch(
+                    "INSERT INTO sites (id, tenant_id, name) VALUES ('site-home', 'tenant-1', '家庭');
+                     INSERT INTO devices
+                     (id, tenant_id, site_id, name, status, capabilities_json)
+                     VALUES ('gateway-home', 'tenant-1', 'site-home', '家庭网关', 'online',
+                             '[\"mesh\",\"subnet_gateway\"]');",
+                )
+                .expect("应创建网关夹具");
+            connection
+                .execute(
+                    "INSERT INTO device_capability_reports (device_id, report_json)
+                     VALUES ('gateway-home', ?1)",
+                    [serde_json::to_string(&report).expect("能力报告应可序列化")],
+                )
+                .expect("应保存能力报告");
+        }
+        let error = enable_detected_site_networks(
+            State(state.clone()),
+            admin_headers(),
+            Json(EnableDetectedNetworksRequest {
+                device_id: "gateway-home".to_owned(),
+                networks: vec![
+                    DetectedNetworkSelection {
+                        interface_id: "eth0".to_owned(),
+                        prefix: "10.10.0.0/24".to_owned(),
+                        name: None,
+                    },
+                    DetectedNetworkSelection {
+                        interface_id: "eth1".to_owned(),
+                        prefix: "fd00:10::/64".to_owned(),
+                        name: None,
+                    },
+                ],
+            }),
+        )
+        .await
+        .expect_err("IPv6 转发关闭时整批必须失败");
+        assert!(error.message.contains("IPv6"));
+        let count: i64 = state
+            .db
+            .lock()
+            .expect("数据库锁应可用")
+            .query_row("SELECT COUNT(*) FROM site_networks", [], |row| row.get(0))
+            .expect("应读取共享网段数量");
+        assert_eq!(count, 0);
+
+        let (_, created) = enable_detected_site_networks(
+            State(state.clone()),
+            admin_headers(),
+            Json(EnableDetectedNetworksRequest {
+                device_id: "gateway-home".to_owned(),
+                networks: vec![DetectedNetworkSelection {
+                    interface_id: "eth0".to_owned(),
+                    prefix: "10.10.0.0/24".to_owned(),
+                    name: Some("家庭 10 网段".to_owned()),
+                }],
+            }),
+        )
+        .await
+        .expect("IPv4 转发开启时应能独立启用");
+        assert_eq!(created.0.len(), 1);
+        let access_count: i64 = state
+            .db
+            .lock()
+            .expect("数据库锁应可用")
+            .query_row("SELECT COUNT(*) FROM subnet_access", [], |row| row.get(0))
+            .expect("应读取工作空间授权");
+        assert_eq!(access_count, 1);
+    }
+
+    #[tokio::test]
+    async fn auth_key_nodes_auto_assign_and_unknown_nodes_remain_isolated() {
+        let headscale = Arc::new(OfficialClientHeadscale::default());
+        headscale.nodes.lock().expect("测试节点应可写").extend([
+            HeadscaleNode {
+                id: "501".to_owned(),
+                name: "phone-auth-key".to_owned(),
+                online: true,
+                ip_addresses: vec!["100.64.0.50".to_owned()],
+                pre_auth_key: Some(HeadscalePreAuthKey {
+                    id: "hs-key-owned".to_owned(),
+                    used: true,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            HeadscaleNode {
+                id: "999".to_owned(),
+                name: "unknown-node".to_owned(),
+                online: true,
+                ..Default::default()
+            },
+        ]);
+        let state = test_state_with_headscale(headscale);
+        {
+            let connection = state.db.lock().expect("数据库锁应可用");
+            connection
+                .execute(
+                    "INSERT INTO tailscale_auth_keys
+                     (id, tenant_id, user_id, headscale_key_id, key_digest, label,
+                      reusable, ephemeral, expires_at, state)
+                     VALUES ('key-owned', 'tenant-1', 'user-1', 'hs-key-owned',
+                             'digest-only', '手机', 0, 0, unixepoch() + 3600, 'issued')",
+                    [],
+                )
+                .expect("应保存 Auth Key 元数据");
+        }
+        sync_tailscale_external_nodes(&state)
+            .await
+            .expect("节点同步应成功");
+        let connection = state.db.lock().expect("数据库锁应可用");
+        let assigned: (String, String, String) = connection
+            .query_row(
+                "SELECT d.tenant_id, meta.registration_method, identity.headscale_node_id
+                 FROM devices d
+                 JOIN tailscale_device_metadata meta ON meta.device_id = d.id
+                 JOIN mesh_identities identity ON identity.nexo_device_id = d.id
+                 WHERE identity.headscale_node_id = '501'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("Auth Key 节点应自动归属");
+        assert_eq!(
+            assigned,
+            (
+                "tenant-1".to_owned(),
+                "auth_key".to_owned(),
+                "501".to_owned()
+            )
+        );
+        let isolated: String = connection
+            .query_row(
+                "SELECT claim_state FROM tailscale_external_nodes WHERE node_id = '999'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("未知节点应进入隔离表");
+        assert_eq!(isolated, "isolated");
     }
 }
