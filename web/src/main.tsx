@@ -452,6 +452,7 @@ type AccessRule = {
 type AccessWorkspace = { id: string; name: string };
 
 type AccessPolicyPreview = {
+  status?: "valid" | "invalid" | "unavailable";
   valid: boolean;
   grant_count: number;
   ssh_rule_count: number;
@@ -1602,6 +1603,14 @@ function AccessControlPage({
     setEnabled(editing.enabled); setGrantees(editing.grants.filter((grant) => grant.status === "accepted").map((grant) => grant.workspace_id));
   }, [devices, editing]);
 
+  const previewStatus = preview?.status ?? (preview?.valid ? "valid" : "invalid");
+  const previewStatusLabel = previewStatus === "valid"
+    ? "校验通过"
+    : previewStatus === "invalid"
+      ? "策略内容有误"
+      : "组网服务不可用";
+  const previewStatusClass = previewStatus === "valid" ? "ready" : previewStatus === "invalid" ? "error" : "working";
+
   const targetOptions = targetType === "device"
     ? devices.map((device) => ({ id: device.id, label: `${device.name}${device.mesh_address ? ` · ${device.mesh_address}` : ""}` }))
     : targetType === "network"
@@ -1675,7 +1684,7 @@ function AccessControlPage({
       <PageHeader eyebrow="策略与共享" title="访问控制" subtitle="按资源所有权建立直接授权，策略由 Nexo 生成并交给 Headscale 校验。" action={<button className="secondary-button" type="button" onClick={() => void onRefresh()}><RefreshCw size={15} aria-hidden="true" />刷新</button>} />
       <PageError error={error} onRetry={onRefresh} />
       <section className="panel access-policy-preview" aria-labelledby="access-policy-preview-heading">
-        <div className="panel-heading"><div><p className="eyebrow">影响预览</p><h2 id="access-policy-preview-heading">当前结构化策略</h2></div><span className={`status-pill ${preview?.valid ? "ready" : "working"}`}><i />{preview?.valid ? "校验通过" : "等待校验"}</span></div>
+        <div className="panel-heading"><div><p className="eyebrow">影响预览</p><h2 id="access-policy-preview-heading">当前结构化策略</h2></div><div className="panel-heading-actions"><span className={`status-pill ${preview ? previewStatusClass : "working"}`}><i />{preview ? previewStatusLabel : "等待校验"}</span><button className="secondary-button compact-button" type="button" onClick={() => void onRefresh()}><RefreshCw size={15} aria-hidden="true" />重新校验</button></div></div>
         <p className="panel-note">{preview?.summary ?? "先创建或校验一条规则，页面会显示受影响目标和 Headscale 校验结果。"}</p>
         {preview?.error && <p className="form-error" role="alert">{preview.error}</p>}
         {preview && <div className="access-policy-facts"><span>Grant {preview.grant_count}</span><span>SSH {preview.ssh_rule_count}</span><span>目标 {preview.affected_targets.length}</span></div>}

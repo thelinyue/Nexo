@@ -3,10 +3,11 @@
 Nexo 是面向个人自托管、NAS/HomeLab 和小型网络环境的设备、异地组网与公网访问管理服务。
 它把设备、共享网络、站点互联、Web 服务和 TCP 端口集中到一个 Web 界面中，正常使用不需要编辑配置文件。
 
-## v0.1.14 快速开始
+## v0.1.15 Server 快速开始
 
-当前版本仅支持 `linux/amd64` Docker。Server 与 Agent 使用独立镜像，
-Agent 可以安装在其他家庭、办公室或 VPS 上并加入任意 Nexo Server。
+当前 Server 版本为 `0.1.15`，Agent 版本仍为 `0.1.14`；本次只发布 Server。
+当前版本仅支持 `linux/amd64` Docker。Server 与 Agent 使用独立镜像，Agent
+可以安装在其他家庭、办公室或 VPS 上并加入任意 Nexo Server。
 
 ### 部署 Server
 
@@ -18,7 +19,7 @@ name: nexo
 
 services:
   nexo-server:
-    image: ghcr.io/thelinyue/nexo-server:0.1.14
+    image: ghcr.io/thelinyue/nexo-server:0.1.15
     container_name: nexo-server
     network_mode: host
     environment:
@@ -149,8 +150,9 @@ docker compose -f docker/compose.phase2.yml exec nexo-server nexo admin recover
 ## Docker 部署
 
 正式发布使用仓库根目录的 [`compose.yml`](compose.yml) 和
-[`compose.agent.yml`](compose.agent.yml)，镜像标签固定为 `0.1.14`，不会隐式
-升级。开发环境的源码构建示例仍保留在 [`docker/compose.phase2.yml`](docker/compose.phase2.yml)。
+[`compose.agent.yml`](compose.agent.yml)，Agent 镜像标签固定为 `0.1.14`，不会隐式
+升级；Server 与 Agent 不要求使用相同标签。开发环境的源码构建示例仍保留在
+[`docker/compose.phase2.yml`](docker/compose.phase2.yml)。
 它们使用 host network，保留真实 LAN 转发所需的最小权限：Agent 只授予
 `/dev/net/tun` 和 `NET_ADMIN`，不使用 `privileged` 或 Docker Socket。
 
@@ -187,11 +189,18 @@ Agent 的 `./data/nexo-agent` 保存设备身份；重装站点前也应单独�
 停止对应容器，把现有数据目录移到安全位置，再解压完整备份并启动。恢复后检查
 管理员登录、设备身份、Tunnel 和组网状态是否自动收敛。
 
-升级时先完成备份，再将 Compose 中两个镜像改为同一个新版本号，执行：
+升级时先完成备份，只更新存在代码变化的组件镜像。Server 和 Agent 的版本可以不同：
 
 ```bash
-docker compose pull
-docker compose up -d
+docker compose pull nexo-server
+docker compose up -d nexo-server
+```
+
+只有 Agent 代码发生变化时才更新 Agent：
+
+```bash
+docker compose -f compose.agent.yml pull nexo-agent
+docker compose -f compose.agent.yml up -d nexo-agent
 ```
 
 数据库迁移只向前执行。升级后的数据目录不得直接交给旧版本二进制；需要回滚时，

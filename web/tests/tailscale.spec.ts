@@ -28,6 +28,7 @@ async function installTailscaleMocks(page: Page, role: Role) {
   let externalRequests = 0;
   let policyPreviewGetRequests = 0;
   let policyPreviewPostRequests = 0;
+  let policyState: "valid" | "invalid" | "unavailable" = "valid";
 
   await page.route("**/api/v1/**", async (route) => {
     const request = route.request();
@@ -85,12 +86,28 @@ async function installTailscaleMocks(page: Page, role: Role) {
     }
     if (path === "/api/v1/access-control/policy/preview" && method === "GET") {
       policyPreviewGetRequests += 1;
-      await json(route, { valid: true, grant_count: 1, ssh_rule_count: 0, affected_targets: ["100.64.0.8"], summary: "Headscale Policy 校验通过", error: null });
+      await json(route, {
+        status: policyState,
+        valid: policyState === "valid",
+        grant_count: 1,
+        ssh_rule_count: 0,
+        affected_targets: ["100.64.0.8"],
+        summary: policyState === "valid" ? "Headscale Policy 校验通过" : policyState === "invalid" ? "策略内容有误" : "组网服务暂不可用，请稍后重新校验",
+        error: policyState === "valid" ? null : policyState === "invalid" ? "策略内容无效：测试目标不存在" : "组网服务暂不可用，请稍后重新校验",
+      });
       return;
     }
     if (path === "/api/v1/access-control/policy/preview" && method === "POST") {
       policyPreviewPostRequests += 1;
-      await json(route, { valid: true, grant_count: 2, ssh_rule_count: 0, affected_targets: ["100.64.0.8"], summary: "Headscale Policy 校验通过", error: null });
+      await json(route, {
+        status: policyState,
+        valid: policyState === "valid",
+        grant_count: 2,
+        ssh_rule_count: 0,
+        affected_targets: ["100.64.0.8"],
+        summary: policyState === "valid" ? "Headscale Policy 校验通过" : policyState === "invalid" ? "策略内容有误" : "组网服务暂不可用，请稍后重新校验",
+        error: policyState === "valid" ? null : policyState === "invalid" ? "策略内容无效：测试目标不存在" : "组网服务暂不可用，请稍后重新校验",
+      });
       return;
     }
     if (path === "/api/v1/mesh/client-config") {
@@ -146,6 +163,7 @@ async function installTailscaleMocks(page: Page, role: Role) {
     externalRequestCount: () => externalRequests,
     policyPreviewGetRequestCount: () => policyPreviewGetRequests,
     policyPreviewPostRequestCount: () => policyPreviewPostRequests,
+    setPolicyState: (state: "valid" | "invalid" | "unavailable") => { policyState = state; },
   };
 }
 
@@ -198,6 +216,26 @@ test("管理员访问控制页支持结构化规则和移动窄屏布局", async
   await expect(page.getByText("协作者访问设备", { exact: true })).toBeVisible();
   await expect(page.getByText("协作者空间", { exact: true }).last()).toBeVisible();
   expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBeLessThanOrEqual(await page.evaluate(() => window.innerWidth));
+});
+
+test("访问控制分别显示策略错误、服务不可用并支持恢复校验", async ({ page }) => {
+  const mock = await installTailscaleMocks(page, "system_admin");
+  await page.goto("/#/access-control");
+  await expect(page.getByText("校验通过", { exact: true })).toBeVisible();
+
+  mock.setPolicyState("invalid");
+  await page.getByRole("button", { name: "重新校验" }).click();
+  await expect(page.locator(".access-policy-preview .status-pill")).toHaveText("策略内容有误");
+  await expect(page.getByText("策略内容无效：测试目标不存在", { exact: true })).toBeVisible();
+
+  mock.setPolicyState("unavailable");
+  await page.getByRole("button", { name: "重新校验" }).click();
+  await expect(page.locator(".access-policy-preview .status-pill")).toHaveText("组网服务不可用");
+  await expect(page.getByText("127.0.0.1", { exact: false })).toHaveCount(0);
+
+  mock.setPolicyState("valid");
+  await page.getByRole("button", { name: "重新校验" }).click();
+  await expect(page.getByText("校验通过", { exact: true })).toBeVisible();
 });
 
 test("设备列表对重复组网地址去重并保留双栈地址", async ({ page }) => {

@@ -11,7 +11,7 @@ use std::{
     path::{Path, PathBuf},
     process::Stdio,
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc, RwLock,
     },
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -290,7 +290,8 @@ pub struct HeadscaleSupervisor {
     child: Arc<Mutex<Option<Child>>>,
     stopping: Arc<AtomicBool>,
     shutdown_notify: Arc<Notify>,
-    restart_requested: Arc<AtomicBool>,
+    /// 配置更新代次；通知本身可以合并，代次保证不会把新进程误判为已停止。
+    restart_generation: Arc<AtomicU64>,
 }
 
 impl std::fmt::Debug for HeadscaleSupervisor {
@@ -311,7 +312,7 @@ impl HeadscaleSupervisor {
             child: Arc::new(Mutex::new(None)),
             stopping: Arc::new(AtomicBool::new(false)),
             shutdown_notify: Arc::new(Notify::new()),
-            restart_requested: Arc::new(AtomicBool::new(false)),
+            restart_generation: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -401,7 +402,8 @@ impl HeadscaleSupervisor {
         }
         self.write_config()?;
         if self.config.enabled {
-            self.restart_requested.store(true, Ordering::SeqCst);
+            self.restart_generation.fetch_add(1, Ordering::SeqCst);
+            tracing::info!("Headscale 配置已更新，准备重启子进程");
             self.shutdown_notify.notify_one();
         }
         Ok(())
@@ -423,12 +425,15 @@ impl HeadscaleSupervisor {
                     ));
                 }
                 (Some(_), None) => return Ok(()),
+                (Some(existing), Some(next)) if existing == next => return Ok(()),
+                (None, None) => return Ok(()),
                 _ => *current = issuer,
             }
         }
         self.write_config()?;
         if self.config.enabled {
-            self.restart_requested.store(true, Ordering::SeqCst);
+            self.restart_generation.fetch_add(1, Ordering::SeqCst);
+            tracing::info!("Headscale OIDC 配置已更新，准备重启子进程");
             self.shutdown_notify.notify_one();
         }
         Ok(())
@@ -439,9 +444,9 @@ impl HeadscaleSupervisor {
         if !self.config.enabled {
             return Ok(MeshComponentStatus::Starting);
         }
+        let handled_generation = self.restart_generation.load(Ordering::SeqCst);
         self.write_config()?;
         self.stopping.store(false, Ordering::SeqCst);
-        self.restart_requested.store(false, Ordering::SeqCst);
         // 首次启动失败不能拖垮 Nexo Core；监控循环会以指数退避重试，
         // 让 LAN 管理、Agent 注册和公网 TCP Tunnel 先继续提供服务。
         if let Err(error) = self.spawn_once().await {
@@ -449,7 +454,7 @@ impl HeadscaleSupervisor {
         }
         let supervisor = self.clone();
         tokio::spawn(async move {
-            supervisor.monitor_loop().await;
+            supervisor.monitor_loop(handled_generation).await;
         });
         Ok(MeshComponentStatus::Starting)
     }
@@ -477,7 +482,7 @@ impl HeadscaleSupervisor {
         Ok(())
     }
 
-    async fn monitor_loop(&self) {
+    async fn monitor_loop(&self, mut handled_generation: u64) {
         let mut attempt = 0_u32;
         while !self.stopping.load(Ordering::SeqCst) {
             // 不要在等待子进程期间持有 Mutex，否则 shutdown 无法取得锁来发送 kill。
@@ -489,6 +494,17 @@ impl HeadscaleSupervisor {
                 if self.stopping.load(Ordering::SeqCst) {
                     break;
                 }
+                let requested_generation = self.restart_generation.load(Ordering::SeqCst);
+                if requested_generation > handled_generation {
+                    handled_generation = requested_generation;
+                    tracing::info!("Headscale 收到合并后的配置重启通知，立即启动最终配置");
+                    if let Err(error) = self.spawn_once().await {
+                        tracing::error!("Headscale 配置重启启动失败，将继续重试：{error:#}");
+                    } else {
+                        attempt = 0;
+                    }
+                    continue;
+                }
                 attempt = attempt.saturating_add(1);
                 let delay = supervisor_backoff(attempt);
                 tokio::select! {
@@ -497,17 +513,18 @@ impl HeadscaleSupervisor {
                         if self.stopping.load(Ordering::SeqCst) {
                             break;
                         }
-                        if self.restart_requested.swap(false, Ordering::SeqCst) {
+                        if self.restart_generation.load(Ordering::SeqCst) > handled_generation {
                             continue;
                         }
-                        break;
+                        tracing::debug!("忽略已处理的 Headscale 配置通知");
+                        continue;
                     },
                 }
                 if self.stopping.load(Ordering::SeqCst) {
                     break;
                 }
                 if let Err(error) = self.spawn_once().await {
-                    tracing::error!("Headscale 启动重试失败：{error:#}");
+                    tracing::error!("Headscale 启动重试失败，将继续指数退避：{error:#}");
                 } else {
                     attempt = 0;
                 }
@@ -516,20 +533,25 @@ impl HeadscaleSupervisor {
             enum MonitorSignal {
                 Exited(std::io::Result<std::process::ExitStatus>),
                 Restart,
+                Ignored,
                 Stop,
             }
             let signal = tokio::select! {
                 status = child.wait() => MonitorSignal::Exited(status),
                 _ = self.shutdown_notify.notified() => {
-                    if let Err(error) = stop_child_gracefully(&mut child).await {
-                        tracing::warn!("停止 Headscale 子进程失败：{error:#}");
-                    }
                     if self.stopping.load(Ordering::SeqCst) {
+                        if let Err(error) = stop_child_gracefully(&mut child).await {
+                            tracing::warn!("停止 Headscale 子进程失败：{error:#}");
+                        }
                         MonitorSignal::Stop
-                    } else if self.restart_requested.swap(false, Ordering::SeqCst) {
+                    } else if self.restart_generation.load(Ordering::SeqCst) > handled_generation {
+                        if let Err(error) = stop_child_gracefully(&mut child).await {
+                            tracing::warn!("停止 Headscale 子进程失败：{error:#}");
+                        }
                         MonitorSignal::Restart
                     } else {
-                        MonitorSignal::Stop
+                        tracing::debug!("忽略已处理的 Headscale 配置通知，不停止当前进程");
+                        MonitorSignal::Ignored
                     }
                 }
             };
@@ -537,29 +559,60 @@ impl HeadscaleSupervisor {
                 if matches!(signal, MonitorSignal::Stop) {
                     break;
                 }
-                attempt = 0;
+                if matches!(signal, MonitorSignal::Ignored) {
+                    let mut guard = self.child.lock().await;
+                    *guard = Some(child);
+                    continue;
+                }
+                let requested_generation = self.restart_generation.load(Ordering::SeqCst);
+                handled_generation = handled_generation.max(requested_generation);
+                tracing::info!("Headscale 配置重启已停止旧进程，将使用最终配置重新启动");
+                if let Err(error) = self.spawn_once().await {
+                    tracing::error!("Headscale 配置重启失败，将继续重试：{error:#}");
+                } else {
+                    attempt = 0;
+                }
                 continue;
             };
             if self.stopping.load(Ordering::SeqCst) {
                 break;
             }
+            let requested_generation = self.restart_generation.load(Ordering::SeqCst);
+            if requested_generation > handled_generation {
+                handled_generation = requested_generation;
+                tracing::warn!("Headscale 配置重启期间旧进程异常退出，立即拉起最终配置");
+                if let Err(error) = self.spawn_once().await {
+                    tracing::error!("Headscale 配置重启启动失败，将继续重试：{error:#}");
+                } else {
+                    attempt = 0;
+                }
+                continue;
+            }
             attempt = attempt.saturating_add(1);
             let delay = supervisor_backoff(attempt);
             match status {
-                Ok(exit) => tracing::error!(?exit, "Headscale 子进程退出，将在退避后重启"),
+                Ok(exit) => tracing::error!(?exit, "Headscale 子进程异常退出，将在退避后重启"),
                 Err(error) => {
                     tracing::error!("等待 Headscale 子进程失败，将在退避后重启：{error:#}")
                 }
             }
             tokio::select! {
                 _ = tokio::time::sleep(delay) => {}
-                _ = self.shutdown_notify.notified() => break,
+                _ = self.shutdown_notify.notified() => {
+                    if self.stopping.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    if self.restart_generation.load(Ordering::SeqCst) > handled_generation {
+                        continue;
+                    }
+                    continue;
+                },
             }
             if self.stopping.load(Ordering::SeqCst) {
                 break;
             }
             if let Err(error) = self.spawn_once().await {
-                tracing::error!("Headscale 重启失败：{error:#}");
+                tracing::error!("Headscale 异常退出后的重启失败，将继续重试：{error:#}");
             } else {
                 attempt = 0;
             }
@@ -569,7 +622,6 @@ impl HeadscaleSupervisor {
     /// 优雅停止子进程，避免 Nexo 退出时留下孤儿 Headscale。
     pub async fn shutdown(&self) -> Result<()> {
         self.stopping.store(true, Ordering::SeqCst);
-        self.restart_requested.store(false, Ordering::SeqCst);
         // `notify_one` 会保留一个 permit，即使 Supervisor 尚未进入 select；
         // 使用 notify_waiters 可能在这个竞态窗口丢失关闭信号。
         self.shutdown_notify.notify_one();
@@ -757,6 +809,99 @@ mod tests {
         let content =
             fs::read_to_string(root.join("headscale").join("config.yaml")).expect("应读取配置");
         assert!(content.contains("trusted_proxies:\n  - 127.0.0.1/32\n  - ::1/128"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn same_oidc_issuer_is_idempotent_and_does_not_request_restart() {
+        let root = std::env::temp_dir().join(format!("nexo-headscale-{}", uuid::Uuid::new_v4()));
+        let config = HeadscaleRuntimeConfig {
+            binary: PathBuf::from("headscale"),
+            data_dir: root.clone(),
+            listen_addr: "127.0.0.1:8281".to_owned(),
+            api_url: "http://127.0.0.1:8281".to_owned(),
+            server_url: "https://mesh.example.com".to_owned(),
+            oidc_issuer: Some("https://nexo.example.com".to_owned()),
+            dns_base_domain: "mesh.nexo.internal".to_owned(),
+            embedded_derp_enabled: false,
+            enabled: false,
+        };
+        let supervisor = HeadscaleSupervisor::new(config);
+        supervisor.write_config().expect("应生成初始配置");
+        let before = fs::read_to_string(supervisor.config().config_path()).expect("应读取初始配置");
+        supervisor
+            .update_oidc_issuer(Some("https://nexo.example.com/".to_owned()))
+            .await
+            .expect("相同 issuer 应保持成功");
+        let after = fs::read_to_string(supervisor.config().config_path()).expect("应读取幂等配置");
+        assert_eq!(before, after);
+        assert_eq!(supervisor.restart_generation.load(Ordering::SeqCst), 0);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn supervisor_merges_notifications_and_keeps_final_child_alive() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = std::env::temp_dir().join(format!("nexo-headscale-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&root).expect("应创建测试目录");
+        let script = root.join("fake-headscale.sh");
+        fs::write(
+            &script,
+            "#!/bin/sh\ntrap 'exit 0' TERM INT\nwhile true; do sleep 0.05; done\n",
+        )
+        .expect("应写入测试 Headscale 脚本");
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755))
+            .expect("应设置测试脚本权限");
+        let supervisor = Arc::new(HeadscaleSupervisor::new(HeadscaleRuntimeConfig {
+            binary: script,
+            data_dir: root.clone(),
+            listen_addr: "127.0.0.1:8281".to_owned(),
+            api_url: "http://127.0.0.1:8281".to_owned(),
+            server_url: "https://mesh.example.com".to_owned(),
+            oidc_issuer: Some("https://nexo.example.com".to_owned()),
+            dns_base_domain: "mesh.nexo.internal".to_owned(),
+            embedded_derp_enabled: false,
+            enabled: true,
+        }));
+        supervisor
+            .clone()
+            .start()
+            .await
+            .expect("测试 Supervisor 应能启动");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        supervisor
+            .update_server_url("https://mesh-one.example.com")
+            .await
+            .expect("第一次配置更新应成功");
+        supervisor
+            .update_server_url("https://mesh-two.example.com")
+            .await
+            .expect("第二次配置更新应成功");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        let mut child_seen = false;
+        while tokio::time::Instant::now() < deadline {
+            if supervisor.child.lock().await.is_some() {
+                child_seen = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(child_seen, "连续配置通知后最终 Headscale 进程应保持存活");
+        supervisor
+            .update_server_url("https://mesh-three.example.com")
+            .await
+            .expect("后续配置更新应继续成功");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            supervisor.child.lock().await.is_some(),
+            "后续重启后进程仍应存活"
+        );
+        supervisor
+            .shutdown()
+            .await
+            .expect("测试 Supervisor 应能关闭");
         let _ = fs::remove_dir_all(root);
     }
 }

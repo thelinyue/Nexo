@@ -29,15 +29,24 @@ jobs:
           tag_version="${GITHUB_REF_NAME#v}"
           cargo_version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n 1)"
           web_version="$(node -p "require('./web/package.json').version")"
+          manifest_version="$(node -p "require('./release-manifest.json').version")"
+          publish_server="$(node -p "require('./release-manifest.json').components.includes('server')")"
+          publish_agent="$(node -p "require('./release-manifest.json').components.includes('agent')")"
           if [[ "$GITHUB_REF_NAME" != "v${tag_version}" || -z "$tag_version" ]]; then
             echo "发布标签必须使用 v<版本号> 格式" >&2
             exit 1
           fi
-          if [[ "$cargo_version" != "$tag_version" || "$web_version" != "$tag_version" ]]; then
-            echo "标签、Cargo 和 Web 版本不一致：tag=$tag_version cargo=$cargo_version web=$web_version" >&2
+          if [[ "$cargo_version" != "$tag_version" || "$web_version" != "$tag_version" || "$manifest_version" != "$tag_version" ]]; then
+            echo "标签、Cargo、Web 和发布清单版本不一致：tag=$tag_version cargo=$cargo_version web=$web_version manifest=$manifest_version" >&2
+            exit 1
+          fi
+          if [[ "$publish_server" != "true" && "$publish_agent" != "true" ]]; then
+            echo "发布清单至少要声明一个实际变化的组件" >&2
             exit 1
           fi
           echo "version=$tag_version" >> "$GITHUB_OUTPUT"
+          echo "publish_server=$publish_server" >> "$GITHUB_OUTPUT"
+          echo "publish_agent=$publish_agent" >> "$GITHUB_OUTPUT"
 
       - name: 准备 Docker Buildx
         uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
@@ -50,6 +59,7 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: 构建并发布 Server
+        if: steps.version.outputs.publish_server == 'true'
         id: server
         uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
@@ -65,6 +75,7 @@ jobs:
           cache-to: type=gha,mode=max,scope=nexo-server
 
       - name: 构建并发布 Agent
+        if: steps.version.outputs.publish_agent == 'true'
         id: agent
         uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
@@ -84,6 +95,8 @@ jobs:
           VERSION: ${{ steps.version.outputs.version }}
           SERVER_DIGEST: ${{ steps.server.outputs.digest }}
           AGENT_DIGEST: ${{ steps.agent.outputs.digest }}
+          PUBLISH_SERVER: ${{ steps.version.outputs.publish_server }}
+          PUBLISH_AGENT: ${{ steps.version.outputs.publish_agent }}
         run: |
           set -euo pipefail
           bundle="nexo-v${VERSION}-docker"
@@ -93,13 +106,16 @@ jobs:
           tar -C dist -czf "dist/${bundle}.tar.gz" "${bundle}"
           (cd dist && sha256sum "${bundle}.tar.gz" > SHA256SUMS)
           cp "docs/releases/v${VERSION}.md" dist/release-notes.md
-          cat >> dist/release-notes.md <<EOF
-
-          ### 不可变镜像摘要
-
-          - \`ghcr.io/thelinyue/nexo-server:${VERSION}@${SERVER_DIGEST}\`
-          - \`ghcr.io/thelinyue/nexo-agent:${VERSION}@${AGENT_DIGEST}\`
-          EOF
+          {
+            echo
+            echo "### 不可变镜像摘要"
+            if [[ "$PUBLISH_SERVER" == "true" ]]; then
+              echo "- \`ghcr.io/thelinyue/nexo-server:${VERSION}@${SERVER_DIGEST}\`"
+            fi
+            if [[ "$PUBLISH_AGENT" == "true" ]]; then
+              echo "- \`ghcr.io/thelinyue/nexo-agent:${VERSION}@${AGENT_DIGEST}\`"
+            fi
+          } >> dist/release-notes.md
 
       - name: 创建 GitHub Release
         env:

@@ -34,6 +34,51 @@ pub enum RouteApplyState {
     Failed,
 }
 
+/// Headscale `policy/check` 的业务级失败分类。
+///
+/// 400/422 表示生成的策略内容被 Headscale 明确拒绝；其余失败属于
+/// 控制服务不可用。Server 依靠这个边界向管理页面返回可操作的中文状态，
+/// 同时仍可在服务端日志中保留底层诊断信息。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PolicyCheckError {
+    Rejected { status: u16, detail: String },
+    Unavailable { detail: String },
+}
+
+impl PolicyCheckError {
+    pub fn is_rejected(&self) -> bool {
+        matches!(self, Self::Rejected { .. })
+    }
+
+    pub fn user_message(&self) -> String {
+        match self {
+            Self::Rejected { detail, .. } if !detail.trim().is_empty() => {
+                format!("策略内容无效：{detail}")
+            }
+            Self::Rejected { .. } => "策略内容未通过组网服务校验".to_owned(),
+            Self::Unavailable { .. } => "组网服务暂不可用，请稍后重新校验".to_owned(),
+        }
+    }
+}
+
+impl std::fmt::Display for PolicyCheckError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Rejected { status, detail } => {
+                write!(
+                    formatter,
+                    "Headscale 策略校验被拒绝（HTTP {status}）：{detail}"
+                )
+            }
+            Self::Unavailable { detail } => {
+                write!(formatter, "Headscale 策略校验服务不可用：{detail}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for PolicyCheckError {}
+
 /// 适配器返回给 Nexo 的最小结果，不暴露 Headscale 原始响应。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RouteApplyReport {
@@ -532,15 +577,32 @@ impl HeadscaleHttpAdapter {
 
     /// 使用 Headscale 官方 `policy/check` 端点校验候选策略。
     ///
-    /// 校验失败只返回可读错误，不会改变当前已经生效的策略；调用方应在
-    /// 保存结构化规则前先执行这一步，避免把无法解析的 Policy 写入状态。
-    pub async fn check_policy(&self, policy: &str) -> Result<()> {
-        self.send_empty(
-            self.request(Method::POST, "/api/v1/policy/check")
-                .json(&CheckPolicyRequest { policy }),
-            "校验组网策略",
-        )
-        .await
+    /// 400/422 是策略内容错误；连接、超时、鉴权和服务端错误都标记为
+    /// `Unavailable`，调用方可以据此决定是否允许用户修改策略或稍后重试。
+    pub async fn check_policy(&self, policy: &str) -> std::result::Result<(), PolicyCheckError> {
+        let response = self
+            .request(Method::POST, "/api/v1/policy/check")
+            .json(&CheckPolicyRequest { policy })
+            .send()
+            .await
+            .map_err(|error| PolicyCheckError::Unavailable {
+                detail: format!("请求 Headscale 策略校验失败：{error}"),
+            })?;
+        let status = response.status();
+        if status.is_success() {
+            return Ok(());
+        }
+        let detail = truncate_error(&response.text().await.unwrap_or_default());
+        if status.as_u16() == 400 || status.as_u16() == 422 {
+            Err(PolicyCheckError::Rejected {
+                status: status.as_u16(),
+                detail,
+            })
+        } else {
+            Err(PolicyCheckError::Unavailable {
+                detail: format!("Headscale 返回 HTTP {}：{}", status.as_u16(), detail),
+            })
+        }
     }
 
     /// 将 Headscale 当前完整批准列表与 Nexo 期望列表合并。
@@ -689,8 +751,10 @@ pub trait HeadscaleControlPlane: Send + Sync {
         Err(anyhow!("Headscale Policy API 尚未配置"))
     }
 
-    async fn check_policy(&self, _policy: &str) -> Result<()> {
-        Err(anyhow!("Headscale Policy 校验 API 尚未配置"))
+    async fn check_policy(&self, _policy: &str) -> std::result::Result<(), PolicyCheckError> {
+        Err(PolicyCheckError::Unavailable {
+            detail: "Headscale Policy 校验 API 尚未配置".to_owned(),
+        })
     }
 }
 
@@ -818,7 +882,7 @@ impl HeadscaleControlPlane for HeadscaleHttpAdapter {
         HeadscaleHttpAdapter::set_policy(self, policy).await
     }
 
-    async fn check_policy(&self, policy: &str) -> Result<()> {
+    async fn check_policy(&self, policy: &str) -> std::result::Result<(), PolicyCheckError> {
         HeadscaleHttpAdapter::check_policy(self, policy).await
     }
 }
@@ -1066,6 +1130,76 @@ mod tests {
             .await
             .expect("官方策略校验接口应成功");
         server.await.expect("测试 HTTP 服务应完成");
+    }
+
+    #[tokio::test]
+    async fn check_policy_classifies_policy_rejection_without_hiding_detail() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("测试 HTTP 监听器应能启动");
+        let address = listener.local_addr().expect("测试监听器应有地址");
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("应接受策略校验请求");
+            let _ = read_http_request(&mut stream).await;
+            let response = format!(
+                "HTTP/1.1 422 Unprocessable Entity\r\nconnection: close\r\ncontent-length: 30\r\n\r\n{}",
+                "策略文档存在无效目标"
+            );
+            stream
+                .write_all(response.as_bytes())
+                .await
+                .expect("应返回策略拒绝响应");
+        });
+        let adapter = HeadscaleHttpAdapter::new(format!("http://{address}"), "test-secret")
+            .expect("测试适配器应能创建");
+        let error = adapter
+            .check_policy("{}")
+            .await
+            .expect_err("422 应被识别为策略内容拒绝");
+        assert!(matches!(
+            error,
+            PolicyCheckError::Rejected { status: 422, .. }
+        ));
+        assert!(error.user_message().contains("无效目标"));
+        server.await.expect("测试 HTTP 服务应完成");
+    }
+
+    #[tokio::test]
+    async fn check_policy_classifies_service_failures_as_unavailable() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("测试 HTTP 监听器应能启动");
+        let address = listener.local_addr().expect("测试监听器应有地址");
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("应接受策略校验请求");
+            let _ = read_http_request(&mut stream).await;
+            stream
+                .write_all(b"HTTP/1.1 503 Service Unavailable\r\nconnection: close\r\ncontent-length: 0\r\n\r\n")
+                .await
+                .expect("应返回服务不可用响应");
+        });
+        let adapter = HeadscaleHttpAdapter::new(format!("http://{address}"), "test-secret")
+            .expect("测试适配器应能创建");
+        let error = adapter
+            .check_policy("{}")
+            .await
+            .expect_err("503 应被识别为服务不可用");
+        assert!(matches!(error, PolicyCheckError::Unavailable { .. }));
+        assert_eq!(error.user_message(), "组网服务暂不可用，请稍后重新校验");
+        server.await.expect("测试 HTTP 服务应完成");
+
+        let unused = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("应能分配未使用端口");
+        let unused_address = unused.local_addr().expect("未使用监听器应有地址");
+        drop(unused);
+        let adapter = HeadscaleHttpAdapter::new(format!("http://{unused_address}"), "test-secret")
+            .expect("测试适配器应能创建");
+        let error = adapter
+            .check_policy("{}")
+            .await
+            .expect_err("连接失败应被识别为服务不可用");
+        assert!(matches!(error, PolicyCheckError::Unavailable { .. }));
     }
 
     #[test]

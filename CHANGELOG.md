@@ -2,6 +2,17 @@
 
 本项目使用 [Semantic Versioning](https://semver.org/) 记录公开版本。
 
+## [0.1.15] - 2026-09-08
+
+### Fixed
+
+- 修复 Headscale Supervisor 在连续配置通知竞态下停止监控、导致 Headscale 子进程永久退出的问题。
+- 访问控制策略校验区分策略内容无效和组网服务暂不可用，并对页面隐藏内部连接错误。
+
+### Release
+
+- 本版本为 Server-only 正式发布，Agent 保持 `0.1.14`，无需升级。
+
 ## [0.1.14] - 2026-09-08
 
 ### Fixed

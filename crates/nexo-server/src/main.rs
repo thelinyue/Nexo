@@ -37,7 +37,7 @@ use nexo_core::{
 };
 use nexo_headscale_adapter::{
     HeadscaleAdapter, HeadscaleAuthKeyOptions, HeadscaleControlPlane, HeadscaleHttpAdapter,
-    HeadscaleNode,
+    HeadscaleNode, PolicyCheckError,
 };
 #[cfg(test)]
 use nexo_protocol::GatewayRouteApplyResult;
@@ -939,12 +939,22 @@ struct AccessRuleResponse {
 
 #[derive(Debug, Serialize)]
 struct AccessPolicyPreviewResponse {
+    status: AccessPolicyPreviewStatus,
     valid: bool,
     grant_count: usize,
     ssh_rule_count: usize,
     affected_targets: Vec<String>,
     summary: String,
     error: Option<String>,
+}
+
+/// Headscale 策略校验的三态结果；`valid` 字段继续保留，兼容旧版 Web 调用方。
+#[derive(Debug, Serialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum AccessPolicyPreviewStatus {
+    Valid,
+    Invalid,
+    Unavailable,
 }
 
 #[allow(dead_code)]
@@ -12084,12 +12094,59 @@ async fn check_access_rule_candidate(
         .headscale
         .check_policy(&document)
         .await
-        .map_err(|error| {
-            ApiError::new(
-                StatusCode::BAD_GATEWAY,
-                format!("Headscale 策略校验失败：{error:#}"),
+        .map_err(policy_check_api_error)
+}
+
+/// 把 Headscale 的底层校验错误转换为管理页面可理解的响应。
+///
+/// 连接地址、英文网络栈和鉴权细节只写服务端日志；页面只需要知道是策略
+/// 内容无效，还是组网服务暂时不可用，避免把容器内部地址暴露给用户。
+fn policy_check_api_error(error: PolicyCheckError) -> ApiError {
+    let status = if error.is_rejected() {
+        StatusCode::UNPROCESSABLE_ENTITY
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
+    let message = error.user_message();
+    if error.is_rejected() {
+        tracing::warn!("Headscale 明确拒绝策略内容：{error}");
+    } else {
+        tracing::error!("Headscale 策略校验服务不可用：{error}");
+    }
+    ApiError::new(status, message)
+}
+
+/// 将策略校验结果映射为稳定的三态 JSON 字段和用户文案。
+fn policy_preview_result(
+    check: std::result::Result<(), PolicyCheckError>,
+) -> (AccessPolicyPreviewStatus, bool, String, Option<String>) {
+    match check {
+        Ok(()) => (
+            AccessPolicyPreviewStatus::Valid,
+            true,
+            "Headscale Policy 校验通过".to_owned(),
+            None,
+        ),
+        Err(error) if error.is_rejected() => {
+            let message = error.user_message();
+            tracing::warn!("Headscale 明确拒绝策略内容：{error}");
+            (
+                AccessPolicyPreviewStatus::Invalid,
+                false,
+                "策略内容有误".to_owned(),
+                Some(message),
             )
-        })
+        }
+        Err(error) => {
+            tracing::error!("Headscale 策略校验服务不可用：{error}");
+            (
+                AccessPolicyPreviewStatus::Unavailable,
+                false,
+                "组网服务暂不可用，请稍后重新校验".to_owned(),
+                Some("组网服务暂不可用，请稍后重新校验".to_owned()),
+            )
+        }
+    }
 }
 
 fn access_rule_response(
@@ -12586,17 +12643,14 @@ async fn current_access_policy_preview(
         (document, grant_count, ssh_rule_count, affected_targets)
     };
     let check = state.headscale.check_policy(&document).await;
-    let error = check.as_ref().err().map(|error| error.to_string());
+    let (status, valid, summary, error) = policy_preview_result(check);
     Ok(Json(AccessPolicyPreviewResponse {
-        valid: error.is_none(),
+        status,
+        valid,
         grant_count,
         ssh_rule_count,
         affected_targets,
-        summary: if error.is_none() {
-            "Headscale Policy 校验通过".to_owned()
-        } else {
-            "Headscale Policy 校验未通过".to_owned()
-        },
+        summary,
         error,
     }))
 }
@@ -12620,6 +12674,7 @@ async fn preview_access_policy(
     };
     if destinations.is_empty() {
         return Ok(Json(AccessPolicyPreviewResponse {
+            status: AccessPolicyPreviewStatus::Invalid,
             valid: false,
             grant_count: 0,
             ssh_rule_count: 0,
@@ -12684,31 +12739,36 @@ async fn preview_access_policy(
         )
     };
     let check = state.headscale.check_policy(&document).await;
-    let error = check.as_ref().err().map(|error| error.to_string());
+    let (status, valid, summary, error) = policy_preview_result(check);
     Ok(Json(AccessPolicyPreviewResponse {
-        valid: error.is_none(),
+        status,
+        valid,
         grant_count,
         ssh_rule_count,
         affected_targets: destinations,
-        summary: if error.is_none() {
-            "Headscale Policy 校验通过".to_owned()
-        } else {
-            "Headscale Policy 校验未通过".to_owned()
-        },
+        summary,
         error,
     }))
 }
 
 /// 从 Nexo Desired State 生成显式 tenant→tenant Grants 并推送 Headscale。
 /// 网络关闭时对应前缀从下一版策略中消失，但 Mesh 连接本身不受影响。
-fn mark_policy_reconcile_error(connection: &Connection, error: &str) -> Result<()> {
+fn mark_policy_reconcile_error(connection: &Connection, message: &str) -> Result<()> {
     connection.execute(
         "UPDATE mesh_access_rules
          SET apply_status = 'error', apply_error = ?, updated_at = unixepoch()
          WHERE desired_revision > applied_revision OR apply_status IN ('checking', 'error')",
-        [error],
+        [message],
     )?;
     Ok(())
+}
+
+fn policy_reconcile_error_message(error: &PolicyCheckError) -> String {
+    if error.is_rejected() {
+        error.user_message()
+    } else {
+        "组网服务暂不可用，策略将在服务恢复后自动重试".to_owned()
+    }
 }
 
 async fn reconcile_headscale_policy(state: &AppState) -> Result<()> {
@@ -12728,19 +12788,23 @@ async fn reconcile_headscale_policy(state: &AppState) -> Result<()> {
         (generate_policy_document(&connection, &grants)?, rule_ids)
     };
     if let Err(error) = state.headscale.check_policy(&document).await {
-        if let Ok(connection) = state.db.lock() {
-            let _ = mark_policy_reconcile_error(
-                &connection,
-                &format!("Headscale 策略校验失败：{error:#}"),
-            );
+        let message = policy_reconcile_error_message(&error);
+        if error.is_rejected() {
+            tracing::warn!("后台 Headscale Policy 内容校验未通过：{error}");
+        } else {
+            tracing::error!("后台 Headscale Policy 校验服务不可用：{error}");
         }
-        return Err(error);
+        if let Ok(connection) = state.db.lock() {
+            let _ = mark_policy_reconcile_error(&connection, &message);
+        }
+        return Err(anyhow::Error::new(error));
     }
     if let Err(error) = state.headscale.set_policy(&document).await {
+        tracing::error!("后台 Headscale Policy 发布失败，将在服务恢复后重试：{error:#}");
         if let Ok(connection) = state.db.lock() {
             let _ = mark_policy_reconcile_error(
                 &connection,
-                &format!("Headscale 策略发布失败：{error:#}"),
+                "组网服务暂不可用，策略将在服务恢复后自动重试",
             );
         }
         return Err(error);
@@ -16984,6 +17048,7 @@ mod tests {
         checked_policies: Mutex<Vec<String>>,
         published_policies: Mutex<Vec<String>>,
         fail_policy_check: Mutex<bool>,
+        policy_check_error: Mutex<Option<PolicyCheckError>>,
         fail_policy_set: Mutex<bool>,
     }
 
@@ -17036,13 +17101,23 @@ mod tests {
                 .clone())
         }
 
-        async fn check_policy(&self, policy: &str) -> Result<()> {
+        async fn check_policy(&self, policy: &str) -> std::result::Result<(), PolicyCheckError> {
+            if let Some(error) = self
+                .policy_check_error
+                .lock()
+                .expect("应读取测试 Policy 错误")
+                .clone()
+            {
+                return Err(error);
+            }
             if *self
                 .fail_policy_check
                 .lock()
                 .expect("应读取测试 Policy 校验开关")
             {
-                anyhow::bail!("测试模拟 Policy 校验失败");
+                return Err(PolicyCheckError::Unavailable {
+                    detail: "测试模拟 Policy 校验失败".to_owned(),
+                });
             }
             self.checked_policies
                 .lock()
@@ -17479,19 +17554,42 @@ mod tests {
             .any(|document| { document.contains("100.64.0.11") && !document.contains("preview") }));
 
         *headscale
-            .fail_policy_check
+            .policy_check_error
             .lock()
-            .expect("应设置测试 Policy 拒绝开关") = true;
-        let rejected = current_access_policy_preview(State(state), admin_headers())
+            .expect("应设置测试 Policy 拒绝响应") = Some(PolicyCheckError::Rejected {
+            status: 400,
+            detail: "host not defined in policy".to_owned(),
+        });
+        let rejected = current_access_policy_preview(State(state.clone()), admin_headers())
             .await
             .expect("Headscale 拒绝应作为预览结果返回")
             .0;
         assert!(!rejected.valid);
-        assert_eq!(rejected.summary, "Headscale Policy 校验未通过");
+        assert_eq!(rejected.status, AccessPolicyPreviewStatus::Invalid);
+        assert_eq!(rejected.summary, "策略内容有误");
         assert!(rejected
             .error
             .as_deref()
-            .is_some_and(|message| message.contains("测试模拟 Policy 校验失败")));
+            .is_some_and(|message| message.contains("host not defined")));
+
+        *headscale
+            .policy_check_error
+            .lock()
+            .expect("应清除测试 Policy 拒绝响应") = None;
+        *headscale
+            .fail_policy_check
+            .lock()
+            .expect("应设置测试 Policy 服务不可用开关") = true;
+        let unavailable = current_access_policy_preview(State(state), admin_headers())
+            .await
+            .expect("Headscale 服务不可用应作为预览结果返回")
+            .0;
+        assert_eq!(unavailable.status, AccessPolicyPreviewStatus::Unavailable);
+        assert_eq!(unavailable.summary, "组网服务暂不可用，请稍后重新校验");
+        assert_eq!(
+            unavailable.error.as_deref(),
+            Some("组网服务暂不可用，请稍后重新校验")
+        );
     }
 
     #[tokio::test]
@@ -17536,7 +17634,7 @@ mod tests {
         )
         .await
         .expect_err("Policy 校验失败时不应保存规则");
-        assert_eq!(error.status, StatusCode::BAD_GATEWAY);
+        assert_eq!(error.status, StatusCode::SERVICE_UNAVAILABLE);
         let count: i64 = state
             .db
             .lock()
