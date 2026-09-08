@@ -31,7 +31,6 @@ pub enum DeviceCapability {
     Tunnel,
     Mesh,
     SubnetGateway,
-    SiteGateway,
 }
 
 /// 设备在 Nexo 管理界面的用户可见状态。
@@ -52,29 +51,17 @@ pub enum AddressFamily {
     Ipv6,
 }
 
-/// 站点中由用户明确选择并发布的局域网。
+/// 工作空间中由用户明确选择、设备承载的局域网。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SiteNetwork {
     pub id: String,
     pub tenant_id: String,
-    pub site_id: String,
+
     pub name: String,
     pub publisher_device_id: String,
     pub interface_id: String,
     pub family: AddressFamily,
     pub prefix: String,
-    pub enabled: bool,
-}
-
-/// 两个站点之间的双向 LAN 互联授权。
-///
-/// SiteLink 只表达一对站点之间的授权，不会产生隐式传递路由。
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SiteLink {
-    pub id: String,
-    pub tenant_id: String,
-    pub left_site_id: String,
-    pub right_site_id: String,
     pub enabled: bool,
 }
 

@@ -45,7 +45,7 @@ services:
       NEXO_CONTROL_SERVER_NAME: ${NEXO_CONTROL_SERVER_NAME:-nexo-server}
       NEXO_ENROLLMENT_TOKEN: ${NEXO_ENROLLMENT_TOKEN:-}
       NEXO_DEVICE_NAME: ${NEXO_DEVICE_NAME:-Nexo Gateway}
-      NEXO_AGENT_CAPABILITIES: ${NEXO_AGENT_CAPABILITIES:-mesh,subnet_gateway,site_gateway}
+      NEXO_AGENT_CAPABILITIES: ${NEXO_AGENT_CAPABILITIES:-mesh,subnet_gateway}
     volumes:
       - nexo-agent-data:/data/nexo-agent
     restart: unless-stopped

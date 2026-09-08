@@ -44,25 +44,19 @@ pub struct ApplyAck {
 
 /// Agent 需要应用的一条网关路由。
 ///
-/// `network_id` 始终指向 Nexo 自己的共享网络记录；站点互联场景另外带有
-/// `site_link_id`，这样 Agent 不需要理解 Headscale 的节点或路由模型。
+/// `network_id` 始终指向 Nexo 自己的共享网段记录；
+/// Agent 不需要理解控制面的节点或路由模型。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct GatewayDesiredRoute {
     pub network_id: String,
-    pub site_link_id: Option<String>,
+
     pub prefix: String,
     pub revision: i64,
     /// 路由是否仍应保留；false 用于把之前发布的网段撤销。
-    #[serde(default = "default_route_enabled")]
     pub enabled: bool,
 }
 
-/// 兼容旧 Agent：旧协议没有 enabled 字段时按“继续保留路由”处理。
-fn default_route_enabled() -> bool {
-    true
-}
-
-/// 服务端根据设备所属站点汇总出的网关 Desired State。
+/// 服务端按承载设备汇总的完整网关期望配置，包括空广告列表。
 ///
 /// 该消息只表达“应该让设备可达哪些网段”，不携带 Tailscale/Headscale
 /// 内部参数；真正的系统路由变更仍由 Agent 后续接入的适配器完成。
@@ -138,15 +132,13 @@ pub struct MeshConnectionCheckResult {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct GatewayRouteApplyResult {
     pub network_id: String,
-    pub site_link_id: Option<String>,
+
     pub prefix: String,
     pub revision: i64,
     pub enabled: bool,
     pub local_applied: bool,
     #[serde(default)]
     pub control_plane_status: Option<String>,
-    #[serde(default)]
-    pub remote_applied: bool,
     #[serde(default)]
     pub error_message: Option<String>,
 }
@@ -401,7 +393,7 @@ mod tests {
             revision: 7,
             routes: vec![GatewayDesiredRoute {
                 network_id: "network-a".to_owned(),
-                site_link_id: Some("link-a-b".to_owned()),
+
                 prefix: "192.168.20.0/24".to_owned(),
                 revision: 7,
                 enabled: true,
@@ -479,7 +471,7 @@ mod tests {
     }
 
     #[test]
-    fn old_gateway_report_without_local_address_remains_compatible() {
+    fn capability_report_allows_network_without_gateway_address() {
         let report: GatewayCapabilityReport = serde_json::from_str(
             r#"{
                 "platform":"linux",
@@ -489,12 +481,10 @@ mod tests {
                 "ipv6_forwarding":true,
                 "local_networks":[{"interface_id":"eth0","prefix":"192.168.10.0/24"}],
                 "subnet_gateway":"ready",
-                "subnet_gateway_reason":null,
-                "site_gateway":"ready",
-                "site_gateway_reason":null
+                "subnet_gateway_reason":null
             }"#,
         )
-        .expect("旧版网关能力报告应仍可解析");
+        .expect("没有网关地址的能力报告应可解析");
         assert_eq!(
             report.local_networks[0].gateway_address, None,
             "旧版报告缺少地址时不得猜测下一跳"

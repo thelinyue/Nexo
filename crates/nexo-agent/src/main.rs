@@ -86,7 +86,7 @@ impl AgentRuntimeConfig {
             .unwrap_or_else(|_| env::var("HOSTNAME").unwrap_or_else(|_| "Nexo Agent".to_owned()));
         let capabilities = parse_capabilities(
             &env::var("NEXO_AGENT_CAPABILITIES")
-                .unwrap_or_else(|_| "mesh,subnet_gateway,site_gateway,tunnel".to_owned()),
+                .unwrap_or_else(|_| "mesh,subnet_gateway,tunnel".to_owned()),
         )?;
         let state_dir = PathBuf::from(
             env::var("NEXO_STATE_DIR").unwrap_or_else(|_| "./data/nexo-agent".to_owned()),
@@ -1534,8 +1534,7 @@ async fn apply_mesh_enrollment_offer(
 /// 生成首次组网加入命令的固定参数。
 ///
 /// `tailscale up` 默认启用 Subnet Route SNAT，让手机等普通客户端无需家庭
-/// 路由器回程配置即可访问共享网段；SiteLink 收到 Desired State 后仍会由
-/// 路由计划切换为无 SNAT。
+/// 路由器回程配置即可访问共享网段；后续完整配置也保持 SNAT 开启。
 fn mesh_enrollment_command_args(offer: &MeshEnrollmentOffer) -> Vec<String> {
     vec![
         "up".to_owned(),
@@ -2110,7 +2109,11 @@ fn apply_gateway_desired_state_with_execution(
         return GatewayApplyExecution {
             ack: GatewayApplyAck {
                 revision: state.revision,
-                status: ApplyStatus::Disabled,
+                status: if local_applied {
+                    ApplyStatus::Disabled
+                } else {
+                    ApplyStatus::Checking
+                },
                 network_ids,
                 applied_network_ids: Vec::new(),
                 error_message: None,
@@ -2179,13 +2182,13 @@ fn gateway_reason_message(reason: GatewayCapabilityReason) -> &'static str {
 
 /// Agent 交给 Tailscale CLI/本地 API 适配器的最小应用计划。
 ///
-/// 计划只包含 Nexo 已确认的本地发布网段和站点互联是否需要接收远端路由，
+/// 计划只包含 Nexo 已确认的本地发布网段，关闭远端路由接收并启用 SNAT，
 /// 不会把 Exit Node 或默认路由混入其中。
 #[derive(Debug, PartialEq, Eq)]
 struct TailscaleRoutePlan {
     advertise_routes: Vec<String>,
     accept_routes: bool,
-    /// 站点互联关闭 SNAT，普通共享网络恢复 Tailscale 默认的 SNAT 行为。
+    /// 普通共享子网保持 Tailscale 默认的 SNAT 行为。
     snat_subnet_routes: Option<bool>,
 }
 
@@ -2224,10 +2227,8 @@ impl PreparedGatewayRoutePlan<'_> {
                         .flatten()
                         .map(str::to_owned)
                 });
-                let applied = route.enabled
-                    && capability_error.is_none()
-                    && apply_error.is_none()
-                    && local_apply_succeeded;
+                let applied =
+                    capability_error.is_none() && apply_error.is_none() && local_apply_succeeded;
                 gateway_route_result(route, applied, error_message)
             })
             .collect()
@@ -2241,29 +2242,24 @@ fn gateway_route_result(
 ) -> GatewayRouteApplyResult {
     GatewayRouteApplyResult {
         network_id: route.network_id.clone(),
-        site_link_id: route.site_link_id.clone(),
+
         prefix: route.prefix.clone(),
         revision: route.revision,
         enabled: route.enabled,
         local_applied,
         control_plane_status: None,
-        remote_applied: route.site_link_id.is_some() && local_applied,
-        error_message: if route.enabled { error_message } else { None },
+
+        error_message,
     }
 }
 
 /// 将 Nexo 语义路由转换为 Tailscale 适配器所需的参数。
-#[cfg(test)]
-fn build_tailscale_route_plan(state: &GatewayDesiredState) -> Result<TailscaleRoutePlan> {
-    Ok(build_tailscale_route_plan_with_report(state, None)?.plan)
-}
-
 fn build_tailscale_route_plan_with_report<'a>(
     state: &'a GatewayDesiredState,
     report: Option<&GatewayCapabilityReport>,
 ) -> Result<PreparedGatewayRoutePlan<'a>> {
     let mut advertise_routes = Vec::new();
-    let mut accept_routes = false;
+    let accept_routes = false;
     let mut routes = Vec::with_capacity(state.routes.len());
     for route in &state.routes {
         let prefix = route
@@ -2282,11 +2278,8 @@ fn build_tailscale_route_plan_with_report<'a>(
             routes.push((route, capability_error));
             continue;
         }
-        if route.site_link_id.is_some() {
-            accept_routes = true;
-        } else {
-            advertise_routes.push(route.prefix.clone());
-        }
+        advertise_routes.push(route.prefix.clone());
+
         routes.push((route, None));
     }
     advertise_routes.sort();
@@ -2303,19 +2296,15 @@ fn build_tailscale_route_plan_with_report<'a>(
 
 /// 在真实应用前按每条路由核对基础能力和对应地址族转发开关。
 fn gateway_route_capability_error(
-    route: &nexo_protocol::GatewayDesiredRoute,
+    _route: &nexo_protocol::GatewayDesiredRoute,
     prefix: IpNet,
     report: &GatewayCapabilityReport,
 ) -> Option<String> {
-    let (capability, reason, label) = if route.site_link_id.is_some() {
-        (report.site_gateway, report.site_gateway_reason, "站点互联")
-    } else {
-        (
-            report.subnet_gateway,
-            report.subnet_gateway_reason,
-            "共享本地网络",
-        )
-    };
+    let (capability, reason, label) = (
+        report.subnet_gateway,
+        report.subnet_gateway_reason,
+        "子网共享",
+    );
     if capability != CapabilityState::Ready
         && reason != Some(GatewayCapabilityReason::IpForwardingDisabled)
     {
@@ -2396,13 +2385,12 @@ fn parse_capabilities(raw: &str) -> Result<Vec<DeviceCapability>> {
             "tunnel" => Ok(DeviceCapability::Tunnel),
             "mesh" => Ok(DeviceCapability::Mesh),
             "subnet_gateway" => Ok(DeviceCapability::SubnetGateway),
-            "site_gateway" => Ok(DeviceCapability::SiteGateway),
             other => anyhow::bail!("NEXO_AGENT_CAPABILITIES 包含未知能力：{other}"),
         })
         .collect()
 }
 
-/// 探测 Agent 是否具备发布本地网络和执行站点转发所需的基础条件。
+/// 探测 Agent 是否具备发布本地网络和执行子网转发所需的基础条件。
 ///
 /// 探测只读系统状态，不会自动开启 TUN、修改 capability 或写入宿主机 sysctl。
 fn detect_gateway_capabilities() -> GatewayCapabilityReport {
@@ -2433,8 +2421,6 @@ fn detect_gateway_capabilities() -> GatewayCapabilityReport {
         local_networks,
         subnet_gateway: state,
         subnet_gateway_reason: reason,
-        site_gateway: state,
-        site_gateway_reason: reason,
     }
 }
 
@@ -2548,8 +2534,6 @@ mod tests {
             ],
             subnet_gateway: CapabilityState::Ready,
             subnet_gateway_reason: None,
-            site_gateway: CapabilityState::Ready,
-            site_gateway_reason: None,
         }
     }
 
@@ -2632,7 +2616,7 @@ mod tests {
             revision: 3,
             routes: vec![nexo_protocol::GatewayDesiredRoute {
                 network_id: "network-a".to_owned(),
-                site_link_id: None,
+
                 prefix: "192.168.10.0/24".to_owned(),
                 revision: 3,
                 enabled: true,
@@ -2652,7 +2636,7 @@ mod tests {
             revision: 4,
             routes: vec![nexo_protocol::GatewayDesiredRoute {
                 network_id: "network-invalid".to_owned(),
-                site_link_id: None,
+
                 prefix: "0.0.0.0/0".to_owned(),
                 revision: 4,
                 enabled: true,
@@ -2671,7 +2655,7 @@ mod tests {
             revision: 5,
             routes: vec![nexo_protocol::GatewayDesiredRoute {
                 network_id: "network-closed".to_owned(),
-                site_link_id: None,
+
                 prefix: "192.168.10.0/24".to_owned(),
                 revision: 5,
                 enabled: false,
@@ -2685,37 +2669,36 @@ mod tests {
     }
 
     #[test]
-    fn tailscale_route_plan_keeps_site_routing_bidirectional_without_snat() {
+    fn route_withdrawal_requires_successful_execution_even_for_empty_advertisements() {
+        struct UnavailableApplier;
+        impl GatewayRouteApplier for UnavailableApplier {
+            fn apply(&self, plan: &TailscaleRoutePlan) -> Result<bool> {
+                assert!(plan.advertise_routes.is_empty());
+                assert!(!plan.accept_routes);
+                assert_eq!(plan.snat_subnet_routes, Some(true));
+                Ok(false)
+            }
+        }
         let state = GatewayDesiredState {
-            revision: 6,
-            routes: vec![
-                nexo_protocol::GatewayDesiredRoute {
-                    network_id: "local".to_owned(),
-                    site_link_id: None,
-                    prefix: "192.168.10.0/24".to_owned(),
-                    revision: 6,
-                    enabled: true,
-                },
-                nexo_protocol::GatewayDesiredRoute {
-                    network_id: "remote".to_owned(),
-                    site_link_id: Some("link-a-b".to_owned()),
-                    prefix: "192.168.20.0/24".to_owned(),
-                    revision: 6,
-                    enabled: true,
-                },
-                nexo_protocol::GatewayDesiredRoute {
-                    network_id: "old".to_owned(),
-                    site_link_id: None,
-                    prefix: "192.168.30.0/24".to_owned(),
-                    revision: 5,
-                    enabled: false,
-                },
-            ],
+            revision: 5,
+            routes: vec![nexo_protocol::GatewayDesiredRoute {
+                network_id: "closed".into(),
+                prefix: "10.10.0.0/24".into(),
+                revision: 5,
+                enabled: false,
+            }],
         };
-        let plan = build_tailscale_route_plan(&state).expect("应生成站点网关应用计划");
-        assert_eq!(plan.advertise_routes, vec!["192.168.10.0/24"]);
-        assert!(plan.accept_routes);
-        assert_eq!(plan.snat_subnet_routes, Some(false));
+        let execution =
+            apply_gateway_desired_state_with_execution(&state, &UnavailableApplier, None);
+        assert_eq!(execution.ack.status, ApplyStatus::Checking);
+        assert!(!execution.route_results[0].local_applied);
+        let empty = GatewayDesiredState {
+            revision: 0,
+            routes: vec![],
+        };
+        let execution =
+            apply_gateway_desired_state_with_execution(&empty, &UnavailableApplier, None);
+        assert_eq!(execution.ack.status, ApplyStatus::Checking);
     }
 
     #[test]
@@ -2725,14 +2708,14 @@ mod tests {
             routes: vec![
                 nexo_protocol::GatewayDesiredRoute {
                     network_id: "network-v4".to_owned(),
-                    site_link_id: None,
+
                     prefix: "192.168.10.0/24".to_owned(),
                     revision: 7,
                     enabled: true,
                 },
                 nexo_protocol::GatewayDesiredRoute {
                     network_id: "network-v6".to_owned(),
-                    site_link_id: None,
+
                     prefix: "2001:db8:10::/64".to_owned(),
                     revision: 7,
                     enabled: true,
@@ -2756,7 +2739,7 @@ mod tests {
         assert!(!execution.route_results[1].local_applied);
         assert_eq!(
             execution.route_results[1].error_message.as_deref(),
-            Some("共享本地网络无法应用：设备未开启 IPv6 转发")
+            Some("子网共享无法应用：设备未开启 IPv6 转发")
         );
     }
 
@@ -2767,14 +2750,14 @@ mod tests {
             routes: vec![
                 nexo_protocol::GatewayDesiredRoute {
                     network_id: "network-v4".to_owned(),
-                    site_link_id: None,
+
                     prefix: "192.168.10.0/24".to_owned(),
                     revision: 8,
                     enabled: true,
                 },
                 nexo_protocol::GatewayDesiredRoute {
                     network_id: "network-v6".to_owned(),
-                    site_link_id: None,
+
                     prefix: "2001:db8:10::/64".to_owned(),
                     revision: 8,
                     enabled: true,
@@ -3005,7 +2988,7 @@ mod tests {
             revision: 7,
             routes: vec![nexo_protocol::GatewayDesiredRoute {
                 network_id: "network-a".to_owned(),
-                site_link_id: None,
+
                 prefix: "192.168.10.0/24".to_owned(),
                 revision: 7,
                 enabled: true,
@@ -3087,7 +3070,7 @@ mod tests {
             revision: 8,
             routes: vec![nexo_protocol::GatewayDesiredRoute {
                 network_id: "network-a".to_owned(),
-                site_link_id: None,
+
                 prefix: "192.168.10.0/24".to_owned(),
                 revision: 8,
                 enabled: false,
@@ -3136,7 +3119,7 @@ mod tests {
             revision: 9,
             routes: vec![nexo_protocol::GatewayDesiredRoute {
                 network_id: "network-a".to_owned(),
-                site_link_id: None,
+
                 prefix: "192.168.10.0/24".to_owned(),
                 revision: 9,
                 enabled: true,
@@ -3151,8 +3134,6 @@ mod tests {
             local_networks: vec![],
             subnet_gateway: CapabilityState::Unavailable,
             subnet_gateway_reason: Some(GatewayCapabilityReason::IpForwardingDisabled),
-            site_gateway: CapabilityState::Unavailable,
-            site_gateway_reason: Some(GatewayCapabilityReason::IpForwardingDisabled),
         };
         let ack = apply_gateway_desired_state_with_report(
             &state,
@@ -3162,7 +3143,7 @@ mod tests {
         assert_eq!(ack.status, ApplyStatus::Failed);
         assert_eq!(
             ack.error_message.as_deref(),
-            Some("共享本地网络无法应用：设备未开启 IPv4 转发")
+            Some("子网共享无法应用：设备未开启 IPv4 转发")
         );
     }
 }

@@ -25,15 +25,13 @@ pub enum GatewayCapabilityReason {
 pub struct DetectedLocalNetwork {
     pub interface_id: String,
     pub prefix: String,
-    /// Agent 在该局域网接口上的地址，供静态路由引导显示下一跳。
-    ///
-    /// 旧 Agent 的能力报告没有这个字段，因此使用 `Option` 并允许反序列化缺省值；
-    /// 地址缺失时 Nexo 只能提示用户自行确认下一跳，不能猜测或自动修改路由器。
+    /// Agent 在该局域网接口上的观测地址；未取得地址时为空。
+    /// 只用于网络诊断，普通子网共享使用 SNAT，不要求用户配置回程路由。
     #[serde(default)]
     pub gateway_address: Option<String>,
 }
 
-/// Subnet Gateway 与 Site Gateway 的环境能力报告。
+/// Agent 承载普通共享子网所需的环境能力报告。
 ///
 /// 该报告只描述探测结果，不代表已经发布路由；发布仍必须经过服务端
 /// Desired State、Agent Apply 和 Applied State 确认流程。
@@ -47,8 +45,6 @@ pub struct GatewayCapabilityReport {
     pub local_networks: Vec<DetectedLocalNetwork>,
     pub subnet_gateway: CapabilityState,
     pub subnet_gateway_reason: Option<GatewayCapabilityReason>,
-    pub site_gateway: CapabilityState,
-    pub site_gateway_reason: Option<GatewayCapabilityReason>,
 }
 
 /// 判断指定网段所需的地址族是否已经开启内核转发。

@@ -89,7 +89,7 @@ impl EnrollmentToken {
 pub struct PendingEnrollment {
     pub id: String,
     pub tenant_id: String,
-    pub site_id: Option<String>,
+
     pub status: EnrollmentStatus,
     pub expires_at: i64,
     pub device_id: Option<String>,

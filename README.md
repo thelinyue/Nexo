@@ -1,7 +1,7 @@
 # Nexo（联巢）
 
 Nexo 是面向个人自托管、NAS/HomeLab 和小型网络环境的设备、异地组网与公网访问管理服务。
-它把设备、共享网络、站点互联、Web 服务和 TCP 端口集中到一个 Web 界面中，正常使用不需要编辑配置文件。
+它把设备、共享网络、Web 服务和 TCP 端口集中到一个 Web 界面中，正常使用不需要编辑配置文件。
 
 ## v0.1.17 快速开始
 
@@ -45,7 +45,7 @@ docker compose exec nexo-server nexo bootstrap-code
 
 ### 添加 Agent
 
-在 Web 的“添加设备”中填写设备名称和站点，Nexo 会生成一份已经包含 Server
+在 Web 的“添加设备”中填写设备名称，Nexo 会生成一份已经包含 Server
 地址和一次性 Token 的完整 Compose。复制到目标设备并运行：
 
 ```bash
@@ -84,7 +84,7 @@ services:
 | `NEXO_SERVER_URL` | Agent 首次联系的 Nexo 管理地址，并用于自动推导同一主机的 `9890/9891` | `http://192.168.1.10:8280` 或 `https://nexo.example.com` | 必填；必须能从 Agent 所在网络访问 |
 | `NEXO_ENROLLMENT_TOKEN` | 授权一台设备提交入网请求 | Web 生成的短时字符串 | 首次入网必填且属于敏感信息；领取设备身份后失效，可从 Compose 或 `.env` 删除 |
 
-设备名称、所属站点、域名与 HTTPS、私网访问和公网服务都在 Web 中管理。
+设备名称、域名与 HTTPS、私网访问和公网服务都在 Web 中管理。
 官方镜像内的组件路径、监听地址、能力开关和数据目录不需要用户设置。Agent
 身份保存在 `./data/nexo-agent`，容器重启后不会再次使用已经失效的 Token。
 
@@ -92,10 +92,11 @@ services:
 
 - 首次打开 LAN 管理入口完成管理员初始化，之后使用 Argon2id 密码和服务端 Session 登录。
 - 设备通过一次性入网请求加入 Nexo，批准后自动建立异地组网身份。
-- Subnet Gateway 和 Site Gateway 保留第一阶段的双向 LAN 互联、真实源 IP 和稳定设备身份。
+- 共享网络统一由承载它的 Agent 提供，普通访问启用 SNAT，不要求家庭路由器配置回程路由。
 - “网络 > 公网服务”统一管理 TCP 端口以及 HTTP/HTTPS Web 服务；Web 服务通过受限本地桥接，不暴露源站端口。
 - “域名与 HTTPS”支持一个主域名和多个附加域名；每项独立管理 Cloudflare DNS-01 或手动证书。列表可批量重新检测或申请证书，并展示根/泛域名证书到期时间、Caddy 预计续期窗口和 CA 自动退避状态。
 - 配置后提供泛域名证书和 `nexo.<domain>` 管理地址、`mesh.<domain>` 组网地址；`mesh.<domain>` 必须保持 Cloudflare DNS only。
+- 设备显示名称与组网访问名独立保存；组网访问名为最多 32 个字符的短 ASCII 名称，例如 `nas.mesh.nexo.internal`。Headscale MagicDNS 的上游解析器固定使用阿里公共 DNS：`223.5.5.5`、`223.6.6.6`、`2400:3200::1`、`2400:3200:baba::1`。
 - Caddy、Headscale 和 Tailscale 是镜像中的独立组件，由 Nexo 负责协调；普通用户不需要操作它们的配置或命令。
 
 当前阶段明确不包含 Exit Node、默认路由、UDP、TLS passthrough、NAT 转换、跨租户共享或 Caddy 路径路由。
@@ -166,10 +167,10 @@ docker compose -f docker/compose.phase2.yml exec nexo-server nexo admin recover
 docker compose -f docker/compose.phase2.yml up -d --build
 ```
 
-如需验收第二阶段 Site-to-Site 拓扑：
+如需验收官方客户端访问共享子网及公网服务：
 
 ```bash
-bash docker/site-to-site-smoke.sh
+bash docker/network-smoke.sh
 ```
 
 验收拓扑只使用固定的 `nexo-phase2-integration` Compose 项目和测试卷，失败时先输出相关状态与日志，然后清理自身资源，不会触碰其他项目或 `.edge-screenshot/`。
@@ -185,7 +186,7 @@ tar -C . -czf nexo-data-$(date +%Y%m%d-%H%M%S).tar.gz data/nexo
 docker compose start nexo-server
 ```
 
-Agent 的 `./data/nexo-agent` 保存设备身份；重装站点前也应单独备份。恢复时先
+Agent 的 `./data/nexo-agent` 保存设备身份；重装 Agent 所在设备前也应单独备份。恢复时先
 停止对应容器，把现有数据目录移到安全位置，再解压完整备份并启动。恢复后检查
 管理员登录、设备身份、Tunnel 和组网状态是否自动收敛。
 
@@ -227,9 +228,11 @@ Nexo Web 可从支持 PWA 的桌面或移动浏览器安装，启动地址为 `/
 
 ## 组网
 
-设备、私网访问和站点互联均通过 Web Desired State 管理。在“网络 > 私网访问”中选择 Agent 检测到的家庭网段并确认后，Nexo 会一次完成路由创建、Agent 广告、控制面批准和同工作空间授权。普通共享网段默认启用 SNAT，不要求家庭路由器配置回程路由；无 SNAT 的 SiteLink 位于“站点互联 · 高级”。Nexo 会拒绝默认路由、重叠网段和错误租户。
+从“网络 > 设备”打开家庭 Agent，选择“编辑子网”，勾选检测到的网段并保存一次。Nexo 自动完成路由创建、Agent 广告、控制面批准和同工作空间授权；额外访问策略继续生效。“私网访问”复用相同编辑器。设备离线时保存的配置会在上线后继续应用。
 
-Tailscale 的 `--snat-subnet-routes` 是节点级开关，无法按单条路由分别设置。同一 Agent 一旦承担 SiteLink，其普通共享网段也会随节点切换为无 SNAT；需要同时保留普通共享网段默认 SNAT 时，应让 SiteLink 使用独立 Agent。
+共享网段统一启用 SNAT，无需家庭路由器配置回程路由。iOS、Android、macOS、Windows 自动接受授权的子网路由；Linux 客户端执行 `sudo tailscale set --accept-routes`。Nexo 拒绝默认路由、重叠网段和跨工作空间修改，IPv4/IPv6 转发分别校验。
+
+升级前备份数据库，Server 与 Agent 同批升级并保留节点身份。迁移会移除站点与 SiteLink，保留普通子网及公网资源；原有 SiteLink 静态路由需由管理员在家庭路由器上人工清理，Nexo 不自动修改路由器。详见 [网络体验与升级说明](docs/network-experience.md)。
 
 官方 Tailscale 客户端从“网络 > 设备 > 添加设备”加入，可使用浏览器登录或“网络设置 > 客户端密钥”签发的短期密钥。OIDC 和 Nexo 签发密钥加入的节点自动归属对应工作空间；未知来源节点保持隔离。连接详情只展示 P2P、节点中继、DERP 中继、空闲或未知，不上传公网端点和中继区域。
 
@@ -242,6 +245,6 @@ cargo fmt --all -- --check
 cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 cd web && npm run build
-bash -n docker/site-to-site-smoke.sh
+bash -n docker/network-smoke.sh
 git diff --check
 ```

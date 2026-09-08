@@ -15,25 +15,25 @@ Agent Gateway 只需要：
 - 持久化 `/data/nexo-agent`
 
 不要使用 `privileged: true` 或挂载 Docker Socket。Linux 生产环境使用
-`network_mode: host`，让静态路由可以指向真实的 LAN 网关地址。
+`network_mode: host`，让 Agent 检测真实 LAN 网卡并访问家庭服务。
 
-`compose.integration.yml` 是 Linux CI 验收拓扑脚手架，启动后由验收脚本负责：
+`compose.phase2.integration.yml` 是 Linux 验收拓扑，启动后由验收脚本负责：
 
 1. 批准两个 Agent 并创建家庭/办公室共享网络；
-2. 创建 Site Link，确认两侧静态路由；
-3. 验证双向大文件 TCP/HTTPS 和真实源 IP；
-4. 关闭 Link、依次重启 Agent/Server，检查 Mesh 保持在线且路由自动收敛。
+2. 签发工作空间密钥，接入一台不运行 Nexo Agent 的官方 Tailscale 客户端；
+3. 验证客户端访问子网、SNAT、公网 Web/TCP、WebSocket 和大文件；
+4. 关闭子网、依次重启 Agent/Server，检查身份保留及路由自动收敛。
 
 在原生 Linux 或具备 Docker Engine 的 WSL2 环境中可直接执行完整验收
 （需要 `docker`、`curl`、`jq`）：
 
 ```bash
-bash docker/site-to-site-smoke.sh
+bash docker/network-smoke.sh
 ```
 
-脚本会创建 default 租户下的两个站点、生成并批准两个 Agent 入网请求，随后
-验证双向 HTTP/HTTPS、8 MiB TCP 传输、真实 LAN 源地址、关闭互联和重启恢复。
-验收终端镜像只包含测试用的 Python/OpenSSL/curl，不包含 Nexo 或 Tailscale。
+脚本使用独立的测试工作空间和容器卷，生成并批准两个 Agent 入网请求，不创建站点。
+LAN 服务终端不安装 Nexo/Tailscale，也不配置静态回程路由。官方客户端仅连接控制网络，
+访问 LAN 服务必须经过 Agent 子网转发；服务端源地址应为 Agent 的 LAN 地址。
 
 Server 默认开启“使用设备名称访问”，内部名称后缀由官方镜像管理。公网域名、
 证书、设备名称、共享网络和公网访问统一在 Web 中配置。

@@ -1,4 +1,4 @@
-# 仅用于 Linux Site-to-Site 验收的普通终端，不包含 Nexo 或 Tailscale。
+# 仅用于 Linux 普通子网验收的 LAN 服务，不包含 Nexo 或 Tailscale。
 FROM debian:bookworm-slim
 RUN apt-get update \
     && apt-get install --no-install-recommends -y iproute2 openssl python3 curl \

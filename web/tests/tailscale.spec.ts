@@ -17,7 +17,8 @@ async function installTailscaleMocks(page: Page, role: Role) {
   let externalNodes = role === "system_admin"
     ? [{
       node_id: "external-1",
-      name: "外部笔记本",
+      name: "localhost",
+      needs_name: true,
       online: true,
       addresses: ["100.64.0.10"],
       claim_state: "isolated",
@@ -49,7 +50,6 @@ async function installTailscaleMocks(page: Page, role: Role) {
       return;
     }
     if (path === "/api/v1/devices") { await json(route, [{ ...devices[0], status: "online", mesh_status: "connected", tailscale_ipv4: "100.64.0.8", tailscale_ipv6: "fd7a:115c:a1e0::8" }]); return; }
-    if (path === "/api/v1/sites") { await json(route, []); return; }
     if (path === "/api/v1/site-networks") { await json(route, []); return; }
     if (path === "/api/v1/enrollments") { await json(route, []); return; }
     if (path === "/api/v1/mesh/status") { await json(route, { status: "normal", message: "组网运行正常" }); return; }
@@ -167,23 +167,23 @@ async function installTailscaleMocks(page: Page, role: Role) {
   };
 }
 
-test("管理员客户端密钥页支持密钥和隔离节点认领", async ({ page }) => {
+test("密钥仅在密钥页管理，未知设备仅在设备页处理", async ({ page }) => {
   const mock = await installTailscaleMocks(page, "system_admin");
   await page.goto("/#/network/settings/keys");
   await expect(page.getByRole("heading", { name: "客户端密钥" }).first()).toBeVisible();
-  await expect(page.getByRole("heading", { name: "使用同一套网络入口连接设备" })).toBeVisible();
-  await expect(page.getByText("由客户端发起", { exact: true })).toBeVisible();
-  await expect(page.getByRole("link", { name: "打开授权入口" })).toHaveCount(0);
-  await expect(page.getByText("Linux、Windows、macOS、iOS、Android、tvOS", { exact: true })).toBeVisible();
-  await expect(page.getByText("外部笔记本", { exact: true })).toBeVisible();
-
+  expect(mock.externalRequestCount()).toBe(0);
+  await page.getByRole("button", { name: "创建密钥", exact: true }).click();
   await page.getByLabel("名称").fill("演示客户端");
-  await page.getByRole("button", { name: "生成密钥" }).click();
+  await page.getByRole("button", { name: "创建密钥", exact: true }).last().click();
   await expect(page.getByText("tskey-auth-test-only-once", { exact: true })).toBeVisible();
-  await expect(page.getByText("只显示这一次", { exact: true })).toBeVisible();
-
-  await page.getByRole("button", { name: "认领" }).click();
-  await expect(page.getByText("已认领“外部笔记本”，设备已加入当前工作空间", { exact: true })).toBeVisible();
+  await page.getByRole("button", { name: "完成", exact: true }).click();
+  await page.goto("/#/network/devices");
+  await expect(page.getByText("localhost", { exact: true })).toBeVisible();
+  await expect(page.getByRole("textbox", { name: "命名external-1" })).toHaveCount(0);
+  const claimRequest = page.waitForRequest(request => request.url().endsWith("/external-nodes/external-1/claim"));
+  await page.getByRole("button", { name: "归属当前工作空间" }).click();
+  expect((await claimRequest).postData()).toBeNull();
+  await expect(page.getByRole("button", { name: "归属当前工作空间" })).toHaveCount(0);
   expect(mock.externalRequestCount()).toBeGreaterThan(0);
 });
 
@@ -242,7 +242,9 @@ test("访问控制分别显示策略错误、服务不可用并支持恢复校�
 test("设备列表对重复组网地址去重并保留双栈地址", async ({ page }) => {
   await installTailscaleMocks(page, "system_admin");
   await page.goto("/#/network/devices");
-  const row = page.locator(".device-row").filter({ hasText: "共享设备" });
+  const row = page.locator(".unified-device-row").filter({ hasText: "共享设备" });
   await expect(row.getByText("100.64.0.8", { exact: true })).toHaveCount(1);
-  await expect(row.getByText("fd7a:115c:a1e0::8", { exact: true })).toHaveCount(1);
+  await row.getByRole("button", { name: "共享设备" }).click();
+  await page.getByText("设备信息与更多操作", { exact: true }).click();
+  await expect(page.getByRole("dialog").getByText("fd7a:115c:a1e0::8", { exact: true })).toHaveCount(1);
 });

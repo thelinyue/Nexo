@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Nexo 第二阶段 Linux Docker 验收：公网入口、管理员 Session、Tunnel、
-# Headscale/Caddy 隔离，以及双向 Site-to-Site 路由的重启收敛。
+# Headscale/Caddy 隔离，以及官方客户端到普通共享子网的重启收敛。
 # Headscale 官方 CLI 只用于读取节点数量和稳定 Node ID，不读取任何数据库。
 set -Eeuo pipefail
 
@@ -46,9 +46,6 @@ cleanup_on_exit() {
       echo "Nexo 设备与组网状态快照：" >&2
       api "$HTTP_URL/api/v1/devices" | jq . >&2 || true
       api "$HTTP_URL/api/v1/mesh/status" | jq . >&2 || true
-      if [[ -n "${link:-}" ]]; then
-        api "$HTTP_URL/api/v1/site-links/$link" | jq . >&2 || true
-      fi
     fi
     dc logs --no-color --tail=160 nexo-server home-gateway office-gateway outside-probe >&2 || true
   fi
@@ -131,12 +128,12 @@ wait_for() {
 
 # Headscale 策略和客户端路由通过长轮询异步下发。控制面进入 disabled 后，
 # 数据面仍可能短暂保留旧路径，因此在明确上限内等待双向新连接都失败。
-site_link_data_plane_is_closed() {
-  if dc exec -T office-terminal curl --fail --silent --show-error --noproxy '*' \
+subnet_data_plane_is_closed() {
+  if dc exec -T tailscale-client curl --fail --silent --show-error --noproxy '*' \
     --connect-timeout 2 --max-time 4 http://192.168.10.100:8800/source >/dev/null 2>&1; then
     return 1
   fi
-  if dc exec -T home-terminal curl --fail --silent --show-error --noproxy '*' \
+  if dc exec -T tailscale-client curl --fail --silent --show-error --noproxy '*' \
     --connect-timeout 2 --max-time 4 http://192.168.20.100:8800/source >/dev/null 2>&1; then
     return 1
   fi
@@ -161,15 +158,8 @@ generate_test_certificate() {
     -out "$CERT_DIR/server.crt" >/dev/null 2>&1
 }
 
-create_site() {
-  post_json "$HTTP_URL/api/v1/sites" \
-    "{\"tenant_id\":\"default\",\"name\":\"$1\"}" | jq -r '.id'
-}
-
 create_token() {
-  post_json "$HTTP_URL/api/v1/enrollments" \
-    "{\"tenant_id\":\"default\",\"site_id\":\"$1\",\"ttl_seconds\":1800}" \
-    | jq -r '.token'
+  post_json "$HTTP_URL/api/v1/enrollments" '{"tenant_id":"default","ttl_seconds":1800}' | jq -r '.token'
 }
 
 find_enrollment() {
@@ -301,7 +291,7 @@ generate_test_certificate
 
 echo "清理上一次同名验收拓扑并一次性构建验收镜像"
 dc down --volumes --remove-orphans >/dev/null 2>&1 || true
-dc build nexo-server home-gateway office-gateway home-terminal office-terminal outside-probe
+dc build nexo-server home-gateway office-gateway home-terminal office-terminal outside-probe tailscale-client
 dc up -d --no-build nexo-server
 wait_for "Nexo Server 健康" "http_curl --fail '$HTTP_URL/health'" 90
 BOOTSTRAP_CODE="$(read_bootstrap_code)"
@@ -341,11 +331,9 @@ wait_for "Caddy HTTPS 管理入口可访问" \
 wait_for "Headscale 组网组件正常" \
   "test \"\$(api '$HTTP_URL/api/v1/mesh/status' | jq -r '.status')\" = normal" 120
 
-echo "创建站点和 Agent 入网凭证"
-home_site="$(create_site 家庭)"
-office_site="$(create_site 办公室)"
-home_token="$(create_token "$home_site")"
-office_token="$(create_token "$office_site")"
+echo "零站点环境创建 Agent 入网凭证"
+home_token="$(create_token)"
+office_token="$(create_token)"
 export NEXO_HOME_ENROLLMENT_TOKEN="$home_token"
 export NEXO_OFFICE_ENROLLMENT_TOKEN="$office_token"
 dc up -d --no-build home-gateway office-gateway
@@ -380,47 +368,31 @@ office_iface="$(api "$HTTP_URL/api/v1/devices" | jq -r \
 
 echo "验证默认路由、错误租户和重叠网段会被拒绝"
 expect_status 400 POST "$HTTP_URL/api/v1/site-networks" \
-  "{\"tenant_id\":\"default\",\"site_id\":\"$home_site\",\"name\":\"默认路由\",\"publisher_device_id\":\"$home_device\",\"interface_id\":\"$home_iface\",\"prefix\":\"0.0.0.0/0\"}"
+  "{\"tenant_id\":\"default\",\"name\":\"默认路由\",\"publisher_device_id\":\"$home_device\",\"interface_id\":\"$home_iface\",\"prefix\":\"0.0.0.0/0\"}"
 expect_status 400 POST "$HTTP_URL/api/v1/site-networks" \
-  "{\"tenant_id\":\"default\",\"site_id\":\"$home_site\",\"name\":\"IPv6 默认路由\",\"publisher_device_id\":\"$home_device\",\"interface_id\":\"$home_iface\",\"prefix\":\"::/0\"}"
-expect_status 404 POST "$HTTP_URL/api/v1/sites" \
-  '{"tenant_id":"missing-tenant","name":"错误租户"}'
+  "{\"tenant_id\":\"default\",\"name\":\"IPv6 默认路由\",\"publisher_device_id\":\"$home_device\",\"interface_id\":\"$home_iface\",\"prefix\":\"::/0\"}"
+expect_status 405 POST "$HTTP_URL/api/v1/sites" '{}'
+home_network="$(put_json "$HTTP_URL/api/v1/devices/$home_device/shared-networks" \
+  "$(jq -cn --arg iface "$home_iface" '{networks:[{interface_id:$iface,prefix:"192.168.10.0/24",enabled:true}]}')" | jq -r '.[0].id')"
+office_network="$(put_json "$HTTP_URL/api/v1/devices/$office_device/shared-networks" \
+  "$(jq -cn --arg iface "$office_iface" '{networks:[{interface_id:$iface,prefix:"192.168.20.0/24",enabled:true}]}')" | jq -r '.[0].id')"
+wait_for "普通共享网段配置正常" \
+  "api '$HTTP_URL/api/v1/site-networks' | jq -e '[.[] | select(.status_reason == \"ready\")] | length == 2'" 180
 
-home_network="$(post_json "$HTTP_URL/api/v1/site-networks" \
-  "{\"tenant_id\":\"default\",\"site_id\":\"$home_site\",\"name\":\"家庭局域网\",\"publisher_device_id\":\"$home_device\",\"interface_id\":\"$home_iface\",\"prefix\":\"192.168.10.0/24\"}" | jq -r '.id')"
-expect_status 409 POST "$HTTP_URL/api/v1/site-networks" \
-  "{\"tenant_id\":\"default\",\"site_id\":\"$office_site\",\"name\":\"办公室冲突网段\",\"publisher_device_id\":\"$office_device\",\"interface_id\":\"$office_iface\",\"prefix\":\"192.168.10.0/24\"}"
-api "$HTTP_URL/api/v1/site-networks" | jq -e --arg site "$office_site" \
-  '[.[] | select(.site_id == $site and .desired_prefix == "192.168.10.0/24")] | length == 0' \
-  >/dev/null
-api "$HTTP_URL/api/v1/site-links" | jq -e 'length == 0' >/dev/null
-office_network="$(post_json "$HTTP_URL/api/v1/site-networks" \
-  "{\"tenant_id\":\"default\",\"site_id\":\"$office_site\",\"name\":\"办公室局域网\",\"publisher_device_id\":\"$office_device\",\"interface_id\":\"$office_iface\",\"prefix\":\"192.168.20.0/24\"}" | jq -r '.id')"
-link="$(post_json "$HTTP_URL/api/v1/site-links" \
-  "{\"tenant_id\":\"default\",\"left_site_id\":\"$home_site\",\"left_network_ids\":[\"$home_network\"],\"right_site_id\":\"$office_site\",\"right_network_ids\":[\"$office_network\"],\"next_hops\":{\"left\":{},\"right\":{}}}" | jq -r '.id')"
-post_json "$HTTP_URL/api/v1/site-links/$link/router-confirmations/$home_site" '{}' >/dev/null
-post_json "$HTTP_URL/api/v1/site-links/$link/router-confirmations/$office_site" '{}' >/dev/null
-wait_for "Site Gateway 路由 READY" \
-  "api '$HTTP_URL/api/v1/site-links/$link' | jq -e '.apply_status == \"ready\" and .health_status == \"ready\"'" 180
-
-echo "验证双向 Site-to-Site HTTP、HTTPS、8 MiB 和真实源 IP"
-dc exec -T office-terminal curl --fail --silent --noproxy '*' \
-  --connect-timeout 3 --max-time 15 http://192.168.10.100:8800/source \
-  | grep -q 'source=192.168.20.100'
-dc exec -T home-terminal curl --fail --silent --noproxy '*' \
-  --connect-timeout 3 --max-time 15 http://192.168.20.100:8800/source \
-  | grep -q 'source=192.168.10.100'
-dc exec -T office-terminal curl --fail --silent --insecure --noproxy '*' \
-  --connect-timeout 3 --max-time 15 https://192.168.10.100:8843/source \
-  | grep -q 'source=192.168.20.100'
-dc exec -T home-terminal curl --fail --silent --insecure --noproxy '*' \
-  --connect-timeout 3 --max-time 15 https://192.168.20.100:8843/source \
-  | grep -q 'source=192.168.10.100'
-[[ "$(dc exec -T office-terminal curl --fail --silent --noproxy '*' \
-  --connect-timeout 3 --max-time 30 http://192.168.10.100:8800/large | wc -c)" -ge 8388608 ]]
-[[ "$(dc exec -T home-terminal curl --fail --silent --noproxy '*' \
-  --connect-timeout 3 --max-time 30 http://192.168.20.100:8800/large | wc -c)" -ge 8388608 ]]
-echo "✓ 双向 Site-to-Site 数据面与源 IP 保留通过"
+echo "签发工作空间密钥并接入官方客户端"
+dc up -d --no-build tailscale-client
+client_key="$(post_json "$HTTP_URL/api/v1/mesh/auth-keys" '{"label":"Linux 验收客户端","ttl_seconds":3600}' | jq -r '.key')"
+# 密钥经标准输入送入容器，不写进命令日志或文件。
+printf '%s' "$client_key" | dc exec -T tailscale-client sh -c 'read -r key || true; tailscale up --login-server=https://mesh.phase2.test --auth-key="$key" --hostname=integration-client --accept-routes=true'
+unset client_key
+wait_for "可信客户端自动归属" \
+  "api '$HTTP_URL/api/v1/devices' | jq -e '[.[] | select(.connection_type == \"tailscale_client\")] | length == 1'" 120
+client_device="$(api "$HTTP_URL/api/v1/devices" | jq -r '.[] | select(.connection_type == "tailscale_client") | .id')"
+echo "验证普通子网 HTTP、HTTPS、8 MiB 与 SNAT"
+wait_for "客户端访问家庭服务且源地址为 Agent" \
+  "dc exec -T tailscale-client curl --fail --silent --noproxy '*' --max-time 8 http://192.168.10.100:8800/source | grep -q 'source=192.168.10.2'" 90
+dc exec -T tailscale-client curl --fail --silent --insecure --noproxy '*' --max-time 15 https://192.168.20.100:8843/source | grep -q 'source=192.168.20.2'
+[[ "$(dc exec -T tailscale-client curl --fail --silent --noproxy '*' --max-time 30 http://192.168.10.100:8800/large | wc -c)" -ge 8388608 ]]
 
 echo "创建 HTTP、HTTPS 和 TCP Tunnel"
 origin_ca_pem="$(dc exec -T home-terminal cat /etc/ssl/certs/nexo-terminal-ca.crt)"
@@ -586,13 +558,12 @@ wait_for "Caddy 恢复后管理 API 可用" \
 
 nodes_before="$(headscale_node_ids)"
 
-echo "关闭 Site Link，确认 LAN 中断但 Mesh 保持连接"
-post_json "$HTTP_URL/api/v1/site-links/$link/disable" '{}' >/dev/null
-wait_for "Site Link 关闭" \
-  "api '$HTTP_URL/api/v1/site-links/$link' | jq -e '.apply_status == \"disabled\"'" 120
-wait_for "关闭 Site Link 后双向 LAN 已中断" "site_link_data_plane_is_closed" 60
-wait_for "关闭 Link 后两台设备 Mesh 仍连接" \
-  "api '$HTTP_URL/api/v1/devices' | jq -e '[.[] | select((.name == \"家庭网关\" or .name == \"办公网关\") and .mesh_status == \"connected\")] | length == 2'" 120
+echo "关闭共享网段，确认路由撤回且 Mesh 保持连接"
+post_json "$HTTP_URL/api/v1/site-networks/$home_network/disable" '{}' >/dev/null
+post_json "$HTTP_URL/api/v1/site-networks/$office_network/disable" '{}' >/dev/null
+wait_for "两个共享网段均已关闭" \
+  "api '$HTTP_URL/api/v1/site-networks' | jq -e '[.[] | select(.apply_status == \"disabled\")] | length == 2'" 120
+wait_for "子网数据面已撤回" "subnet_data_plane_is_closed" 60
 
 echo "依次重启两个 Agent、Nexo Server 和 Headscale"
 dc restart home-gateway
@@ -603,42 +574,43 @@ wait_for "办公室 Agent 重启后在线" \
   "test \"\$(api '$HTTP_URL/api/v1/devices' | jq -r '[.[] | select(.name == \"办公网关\" and .status == \"online\")] | length')\" -eq 1" 120
 wait_for "Agent 重启后无重复设备" \
   "api '$HTTP_URL/api/v1/devices' | jq -e '[.[] | select(.name == \"家庭网关\" or .name == \"办公网关\")] | length == 2'" 120
-wait_for "Agent 重启后无重复 Mesh Node" "test \"\$(headscale_node_count)\" -eq 2" 120
+wait_for "Agent 重启后无重复 Mesh Node" "test \"\$(headscale_node_count)\" -eq 3" 120
 wait_for "Agent 重启后无 Tailnet Lock 状态目录告警" "assert_no_tailnet_lock_state_warning" 30
 [[ "$nodes_before" == "$(headscale_node_ids)" ]]
 
-post_json "$HTTP_URL/api/v1/site-links/$link/enable" '{}' >/dev/null
-wait_for "Site Link 重新启用后恢复 READY" \
-  "api '$HTTP_URL/api/v1/site-links/$link' | jq -e '.apply_status == \"ready\" and .health_status == \"ready\"'" 180
+post_json "$HTTP_URL/api/v1/site-networks/$office_network/enable" '{}' >/dev/null
+post_json "$HTTP_URL/api/v1/site-networks/$home_network/enable" '{}' >/dev/null
+wait_for "共享网段 重新启用后恢复 READY" \
+  "api '$HTTP_URL/api/v1/site-networks/$home_network' | jq -e '.apply_status == \"ready\" and .health_status == \"ready\"'" 180
 
 dc restart nexo-server
 wait_for "Nexo Server 重启后健康" "http_curl --fail '$HTTP_URL/health'" 120
-wait_for "Nexo Server 重启后 Site Link 自动收敛" \
-  "api '$HTTP_URL/api/v1/site-links/$link' | jq -e '.apply_status == \"ready\" and .health_status == \"ready\"'" 180
-wait_for "Nexo Server 重启后无重复 Mesh Node" "test \"\$(headscale_node_count)\" -eq 2" 120
+wait_for "Nexo Server 重启后 共享网段 自动收敛" \
+  "api '$HTTP_URL/api/v1/site-networks/$home_network' | jq -e '.apply_status == \"ready\" and .health_status == \"ready\"'" 180
+wait_for "Nexo Server 重启后无重复 Mesh Node" "test \"\$(headscale_node_count)\" -eq 3" 120
 [[ "$nodes_before" == "$(headscale_node_ids)" ]]
 
 HEADSCALE_PID="$(headscale_pid)"
 dc exec -T nexo-server sh -c "kill -TERM $HEADSCALE_PID"
 wait_for "Headscale 子进程重启后组件正常" \
   "test \"\$(api '$HTTP_URL/api/v1/mesh/status' | jq -r '.status')\" = normal" 120
-wait_for "Headscale 重启后无重复 Mesh Node" "test \"\$(headscale_node_count)\" -eq 2" 120
+wait_for "Headscale 重启后无重复 Mesh Node" "test \"\$(headscale_node_count)\" -eq 3" 120
 [[ "$nodes_before" == "$(headscale_node_ids)" ]]
 
 HEADSCALE_PID="$(headscale_pid)"
 dc exec -T nexo-server sh -c "kill -STOP $HEADSCALE_PID"
 HEADSCALE_STOPPED=1
-post_json "$HTTP_URL/api/v1/site-links/$link/recheck" '{}' >/dev/null
+post_json "$HTTP_URL/api/v1/site-networks/$home_network/recheck" '{}' >/dev/null
 wait_for "Headscale 不可用时路由进入 retrying" \
-  "api '$HTTP_URL/api/v1/site-links/$link' | jq -e '.apply_status == \"retrying\"'" 90
+  "api '$HTTP_URL/api/v1/site-networks/$home_network' | jq -e '.apply_status == \"retrying\"'" 90
 wait_for "Headscale 不可用时组网状态受限" \
   "test \"\$(api '$HTTP_URL/api/v1/mesh/status' | jq -r '.status')\" != normal" 90
 dc exec -T nexo-server sh -c "kill -CONT $HEADSCALE_PID"
 HEADSCALE_STOPPED=0
 wait_for "Headscale 恢复后组件正常" \
   "test \"\$(api '$HTTP_URL/api/v1/mesh/status' | jq -r '.status')\" = normal" 120
-wait_for "Headscale 恢复后 Site Link 自动收敛" \
-  "api '$HTTP_URL/api/v1/site-links/$link' | jq -e '.apply_status == \"ready\" and .health_status == \"ready\"'" 180
+wait_for "Headscale 恢复后 共享网段 自动收敛" \
+  "api '$HTTP_URL/api/v1/site-networks/$home_network' | jq -e '.apply_status == \"ready\" and .health_status == \"ready\"'" 180
 [[ "$nodes_before" == "$(headscale_node_ids)" ]]
 
 echo "验证 8281/8290 仅限 Server 本机访问"
@@ -654,7 +626,7 @@ if dc exec -T outside-probe curl --silent --show-error --noproxy '*' \
 fi
 echo "✓ 内部管理端口隔离通过"
 
-echo "按依赖顺序删除 Tunnel、Site Link、共享网络、设备和站点"
+echo "按依赖顺序删除 Tunnel、共享网段和设备"
 for tunnel_id in "$http_tunnel" "$https_tunnel" "$tcp_tunnel"; do
   delete_json "$HTTP_URL/api/v1/tunnels/$tunnel_id" \
     | jq -e --arg id "$tunnel_id" '.id == $id and .deleted == true and .pending == false' \
@@ -663,12 +635,6 @@ done
 api "$HTTP_URL/api/v1/tunnels" | jq -e --arg http "$http_tunnel" --arg https "$https_tunnel" --arg tcp "$tcp_tunnel" \
   '[.[] | select(.id == $http or .id == $https or .id == $tcp)] | length == 0' \
   >/dev/null
-
-delete_json "$HTTP_URL/api/v1/site-links/$link" \
-  | jq -e --arg id "$link" '.id == $id and .deleted == false and .pending == true' \
-  >/dev/null
-wait_for "Site Link 已完成删除" \
-  "api '$HTTP_URL/api/v1/site-links' | jq -e --arg id '$link' '[.[] | select(.id == \$id)] | length == 0'" 180
 
 for network_id in "$home_network" "$office_network"; do
   delete_json "$HTTP_URL/api/v1/site-networks/$network_id" \
@@ -680,18 +646,19 @@ wait_for "两侧共享网络已完成删除" \
     '[.[] | select(.id == \$home or .id == \$office)] | length == 0'" 180
 
 echo "确认删除互联和共享网络后双向 LAN 路由均已失效"
-if dc exec -T office-terminal curl --fail --silent --show-error --noproxy '*' \
+if dc exec -T tailscale-client curl --fail --silent --show-error --noproxy '*' \
   --connect-timeout 3 --max-time 8 http://192.168.10.100:8800/source >/dev/null 2>&1; then
-  echo "删除 Site Link 和共享网络后仍可访问家庭 LAN" >&2
+  echo "删除 共享网段 和共享网络后仍可访问家庭 LAN" >&2
   exit 1
 fi
-if dc exec -T home-terminal curl --fail --silent --show-error --noproxy '*' \
+if dc exec -T tailscale-client curl --fail --silent --show-error --noproxy '*' \
   --connect-timeout 3 --max-time 8 http://192.168.20.100:8800/source >/dev/null 2>&1; then
-  echo "删除 Site Link 和共享网络后仍可访问办公室 LAN" >&2
+  echo "删除 共享网段 和共享网络后仍可访问办公室 LAN" >&2
   exit 1
 fi
 echo "✓ 删除后双向 LAN 路由均已失效"
 
+delete_json "$HTTP_URL/api/v1/devices/$client_device" >/dev/null
 delete_json "$HTTP_URL/api/v1/devices/$home_device" \
   | jq -e --arg id "$home_device" '.id == $id and .deleted == true and .pending == false' \
   >/dev/null
@@ -702,21 +669,11 @@ wait_for "两台设备及 Headscale Node 已完成删除" \
   "api '$HTTP_URL/api/v1/devices' | jq -e --arg home '$home_device' --arg office '$office_device' \
     '[.[] | select(.id == \$home or .id == \$office)] | length == 0' && test \"\$(headscale_node_count)\" -eq 0" 120
 
-delete_json "$HTTP_URL/api/v1/sites/$home_site" \
-  | jq -e --arg id "$home_site" '.id == $id and .deleted == true and .pending == false' \
-  >/dev/null
-delete_json "$HTTP_URL/api/v1/sites/$office_site" \
-  | jq -e --arg id "$office_site" '.id == $id and .deleted == true and .pending == false' \
-  >/dev/null
-api "$HTTP_URL/api/v1/sites" | jq -e --arg home "$home_site" --arg office "$office_site" \
-  '[.[] | select(.id == $home or .id == $office)] | length == 0' >/dev/null
 api "$HTTP_URL/api/v1/devices" | jq -e --arg home "$home_device" --arg office "$office_device" \
   '[.[] | select(.id == $home or .id == $office)] | length == 0' >/dev/null
 api "$HTTP_URL/api/v1/site-networks" | jq -e --arg home "$home_network" --arg office "$office_network" \
   '[.[] | select(.id == $home or .id == $office)] | length == 0' >/dev/null
-api "$HTTP_URL/api/v1/site-links" | jq -e --arg id "$link" \
-  '[.[] | select(.id == $id)] | length == 0' >/dev/null
 api "$HTTP_URL/api/v1/tunnels" | jq -e --arg http "$http_tunnel" --arg https "$https_tunnel" --arg tcp "$tcp_tunnel" \
   '[.[] | select(.id == $http or .id == $https or .id == $tcp)] | length == 0' >/dev/null
 echo "✓ 删除资源已从相关 API 列表中移除"
-echo "第二阶段 Linux Docker 公网访问和 Site-to-Site 完整验收通过"
+echo "第二阶段 Linux Docker 公网访问和 普通子网 完整验收通过"

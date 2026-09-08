@@ -14,6 +14,7 @@ use std::{
 
 mod auth;
 mod caddy;
+mod device_networks;
 mod headscale;
 mod oidc;
 mod policy;
@@ -103,6 +104,7 @@ const ROUTE_CONFIRMATIONS_MIGRATION: &str =
     include_str!("../../../migrations/0021_route_confirmations.sql");
 const MESH_CONNECTIONS_MIGRATION: &str =
     include_str!("../../../migrations/0022_mesh_connections.sql");
+const MESH_NAMES_MIGRATION: &str = include_str!("../../../migrations/0024_mesh_names.sql");
 
 #[derive(Clone)]
 pub(crate) struct AppState {
@@ -728,8 +730,14 @@ struct CertificateMetadata {
 struct DeviceResponse {
     id: String,
     tenant_id: String,
-    site_id: Option<String>,
+
     name: String,
+    /// Nexo 期望应用到 Headscale 的短访问名；与中文显示名称独立保存。
+    mesh_name: Option<String>,
+    /// Headscale 当前已经应用的访问名。重命名协调期间可能暂时仍是旧名称。
+    active_mesh_name: Option<String>,
+    mesh_fqdn: Option<String>,
+    mesh_name_status: String,
     os: Option<String>,
     architecture: Option<String>,
     agent_version: Option<String>,
@@ -760,31 +768,19 @@ struct DeviceResponse {
 #[derive(Debug, Deserialize)]
 struct UpdateDeviceRequest {
     name: String,
-    site_id: Option<String>,
-}
-
-/// 站点目录摘要；Web 只需要用户可读名称和租户归属，不暴露站点内部关系。
-#[derive(Debug, Serialize)]
-struct SiteResponse {
-    id: String,
-    tenant_id: String,
-    name: String,
+    /// 为空时保留现有访问名；新设备或未分配旧设备会自动生成短名。
+    #[serde(default)]
+    mesh_name: Option<String>,
 }
 
 /// 管理端创建一次性设备入网凭证的请求。
 #[derive(Debug, Deserialize)]
 struct CreateEnrollmentRequest {
     tenant_id: String,
-    site_id: Option<String>,
+
     ttl_seconds: Option<i64>,
     /// Web 预先指定的展示名称；旧客户端省略时继续使用 Agent 上报的主机名。
     device_name: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct CreateSiteRequest {
-    tenant_id: String,
-    name: String,
 }
 
 /// 创建凭证的响应。token 仅在本次响应返回，服务端不保存明文。
@@ -810,7 +806,7 @@ struct EnrollmentListItem {
     enrollment_id: String,
     status: EnrollmentStatus,
     tenant_id: String,
-    site_id: Option<String>,
+
     device_name: Option<String>,
     os: Option<String>,
     architecture: Option<String>,
@@ -923,6 +919,8 @@ struct TailscaleExternalNodeResponse {
 
 #[derive(Debug, Serialize)]
 struct TailscaleClientConfigResponse {
+    magic_dns_enabled: bool,
+    dns_base_domain: String,
     login_server: String,
     /// Headscale 的授权地址必须由客户端在登录时带注册上下文生成，不能拼接
     /// 一个无效的固定 `/register` 页面。
@@ -1011,17 +1009,11 @@ struct ClaimTailscaleNodeRequest {
     name: Option<String>,
 }
 
-#[derive(Debug, Serialize)]
-struct RouteConfirmationResponse {
-    site_id: String,
-    confirmed_at: i64,
-}
-
 /// 管理员明确选择要共享的本地网络。
 #[derive(Debug, Deserialize)]
 struct CreateSiteNetworkRequest {
     tenant_id: String,
-    site_id: String,
+
     name: String,
     publisher_device_id: String,
     /// 旧版请求仍传入字符串；手动模式允许省略或传空字符串。
@@ -1059,10 +1051,11 @@ enum SiteNetworkSourceRequest {
 /// 共享本地网络的 Desired / Applied 状态。
 #[derive(Debug, Serialize)]
 struct SiteNetworkResponse {
+    status_reason: String,
+    updated_at: i64,
     id: String,
     tenant_id: String,
-    site_id: String,
-    site_name: String,
+
     name: String,
     publisher_device_id: String,
     publisher_device_name: String,
@@ -1082,113 +1075,6 @@ struct SiteNetworkResponse {
     health_error: Option<String>,
 }
 
-/// 管理员创建两个站点之间的双向互联期望状态。
-#[derive(Debug, Deserialize)]
-struct CreateSiteLinkRequest {
-    tenant_id: String,
-    left_site_id: String,
-    left_network_ids: Vec<String>,
-    right_site_id: String,
-    right_network_ids: Vec<String>,
-    #[serde(default)]
-    next_hops: SiteLinkNextHops,
-}
-
-/// 按站点和地址族保存静态路由下一跳。下一跳只接受 Agent 最近一次
-/// 能力报告中的 LAN 地址，服务端不会替用户路由器写入配置。
-#[derive(Debug, Clone, Default, Deserialize)]
-struct SiteLinkNextHops {
-    #[serde(default)]
-    left: SiteLinkFamilyNextHops,
-    #[serde(default)]
-    right: SiteLinkFamilyNextHops,
-}
-
-#[derive(Debug, Clone, Default, Deserialize)]
-struct SiteLinkFamilyNextHops {
-    #[serde(default)]
-    ipv4: Option<String>,
-    #[serde(default)]
-    ipv6: Option<String>,
-}
-
-impl SiteLinkNextHops {
-    fn value(&self, side: &str, family: &str) -> Option<String> {
-        match (side, family) {
-            ("left", "ipv4") => self.left.ipv4.clone(),
-            ("left", "ipv6") => self.left.ipv6.clone(),
-            ("right", "ipv4") => self.right.ipv4.clone(),
-            ("right", "ipv6") => self.right.ipv6.clone(),
-            _ => None,
-        }
-    }
-}
-
-#[derive(Debug, Deserialize, Default)]
-struct UpdateSiteLinkRequest {
-    #[serde(default)]
-    tenant_id: Option<String>,
-    #[serde(default)]
-    left_network_ids: Option<Vec<String>>,
-    #[serde(default)]
-    right_network_ids: Option<Vec<String>>,
-    #[serde(default)]
-    next_hops: SiteLinkNextHops,
-}
-
-/// 站点互联的应用状态和两侧网段。
-#[derive(Debug, Serialize)]
-struct SiteLinkResponse {
-    id: String,
-    tenant_id: String,
-    left_site_id: String,
-    right_site_id: String,
-    left_site_name: String,
-    right_site_name: String,
-    left_gateway_address: Option<String>,
-    right_gateway_address: Option<String>,
-    left_networks: Vec<SiteLinkNetworkSummary>,
-    right_networks: Vec<SiteLinkNetworkSummary>,
-    static_routes: Vec<StaticRouteGuide>,
-    route_statuses: Vec<SiteLinkRouteStatus>,
-    route_confirmations: Vec<RouteConfirmationResponse>,
-    enabled: bool,
-    apply_status: ApplyStatus,
-    apply_error: Option<String>,
-    deletion_pending: bool,
-    /// 两端网关和站点互联路由的综合健康状态。
-    health_status: GatewayHealthStatus,
-    health_error: Option<String>,
-}
-
-#[derive(Debug, Serialize, Clone)]
-struct SiteLinkNetworkSummary {
-    id: String,
-    name: String,
-    prefix: String,
-    source: String,
-    address_family: String,
-    publisher_device_id: String,
-    publisher_device_name: String,
-    gateway_address: Option<String>,
-    apply_status: ApplyStatus,
-}
-
-/// 单条远端网段在设备发布、控制端服务和对端接受阶段的聚合状态。
-#[derive(Debug, Serialize, Clone)]
-struct SiteLinkRouteStatus {
-    network_id: String,
-    router_site_id: String,
-    destination_site_id: String,
-    destination_prefix: String,
-    address_family: String,
-    device_status: String,
-    control_plane_status: String,
-    remote_status: String,
-    error: Option<String>,
-    checked_at: Option<i64>,
-}
-
 /// 网关健康状态只描述当前链路是否具备可用条件；具体配置版本仍由
 /// `apply_status` 和 `desired_revision` 表达，两者不能互相替代。
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
@@ -1198,32 +1084,6 @@ enum GatewayHealthStatus {
     Degraded,
     Failed,
     Disabled,
-}
-
-/// 给用户路由器配置静态路由时需要填写的最小信息。
-///
-/// Nexo 只生成引导，不会登录或修改用户路由器；`next_hop` 缺失时表示旧版
-/// Agent 尚未上报本地地址，UI 必须要求用户先确认设备的固定局域网地址。
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
-struct StaticRouteGuide {
-    /// 站点网段路由和组网客户端回程路由都使用同一份确认流程。
-    purpose: StaticRoutePurpose,
-    router_site_id: String,
-    destination_site_id: String,
-    router_site_name: String,
-    destination_site_name: String,
-    destination_label: String,
-    destination_prefix: String,
-    next_hop: Option<String>,
-    /// 用户在该站点路由器上完成配置后的持久化确认。
-    router_confirmed: bool,
-}
-
-#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-enum StaticRoutePurpose {
-    SiteNetwork,
-    MeshClientReturn,
 }
 
 /// 服务端本地 CA 材料。私钥只在服务端内存中短暂使用，绝不通过 API 返回。
@@ -1248,12 +1108,15 @@ struct IssuedIdentity {
 #[derive(Debug, Serialize)]
 struct ErrorResponse {
     error: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    code: Option<String>,
 }
 
 #[derive(Debug)]
 struct ApiError {
     status: StatusCode,
     message: String,
+    code: Option<String>,
 }
 
 impl ApiError {
@@ -1261,6 +1124,15 @@ impl ApiError {
         Self {
             status,
             message: message.into(),
+            code: None,
+        }
+    }
+
+    fn with_code(status: StatusCode, message: impl Into<String>, code: impl Into<String>) -> Self {
+        Self {
+            status,
+            message: message.into(),
+            code: Some(code.into()),
         }
     }
 }
@@ -1271,6 +1143,7 @@ impl IntoResponse for ApiError {
             self.status,
             Json(ErrorResponse {
                 error: self.message,
+                code: self.code,
             }),
         )
             .into_response()
@@ -1295,6 +1168,9 @@ async fn main() -> Result<()> {
     apply_oidc_accounts_migration(&connection).context("无法初始化 OIDC 账号映射数据结构")?;
     apply_route_confirmations_migration(&connection).context("无法更新站点路由确认状态")?;
     apply_mesh_connections_migration(&connection).context("无法初始化连接观测数据结构")?;
+    apply_device_networks_migration(&connection)?;
+    apply_mesh_names_migration(&connection)?;
+    ensure_mesh_name_values(&connection).context("无法初始化设备 MagicDNS 访问名称")?;
     ensure_server_ca(&connection).context("无法初始化服务端设备身份 CA")?;
     ensure_server_control_identity(&connection).context("无法初始化控制通道服务端证书")?;
     let data_dir = db_path
@@ -1549,8 +1425,6 @@ async fn main() -> Result<()> {
             "/api/v1/devices/{id}",
             put(update_device).delete(delete_device),
         )
-        .route("/api/v1/sites", get(list_sites).post(create_site))
-        .route("/api/v1/sites/{id}", delete(delete_site))
         .route(
             "/api/v1/enrollments",
             get(list_enrollments).post(create_enrollment),
@@ -1563,6 +1437,14 @@ async fn main() -> Result<()> {
             post(poll_agent_enrollment),
         )
         .route("/api/v1/mesh/status", get(mesh_status))
+        .route(
+            "/api/v1/devices/{id}/shared-networks",
+            put(device_networks::save),
+        )
+        .route(
+            "/api/v1/site-networks/{id}/recheck",
+            post(device_networks::recheck),
+        )
         .route("/api/v1/mesh/connections", get(list_mesh_connections))
         .route(
             "/api/v1/mesh/connection-checks",
@@ -1629,23 +1511,6 @@ async fn main() -> Result<()> {
             "/api/v1/site-networks/{id}/enable",
             post(enable_site_network),
         )
-        .route(
-            "/api/v1/site-links",
-            get(list_site_links).post(create_site_link),
-        )
-        .route(
-            "/api/v1/site-links/{id}",
-            get(get_site_link)
-                .patch(update_site_link)
-                .delete(delete_site_link),
-        )
-        .route("/api/v1/site-links/{id}/disable", post(disable_site_link))
-        .route("/api/v1/site-links/{id}/enable", post(enable_site_link))
-        .route(
-            "/api/v1/site-links/{id}/router-confirmations/{site_id}",
-            post(confirm_site_link_router),
-        )
-        .route("/api/v1/site-links/{id}/recheck", post(recheck_site_link))
         .fallback_service(ServeDir::new(
             env::var("NEXO_WEB_DIR").unwrap_or_else(|_| "./web/dist".to_owned()),
         ))
@@ -1759,6 +1624,9 @@ fn run_cli_command(command: CliCommand) -> Result<()> {
     apply_oidc_accounts_migration(&connection)?;
     apply_route_confirmations_migration(&connection)?;
     apply_mesh_connections_migration(&connection)?;
+    apply_device_networks_migration(&connection)?;
+    apply_mesh_names_migration(&connection)?;
+    ensure_mesh_name_values(&connection)?;
     let data_dir = db_path.parent().context("Nexo 数据库路径缺少父目录")?;
     match command {
         CliCommand::BootstrapCode => {
@@ -1893,6 +1761,51 @@ fn apply_route_confirmations_migration(connection: &Connection) -> Result<()> {
 
 /// 建立脱敏连接观测和异步检测任务表。迁移只增加新表，不改写已有设备、
 /// 路由或身份数据，因此升级失败时不会留下部分业务状态。
+/// 移除站点业务结构并保留设备身份与共享网段；失败时整体回滚。
+fn apply_device_networks_migration(connection: &Connection) -> Result<()> {
+    let applied: bool = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version = 23)",
+        [],
+        |row| row.get(0),
+    )?;
+    if !applied {
+        let transaction = connection.unchecked_transaction()?;
+        transaction.execute_batch(include_str!("../../../migrations/0023_device_networks.sql"))?;
+        let violations: i64 =
+            transaction.query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+                row.get(0)
+            })?;
+        anyhow::ensure!(violations == 0, "移除站点后检测到无效外键，迁移已回滚");
+        transaction.commit()?;
+    }
+    Ok(())
+}
+
+/// 为设备增加独立的 MagicDNS 访问名称；迁移只建立字段和唯一约束，
+/// 现有设备的短名由启动后的分配器按稳定顺序补齐，避免在 SQL 中猜测中文名称。
+fn apply_mesh_names_migration(connection: &Connection) -> Result<()> {
+    let applied = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version = 24)",
+        [],
+        |row| row.get::<_, bool>(0),
+    )?;
+    if applied {
+        return Ok(());
+    }
+    let has_previous = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version = 23)",
+        [],
+        |row| row.get::<_, bool>(0),
+    )?;
+    if !has_previous {
+        anyhow::bail!("数据库版本过旧或未完成迁移；设备访问名称迁移要求先完成设备网络迁移");
+    }
+    let transaction = connection.unchecked_transaction()?;
+    transaction.execute_batch(MESH_NAMES_MIGRATION)?;
+    transaction.commit()?;
+    Ok(())
+}
+
 fn apply_mesh_connections_migration(connection: &Connection) -> Result<()> {
     let applied = connection.query_row(
         "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version = 22)",
@@ -6418,7 +6331,7 @@ async fn reconcile_caddy_config_best_effort(state: &AppState) {
             let (status, message) = if entry.https_enabled {
                 ("error", Some("域名与 HTTPS 尚未启用"))
             } else {
-                ("not_configured", None)
+                ("ready", None)
             };
             update_primary_domain_apply_state(state, status, message, None)?;
             return Ok::<(), anyhow::Error>(());
@@ -6427,9 +6340,7 @@ async fn reconcile_caddy_config_best_effort(state: &AppState) {
         sync_caddy_certificate_metadata(state)?;
         update_public_domain_apply_states(state, None)?;
         let certificate_ready = public_certificate_material_ready(state, &entry).await;
-        let (status, message) = if !entry.https_enabled {
-            ("not_configured", None)
-        } else if certificate_ready {
+        let (status, message) = if !entry.https_enabled || certificate_ready {
             ("ready", None)
         } else {
             ("configuring", Some("正在等待证书材料或 ACME 签发"))
@@ -7311,16 +7222,22 @@ async fn list_devices(
         .db
         .lock()
         .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "数据库锁不可用"))?;
-    list_devices_for_tenant(&connection, &tenant_id).map(Json)
+    list_devices_for_tenant(
+        &connection,
+        &tenant_id,
+        &state.headscale_runtime.config().dns_base_domain,
+    )
+    .map(Json)
 }
 
 fn list_devices_for_tenant(
     connection: &Connection,
     tenant_id: &str,
+    dns_base_domain: &str,
 ) -> Result<Vec<DeviceResponse>, ApiError> {
     let mut statement = connection
         .prepare(
-            "SELECT d.id, d.tenant_id, d.site_id, d.name, d.os, d.architecture,
+            "SELECT d.id, d.tenant_id, d.name, d.os, d.architecture,
                     d.agent_version, d.status, d.capabilities_json, r.report_json,
                     m.state, m.tailscale_ipv4, m.online, unixepoch(d.last_seen_at),
                     (SELECT a.state FROM mesh_enrollment_attempts a
@@ -7331,7 +7248,8 @@ fn list_devices_for_tenant(
                     tm.user_id, tm.registration_method, tm.tags_json,
                     tm.tailscale_ipv4, tm.tailscale_ipv6, tm.expires_at,
                     tm.control_plane_state,
-                    (SELECT u.username FROM users u WHERE u.id = tm.user_id)
+                    (SELECT u.username FROM users u WHERE u.id = tm.user_id),
+                    d.mesh_name, m.hostname
              FROM devices d
              LEFT JOIN device_capability_reports r ON r.device_id = d.id
              LEFT JOIN mesh_identities m ON m.nexo_device_id = d.id
@@ -7341,7 +7259,9 @@ fn list_devices_for_tenant(
         )
         .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法读取设备列表"))?;
     let rows = statement
-        .query_map([tenant_id], device_response_from_row)
+        .query_map([tenant_id], |row| {
+            device_response_from_row(row, dns_base_domain)
+        })
         .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法读取设备列表"))?;
     rows.map(|row| {
         row.map_err(|_| {
@@ -7354,28 +7274,50 @@ fn list_devices_for_tenant(
     .collect::<Result<Vec<_>, _>>()
 }
 
-fn device_response_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<DeviceResponse> {
-    let capabilities_json: String = row.get(8)?;
-    let report_json: Option<String> = row.get(9)?;
-    let mesh_state: Option<String> = row.get(10)?;
-    let mesh_online = row.get::<_, Option<i64>>(12)?.unwrap_or_default() != 0;
-    let enrollment_state: Option<String> = row.get(14)?;
-    let device_status: String = row.get(7)?;
-    let device_name: String = row.get(3)?;
-    let owner_user_id: Option<String> = row.get(16)?;
-    let registration_method: Option<String> = row.get(17)?;
+fn device_response_from_row(
+    row: &rusqlite::Row<'_>,
+    dns_base_domain: &str,
+) -> rusqlite::Result<DeviceResponse> {
+    let capabilities_json: String = row.get(7)?;
+    let report_json: Option<String> = row.get(8)?;
+    let mesh_state: Option<String> = row.get(9)?;
+    let mesh_online = row.get::<_, Option<i64>>(11)?.unwrap_or_default() != 0;
+    let enrollment_state: Option<String> = row.get(13)?;
+    let device_status: String = row.get(6)?;
+    let device_name: String = row.get(2)?;
+    let mesh_name: Option<String> = row.get(23)?;
+    let active_mesh_name: Option<String> = row
+        .get::<_, Option<String>>(24)?
+        .filter(|name| !name.trim().is_empty());
+    let mesh_name_status = match (&mesh_name, &active_mesh_name) {
+        (Some(expected), Some(active)) if expected.eq_ignore_ascii_case(active) => "ready",
+        (Some(_), Some(_)) => "applying",
+        (Some(_), None) => "not_joined",
+        (None, _) => "not_joined",
+    };
+    // 只有 Headscale 已应用的名称才是当前可用地址；处理中继续返回旧地址，
+    // 尚未加入组网的设备则不提前展示一个尚未生效的未来地址。
+    let mesh_fqdn = active_mesh_name
+        .as_deref()
+        .map(|name| format!("{name}.{dns_base_domain}"));
+    let owner_user_id: Option<String> = row.get(15)?;
+    let registration_method: Option<String> = row.get(16)?;
     let needs_name = registration_method.is_some() && is_placeholder_tailscale_name(&device_name);
     let tags_json: String = row
-        .get::<_, Option<String>>(18)?
+        .get::<_, Option<String>>(17)?
         .unwrap_or_else(|| "[]".to_owned());
     Ok(DeviceResponse {
         id: row.get(0)?,
         tenant_id: row.get(1)?,
-        site_id: row.get(2)?,
+
         name: device_name.clone(),
-        os: row.get(4)?,
-        architecture: row.get(5)?,
-        agent_version: row.get(6)?,
+        mesh_name,
+        active_mesh_name,
+        mesh_fqdn,
+        mesh_name_status: mesh_name_status.to_owned(),
+        os: row.get(3)?,
+        architecture: row.get(4)?,
+        agent_version: row.get(5)?,
         status: device_status.clone(),
         capabilities: serde_json::from_str(&capabilities_json).map_err(|error| {
             rusqlite::Error::FromSqlConversionFailure(
@@ -7407,14 +7349,14 @@ fn device_response_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<DeviceR
             (Some("enrolling") | Some("issued"), _) => "joining".to_owned(),
             _ => "not_joined".to_owned(),
         },
-        mesh_address: row.get(11)?,
+        mesh_address: row.get(10)?,
         connection_type: if registration_method.is_some() {
             "tailscale_client".to_owned()
         } else {
             "nexo_agent".to_owned()
         },
         owner_user_id,
-        owner_username: row.get(23)?,
+        owner_username: row.get(22)?,
         registration_method,
         tags: serde_json::from_str(&tags_json).map_err(|error| {
             rusqlite::Error::FromSqlConversionFailure(
@@ -7424,96 +7366,21 @@ fn device_response_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<DeviceR
             )
         })?,
         tailscale_ipv4: row
-            .get::<_, Option<String>>(19)?
-            .or(row.get::<_, Option<String>>(11)?),
-        tailscale_ipv6: row.get(20)?,
-        expires_at: row.get(21)?,
-        control_plane_state: row.get(22)?,
-        last_seen_at: row.get(13)?,
+            .get::<_, Option<String>>(18)?
+            .or(row.get::<_, Option<String>>(10)?),
+        tailscale_ipv6: row.get(19)?,
+        expires_at: row.get(20)?,
+        control_plane_state: row.get(21)?,
+        last_seen_at: row.get(12)?,
         needs_name,
-        tunnel_count: row.get(15)?,
+        tunnel_count: row.get(14)?,
     })
 }
 
-/// 返回站点目录，供 Web 创建共享网络和站点互联时选择站点。
-async fn list_sites(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-) -> Result<Json<Vec<SiteResponse>>, ApiError> {
-    let tenant_id = auth::admin_tenant_id(&state, &headers)?;
-    let connection = state
-        .db
-        .lock()
-        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "数据库锁不可用"))?;
-    let mut statement = connection
-        .prepare(
-            "SELECT id, tenant_id, name
-             FROM sites
-             WHERE tenant_id = ?1
-             ORDER BY name ASC, id ASC",
-        )
-        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法读取站点列表"))?;
-    let rows = statement
-        .query_map([tenant_id], |row| {
-            Ok(SiteResponse {
-                id: row.get(0)?,
-                tenant_id: row.get(1)?,
-                name: row.get(2)?,
-            })
-        })
-        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法读取站点列表"))?;
-    rows.map(|row| {
-        row.map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "站点数据格式无效"))
-    })
-    .collect::<Result<Vec<_>, _>>()
-    .map(Json)
-}
-
-/// 创建一个用户可见站点；Site Gateway 和共享网络都必须归属于站点。
-async fn create_site(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Json(request): Json<CreateSiteRequest>,
-) -> Result<Json<SiteResponse>, ApiError> {
-    let session_tenant = auth::admin_tenant_id(&state, &headers)?;
-    let tenant_id = request.tenant_id.trim().to_owned();
-    let name = request.name.trim().to_owned();
-    if tenant_id.is_empty() || name.is_empty() {
-        return Err(ApiError::new(
-            StatusCode::BAD_REQUEST,
-            "tenant_id 和 name 不能为空",
-        ));
-    }
-    let id = Uuid::new_v4().to_string();
-    let connection = state
-        .db
-        .lock()
-        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "数据库锁不可用"))?;
-    let tenant_exists: i64 = connection
-        .query_row(
-            "SELECT COUNT(*) FROM tenants WHERE id = ?1",
-            [&tenant_id],
-            |row| row.get(0),
-        )
-        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法检查租户"))?;
-    if tenant_exists == 0 {
-        return Err(ApiError::new(StatusCode::NOT_FOUND, "租户不存在"));
-    }
-    ensure_tenant_scope(&tenant_id, &session_tenant)?;
-    connection
-        .execute(
-            "INSERT INTO sites (id, tenant_id, name) VALUES (?1, ?2, ?3)",
-            rusqlite::params![id, tenant_id, name],
-        )
-        .map_err(|_| ApiError::new(StatusCode::CONFLICT, "站点名称或站点数据已存在"))?;
-    Ok(Json(SiteResponse {
-        id,
-        tenant_id,
-        name,
-    }))
-}
-
-/// 更新设备的用户可见资料；组网身份名称与设备名称保持同一套稳定规则。
+/// 更新设备显示名称和独立的 MagicDNS 访问名称。
+///
+/// 访问名称先写入 Desired State，再立即尝试通知 Headscale；控制面暂时不可用
+/// 时保留旧 Applied 名称，由后台协调器继续重试，避免一次重命名让设备失联。
 async fn update_device(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -7522,6 +7389,12 @@ async fn update_device(
 ) -> Result<Json<DeviceResponse>, ApiError> {
     let tenant_id = auth::admin_tenant_id(&state, &headers)?;
     let name = request.name.trim().to_owned();
+    let requested_mesh_name = request
+        .mesh_name
+        .as_deref()
+        .map(normalize_mesh_name)
+        .transpose()
+        .map_err(|message| ApiError::new(StatusCode::BAD_REQUEST, message))?;
     if name.is_empty() {
         return Err(ApiError::new(StatusCode::BAD_REQUEST, "设备名称不能为空"));
     }
@@ -7531,98 +7404,22 @@ async fn update_device(
             "设备名称不能使用 localhost，请填写可识别的设备名称",
         ));
     }
-    let site_id = request
-        .site_id
-        .map(|value| value.trim().to_owned())
-        .filter(|value| !value.is_empty());
-
-    let (old_name, old_site_id, node_id) = {
+    let (old_name, old_mesh_name) = {
         let connection = state
             .db
             .lock()
             .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "数据库锁不可用"))?;
-        let current = connection
+        connection
             .query_row(
-                "SELECT d.name, d.site_id, m.headscale_node_id
+                "SELECT d.name, d.mesh_name
                  FROM devices d
-                 LEFT JOIN mesh_identities m ON m.nexo_device_id = d.id
                  WHERE d.id = ?1 AND d.tenant_id = ?2",
                 rusqlite::params![id, tenant_id],
-                |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, Option<String>>(1)?,
-                        row.get::<_, Option<String>>(2)?,
-                    ))
-                },
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
             )
             .optional()
             .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法读取设备资料"))?
-            .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "设备不存在"))?;
-
-        if let Some(target_site_id) = site_id.as_deref() {
-            let exists: i64 = connection
-                .query_row(
-                    "SELECT COUNT(*) FROM sites WHERE id = ?1 AND tenant_id = ?2",
-                    rusqlite::params![target_site_id, tenant_id],
-                    |row| row.get(0),
-                )
-                .map_err(|_| {
-                    ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法检查目标站点")
-                })?;
-            if exists == 0 {
-                return Err(ApiError::new(StatusCode::NOT_FOUND, "目标站点不存在"));
-            }
-        }
-        if current.1 != site_id {
-            let has_network: i64 = connection
-                .query_row(
-                    "SELECT EXISTS(SELECT 1 FROM site_networks WHERE publisher_device_id = ?1)",
-                    [&id],
-                    |row| row.get(0),
-                )
-                .map_err(|_| {
-                    ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法检查设备共享网络")
-                })?;
-            let is_gateway: i64 = connection
-                .query_row(
-                    "SELECT EXISTS(SELECT 1 FROM sites WHERE active_site_gateway_device_id = ?1)",
-                    [&id],
-                    |row| row.get(0),
-                )
-                .map_err(|_| {
-                    ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法检查设备站点网关")
-                })?;
-            if has_network != 0 || is_gateway != 0 {
-                return Err(ApiError::new(
-                    StatusCode::CONFLICT,
-                    "设备正在承载共享网络或站点网关，暂不能更换所属站点，请先解除相关配置",
-                ));
-            }
-        }
-        (current.0, current.1, current.2)
-    };
-
-    let renamed_node = if old_name != name {
-        if let Some(node_id) = node_id.as_deref() {
-            let hostname = mesh_hostname(&tenant_id, &name, &id);
-            state
-                .headscale
-                .rename_node(node_id, &hostname)
-                .await
-                .map_err(|error| {
-                    tracing::warn!(device_id = %id, headscale_node_id = %node_id, "无法同步设备组网访问名：{error:#}");
-                    ApiError::new(
-                        StatusCode::BAD_GATEWAY,
-                        "暂时无法同步设备组网访问名，设备资料尚未修改，请稍后重试",
-                    )
-                })?;
-            Some(hostname)
-        } else {
-            None
-        }
-    } else {
-        None
+            .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "设备不存在"))?
     };
 
     {
@@ -7633,74 +7430,72 @@ async fn update_device(
         let transaction = connection.transaction().map_err(|_| {
             ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法开始设备编辑事务")
         })?;
-        let current: Option<(String, Option<String>)> = transaction
+        let current: Option<(String, Option<String>, Option<String>, bool)> = transaction
             .query_row(
-                "SELECT name, site_id FROM devices WHERE id = ?1 AND tenant_id = ?2",
+                "SELECT d.name, d.mesh_name, d.os,
+                        EXISTS(SELECT 1 FROM tailscale_device_metadata tm
+                               WHERE tm.device_id = d.id)
+                 FROM devices d WHERE d.id = ?1 AND d.tenant_id = ?2",
                 rusqlite::params![id, tenant_id],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
             )
             .optional()
             .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法复核设备资料"))?;
-        let Some((current_name, current_site)) = current else {
+        let Some((current_name, current_mesh_name, current_os, is_client)) = current else {
             return Err(ApiError::new(StatusCode::NOT_FOUND, "设备不存在"));
         };
-        if current_name != old_name || current_site != old_site_id {
+        if current_name != old_name || current_mesh_name != old_mesh_name {
             return Err(ApiError::new(
                 StatusCode::CONFLICT,
                 "设备资料在编辑期间发生变化，请刷新后重试",
             ));
         }
-        if current_site != site_id {
-            let has_network: i64 = transaction
-                .query_row(
-                    "SELECT EXISTS(SELECT 1 FROM site_networks WHERE publisher_device_id = ?1)",
-                    [&id],
-                    |row| row.get(0),
-                )
-                .map_err(|_| {
-                    ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法复核设备共享网络")
-                })?;
-            let is_gateway: i64 = transaction
-                .query_row(
-                    "SELECT EXISTS(SELECT 1 FROM sites WHERE active_site_gateway_device_id = ?1)",
-                    [&id],
-                    |row| row.get(0),
-                )
-                .map_err(|_| {
-                    ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法复核设备站点网关")
-                })?;
-            if has_network != 0 || is_gateway != 0 {
-                return Err(ApiError::new(
+        let mesh_name = if let Some(mesh_name) = requested_mesh_name.as_deref() {
+            if mesh_name_taken(&transaction, mesh_name, Some(&id)).map_err(|_| {
+                ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法检查组网访问名")
+            })? {
+                return Err(ApiError::with_code(
                     StatusCode::CONFLICT,
-                    "设备正在承载共享网络或站点网关，暂不能更换所属站点，请先解除相关配置",
+                    "组网访问名已被其他设备使用",
+                    "mesh_name_conflict",
                 ));
             }
-        }
+            mesh_name.to_owned()
+        } else if let Some(mesh_name) = current_mesh_name {
+            mesh_name
+        } else {
+            allocate_mesh_name(
+                &transaction,
+                &name,
+                is_client,
+                current_os.as_deref(),
+                Some(&id),
+            )
+            .map_err(|error| {
+                ApiError::new(
+                    StatusCode::CONFLICT,
+                    format!("无法分配组网访问名：{error:#}"),
+                )
+            })?
+        };
         let changed = transaction
             .execute(
-                "UPDATE devices SET name = ?1, site_id = ?2, updated_at = CURRENT_TIMESTAMP
+                "UPDATE devices SET name = ?1, mesh_name = ?2,
+                        updated_at = CURRENT_TIMESTAMP
                  WHERE id = ?3 AND tenant_id = ?4",
-                rusqlite::params![name, site_id, id, tenant_id],
+                rusqlite::params![name, mesh_name, id, tenant_id],
             )
-            .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法更新设备资料"))?;
+            .map_err(|error| device_update_database_error(error, "无法更新设备资料"))?;
         if changed != 1 {
             return Err(ApiError::new(StatusCode::NOT_FOUND, "设备不存在"));
         }
-        if let Some(hostname) = renamed_node.as_ref() {
-            transaction
-                .execute(
-                    "UPDATE mesh_identities SET hostname = ?1, updated_at = CURRENT_TIMESTAMP
-                     WHERE nexo_device_id = ?2",
-                    rusqlite::params![hostname, id],
-                )
-                .map_err(|_| {
-                    ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法保存设备组网访问名")
-                })?;
-        }
         write_audit_event(&transaction, &tenant_id, "DEVICE_UPDATED", "device", &id)?;
-        transaction.commit().map_err(|_| {
-            ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法提交设备编辑事务")
-        })?;
+        transaction
+            .commit()
+            .map_err(|error| device_update_database_error(error, "无法提交设备编辑事务"))?;
+    }
+    if let Err(error) = reconcile_device_mesh_name(&state, &id).await {
+        tracing::warn!(device_id = %id, "设备 MagicDNS 访问名将在后台重试：{error:#}");
     }
 
     let connection = state
@@ -7709,7 +7504,7 @@ async fn update_device(
         .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "数据库锁不可用"))?;
     connection
         .query_row(
-            "SELECT d.id, d.tenant_id, d.site_id, d.name, d.os, d.architecture,
+            "SELECT d.id, d.tenant_id, d.name, d.os, d.architecture,
                     d.agent_version, d.status, d.capabilities_json, r.report_json,
                     m.state, m.tailscale_ipv4, m.online, unixepoch(d.last_seen_at),
                     (SELECT a.state FROM mesh_enrollment_attempts a
@@ -7720,87 +7515,42 @@ async fn update_device(
                      tm.user_id, tm.registration_method, tm.tags_json,
                      tm.tailscale_ipv4, tm.tailscale_ipv6, tm.expires_at,
                      tm.control_plane_state,
-                     (SELECT u.username FROM users u WHERE u.id = tm.user_id)
+                     (SELECT u.username FROM users u WHERE u.id = tm.user_id),
+                     d.mesh_name, m.hostname
              FROM devices d
              LEFT JOIN device_capability_reports r ON r.device_id = d.id
              LEFT JOIN mesh_identities m ON m.nexo_device_id = d.id
              LEFT JOIN tailscale_device_metadata tm ON tm.device_id = d.id
              WHERE d.id = ?1 AND d.tenant_id = ?2",
             rusqlite::params![id, tenant_id],
-            device_response_from_row,
+            |row| device_response_from_row(row, &state.headscale_runtime.config().dns_base_domain),
         )
         .map(Json)
         .map_err(|_| ApiError::new(StatusCode::NOT_FOUND, "设备不存在"))
 }
 
-/// 删除空站点；设备和网络拓扑属于显式业务资源，存在任一依赖时都拒绝级联。
-async fn delete_site(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Path(id): Path<String>,
-) -> Result<Json<DeleteResponse>, ApiError> {
-    let tenant_id = auth::admin_tenant_id(&state, &headers)?;
-    let mut connection = state
-        .db
-        .lock()
-        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "数据库锁不可用"))?;
-    let transaction = connection
-        .transaction()
-        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法开始站点删除事务"))?;
-    let (name, device_count, network_count, link_count): (String, i64, i64, i64) = transaction
-        .query_row(
-            "SELECT s.name,
-                        (SELECT COUNT(*) FROM devices d WHERE d.site_id = s.id),
-                        (SELECT COUNT(*) FROM site_networks n WHERE n.site_id = s.id),
-                        (SELECT COUNT(*) FROM site_links l
-                         WHERE l.left_site_id = s.id OR l.right_site_id = s.id)
-                 FROM sites s WHERE s.id = ?1 AND s.tenant_id = ?2",
-            rusqlite::params![id, tenant_id],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-        )
-        .optional()
-        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法检查站点依赖"))?
-        .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "站点不存在"))?;
-    if let Some(message) = delete_dependency_message(
-        "站点",
-        &[
-            ("台设备", device_count),
-            ("个共享网络", network_count),
-            ("个互联关系", link_count),
-        ],
+/// 将设备访问名唯一约束映射为稳定的 API 错误码，避免并发编辑时把可操作的
+/// 名称冲突误报成服务器故障。设备编辑事务中唯一约束只来自 mesh_name 索引。
+fn device_update_database_error(error: rusqlite::Error, message: &'static str) -> ApiError {
+    if matches!(
+        error,
+        rusqlite::Error::SqliteFailure(ref code, _)
+            if code.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_UNIQUE
     ) {
-        tracing::warn!(site_id = %id, "拒绝删除站点：{message}");
-        return Err(ApiError::new(StatusCode::CONFLICT, message));
+        return ApiError::with_code(
+            StatusCode::CONFLICT,
+            "组网访问名已被其他设备使用",
+            "mesh_name_conflict",
+        );
     }
-    // 未完成的入网请求只是站点内部凭证，不应让一个已经没有业务资源的站点
-    // 永久无法删除；随站点删除一并作废，旧 token 此后无法再换取设备证书。
-    transaction
-        .execute("DELETE FROM pending_enrollments WHERE site_id = ?1", [&id])
-        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法作废站点入网请求"))?;
-    write_audit_event(&transaction, &tenant_id, "SITE_DELETED", "site", &id)?;
-    transaction
-        .execute(
-            "DELETE FROM sites WHERE id = ?1 AND tenant_id = ?2",
-            rusqlite::params![id, tenant_id],
-        )
-        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法删除站点"))?;
-    transaction
-        .commit()
-        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法提交站点删除事务"))?;
-    tracing::info!(site_id = %id, site_name = %name, "站点已删除");
-    Ok(Json(DeleteResponse {
-        deleted: true,
-        pending: false,
-        id,
-        message: "站点已删除".to_owned(),
-    }))
+    ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, message)
 }
 
 /// 删除设备前先撤销 Headscale 凭证和节点，再清理本地身份链。
 ///
 /// 外部撤销失败时保留本地记录，避免管理界面声称设备已删除但旧节点仍可继续
-/// 参与组网。Tunnel 会保留为未分配并关闭；共享网络和活动站点网关仍需
-/// 先解除，避免删除设备后留下不可解释的网关拓扑。
+/// 参与组网。Tunnel 会保留为未分配并关闭；共享网段须先撤回并删除，
+/// 避免失去承载设备后无法确认路由撤销。
 async fn delete_device(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -7812,30 +7562,22 @@ async fn delete_device(
             .db
             .lock()
             .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "数据库锁不可用"))?;
-        let (name, node_id, network_count, gateway_count): (String, Option<String>, i64, i64) =
-            connection
-                .query_row(
-                    "SELECT d.name, m.headscale_node_id,
+        let (name, node_id, network_count): (String, Option<String>, i64) = connection
+            .query_row(
+                "SELECT d.name, m.headscale_node_id,
                         (SELECT COUNT(*) FROM site_networks n
-                         WHERE n.publisher_device_id = d.id),
-                        (SELECT COUNT(*) FROM sites s
-                         WHERE s.active_site_gateway_device_id = d.id)
+                         WHERE n.publisher_device_id = d.id)
                  FROM devices d
                  LEFT JOIN mesh_identities m ON m.nexo_device_id = d.id
                  WHERE d.id = ?1 AND d.tenant_id = ?2",
-                    rusqlite::params![id, tenant_id],
-                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-                )
-                .optional()
-                .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法检查设备依赖"))?
-                .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "设备不存在"))?;
-        if let Some(message) = delete_dependency_message(
-            "设备",
-            &[
-                ("个共享网络", network_count),
-                ("个活动站点网关", gateway_count),
-            ],
-        ) {
+                rusqlite::params![id, tenant_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()
+            .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法检查设备依赖"))?
+            .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "设备不存在"))?;
+        if let Some(message) = delete_dependency_message("设备", &[("个共享网络", network_count)])
+        {
             tracing::warn!(device_id = %id, "拒绝删除设备：{message}");
             return Err(ApiError::new(StatusCode::CONFLICT, message));
         }
@@ -7906,22 +7648,8 @@ async fn delete_device(
                 |row| row.get(0),
             )
             .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法复核设备依赖"))?;
-        let gateway_count: i64 = transaction
-            .query_row(
-                "SELECT COUNT(*) FROM sites WHERE active_site_gateway_device_id = ?1",
-                [&id],
-                |row| row.get(0),
-            )
-            .map_err(|_| {
-                ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法复核设备站点网关")
-            })?;
-        if let Some(message) = delete_dependency_message(
-            "设备",
-            &[
-                ("个共享网络", network_count),
-                ("个活动站点网关", gateway_count),
-            ],
-        ) {
+        if let Some(message) = delete_dependency_message("设备", &[("个共享网络", network_count)])
+        {
             tracing::warn!(device_id = %id, "复核时拒绝删除设备：{message}");
             return Err(ApiError::new(StatusCode::CONFLICT, message));
         }
@@ -8005,9 +7733,9 @@ async fn delete_device(
                 tunnel_id,
             )?;
         }
-        refresh_site_link_apply_status(&transaction).map_err(|error| {
-            tracing::error!(device_id = %id, "删除设备时刷新互联状态失败：{error:#}");
-            ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法刷新站点互联状态")
+        refresh_network_deletions(&transaction).map_err(|error| {
+            tracing::error!(device_id = %id, "删除设备时刷新网段状态失败：{error:#}");
+            ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法刷新共享网段状态")
         })?;
         write_audit_event(&transaction, &tenant_id, "DEVICE_DELETED", "device", &id)?;
         transaction
@@ -8863,7 +8591,7 @@ async fn serve_control_connection(
              WHERE nexo_device_id = ?1",
             [&device_id],
         )?;
-        refresh_site_link_apply_status(&transaction)?;
+        refresh_network_deletions(&transaction)?;
         transaction.commit()?;
     }
     // 控制面离线后立即重新汇总公网入口；即使数据面连接还未结束，
@@ -9538,7 +9266,7 @@ fn load_gateway_desired_state_with_mesh_allowed(
         let rows = statement.query_map([device_id], |row| {
             Ok(GatewayDesiredRoute {
                 network_id: row.get(0)?,
-                site_link_id: None,
+
                 prefix: row.get(1)?,
                 revision: row.get(2)?,
                 enabled: row.get::<_, i64>(3)? != 0 && !identity_mismatch && mesh_allowed,
@@ -9548,47 +9276,7 @@ fn load_gateway_desired_state_with_mesh_allowed(
             routes.push(row?);
         }
     }
-    {
-        let mut statement = connection.prepare(
-            "SELECT DISTINCT remote_n.id, l.id, remote_g.desired_prefix, remote_g.desired_revision,
-                    l.apply_revision, l.enabled, local_n.enabled, remote_n.enabled
-             FROM site_links l
-             JOIN site_link_networks local_link ON local_link.site_link_id = l.id
-             JOIN site_networks local_n ON local_n.id = local_link.site_network_id
-             JOIN site_link_networks remote_link ON remote_link.site_link_id = l.id
-                AND remote_link.side <> local_link.side
-             JOIN site_networks remote_n ON remote_n.id = remote_link.site_network_id
-             JOIN gateway_network_states remote_g ON remote_g.site_network_id = remote_n.id
-             WHERE local_n.publisher_device_id = ?1
-            ",
-        )?;
-        let rows = statement.query_map([device_id], |row| {
-            let network_revision: i64 = row.get(3)?;
-            let link_revision: i64 = row.get(4)?;
-            Ok(GatewayDesiredRoute {
-                network_id: row.get(0)?,
-                site_link_id: Some(row.get(1)?),
-                prefix: row.get(2)?,
-                revision: network_revision.max(link_revision),
-                enabled: row.get::<_, i64>(5)? != 0
-                    && row.get::<_, i64>(6)? != 0
-                    && row.get::<_, i64>(7)? != 0
-                    && !identity_mismatch
-                    && mesh_allowed,
-            })
-        })?;
-        for row in rows {
-            routes.push(row?);
-        }
-    }
-    if routes.is_empty() {
-        return Ok(None);
-    }
-    routes.sort_by(|left, right| {
-        left.network_id
-            .cmp(&right.network_id)
-            .then_with(|| left.site_link_id.cmp(&right.site_link_id))
-    });
+    routes.sort_by(|left, right| left.network_id.cmp(&right.network_id));
     let revision = routes
         .iter()
         .map(|route| route.revision)
@@ -10315,13 +10003,13 @@ fn apply_gateway_ack(state: &AppState, device_id: &str, ack: &GatewayApplyAck) -
             )?;
             transaction.execute(
                 "INSERT INTO gateway_route_applies
-                 (device_id, network_id, site_link_id, desired_revision, local_status,
-                  control_plane_status, remote_status, last_error, last_checked_at,
+                 (device_id, network_id, desired_revision, local_status,
+                  control_plane_status, last_error, last_checked_at,
                   updated_at)
-                 VALUES (?1, ?2, '', ?3, 'upgrade_required', 'pending', 'pending',
+                 VALUES (?1, ?2, ?3, 'upgrade_required', 'pending',
                          'Agent 需要升级以报告逐路由应用结果', CURRENT_TIMESTAMP,
                          CURRENT_TIMESTAMP)
-                 ON CONFLICT(device_id, network_id, site_link_id) DO UPDATE SET
+                 ON CONFLICT(device_id, network_id) DO UPDATE SET
                  local_status = 'upgrade_required', last_error = excluded.last_error,
                  last_checked_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP",
                 rusqlite::params![device_id, network_id, ack.revision],
@@ -10363,118 +10051,10 @@ fn apply_gateway_ack(state: &AppState, device_id: &str, ack: &GatewayApplyAck) -
                     device_id
                 ],
             )?;
-            transaction.execute(
-                "UPDATE site_links SET apply_status = ?1, apply_error = ?2,
-                     updated_at = CURRENT_TIMESTAMP
-                 WHERE id IN (
-                     SELECT DISTINCT l.id
-                     FROM site_links l
-                     JOIN site_link_networks ln ON ln.site_link_id = l.id
-                     WHERE ln.site_network_id = ?3 AND l.enabled = 1
-                 )",
-                rusqlite::params![status, ack.error_message, network_id],
-            )?;
         }
     }
-    refresh_site_link_apply_status(&transaction)?;
+    refresh_network_deletions(&transaction)?;
     transaction.commit()?;
-    Ok(())
-}
-
-/// 根据两侧逐路由状态收敛 Site Gateway；任何一侧缺少本地/远端 ACK 都保持
-/// checking，只有两侧全部 serving 且接受远端路由才进入 ready。
-fn refresh_site_link_apply_status(transaction: &rusqlite::Transaction<'_>) -> Result<()> {
-    transaction.execute_batch(
-        "UPDATE site_links
-         SET apply_status = CASE
-           -- 关闭互联不能依赖共享网络本身的状态：共享网络仍可能继续
-           -- 对租户组网开放。只有两侧 Agent 都 ACK 了该 Link 的撤销路由，
-           -- 才能把 Link 标记为 DISABLED。
-            -- 关闭后的终态必须同时满足：两侧当前 revision 都有逐路由
-            -- ACK，且本地、控制平面、远端接受状态全部已撤销。不能用
-            -- 旧 revision 或后台投影的默认值提前宣称 DISABLED。
-            WHEN enabled = 0
-             AND EXISTS (
-              SELECT 1
-              FROM site_link_networks local_link
-              JOIN site_networks local_n
-                ON local_n.id = local_link.site_network_id
-              JOIN site_link_networks remote_link
-                ON remote_link.site_link_id = local_link.site_link_id
-               AND remote_link.side <> local_link.side
-              JOIN site_networks remote_n
-                ON remote_n.id = remote_link.site_network_id
-              JOIN gateway_route_applies a
-                ON a.device_id = local_n.publisher_device_id
-               AND a.network_id = remote_n.id
-               AND a.site_link_id = site_links.id
-               AND a.desired_revision >= site_links.apply_revision
-             )
-             AND NOT EXISTS (
-              SELECT 1
-              FROM site_link_networks local_link
-              JOIN site_networks local_n
-                ON local_n.id = local_link.site_network_id
-              JOIN site_link_networks remote_link
-                ON remote_link.site_link_id = local_link.site_link_id
-               AND remote_link.side <> local_link.side
-              JOIN site_networks remote_n
-                ON remote_n.id = remote_link.site_network_id
-              LEFT JOIN gateway_route_applies a
-                ON a.device_id = local_n.publisher_device_id
-               AND a.network_id = remote_n.id
-               AND a.site_link_id = site_links.id
-               AND a.desired_revision >= site_links.apply_revision
-               WHERE local_link.site_link_id = site_links.id
-                 AND (COALESCE(a.local_status, '') <> 'disabled'
-                   OR COALESCE(a.remote_status, '') <> 'disabled'
-                   OR COALESCE(a.control_plane_status, '') <> 'disabled')
-            ) THEN 'disabled'
-            WHEN enabled = 0 THEN 'checking'
-            WHEN EXISTS (
-              SELECT 1
-              FROM site_link_networks ln
-              JOIN gateway_network_states g
-                ON g.site_network_id = ln.site_network_id
-              WHERE ln.site_link_id = site_links.id
-                AND g.apply_status = 'retrying'
-            ) THEN 'retrying'
-            WHEN EXISTS (
-              SELECT 1
-              FROM site_link_networks local_link
-              JOIN site_networks local_n
-                ON local_n.id = local_link.site_network_id
-              JOIN gateway_network_states local_g
-                ON local_g.site_network_id = local_n.id
-              JOIN devices d
-                ON d.id = local_n.publisher_device_id
-              LEFT JOIN mesh_identities m
-                ON m.nexo_device_id = local_n.publisher_device_id
-              JOIN site_link_networks remote_link
-                ON remote_link.site_link_id = local_link.site_link_id
-               AND remote_link.side <> local_link.side
-              JOIN site_networks remote_n
-                ON remote_n.id = remote_link.site_network_id
-              WHERE local_link.site_link_id = site_links.id
-                AND (local_g.apply_status <> 'ready'
-                      OR d.status <> 'online'
-                      OR COALESCE(m.state, '') <> 'ready'
-                      OR COALESCE(m.online, 0) <> 1
-                      OR NOT EXISTS (
-                  SELECT 1
-                  FROM gateway_route_applies a
-                  WHERE a.device_id = local_n.publisher_device_id
-                    AND a.network_id = remote_n.id
-                    AND a.site_link_id = site_links.id
-                    AND a.local_status = 'applied'
-                    AND a.control_plane_status = 'serving'
-                   AND a.remote_status = 'accepted'))
-           ) THEN 'checking'
-           ELSE 'ready' END,
-         apply_error = CASE WHEN enabled = 0 THEN NULL ELSE apply_error END,
-         updated_at = CURRENT_TIMESTAMP",
-    )?;
-    finalize_requested_resource_deletions(transaction)?;
     Ok(())
 }
 
@@ -10483,80 +10063,20 @@ fn refresh_site_link_apply_status(transaction: &rusqlite::Transaction<'_>) -> Re
 /// `local_status` 和 `remote_status` 来自 Agent 对当前 Desired revision 的 ACK，
 /// `control_plane_status` 只能由 Server 完成 Headscale 协调后写入。先清理 Link，
 /// 再清理 Network，保证映射和路由状态不会反向绕过固定的删除顺序。
-fn finalize_requested_resource_deletions(transaction: &rusqlite::Transaction<'_>) -> Result<()> {
-    let completed_links: Vec<(String, String)> = {
-        let mut statement = transaction.prepare(
-            "SELECT l.id, l.tenant_id
-             FROM site_links l
-             WHERE l.deletion_requested = 1 AND l.enabled = 0
-               AND EXISTS (SELECT 1 FROM site_link_networks ln
-                           WHERE ln.site_link_id = l.id AND ln.side = 'left')
-               AND EXISTS (SELECT 1 FROM site_link_networks ln
-                           WHERE ln.site_link_id = l.id AND ln.side = 'right')
-               AND NOT EXISTS (
-                 SELECT 1
-                 FROM site_link_networks local_link
-                 JOIN site_networks local_n ON local_n.id = local_link.site_network_id
-                 JOIN site_link_networks remote_link
-                   ON remote_link.site_link_id = local_link.site_link_id
-                  AND remote_link.side <> local_link.side
-                 JOIN site_networks remote_n ON remote_n.id = remote_link.site_network_id
-                 LEFT JOIN gateway_route_applies a
-                   ON a.device_id = local_n.publisher_device_id
-                  AND a.network_id = remote_n.id
-                  AND a.site_link_id = l.id
-                 WHERE local_link.site_link_id = l.id
-                   AND (a.desired_revision IS NULL OR a.desired_revision <> l.apply_revision
-                     OR a.local_status <> 'disabled'
-                     OR a.control_plane_status <> 'disabled'
-                     OR a.remote_status <> 'disabled')
-               )",
-        )?;
-        let rows = statement
-            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        rows
-    };
-    for (link_id, tenant_id) in completed_links {
-        transaction.execute(
-            "DELETE FROM gateway_route_applies WHERE site_link_id = ?1",
-            [&link_id],
-        )?;
-        transaction.execute(
-            "DELETE FROM site_link_route_confirmations WHERE site_link_id = ?1",
-            [&link_id],
-        )?;
-        transaction.execute(
-            "DELETE FROM site_link_networks WHERE site_link_id = ?1",
-            [&link_id],
-        )?;
-        transaction.execute(
-            "INSERT INTO audit_events (tenant_id, event_type, resource_type, resource_id)
-             VALUES (?1, 'SITE_LINK_DELETED', 'site_link', ?2)",
-            rusqlite::params![tenant_id, link_id],
-        )?;
-        transaction.execute(
-            "DELETE FROM site_links WHERE id = ?1 AND deletion_requested = 1",
-            [&link_id],
-        )?;
-    }
-
+fn refresh_network_deletions(transaction: &rusqlite::Transaction<'_>) -> Result<()> {
     let completed_networks: Vec<(String, String)> = {
         let mut statement = transaction.prepare(
             "SELECT n.id, n.tenant_id
              FROM site_networks n
              JOIN gateway_network_states g ON g.site_network_id = n.id
              WHERE n.deletion_requested = 1 AND n.enabled = 0
-               AND NOT EXISTS (SELECT 1 FROM site_link_networks ln
-                               WHERE ln.site_network_id = n.id)
                AND EXISTS (
                  SELECT 1 FROM gateway_route_applies a
                  WHERE a.device_id = n.publisher_device_id
-                   AND a.network_id = n.id AND a.site_link_id = ''
+                   AND a.network_id = n.id
                    AND a.desired_revision = g.desired_revision
                    AND a.local_status = 'disabled'
                    AND a.control_plane_status = 'disabled'
-                   AND a.remote_status = 'disabled'
                )",
         )?;
         let rows = statement
@@ -10621,7 +10141,7 @@ async fn ensure_mesh_enrollment_for_device_locked(state: &AppState, device_id: &
     if ensure_public_domain_migration_offer(state, device_id).await? {
         return Ok(());
     }
-    let details: Option<(String, String)> = {
+    let details: Option<(String, String, Option<String>)> = {
         let connection = state
             .db
             .lock()
@@ -10641,13 +10161,13 @@ async fn ensure_mesh_enrollment_for_device_locked(state: &AppState, device_id: &
         }
         connection
             .query_row(
-                "SELECT tenant_id, name FROM devices WHERE id = ?1",
+                "SELECT tenant_id, name, mesh_name FROM devices WHERE id = ?1",
                 [device_id],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .optional()?
     };
-    let Some((tenant_id, device_name)) = details else {
+    let Some((tenant_id, device_name, mesh_name)) = details else {
         return Ok(());
     };
     let attempt: Option<(String, i64, String)> = {
@@ -10706,7 +10226,9 @@ async fn ensure_mesh_enrollment_for_device_locked(state: &AppState, device_id: &
                                 endpoint: state.headscale_runtime.server_url(),
                                 auth_key: plaintext,
                                 auth_key_id: key.id,
-                                hostname: mesh_hostname(&tenant_id, &device_name, device_id),
+                                hostname: mesh_name
+                                    .clone()
+                                    .unwrap_or_else(|| mesh_name_base(&device_name, false, None)),
                                 reset: false,
                                 tenant_id: Some(tenant_id),
                             },
@@ -10874,50 +10396,6 @@ fn record_public_domain_migration_ack(
     Ok(())
 }
 
-/// 生成只供 Tailscale 使用的稳定 DNS 主机名。
-///
-/// 设备显示名可以是中文或包含标点，但 Tailscale 只接受 ASCII DNS 标签。
-/// 因此这里把租户和设备名称分别规范化，并始终附加设备 ID 短后缀，避免
-/// 同名设备依赖 Headscale 的隐式冲突后缀。该名称只进入 Mesh Enrollment，
-/// Web 仍然显示用户设置的原始设备名称。
-fn mesh_hostname(tenant_id: &str, device_name: &str, device_id: &str) -> String {
-    const MAX_LABEL_LENGTH: usize = 63;
-
-    let tenant_slug = dns_label_slug(tenant_id);
-    let device_slug = dns_label_slug(device_name);
-    let tenant_slug = if tenant_slug.is_empty() {
-        "tenant"
-    } else {
-        tenant_slug.as_str()
-    };
-    let device_slug = if device_slug.is_empty() {
-        "device"
-    } else {
-        device_slug.as_str()
-    };
-    let id_suffix = dns_label_slug(device_id)
-        .chars()
-        .filter(|character| character.is_ascii_alphanumeric())
-        .take(32)
-        .collect::<String>();
-    let id_suffix = if id_suffix.is_empty() {
-        "node".to_owned()
-    } else {
-        id_suffix
-    };
-
-    // 先保留 ID 后缀，再截断用户输入，确保长名称不会丢掉稳定唯一部分。
-    let prefix = format!("{tenant_slug}-{device_slug}");
-    let prefix_length = MAX_LABEL_LENGTH.saturating_sub(id_suffix.len() + 1);
-    let prefix = prefix
-        .chars()
-        .take(prefix_length)
-        .collect::<String>()
-        .trim_end_matches('-')
-        .to_owned();
-    format!("{prefix}-{id_suffix}")
-}
-
 /// 把任意用户文本压缩为 DNS 标签可接受的 ASCII 片段。
 fn dns_label_slug(value: &str) -> String {
     let mut slug = String::new();
@@ -10929,6 +10407,240 @@ fn dns_label_slug(value: &str) -> String {
         }
     }
     slug.trim_matches('-').to_owned()
+}
+
+const MAX_MESH_NAME_LENGTH: usize = 32;
+
+/// 校验用户可编辑的 MagicDNS 单标签名称；显示名称可以是中文，访问名称
+/// 必须保持 ASCII，保证 Tailscale、系统搜索域和浏览器输入行为一致。
+fn normalize_mesh_name(value: &str) -> Result<String, &'static str> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Err("组网访问名不能为空");
+    }
+    if value.len() > MAX_MESH_NAME_LENGTH {
+        return Err("组网访问名不能超过 32 个字符");
+    }
+    if is_placeholder_tailscale_name(value) {
+        return Err("组网访问名不能使用 localhost");
+    }
+    if value.starts_with('-') || value.ends_with('-') {
+        return Err("组网访问名不能以连字符开头或结尾");
+    }
+    if !value
+        .chars()
+        .all(|character| character.is_ascii_alphanumeric() || character == '-')
+    {
+        return Err("组网访问名只能使用字母、数字和连字符");
+    }
+    Ok(value.to_ascii_lowercase())
+}
+
+/// 根据显示名称生成短名称。中文无法在没有额外词典的情况下可靠转写，
+/// 因此纯中文名称按设备类型回退，用户仍可在设备详情中编辑成喜欢的名称。
+fn mesh_name_base(device_name: &str, is_client: bool, _os: Option<&str>) -> String {
+    let slug = dns_label_slug(device_name);
+    if !slug.is_empty() && !is_placeholder_tailscale_name(device_name) {
+        return slug;
+    }
+    if !is_client {
+        return "agent".to_owned();
+    }
+    "client".to_owned()
+}
+
+fn mesh_name_candidate(base: &str, suffix: usize) -> String {
+    let suffix_text = if suffix == 1 {
+        String::new()
+    } else {
+        format!("-{suffix}")
+    };
+    let keep = MAX_MESH_NAME_LENGTH.saturating_sub(suffix_text.len());
+    let base = base
+        .chars()
+        .take(keep)
+        .collect::<String>()
+        .trim_end_matches('-')
+        .to_owned();
+    format!("{base}{suffix_text}")
+}
+
+/// 查询全局名称空间。一个 Headscale 实例承载多个 Nexo 工作空间，
+/// MagicDNS 名称因此必须同时避让已知设备、已应用节点和隔离节点。
+fn mesh_name_taken(
+    transaction: &rusqlite::Transaction<'_>,
+    name: &str,
+    exclude_device_id: Option<&str>,
+) -> rusqlite::Result<bool> {
+    let device_taken: bool = transaction.query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM devices
+             WHERE LOWER(mesh_name) = LOWER(?1)
+               AND (?2 IS NULL OR id <> ?2)
+         )",
+        rusqlite::params![name, exclude_device_id],
+        |row| row.get(0),
+    )?;
+    if device_taken {
+        return Ok(true);
+    }
+    let identity_taken: bool = transaction.query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM mesh_identities m
+             WHERE LOWER(m.hostname) = LOWER(?1)
+               AND (?2 IS NULL OR m.nexo_device_id <> ?2)
+         )",
+        rusqlite::params![name, exclude_device_id],
+        |row| row.get(0),
+    )?;
+    if identity_taken {
+        return Ok(true);
+    }
+    transaction.query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM tailscale_external_nodes
+             WHERE LOWER(node_name) = LOWER(?1)
+               AND (?2 IS NULL OR claimed_device_id IS NULL OR claimed_device_id <> ?2)
+         )",
+        rusqlite::params![name, exclude_device_id],
+        |row| row.get(0),
+    )
+}
+
+/// 在同一事务内分配全局唯一短名；数字后缀只用于自动分配，
+/// 用户自定义名称冲突由调用方直接返回 409。
+fn allocate_mesh_name(
+    transaction: &rusqlite::Transaction<'_>,
+    device_name: &str,
+    is_client: bool,
+    os: Option<&str>,
+    exclude_device_id: Option<&str>,
+) -> anyhow::Result<String> {
+    let base = mesh_name_base(device_name, is_client, os);
+    for suffix in 1..=100_000 {
+        let candidate = mesh_name_candidate(&base, suffix);
+        if !mesh_name_taken(transaction, &candidate, exclude_device_id)? {
+            return Ok(candidate);
+        }
+    }
+    anyhow::bail!("没有可分配的 MagicDNS 设备访问名")
+}
+
+/// 为迁移后的历史设备补齐期望短名。按创建时间和 ID 排序，重复启动
+/// 会得到同一批名称，且不会触碰设备身份或现有 Headscale 节点。
+fn ensure_mesh_name_values(connection: &Connection) -> anyhow::Result<()> {
+    let transaction = connection.unchecked_transaction()?;
+    let devices = {
+        let mut statement = transaction.prepare(
+            "SELECT d.id, d.name, d.os,
+                    EXISTS(SELECT 1 FROM tailscale_device_metadata tm
+                           WHERE tm.device_id = d.id)
+             FROM devices d
+             WHERE d.mesh_name IS NULL OR trim(d.mesh_name) = ''
+             ORDER BY d.created_at ASC, d.id ASC",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, bool>(3)?,
+            ))
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    for (device_id, device_name, os, is_client) in devices {
+        let mesh_name = allocate_mesh_name(
+            &transaction,
+            &device_name,
+            is_client,
+            os.as_deref(),
+            Some(&device_id),
+        )?;
+        transaction.execute(
+            "UPDATE devices SET mesh_name = ?1, updated_at = CURRENT_TIMESTAMP
+             WHERE id = ?2 AND (mesh_name IS NULL OR trim(mesh_name) = '')",
+            rusqlite::params![mesh_name, device_id],
+        )?;
+    }
+    transaction.commit()?;
+    Ok(())
+}
+
+/// 将单台设备的期望短名同步到 Headscale。网络错误只返回给后台调用者，
+/// 数据库中的期望值保持不变，下一周期会继续尝试；成功后再更新 Applied 名称。
+async fn reconcile_device_mesh_name(state: &AppState, device_id: &str) -> anyhow::Result<()> {
+    let details: Option<(String, String, Option<String>)> = {
+        let connection = state
+            .db
+            .lock()
+            .map_err(|_| anyhow::anyhow!("数据库锁不可用"))?;
+        connection
+            .query_row(
+                "SELECT m.headscale_node_id, d.mesh_name, m.hostname
+                 FROM devices d JOIN mesh_identities m ON m.nexo_device_id = d.id
+                 WHERE d.id = ?1 AND d.mesh_name IS NOT NULL",
+                [device_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?
+    };
+    let Some((node_id, expected_name, active_name)) = details else {
+        return Ok(());
+    };
+    if active_name
+        .as_deref()
+        .is_some_and(|active| active.eq_ignore_ascii_case(&expected_name))
+    {
+        return Ok(());
+    }
+    state
+        .headscale
+        .rename_node(&node_id, &expected_name)
+        .await
+        .with_context(|| format!("无法将 Headscale 节点重命名为 {expected_name}"))?;
+    let connection = state
+        .db
+        .lock()
+        .map_err(|_| anyhow::anyhow!("数据库锁不可用"))?;
+    connection.execute(
+        "UPDATE mesh_identities SET hostname = ?1, updated_at = CURRENT_TIMESTAMP
+         WHERE nexo_device_id = ?2",
+        rusqlite::params![expected_name, device_id],
+    )?;
+    tracing::info!(device_id, mesh_name = %expected_name, "设备 MagicDNS 访问名已更新");
+    Ok(())
+}
+
+/// 周期收敛所有已加入设备的短访问名。先读取快照再逐台调用控制面，
+/// 避免持有 SQLite 锁等待网络；单台失败不阻塞其他设备。
+async fn reconcile_mesh_names(state: &AppState) -> anyhow::Result<()> {
+    let device_ids: Vec<String> = {
+        let connection = state
+            .db
+            .lock()
+            .map_err(|_| anyhow::anyhow!("数据库锁不可用"))?;
+        let mut statement = connection.prepare(
+            "SELECT d.id FROM devices d
+             JOIN mesh_identities m ON m.nexo_device_id = d.id
+             WHERE d.mesh_name IS NOT NULL
+               AND (m.hostname IS NULL OR LOWER(m.hostname) <> LOWER(d.mesh_name))
+             ORDER BY d.created_at ASC, d.id ASC",
+        )?;
+        let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    let mut failed = false;
+    for device_id in device_ids {
+        if let Err(error) = reconcile_device_mesh_name(state, &device_id).await {
+            failed = true;
+            tracing::warn!(device_id = %device_id, "设备 MagicDNS 访问名同步失败，将在下次重试：{error:#}");
+        }
+    }
+    if failed {
+        anyhow::bail!("部分设备 MagicDNS 访问名尚未收敛");
+    }
+    Ok(())
 }
 
 /// 判断官方客户端是否仍使用 Apple 客户端可能上报的占位主机名。
@@ -10979,22 +10691,30 @@ async fn recover_mesh_offers(state: &AppState) -> Result<()> {
     }
     let keys = state.headscale.list_pre_auth_keys().await?;
     for key in keys {
-        let attempt: Option<(String, String, String, i64)> = {
+        let attempt: Option<(String, String, String, Option<String>, i64)> = {
             let connection = state
                 .db
                 .lock()
                 .map_err(|_| anyhow::anyhow!("数据库锁不可用"))?;
             connection
                 .query_row(
-                    "SELECT a.nexo_device_id, a.tenant_id, d.name, a.expires_at
+                    "SELECT a.nexo_device_id, a.tenant_id, d.name, d.mesh_name, a.expires_at
                      FROM mesh_enrollment_attempts a JOIN devices d ON d.id = a.nexo_device_id
                      WHERE a.headscale_pre_auth_key_id = ?1 AND a.state = 'issued'",
                     [&key.id],
-                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                    |row| {
+                        Ok((
+                            row.get(0)?,
+                            row.get(1)?,
+                            row.get(2)?,
+                            row.get(3)?,
+                            row.get(4)?,
+                        ))
+                    },
                 )
                 .optional()?
         };
-        let Some((device_id, tenant_id, device_name, expires_at)) = attempt else {
+        let Some((device_id, tenant_id, device_name, mesh_name, expires_at)) = attempt else {
             continue;
         };
         if key.used {
@@ -11033,7 +10753,7 @@ async fn recover_mesh_offers(state: &AppState) -> Result<()> {
                 endpoint: state.headscale_runtime.server_url(),
                 auth_key: plaintext,
                 auth_key_id: key.id,
-                hostname: mesh_hostname(&tenant_id, &device_name, &device_id),
+                hostname: mesh_name.unwrap_or_else(|| mesh_name_base(&device_name, false, None)),
                 reset: false,
                 tenant_id: Some(tenant_id),
             },
@@ -11265,23 +10985,10 @@ fn record_mesh_identity_report(
              )",
             rusqlite::params![message, device_id],
         )?;
-        transaction.execute(
-            "UPDATE site_links
-             SET apply_revision = apply_revision + 1, apply_status = 'failed',
-                 apply_error = ?1, updated_at = CURRENT_TIMESTAMP
-             WHERE id IN (
-                 SELECT DISTINCT l.id
-                 FROM site_links l
-                 JOIN site_link_networks ln ON ln.site_link_id = l.id
-                 JOIN site_networks n ON n.id = ln.site_network_id
-                 WHERE n.publisher_device_id = ?2
-             )",
-            rusqlite::params![message, device_id],
-        )?;
+
         transaction.execute(
             "UPDATE gateway_route_applies
-             SET local_status = 'failed', control_plane_status = 'failed',
-                 remote_status = 'failed', applied_prefix = NULL, last_error = ?1,
+             SET local_status = 'failed', control_plane_status = 'failed', applied_prefix = NULL, last_error = ?1,
                  last_checked_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
              WHERE device_id = ?2",
             rusqlite::params![message, device_id],
@@ -11312,7 +11019,7 @@ fn record_mesh_identity_report(
             device_id
         ],
     )?;
-    refresh_site_link_apply_status(&transaction)?;
+    refresh_network_deletions(&transaction)?;
     transaction.commit()?;
     Ok(())
 }
@@ -11358,59 +11065,22 @@ fn apply_gateway_route_report(
         return Ok(());
     }
     for route in &report.routes {
-        let site_link_key = route.site_link_id.clone().unwrap_or_default();
-        // Agent 上报的每一条路由都必须能在当前 Desired State 中找到；否则不能
-        // 让伪造的 network_id/prefix 污染 Applied 状态或触发 Headscale 协调。
-        let expected: Option<(String, bool, i64)> = if site_link_key.is_empty() {
-            transaction
-                .query_row(
-                    "SELECT g.desired_prefix, n.enabled, g.desired_revision
+        let expected: Option<(String, bool, i64)> = transaction
+            .query_row(
+                "SELECT g.desired_prefix, n.enabled, g.desired_revision
                      FROM site_networks n
                      JOIN gateway_network_states g ON g.site_network_id = n.id
                      WHERE n.id = ?1 AND n.publisher_device_id = ?2",
-                    rusqlite::params![route.network_id, device_id],
-                    |row| {
-                        Ok((
-                            row.get::<_, String>(0)?,
-                            row.get::<_, i64>(1)? != 0,
-                            row.get(2)?,
-                        ))
-                    },
-                )
-                .optional()?
-        } else {
-            transaction
-                .query_row(
-                    "SELECT remote_g.desired_prefix,
-                            (l.enabled <> 0 AND local_n.enabled <> 0 AND remote_n.enabled <> 0),
-                            MAX(l.apply_revision, remote_g.desired_revision)
-                     FROM site_links l
-                     JOIN site_link_networks local_link
-                       ON local_link.site_link_id = l.id
-                     JOIN site_networks local_n
-                       ON local_n.id = local_link.site_network_id
-                     JOIN site_link_networks remote_link
-                       ON remote_link.site_link_id = l.id
-                      AND remote_link.side <> local_link.side
-                     JOIN site_networks remote_n
-                       ON remote_n.id = remote_link.site_network_id
-                     JOIN gateway_network_states remote_g
-                       ON remote_g.site_network_id = remote_n.id
-                     WHERE l.id = ?1
-                       AND l.tenant_id = (SELECT tenant_id FROM devices WHERE id = ?2)
-                       AND local_n.publisher_device_id = ?2
-                       AND remote_n.id = ?3",
-                    rusqlite::params![site_link_key, device_id, route.network_id],
-                    |row| {
-                        Ok((
-                            row.get::<_, String>(0)?,
-                            row.get::<_, i64>(1)? != 0,
-                            row.get(2)?,
-                        ))
-                    },
-                )
-                .optional()?
-        };
+                rusqlite::params![route.network_id, device_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)? != 0,
+                        row.get(2)?,
+                    ))
+                },
+            )
+            .optional()?;
         let Some((expected_prefix, mut expected_enabled, expected_revision)) = expected else {
             anyhow::bail!(
                 "设备 {device_id} 上报了未授权的网关路由 {}",
@@ -11447,7 +11117,6 @@ fn apply_gateway_route_report(
             tracing::warn!(
                 device_id = %device_id,
                 network_id = %route.network_id,
-                site_link_id = %site_link_key,
                 reported_revision = route.revision,
                 expected_revision,
                 reported_enabled = route.enabled,
@@ -11456,7 +11125,7 @@ fn apply_gateway_route_report(
             );
             anyhow::bail!("设备 {device_id} 上报的网关开关与当前期望不一致");
         }
-        let local_status = if !route.enabled {
+        let local_status = if !route.enabled && route.local_applied {
             "disabled"
         } else if route.local_applied {
             "applied"
@@ -11467,39 +11136,20 @@ fn apply_gateway_route_report(
         };
         // Agent 无法证明 Headscale 已撤销路由。关闭 ACK 只确认本地状态，
         // 控制平面的 disabled 必须等服务端实际调用 Headscale 后再写入。
-        let control_plane_status = if !route.enabled {
-            "pending"
-        } else {
-            route
-                .control_plane_status
-                .as_deref()
-                .filter(|status| {
-                    matches!(
-                        *status,
-                        "pending" | "discovered" | "approved" | "serving" | "failed" | "disabled"
-                    )
-                })
-                .unwrap_or("pending")
-        };
-        let remote_status = if !route.enabled {
-            "disabled"
-        } else if route.remote_applied {
-            "accepted"
-        } else {
-            "pending"
-        };
+        // 控制面批准只能由服务端协调器确认，不能信任 Agent 上报的阶段。
+        let control_plane_status = "pending";
         transaction.execute(
             "INSERT INTO gateway_route_applies
-             (device_id, network_id, site_link_id, desired_revision, local_status,
-              control_plane_status, remote_status, applied_prefix, last_error,
+             (device_id, network_id, desired_revision, local_status,
+              control_plane_status, applied_prefix, last_error,
               last_checked_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, CURRENT_TIMESTAMP,
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, CURRENT_TIMESTAMP,
                      CURRENT_TIMESTAMP)
-             ON CONFLICT(device_id, network_id, site_link_id) DO UPDATE SET
+             ON CONFLICT(device_id, network_id) DO UPDATE SET
              desired_revision = excluded.desired_revision,
              local_status = excluded.local_status,
              control_plane_status = excluded.control_plane_status,
-             remote_status = excluded.remote_status,
+
              applied_prefix = excluded.applied_prefix,
              last_error = excluded.last_error,
              last_checked_at = CURRENT_TIMESTAMP,
@@ -11507,11 +11157,9 @@ fn apply_gateway_route_report(
             rusqlite::params![
                 device_id,
                 route.network_id,
-                site_link_key,
                 route.revision,
                 local_status,
                 control_plane_status,
-                remote_status,
                 if route.local_applied && route.enabled {
                     Some(route.prefix.as_str())
                 } else {
@@ -11529,9 +11177,7 @@ fn apply_gateway_route_report(
                AND site_network_id IN
                  (SELECT id FROM site_networks WHERE publisher_device_id = ?5)",
             rusqlite::params![
-                if !route.enabled {
-                    "disabled"
-                } else if route.local_applied {
+                if route.local_applied {
                     "checking"
                 } else {
                     "retrying"
@@ -11543,7 +11189,7 @@ fn apply_gateway_route_report(
             ],
         )?;
     }
-    refresh_site_link_apply_status(&transaction)?;
+    refresh_network_deletions(&transaction)?;
     transaction.commit()?;
     Ok(())
 }
@@ -11575,14 +11221,14 @@ async fn reconcile_headscale_routes(state: &AppState, device_id: &str) -> Result
                     EXISTS (SELECT 1 FROM gateway_route_applies a
                             WHERE a.device_id = n.publisher_device_id
                               AND a.network_id = n.id
-                              AND a.site_link_id = ''
                               AND a.desired_revision = g.desired_revision
-                              AND a.local_status = 'applied')
+                              AND a.local_status = CASE WHEN n.enabled = 1 AND ?2 = 1
+                                  THEN 'applied' ELSE 'disabled' END)
              FROM site_networks n
              JOIN gateway_network_states g ON g.site_network_id = n.id
              WHERE n.publisher_device_id = ?1",
         )?;
-        let rows = statement.query_map([device_id], |row| {
+        let rows = statement.query_map(rusqlite::params![device_id, mesh_allowed], |row| {
             Ok(GatewayRouteApplyInput {
                 network_id: row.get(0)?,
                 prefix: row.get(2)?,
@@ -11634,26 +11280,26 @@ async fn reconcile_headscale_routes(state: &AppState, device_id: &str) -> Result
                 // Headscale 暂不可用不等于 Agent 本地命令被撤销；保留已
                 // 确认的 local_status，让后台协调器在控制平面恢复后继续
                 // 发送同一 Desired Route，而不是把重试条件永久清空。
-                let local_status = if !route.enabled {
+                let local_status = if !route.enabled && route.local_applied {
                     "disabled"
                 } else if route.local_applied {
                     "applied"
                 } else {
                     "pending"
                 };
-                let remote_status = if route.enabled { "pending" } else { "disabled" };
+
                 transaction.execute(
                     "INSERT INTO gateway_route_applies
-                     (device_id, network_id, site_link_id, desired_revision, local_status,
-                      control_plane_status, remote_status, applied_prefix, last_error,
+                     (device_id, network_id, desired_revision, local_status,
+                      control_plane_status, applied_prefix, last_error,
                       last_checked_at, updated_at)
-                     VALUES (?1, ?2, '', ?3, ?4, ?5, ?6, NULL, ?7,
+                     VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6,
                              CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
-                     ON CONFLICT(device_id, network_id, site_link_id) DO UPDATE SET
+                     ON CONFLICT(device_id, network_id) DO UPDATE SET
                      desired_revision = excluded.desired_revision,
                      local_status = excluded.local_status,
                      control_plane_status = excluded.control_plane_status,
-                     remote_status = excluded.remote_status,
+
                      applied_prefix = excluded.applied_prefix,
                      last_error = excluded.last_error,
                      last_checked_at = CURRENT_TIMESTAMP,
@@ -11664,7 +11310,6 @@ async fn reconcile_headscale_routes(state: &AppState, device_id: &str) -> Result
                         route.revision,
                         local_status,
                         control_status,
-                        remote_status,
                         message
                     ],
                 )?;
@@ -11679,7 +11324,7 @@ async fn reconcile_headscale_routes(state: &AppState, device_id: &str) -> Result
                     rusqlite::params![control_status, message, route.network_id, device_id],
                 )?;
             }
-            refresh_site_link_apply_status(&transaction)?;
+            refresh_network_deletions(&transaction)?;
             transaction.commit()?;
             return Err(error);
         }
@@ -11689,7 +11334,6 @@ async fn reconcile_headscale_routes(state: &AppState, device_id: &str) -> Result
         .lock()
         .map_err(|_| anyhow::anyhow!("数据库锁不可用"))?;
     let transaction = connection.unchecked_transaction()?;
-    let mesh_allowed = mesh_application_allowed_with_connection(&transaction);
     for route in &desired {
         let (control_status, error) = if !route.enabled {
             ("disabled", None)
@@ -11718,19 +11362,17 @@ async fn reconcile_headscale_routes(state: &AppState, device_id: &str) -> Result
         };
         transaction.execute(
             "INSERT INTO gateway_route_applies
-             (device_id, network_id, site_link_id, desired_revision, local_status,
-              control_plane_status, remote_status, applied_prefix, last_error,
+             (device_id, network_id, desired_revision, local_status,
+              control_plane_status, applied_prefix, last_error,
               last_checked_at, updated_at)
-             VALUES (?1, ?2, '', ?3, CASE WHEN ?4 = 'disabled' THEN 'disabled' ELSE 'pending' END,
-                     ?4, CASE WHEN ?4 = 'disabled' THEN 'disabled' ELSE 'pending' END,
+             VALUES (?1, ?2, ?3, 'pending',
+                     ?4,
                      NULL, ?5,
                      CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
-             ON CONFLICT(device_id, network_id, site_link_id) DO UPDATE SET
+             ON CONFLICT(device_id, network_id) DO UPDATE SET
+             local_status = CASE WHEN desired_revision = excluded.desired_revision
+                                 THEN local_status ELSE 'pending' END,
              desired_revision = excluded.desired_revision,
-             local_status = CASE WHEN excluded.control_plane_status = 'disabled'
-                                  THEN 'disabled' ELSE local_status END,
-             remote_status = CASE WHEN excluded.control_plane_status = 'disabled'
-                                  THEN 'disabled' ELSE remote_status END,
              applied_prefix = CASE WHEN excluded.control_plane_status = 'disabled'
                                    THEN NULL ELSE applied_prefix END,
              control_plane_status = excluded.control_plane_status,
@@ -11747,10 +11389,14 @@ async fn reconcile_headscale_routes(state: &AppState, device_id: &str) -> Result
         )?;
         transaction.execute(
             "UPDATE gateway_network_states SET apply_status = CASE
-                 WHEN ?3 = 0 THEN 'disabled'
+                 WHEN ?3 = 0 AND EXISTS (SELECT 1 FROM gateway_route_applies a
+                   WHERE a.device_id = ?1 AND a.network_id = ?2 AND a.local_status = 'disabled'
+                     AND a.desired_revision = gateway_network_states.desired_revision
+                     AND a.control_plane_status = 'disabled') THEN 'disabled'
                  WHEN EXISTS (SELECT 1 FROM gateway_route_applies a
                               WHERE a.device_id = ?1 AND a.network_id = ?2
-                                AND a.site_link_id = '' AND a.local_status = 'applied'
+                                AND a.local_status = 'applied'
+                                AND a.desired_revision = gateway_network_states.desired_revision
                                 AND a.control_plane_status = 'serving')
                  THEN 'ready' ELSE 'checking' END,
              applied_prefix = CASE WHEN ?3 = 0 THEN NULL ELSE applied_prefix END,
@@ -11765,121 +11411,7 @@ async fn reconcile_headscale_routes(state: &AppState, device_id: &str) -> Result
             ],
         )?;
     }
-    // Site Gateway 收到的是“对端网段”。Headscale 的 Serving 状态属于
-    // 对端发布节点的本地路由，不能由 Agent 的 accept-routes ACK 伪造；
-    // 这里把对端本地路由的控制平面状态投影到当前设备的 site_link 路由行。
-    let site_routes: Vec<(String, String, String, i64, bool)> = {
-        let mut statement = transaction.prepare(
-            "SELECT l.id, remote_n.id, remote_n.publisher_device_id,
-                    MAX(l.apply_revision, remote_g.desired_revision),
-                    (l.enabled <> 0 AND local_n.enabled <> 0 AND remote_n.enabled <> 0)
-             FROM site_links l
-             JOIN site_link_networks local_link ON local_link.site_link_id = l.id
-             JOIN site_networks local_n ON local_n.id = local_link.site_network_id
-             JOIN site_link_networks remote_link
-               ON remote_link.site_link_id = l.id
-              AND remote_link.side <> local_link.side
-             JOIN site_networks remote_n ON remote_n.id = remote_link.site_network_id
-             JOIN gateway_network_states remote_g
-               ON remote_g.site_network_id = remote_n.id
-             WHERE local_n.publisher_device_id = ?1",
-        )?;
-        let rows = statement.query_map([device_id], |row| {
-            Ok((
-                row.get(0)?,
-                row.get(1)?,
-                row.get(2)?,
-                row.get(3)?,
-                row.get::<_, i64>(4)? != 0 && mesh_allowed,
-            ))
-        })?;
-        rows.collect::<rusqlite::Result<Vec<_>>>()?
-    };
-    for (link_id, remote_network_id, remote_device_id, revision, enabled) in site_routes {
-        // 关闭 Link 时，必须先看到当前 revision 的 Agent 撤销 ACK，才允许
-        // 把控制平面状态推进到 disabled。旧 revision 的行只能继续显示检查中。
-        let current_route: Option<(String, String, String, Option<String>)> = transaction
-            .query_row(
-                "SELECT local_status, control_plane_status, remote_status, last_error
-                 FROM gateway_route_applies
-                 WHERE device_id = ?1 AND network_id = ?2 AND site_link_id = ?3
-                   AND desired_revision >= ?4",
-                rusqlite::params![device_id, remote_network_id, link_id, revision],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-            )
-            .optional()?;
-        let remote_route: Option<(String, String, Option<String>)> = transaction
-            .query_row(
-                "SELECT local_status, control_plane_status, last_error
-                 FROM gateway_route_applies
-                 WHERE device_id = ?1 AND network_id = ?2 AND site_link_id = ''",
-                rusqlite::params![remote_device_id, remote_network_id],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-            )
-            .optional()?;
-        let (control_status, error): (String, Option<String>) = if !enabled {
-            match current_route {
-                Some((local_status, _, remote_status, _))
-                    if local_status == "disabled" && remote_status == "disabled" =>
-                {
-                    // Agent 已确认撤销本地和远端接受状态；当前函数刚完成
-                    // Headscale API 检查，因此现在才可确认控制平面已撤销。
-                    ("disabled".to_owned(), None)
-                }
-                Some((_, control_status, _, error)) => (control_status, error),
-                None => (
-                    "pending".to_owned(),
-                    Some("等待 Agent 确认撤销站点路由".to_owned()),
-                ),
-            }
-        } else if let Some((local_status, control_status, error)) = remote_route {
-            if local_status == "applied" && control_status == "serving" {
-                ("serving".to_owned(), None)
-            } else if control_status == "failed" {
-                ("failed".to_owned(), error)
-            } else {
-                (control_status, error)
-            }
-        } else {
-            (
-                "pending".to_owned(),
-                Some("等待对端网关发布本地网络".to_owned()),
-            )
-        };
-        transaction.execute(
-            "INSERT INTO gateway_route_applies
-             (device_id, network_id, site_link_id, desired_revision, local_status,
-              control_plane_status, remote_status, applied_prefix, last_error,
-              last_checked_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4,
-                     CASE WHEN ?5 = 'disabled' THEN 'disabled' ELSE 'pending' END,
-                     ?5,
-                     CASE WHEN ?5 = 'disabled' THEN 'disabled' ELSE 'pending' END,
-                     NULL, ?6,
-                     CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
-             ON CONFLICT(device_id, network_id, site_link_id) DO UPDATE SET
-             desired_revision = excluded.desired_revision,
-             local_status = CASE WHEN excluded.control_plane_status = 'disabled'
-                                  THEN 'disabled' ELSE local_status END,
-             control_plane_status = excluded.control_plane_status,
-             remote_status = CASE WHEN excluded.control_plane_status = 'disabled'
-                                  THEN 'disabled' ELSE remote_status END,
-             applied_prefix = CASE WHEN excluded.control_plane_status = 'disabled'
-                                   THEN NULL ELSE applied_prefix END,
-             last_error = excluded.last_error,
-             last_checked_at = CURRENT_TIMESTAMP,
-             updated_at = CURRENT_TIMESTAMP",
-            rusqlite::params![
-                device_id,
-                remote_network_id,
-                link_id,
-                revision,
-                control_status,
-                error,
-            ],
-        )?;
-    }
-    refresh_site_link_apply_status(&transaction)?;
+    refresh_network_deletions(&transaction)?;
     transaction.commit()?;
     Ok(())
 }
@@ -12033,7 +11565,7 @@ fn access_rule_target(
     }
 }
 
-/// 从旧版共享网络/SiteLink 和 v0.3 访问规则生成同一份显式 Policy。
+/// 从普通共享网段与额外访问规则生成同一份显式 Policy。
 ///
 /// 受让人只作为直接 Source 写入；这里不会读取其他规则再递归展开，因而
 /// A 授权 B、B 授权 C 不会自动产生 A→C。
@@ -12134,59 +11666,6 @@ fn build_policy_grants(connection: &Connection) -> Result<Vec<policy::PolicyGran
                 });
             }
         }
-    }
-
-    let mut link_prefixes: BTreeMap<(String, String), (BTreeSet<String>, BTreeSet<String>)> =
-        BTreeMap::new();
-    let mut statement = connection.prepare(
-        "SELECT l.id, l.tenant_id, ln.side, g.desired_prefix
-         FROM site_links l
-         JOIN site_link_networks ln ON ln.site_link_id = l.id
-         JOIN site_networks n ON n.id = ln.site_network_id AND n.enabled = 1
-         JOIN gateway_network_states g ON g.site_network_id = n.id
-         WHERE l.enabled = 1",
-    )?;
-    let rows = statement.query_map([], |row| {
-        Ok((
-            row.get::<_, String>(0)?,
-            row.get::<_, String>(1)?,
-            row.get::<_, String>(2)?,
-            row.get::<_, String>(3)?,
-        ))
-    })?;
-    for row in rows {
-        let (link_id, tenant_id, side, prefix) = row?;
-        let entry = link_prefixes.entry((tenant_id, link_id)).or_default();
-        if side == "left" {
-            entry.0.insert(prefix);
-        } else {
-            entry.1.insert(prefix);
-        }
-    }
-    for ((tenant_id, _link_id), (left_prefixes, right_prefixes)) in link_prefixes {
-        if !tenant_users.contains_key(&tenant_id) {
-            continue;
-        }
-        let left_prefixes: Vec<String> = left_prefixes.into_iter().collect();
-        let right_prefixes: Vec<String> = right_prefixes.into_iter().collect();
-        grants.push(policy::PolicyGrant {
-            source_tenant: tenant_id.clone(),
-            target_tenant: tenant_id.clone(),
-            sources: left_prefixes.clone(),
-            destinations: right_prefixes.clone(),
-            protocols: Vec::new(),
-            ports: vec!["*".to_owned()],
-            ssh: false,
-        });
-        grants.push(policy::PolicyGrant {
-            source_tenant: tenant_id.clone(),
-            target_tenant: tenant_id,
-            sources: right_prefixes,
-            destinations: left_prefixes,
-            protocols: Vec::new(),
-            ports: vec!["*".to_owned()],
-            ssh: false,
-        });
     }
 
     let mut statement = connection.prepare(
@@ -13184,8 +12663,10 @@ fn spawn_mesh_reconciliation(state: AppState) -> tokio::task::JoinHandle<()> {
             if let Err(error) = auth::reconcile_pending_mesh_revocations(&state).await {
                 tracing::debug!("后台账号组网撤销将在下周期重试：{error:#}");
             }
-            if let Err(error) = sync_oidc_nodes(&state).await {
-                tracing::debug!("后台 OIDC 节点归属将在下周期重试：{error:#}");
+            // 入网归属不依赖管理员打开页面；可信密钥与 OIDC 节点都由后台同步，
+            // 未知来源仅写入隔离记录，不能自动获得工作空间访问权限。
+            if let Err(error) = sync_tailscale_external_nodes(&state).await {
+                tracing::debug!("后台客户端归属将在下周期重试：{error:#}");
             }
             let device_ids = match state.db.lock() {
                 Ok(connection) => {
@@ -13363,30 +12844,14 @@ async fn create_enrollment(
     if tenant_exists == 0 {
         return Err(ApiError::new(StatusCode::NOT_FOUND, "租户不存在"));
     }
-    if let Some(site_id) = &request.site_id {
-        let site_exists: i64 = connection
-            .query_row(
-                "SELECT COUNT(*) FROM sites WHERE id = ?1 AND tenant_id = ?2",
-                rusqlite::params![site_id, request.tenant_id],
-                |row| row.get(0),
-            )
-            .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法检查站点"))?;
-        if site_exists == 0 {
-            return Err(ApiError::new(
-                StatusCode::NOT_FOUND,
-                "站点不存在或不属于该租户",
-            ));
-        }
-    }
     connection
         .execute(
             "INSERT INTO pending_enrollments
-             (id, tenant_id, site_id, token_digest, expires_at, requested_name)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+             (id, tenant_id, token_digest, expires_at, requested_name)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
             rusqlite::params![
                 enrollment_id,
                 request.tenant_id,
-                request.site_id,
                 token.digest,
                 token.expires_at,
                 device_name,
@@ -13460,7 +12925,7 @@ async fn list_enrollments(
         .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "数据库锁不可用"))?;
     let mut statement = connection
         .prepare(
-            "SELECT id, status, tenant_id, site_id, requested_name, requested_os,
+            "SELECT id, status, tenant_id, requested_name, requested_os,
                     requested_architecture, requested_agent_version, expires_at, device_id
              FROM pending_enrollments
              WHERE tenant_id = ?1
@@ -13474,13 +12939,13 @@ async fn list_enrollments(
                 enrollment_id: row.get(0)?,
                 status: parse_enrollment_status(&status),
                 tenant_id: row.get(2)?,
-                site_id: row.get(3)?,
-                device_name: row.get(4)?,
-                os: row.get(5)?,
-                architecture: row.get(6)?,
-                agent_version: row.get(7)?,
-                expires_at: row.get(8)?,
-                device_id: row.get(9)?,
+
+                device_name: row.get(3)?,
+                os: row.get(4)?,
+                architecture: row.get(5)?,
+                agent_version: row.get(6)?,
+                expires_at: row.get(7)?,
+                device_id: row.get(8)?,
             })
         })
         .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法读取入网请求列表"))?;
@@ -13747,6 +13212,8 @@ async fn tailscale_client_config(
     auth::admin_tenant_id(&state, &headers)?;
     let login_server = state.headscale_runtime.server_url();
     Ok(Json(TailscaleClientConfigResponse {
+        magic_dns_enabled: true,
+        dns_base_domain: state.headscale_runtime.config().dns_base_domain.clone(),
         browser_authorization_url: None,
         login_server,
         supported_platforms: ["Linux", "Windows", "macOS", "iOS", "Android", "tvOS"]
@@ -13756,7 +13223,7 @@ async fn tailscale_client_config(
         notes: vec![
             "请在官方 Tailscale 客户端填写登录服务器并开始连接，客户端会打开一次性授权页面"
                 .to_owned(),
-            "授权完成后，设备会先进入隔离列表，认领后才加入当前工作空间".to_owned(),
+            "可信登录自动归属工作空间；未知来源设备由管理员确认归属".to_owned(),
         ],
     }))
 }
@@ -14097,16 +13564,19 @@ async fn sync_oidc_nodes(state: &AppState) -> Result<()> {
         } else {
             node.name.clone()
         };
+        let mesh_name =
+            allocate_mesh_name(&transaction, &device_name, true, None, Some(&device_id))?;
         transaction.execute(
             "INSERT INTO devices
-             (id, tenant_id, name, os, architecture, status, capabilities_json,
+             (id, tenant_id, name, mesh_name, os, architecture, status, capabilities_json,
               enrolled_at, created_at, updated_at)
-             VALUES (?1, ?2, ?3, 'unknown', 'unknown', ?4, '[]', CURRENT_TIMESTAMP,
+             VALUES (?1, ?2, ?3, ?4, 'unknown', 'unknown', ?5, '[]', CURRENT_TIMESTAMP,
                      CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
             rusqlite::params![
                 device_id,
                 workspace_id,
                 device_name,
+                mesh_name,
                 if node.online { "online" } else { "offline" }
             ],
         )?;
@@ -14245,6 +13715,8 @@ async fn sync_auth_key_nodes(state: &AppState) -> Result<()> {
         } else {
             node.name.clone()
         };
+        let mesh_name =
+            allocate_mesh_name(&transaction, &device_name, true, None, Some(&device_id))?;
         let ipv4 = node
             .ip_addresses
             .iter()
@@ -14258,14 +13730,15 @@ async fn sync_auth_key_nodes(state: &AppState) -> Result<()> {
         let tags_json = serde_json::to_string(&node.tags)?;
         transaction.execute(
             "INSERT INTO devices
-             (id, tenant_id, name, os, architecture, status, capabilities_json,
+             (id, tenant_id, name, mesh_name, os, architecture, status, capabilities_json,
               enrolled_at, created_at, updated_at)
-             VALUES (?1, ?2, ?3, 'unknown', 'unknown', ?4, '[]', CURRENT_TIMESTAMP,
+             VALUES (?1, ?2, ?3, ?4, 'unknown', 'unknown', ?5, '[]', CURRENT_TIMESTAMP,
                      CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
             rusqlite::params![
                 device_id,
                 workspace_id,
                 device_name,
+                mesh_name,
                 if node.online { "online" } else { "offline" }
             ],
         )?;
@@ -14391,80 +13864,90 @@ async fn sync_tailscale_external_nodes(state: &AppState) -> Result<()> {
     sync_auth_key_nodes(state).await?;
     sync_oidc_nodes(state).await?;
     let nodes = state.headscale.list_nodes().await?;
-    let connection = state
-        .db
-        .lock()
-        .map_err(|_| anyhow::anyhow!("数据库锁不可用"))?;
-    for node in nodes {
-        let known: Option<String> = connection
-            .query_row(
-                "SELECT nexo_device_id FROM mesh_identities WHERE headscale_node_id = ?1",
-                [&node.id],
-                |row| row.get(0),
-            )
-            .optional()?;
-        if let Some(device_id) = known {
-            let incoming_name = node.name.trim();
-            if !incoming_name.is_empty() && !is_placeholder_tailscale_name(incoming_name) {
-                let current_name: Option<String> = connection
-                    .query_row(
-                        "SELECT name FROM devices WHERE id = ?1",
-                        [&device_id],
-                        |row| row.get(0),
-                    )
-                    .optional()?;
-                if current_name
-                    .as_deref()
-                    .is_some_and(is_placeholder_tailscale_name)
-                {
-                    connection.execute(
+    {
+        let connection = state
+            .db
+            .lock()
+            .map_err(|_| anyhow::anyhow!("数据库锁不可用"))?;
+        for node in nodes {
+            let known: Option<String> = connection
+                .query_row(
+                    "SELECT nexo_device_id FROM mesh_identities WHERE headscale_node_id = ?1",
+                    [&node.id],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if let Some(device_id) = known {
+                let incoming_name = node.name.trim();
+                if !incoming_name.is_empty() && !is_placeholder_tailscale_name(incoming_name) {
+                    let current_name: Option<String> = connection
+                        .query_row(
+                            "SELECT name FROM devices WHERE id = ?1",
+                            [&device_id],
+                            |row| row.get(0),
+                        )
+                        .optional()?;
+                    if current_name
+                        .as_deref()
+                        .is_some_and(is_placeholder_tailscale_name)
+                    {
+                        connection.execute(
                         "UPDATE devices SET name = ?1, updated_at = CURRENT_TIMESTAMP WHERE id = ?2",
                         rusqlite::params![incoming_name, device_id],
                     )?;
-                    tracing::info!(device_id = %device_id, "Headscale 已提供有效设备名称，已更新 Nexo 设备资料");
+                        tracing::info!(device_id = %device_id, "Headscale 已提供有效设备名称，已更新 Nexo 设备资料");
+                    }
                 }
-            }
-            let ipv4 = node
-                .ip_addresses
-                .iter()
-                .find(|value| value.contains('.'))
-                .cloned();
-            let ipv6 = node
-                .ip_addresses
-                .iter()
-                .find(|value| value.contains(':'))
-                .cloned();
-            let tags_json = serde_json::to_string(&node.tags)?;
-            let expires_at = parse_headscale_expiration(node.expiry.as_deref());
-            connection.execute(
-                "UPDATE mesh_identities SET online = ?1,
+                let ipv4 = node
+                    .ip_addresses
+                    .iter()
+                    .find(|value| value.contains('.'))
+                    .cloned();
+                let ipv6 = node
+                    .ip_addresses
+                    .iter()
+                    .find(|value| value.contains(':'))
+                    .cloned();
+                let tags_json = serde_json::to_string(&node.tags)?;
+                let expires_at = parse_headscale_expiration(node.expiry.as_deref());
+                connection.execute(
+                    "UPDATE mesh_identities SET online = ?1,
                  tailscale_ipv4 = COALESCE(?2, tailscale_ipv4),
                  tailscale_ipv6 = COALESCE(?3, tailscale_ipv6),
                  hostname = COALESCE(NULLIF(?4, ''), hostname),
                  updated_at = CURRENT_TIMESTAMP WHERE nexo_device_id = ?5",
-                rusqlite::params![i64::from(node.online), ipv4, ipv6, node.name, device_id],
-            )?;
-            connection.execute(
-                "UPDATE tailscale_device_metadata
+                    rusqlite::params![i64::from(node.online), ipv4, ipv6, node.name, device_id],
+                )?;
+                connection.execute(
+                    "UPDATE tailscale_device_metadata
                  SET tags_json = ?1,
                      tailscale_ipv4 = COALESCE(?2, tailscale_ipv4),
                      tailscale_ipv6 = COALESCE(?3, tailscale_ipv6),
                      expires_at = ?4,
                      updated_at = unixepoch()
                  WHERE device_id = ?5",
-                rusqlite::params![tags_json, ipv4, ipv6, expires_at, device_id],
-            )?;
-            continue;
-        }
-        let node_json = serde_json::to_string(&node)?;
-        connection.execute(
-            "INSERT INTO tailscale_external_nodes
+                    rusqlite::params![tags_json, ipv4, ipv6, expires_at, device_id],
+                )?;
+                continue;
+            }
+            // 隔离记录只需要节点身份与 Key ID；控制面返回的密钥明文不得落库。
+            let mut snapshot = node.clone();
+            if let Some(key) = snapshot.pre_auth_key.as_mut() {
+                key.key = None;
+            }
+            let node_json = serde_json::to_string(&snapshot)?;
+            connection.execute(
+                "INSERT INTO tailscale_external_nodes
              (node_id, node_name, node_json, discovered_at, last_seen_at, claim_state)
              VALUES (?1, ?2, ?3, unixepoch(), unixepoch(), 'isolated')
              ON CONFLICT(node_id) DO UPDATE SET node_name = excluded.node_name,
              node_json = excluded.node_json, last_seen_at = unixepoch()",
-            rusqlite::params![node.id, node.name, node_json],
-        )?;
+                rusqlite::params![node.id, node.name, node_json],
+            )?;
+        }
+    }
+    if let Err(error) = reconcile_mesh_names(state).await {
+        tracing::warn!("官方客户端访问名尚未完全应用，将在下次重试：{error:#}");
     }
     Ok(())
 }
@@ -14591,44 +14074,11 @@ async fn claim_tailscale_external_node(
                 "设备名称不能使用 localhost，请填写可识别的设备名称",
             ));
         }
-        None if is_placeholder_tailscale_name(&node.name) => {
-            return Err(ApiError::new(
-                StatusCode::BAD_REQUEST,
-                "Headscale 只返回 localhost，请先在 Tailscale 中设置设备名称，或在此输入设备名称",
-            ));
-        }
         None if node.name.trim().is_empty() => format!("官方客户端-{}", node.id),
         None => node.name.clone(),
     };
-    // 命名并认领必须与设备编辑使用同一套 Headscale 主机名规则，避免
-    // Nexo 只改本地显示名而官方客户端下一次同步又回到 localhost。
-    let renamed_hostname = if requested_name
-        .as_deref()
-        .is_some_and(|name| name != node.name.trim())
-    {
-        let hostname = mesh_hostname(&tenant_id, &device_name, &device_id);
-        state
-            .headscale
-            .rename_node(&node.id, &hostname)
-            .await
-            .map_err(|error| {
-                tracing::warn!(
-                    node_id = %node.id,
-                    device_name = %device_name,
-                    "认领前无法同步官方客户端名称到 Headscale：{error:#}"
-                );
-                ApiError::new(
-                    StatusCode::BAD_GATEWAY,
-                    "暂时无法同步设备组网名称，设备尚未认领，请稍后重试",
-                )
-            })?;
-        Some(hostname)
-    } else {
-        None
-    };
-    let headscale_hostname = renamed_hostname
-        .clone()
-        .or_else(|| (!node.name.trim().is_empty()).then(|| node.name.clone()));
+    // 认领先完成工作空间归属，再由同一套访问名协调器重命名 Headscale。
+    // 控制面暂时不可用时保留节点当前名称，后台会继续重试，不阻断认领。
     let ipv4 = node
         .ip_addresses
         .iter()
@@ -14647,89 +14097,115 @@ async fn claim_tailscale_external_node(
     })?;
     let expires_at = parse_headscale_expiration(node.expiry.as_deref());
     let now = unix_now();
+    {
+        let connection = state
+            .db
+            .lock()
+            .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "数据库锁不可用"))?;
+        let transaction = connection.unchecked_transaction().map_err(|_| {
+            ApiError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "无法开始外部节点认领事务",
+            )
+        })?;
+        let already_claimed: i64 = transaction
+            .query_row(
+                "SELECT COUNT(*) FROM mesh_identities WHERE headscale_node_id = ?1",
+                [&node.id],
+                |row| row.get(0),
+            )
+            .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法检查节点归属"))?;
+        if already_claimed > 0 {
+            return Err(ApiError::new(StatusCode::CONFLICT, "该节点已经被认领"));
+        }
+        let mesh_name =
+            allocate_mesh_name(&transaction, &device_name, true, None, Some(&device_id)).map_err(
+                |error| {
+                    ApiError::new(
+                        StatusCode::CONFLICT,
+                        format!("无法分配组网访问名：{error:#}"),
+                    )
+                },
+            )?;
+        transaction
+            .execute(
+                "INSERT INTO mesh_tenant_mappings (tenant_id, headscale_user_id, status)
+             VALUES (?1, ?2, 'ready')
+             ON CONFLICT(tenant_id) DO UPDATE SET headscale_user_id = excluded.headscale_user_id,
+             status = 'ready', updated_at = CURRENT_TIMESTAMP",
+                rusqlite::params![tenant_id, headscale_user_id],
+            )
+            .map_err(|_| {
+                ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法保存组网用户映射")
+            })?;
+        transaction
+            .execute(
+            "INSERT INTO devices (id, tenant_id, name, mesh_name, os, architecture, status, capabilities_json, enrolled_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, 'unknown', 'unknown', ?5, '[]', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+            rusqlite::params![device_id, tenant_id, device_name, mesh_name, if node.online { "online" } else { "offline" }],
+            )
+            .map_err(|_| ApiError::new(StatusCode::CONFLICT, "无法创建官方客户端设备"))?;
+        transaction
+            .execute(
+                "INSERT INTO tailscale_device_metadata
+             (device_id, user_id, registration_method, tags_json, tailscale_ipv4, tailscale_ipv6,
+              expires_at, control_plane_state, external_node, created_at, updated_at)
+             VALUES (?1, ?2, 'browser', ?3, ?4, ?5, ?6, 'ready', 1, ?7, ?7)",
+                rusqlite::params![
+                    device_id,
+                    owner_user_id,
+                    tags_json,
+                    ipv4,
+                    ipv6,
+                    expires_at,
+                    now
+                ],
+            )
+            .map_err(|_| {
+                ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法保存官方客户端归属")
+            })?;
+        transaction
+            .execute(
+                "INSERT INTO mesh_identities
+             (nexo_device_id, tenant_id, headscale_node_id, state, tailscale_ipv4, hostname, online)
+             VALUES (?1, ?2, ?3, 'ready', ?4, ?5, ?6)",
+                rusqlite::params![
+                    device_id,
+                    tenant_id,
+                    node.id,
+                    ipv4,
+                    node.name,
+                    i64::from(node.online)
+                ],
+            )
+            .map_err(|_| ApiError::new(StatusCode::CONFLICT, "无法绑定官方客户端组网身份"))?;
+        transaction
+            .execute(
+            "UPDATE tailscale_external_nodes SET claimed_device_id = ?1, claim_state = 'claimed', last_seen_at = unixepoch()
+             WHERE node_id = ?2",
+            rusqlite::params![device_id, node.id],
+            )
+            .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法更新外部节点认领状态"))?;
+        transaction.commit().map_err(|_| {
+            ApiError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "无法提交外部节点认领事务",
+            )
+        })?;
+    }
+    schedule_policy_reconcile(&state);
+    if let Err(error) = reconcile_device_mesh_name(&state, &device_id).await {
+        tracing::warn!(device_id = %device_id, "认领设备访问名将在后台重试：{error:#}");
+    }
     let connection = state
         .db
         .lock()
         .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "数据库锁不可用"))?;
-    let transaction = connection.unchecked_transaction().map_err(|_| {
-        ApiError::new(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "无法开始外部节点认领事务",
-        )
-    })?;
-    let already_claimed: i64 = transaction
-        .query_row(
-            "SELECT COUNT(*) FROM mesh_identities WHERE headscale_node_id = ?1",
-            [&node.id],
-            |row| row.get(0),
-        )
-        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法检查节点归属"))?;
-    if already_claimed > 0 {
-        return Err(ApiError::new(StatusCode::CONFLICT, "该节点已经被认领"));
-    }
-    transaction
-        .execute(
-            "INSERT INTO mesh_tenant_mappings (tenant_id, headscale_user_id, status)
-             VALUES (?1, ?2, 'ready')
-             ON CONFLICT(tenant_id) DO UPDATE SET headscale_user_id = excluded.headscale_user_id,
-             status = 'ready', updated_at = CURRENT_TIMESTAMP",
-            rusqlite::params![tenant_id, headscale_user_id],
-        )
-        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法保存组网用户映射"))?;
-    transaction
-        .execute(
-            "INSERT INTO devices (id, tenant_id, name, os, architecture, status, capabilities_json, enrolled_at, updated_at)
-             VALUES (?1, ?2, ?3, 'unknown', 'unknown', ?4, '[]', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
-            rusqlite::params![device_id, tenant_id, device_name, if node.online { "online" } else { "offline" }],
-        )
-        .map_err(|_| ApiError::new(StatusCode::CONFLICT, "无法创建官方客户端设备"))?;
-    transaction
-        .execute(
-            "INSERT INTO tailscale_device_metadata
-             (device_id, user_id, registration_method, tags_json, tailscale_ipv4, tailscale_ipv6,
-              expires_at, control_plane_state, external_node, created_at, updated_at)
-             VALUES (?1, ?2, 'browser', ?3, ?4, ?5, ?6, 'ready', 1, ?7, ?7)",
-            rusqlite::params![
-                device_id,
-                owner_user_id,
-                tags_json,
-                ipv4,
-                ipv6,
-                expires_at,
-                now
-            ],
-        )
-        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法保存官方客户端归属"))?;
-    transaction
-        .execute(
-            "INSERT INTO mesh_identities
-             (nexo_device_id, tenant_id, headscale_node_id, state, tailscale_ipv4, hostname, online)
-             VALUES (?1, ?2, ?3, 'ready', ?4, ?5, ?6)",
-            rusqlite::params![
-                device_id,
-                tenant_id,
-                node.id,
-                ipv4,
-                headscale_hostname,
-                i64::from(node.online)
-            ],
-        )
-        .map_err(|_| ApiError::new(StatusCode::CONFLICT, "无法绑定官方客户端组网身份"))?;
-    transaction
-        .execute(
-            "UPDATE tailscale_external_nodes SET claimed_device_id = ?1, claim_state = 'claimed', last_seen_at = unixepoch()
-             WHERE node_id = ?2",
-            rusqlite::params![device_id, node.id],
-        )
-        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法更新外部节点认领状态"))?;
-    transaction.commit().map_err(|_| {
-        ApiError::new(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "无法提交外部节点认领事务",
-        )
-    })?;
-    schedule_policy_reconcile(&state);
-    let response = list_devices_for_tenant(&connection, &tenant_id)?;
+    let response = list_devices_for_tenant(
+        &connection,
+        &tenant_id,
+        &state.headscale_runtime.config().dns_base_domain,
+    )?;
     response
         .into_iter()
         .find(|device| device.id == device_id)
@@ -14753,7 +14229,6 @@ async fn approve_enrollment(
         .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法开始入网审批事务"))?;
     let (
         tenant_id,
-        site_id,
         name,
         os,
         architecture,
@@ -14764,7 +14239,7 @@ async fn approve_enrollment(
         expires_at,
     ) = transaction
         .query_row(
-            "SELECT tenant_id, site_id, requested_name, requested_os,
+            "SELECT tenant_id, requested_name, requested_os,
                     requested_architecture, requested_agent_version,
                     requested_capabilities_json, requested_csr_pem, status, expires_at
              FROM pending_enrollments WHERE id = ?1 AND tenant_id = ?2",
@@ -14776,11 +14251,10 @@ async fn approve_enrollment(
                     row.get::<_, Option<String>>(2)?,
                     row.get::<_, Option<String>>(3)?,
                     row.get::<_, Option<String>>(4)?,
-                    row.get::<_, Option<String>>(5)?,
-                    row.get::<_, String>(6)?,
-                    row.get::<_, Option<String>>(7)?,
-                    row.get::<_, String>(8)?,
-                    row.get::<_, i64>(9)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                    row.get::<_, String>(7)?,
+                    row.get::<_, i64>(8)?,
                 ))
             },
         )
@@ -14813,6 +14287,13 @@ async fn approve_enrollment(
         )
     })?;
     let device_id = Uuid::new_v4().to_string();
+    let mesh_name = allocate_mesh_name(&transaction, &name, false, None, Some(&device_id))
+        .map_err(|error| {
+            ApiError::new(
+                StatusCode::CONFLICT,
+                format!("无法分配组网访问名：{error:#}"),
+            )
+        })?;
     let ca = load_server_ca(&transaction)
         .map_err(|error| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
     let identity = issue_device_identity(&ca, &csr_pem, &device_id)
@@ -14820,14 +14301,14 @@ async fn approve_enrollment(
     transaction
         .execute(
             "INSERT INTO devices
-             (id, tenant_id, site_id, name, os, architecture, agent_version,
+             (id, tenant_id, name, mesh_name, os, architecture, agent_version,
               status, capabilities_json)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'pending', ?8)",
             rusqlite::params![
                 device_id,
                 tenant_id,
-                site_id,
                 name,
+                mesh_name,
                 os,
                 architecture,
                 agent_version,
@@ -14991,6 +14472,21 @@ async fn start_mesh_enrollment_locked(
         .clone()
         .filter(|value| !value.trim().is_empty())
         .context("Headscale 创建密钥响应缺少明文 Key")?;
+    let offer_hostname = {
+        let connection = state
+            .db
+            .lock()
+            .map_err(|_| anyhow::anyhow!("数据库锁不可用"))?;
+        connection
+            .query_row(
+                "SELECT mesh_name FROM devices WHERE id = ?1 AND tenant_id = ?2",
+                rusqlite::params![device_id, tenant_id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten()
+            .unwrap_or_else(|| mesh_name_base(device_name, false, None))
+    };
     let attempt_id = Uuid::new_v4().to_string();
     {
         let connection = state
@@ -15013,7 +14509,7 @@ async fn start_mesh_enrollment_locked(
         endpoint: state.headscale_runtime.server_url(),
         auth_key: plaintext,
         auth_key_id: key.id,
-        hostname: mesh_hostname(tenant_id, device_name, device_id),
+        hostname: offer_hostname,
         reset,
         tenant_id: Some(tenant_id.to_owned()),
     };
@@ -15265,15 +14761,15 @@ async fn enable_detected_site_networks(
         .db
         .lock()
         .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "数据库锁不可用"))?;
-    let (site_id, report_json, official_client): (Option<String>, Option<String>, i64) = connection
+    let (report_json, official_client): (Option<String>, i64) = connection
         .query_row(
-            "SELECT d.site_id, report.report_json,
+            "SELECT report.report_json,
                     EXISTS(SELECT 1 FROM tailscale_device_metadata meta WHERE meta.device_id = d.id)
              FROM devices d
              LEFT JOIN device_capability_reports report ON report.device_id = d.id
              WHERE d.id = ?1 AND d.tenant_id = ?2",
             rusqlite::params![device_id, tenant_id],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .optional()
         .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法读取设备能力"))?
@@ -15284,12 +14780,6 @@ async fn enable_detected_site_networks(
             "Tailscale 客户端不能承载共享网段，请选择 Nexo Agent",
         ));
     }
-    let site_id = site_id.ok_or_else(|| {
-        ApiError::new(
-            StatusCode::CONFLICT,
-            "Agent 尚未归属站点，请先在设备详情中选择站点",
-        )
-    })?;
     let report: GatewayCapabilityReport = serde_json::from_str(
         report_json
             .as_deref()
@@ -15391,13 +14881,12 @@ async fn enable_detected_site_networks(
         transaction
             .execute(
                 "INSERT INTO site_networks
-                 (id, tenant_id, site_id, name, publisher_device_id, interface_id,
+                 (id, tenant_id, name, publisher_device_id, interface_id,
                   address_family, source, enabled, apply_status)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'direct_interface', 1, 'checking')",
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'direct_interface', 1, 'checking')",
                 rusqlite::params![
                     id,
                     tenant_id,
-                    site_id,
                     name,
                     device_id,
                     interface_id,
@@ -15459,13 +14948,12 @@ async fn create_site_network(
 ) -> Result<Json<SiteNetworkResponse>, ApiError> {
     let session_tenant = auth::admin_tenant_id(&state, &headers)?;
     if request.tenant_id.trim().is_empty()
-        || request.site_id.trim().is_empty()
         || request.name.trim().is_empty()
         || request.publisher_device_id.trim().is_empty()
     {
         return Err(ApiError::new(
             StatusCode::BAD_REQUEST,
-            "租户、站点、名称和设备不能为空",
+            "工作空间、名称和设备不能为空",
         ));
     }
     let prefix: IpNet = request
@@ -15484,19 +14972,6 @@ async fn create_site_network(
         .db
         .lock()
         .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "数据库锁不可用"))?;
-    let site_exists: i64 = connection
-        .query_row(
-            "SELECT COUNT(*) FROM sites WHERE id = ?1 AND tenant_id = ?2",
-            rusqlite::params![request.site_id, request.tenant_id],
-            |row| row.get(0),
-        )
-        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法检查站点"))?;
-    if site_exists == 0 {
-        return Err(ApiError::new(
-            StatusCode::NOT_FOUND,
-            "站点不存在或不属于该租户",
-        ));
-    }
     let is_manual = request.source == SiteNetworkSourceRequest::Manual;
     if !is_manual && request.interface_id.trim().is_empty() {
         return Err(ApiError::new(
@@ -15506,7 +14981,7 @@ async fn create_site_network(
     }
     let gateway_requirement = GatewayDeviceRequirement {
         tenant_id: &request.tenant_id,
-        site_id: &request.site_id,
+
         device_id: &request.publisher_device_id,
         interface_id: (!is_manual).then_some(request.interface_id.trim()),
         prefix,
@@ -15514,21 +14989,31 @@ async fn create_site_network(
         require_detected_network: !is_manual,
     };
     ensure_gateway_device(&connection, &gateway_requirement)?;
-    let duplicate: i64 = connection
-        .query_row(
-            "SELECT COUNT(*) FROM gateway_network_states g
+    let mut overlaps = connection
+        .prepare(
+            "SELECT g.desired_prefix FROM gateway_network_states g
              JOIN site_networks n ON n.id = g.site_network_id
-             WHERE n.tenant_id = ?1 AND n.site_id = ?2 AND g.desired_prefix = ?3",
-            rusqlite::params![request.tenant_id, request.site_id, prefix.to_string()],
-            |row| row.get(0),
+             WHERE n.tenant_id = ?1",
         )
-        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法检查重复网络"))?;
-    if duplicate > 0 {
-        return Err(ApiError::new(
-            StatusCode::CONFLICT,
-            "该站点已经存在相同的共享网络",
-        ));
+        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法检查共享网段"))?;
+    for existing in overlaps
+        .query_map([&request.tenant_id], |row| row.get::<_, String>(0))
+        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法读取共享网段"))?
+    {
+        let other = existing
+            .ok()
+            .and_then(|value| value.parse::<IpNet>().ok())
+            .ok_or_else(|| {
+                ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "已保存网段格式无效")
+            })?;
+        if networks_overlap(prefix, other) {
+            return Err(ApiError::new(
+                StatusCode::CONFLICT,
+                "网段与已有共享网段重叠",
+            ));
+        }
     }
+    drop(overlaps);
     let id = Uuid::new_v4().to_string();
     let transaction = connection
         .transaction()
@@ -15536,13 +15021,12 @@ async fn create_site_network(
     transaction
         .execute(
             "INSERT INTO site_networks
-             (id, tenant_id, site_id, name, publisher_device_id, interface_id,
+             (id, tenant_id, name, publisher_device_id, interface_id,
               address_family, source, enabled, apply_status)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 1, 'checking')",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 1, 'checking')",
             rusqlite::params![
                 id,
                 request.tenant_id,
-                request.site_id,
                 request.name,
                 request.publisher_device_id,
                 if is_manual {
@@ -15638,7 +15122,7 @@ async fn get_site_network(
 }
 
 /// 请求删除共享网络：先发布新的关闭 revision，待 Agent 与 Headscale 均确认
-/// 撤销后，由 `finalize_requested_resource_deletions` 在状态事务内物理删除。
+/// 撤销后，由 `refresh_network_deletions` 在状态事务内物理删除。
 async fn delete_site_network(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -15662,8 +15146,7 @@ async fn delete_site_network(
             .query_row(
                 "SELECT n.tenant_id, n.publisher_device_id, g.desired_revision,
                         n.deletion_requested,
-                        (SELECT COUNT(*) FROM site_link_networks ln
-                         WHERE ln.site_network_id = n.id)
+                        0
                  FROM site_networks n
                  JOIN gateway_network_states g ON g.site_network_id = n.id
                  WHERE n.id = ?1 AND n.tenant_id = ?2",
@@ -15774,7 +15257,7 @@ async fn enable_site_network(
     set_site_network_enabled(state, headers, id, true).await
 }
 
-/// 事务性切换共享网络开关，并把关联站点互联退回检查状态。
+/// 事务性切换共享网段开关，并等待设备与控制面重新应用。
 async fn set_site_network_enabled(
     state: AppState,
     headers: HeaderMap,
@@ -15830,22 +15313,7 @@ async fn set_site_network_enabled(
                     "无法生成网关撤销 revision",
                 )
             })?;
-        transaction
-            .execute(
-                "UPDATE site_links SET apply_status = 'checking', apply_error = NULL,
-                     updated_at = CURRENT_TIMESTAMP
-                 WHERE id IN (
-                     SELECT DISTINCT site_link_id FROM site_link_networks
-                     WHERE site_network_id = ?1
-                 )",
-                [&id],
-            )
-            .map_err(|_| {
-                ApiError::new(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "无法刷新关联站点互联状态",
-                )
-            })?;
+
         write_audit_event(
             &transaction,
             &tenant_id,
@@ -15872,40 +15340,40 @@ fn read_site_network_response(
 ) -> Result<SiteNetworkResponse, ApiError> {
     let response = connection
         .query_row(
-            "SELECT n.id, n.tenant_id, n.site_id, s.name, n.name,
+            "SELECT n.id, n.tenant_id, n.name,
                     n.publisher_device_id, d.name, n.interface_id, n.source,
                     g.desired_prefix, g.applied_prefix,
                     g.desired_revision, n.enabled, g.apply_status, g.apply_error,
                     n.deletion_requested
              FROM site_networks n JOIN gateway_network_states g
              ON g.site_network_id = n.id
-             JOIN sites s ON s.id = n.site_id
              JOIN devices d ON d.id = n.publisher_device_id
              WHERE n.id = ?1",
             [id],
             |row| {
                 Ok(SiteNetworkResponse {
+                    status_reason: "applying".to_owned(),
+                    updated_at: 0,
                     id: row.get(0)?,
                     tenant_id: row.get(1)?,
-                    site_id: row.get(2)?,
-                    site_name: row.get(3)?,
-                    name: row.get(4)?,
-                    publisher_device_id: row.get(5)?,
-                    publisher_device_name: row.get(6)?,
-                    interface_id: row.get(7)?,
-                    source: if row.get::<_, String>(8)? == "manual" {
+
+                    name: row.get(2)?,
+                    publisher_device_id: row.get(3)?,
+                    publisher_device_name: row.get(4)?,
+                    interface_id: row.get(5)?,
+                    source: if row.get::<_, String>(6)? == "manual" {
                         "manual".to_owned()
                     } else {
                         "detected".to_owned()
                     },
                     gateway_address: None,
-                    desired_prefix: row.get(9)?,
-                    applied_prefix: row.get(10)?,
-                    desired_revision: row.get(11)?,
-                    enabled: row.get::<_, i64>(12)? != 0,
-                    apply_status: parse_apply_status(&row.get::<_, String>(13)?),
-                    apply_error: row.get(14)?,
-                    deletion_pending: row.get::<_, i64>(15)? != 0,
+                    desired_prefix: row.get(7)?,
+                    applied_prefix: row.get(8)?,
+                    desired_revision: row.get(9)?,
+                    enabled: row.get::<_, i64>(10)? != 0,
+                    apply_status: parse_apply_status(&row.get::<_, String>(11)?),
+                    apply_error: row.get(12)?,
+                    deletion_pending: row.get::<_, i64>(13)? != 0,
                     health_status: GatewayHealthStatus::Degraded,
                     health_error: None,
                 })
@@ -15931,773 +15399,20 @@ fn read_site_network_response(
             let (health_status, health_error) = gateway_network_health(connection, &health_input)?;
             response.health_status = health_status;
             response.health_error = health_error;
+            response.updated_at = connection
+                .query_row(
+                    "SELECT COALESCE(unixepoch(updated_at), 0) FROM site_networks WHERE id = ?1",
+                    [id],
+                    |row| row.get(0),
+                )
+                .map_err(|_| {
+                    ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法读取网段更新时间")
+                })?;
+            response.status_reason =
+                device_networks::status_reason(connection, &response)?.to_owned();
             Ok(response)
         });
     response
-}
-
-/// 返回所有站点互联及其双向静态路由引导，供组网页面展示。
-async fn list_site_links(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-) -> Result<Json<Vec<SiteLinkResponse>>, ApiError> {
-    let tenant_id = auth::admin_tenant_id(&state, &headers)?;
-    let connection = state
-        .db
-        .lock()
-        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "数据库锁不可用"))?;
-    let ids = {
-        let mut statement = connection
-            .prepare(
-                "SELECT id FROM site_links
-                 WHERE tenant_id = ?1
-                 ORDER BY updated_at DESC, id ASC",
-            )
-            .map_err(|_| {
-                ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法读取站点互联列表")
-            })?;
-        let ids = statement
-            .query_map([tenant_id], |row| row.get::<_, String>(0))
-            .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法读取站点互联列表"))?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|_| {
-                ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "站点互联数据格式无效")
-            })?;
-        ids
-    };
-    ids.iter()
-        .map(|id| read_site_link_response(&connection, id))
-        .collect::<Result<Vec<_>, _>>()
-        .map(Json)
-}
-
-fn normalized_network_ids(ids: &[String]) -> Vec<String> {
-    let mut result = Vec::new();
-    for id in ids.iter().map(|id| id.trim()).filter(|id| !id.is_empty()) {
-        if !result.iter().any(|existing| existing == id) {
-            result.push(id.to_owned());
-        }
-    }
-    result
-}
-
-#[derive(Debug, Default, Clone)]
-struct ResolvedNextHops {
-    ipv4: Option<String>,
-    ipv6: Option<String>,
-}
-
-fn families(networks: &[LinkNetwork]) -> BTreeSet<String> {
-    networks
-        .iter()
-        .map(|network| network.address_family.clone())
-        .collect()
-}
-
-/// 读取一侧的多个共享网络，并验证它们确实由同一个 Site Gateway 发布。
-fn load_networks_for_link(
-    connection: &rusqlite::Transaction<'_>,
-    tenant_id: &str,
-    network_ids: &[String],
-    site_id: &str,
-) -> Result<Vec<LinkNetwork>, ApiError> {
-    if network_ids.is_empty() {
-        return Err(ApiError::new(
-            StatusCode::BAD_REQUEST,
-            "每侧至少选择一个共享网络",
-        ));
-    }
-    let mut networks = Vec::with_capacity(network_ids.len());
-    for network_id in network_ids {
-        networks.push(load_network_for_link(
-            connection, tenant_id, network_id, site_id,
-        )?);
-    }
-    let device_id = networks[0].device_id.clone();
-    if networks
-        .iter()
-        .any(|network| network.device_id != device_id)
-    {
-        return Err(ApiError::new(
-            StatusCode::CONFLICT,
-            "同一侧的共享网络必须由同一台 Site Gateway 发布",
-        ));
-    }
-    Ok(networks)
-}
-
-fn parse_next_hop(value: &str, family: &str) -> Result<std::net::IpAddr, ApiError> {
-    let address = value.trim().parse::<std::net::IpAddr>().map_err(|_| {
-        ApiError::new(
-            StatusCode::BAD_REQUEST,
-            format!("{family} 下一跳不是有效 IP 地址"),
-        )
-    })?;
-    let matches_family = matches!(
-        (family, address),
-        ("ipv4", std::net::IpAddr::V4(_)) | ("ipv6", std::net::IpAddr::V6(_))
-    );
-    if !matches_family {
-        return Err(ApiError::new(
-            StatusCode::CONFLICT,
-            format!("{family} 下一跳的地址族不匹配"),
-        ));
-    }
-    Ok(address)
-}
-
-/// 下一跳必须是该网关最新能力报告中的 LAN 地址；缺少显式输入时仅为兼容
-/// 旧单网段请求，自动取同地址族的第一条已上报地址。
-fn resolve_next_hops(
-    connection: &rusqlite::Transaction<'_>,
-    side: &str,
-    device_id: &str,
-    required_families: &BTreeSet<String>,
-    request: &SiteLinkNextHops,
-) -> Result<ResolvedNextHops, ApiError> {
-    let report_json: Option<String> = connection
-        .query_row(
-            "SELECT report_json FROM device_capability_reports WHERE device_id = ?1",
-            [device_id],
-            |row| row.get(0),
-        )
-        .optional()
-        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法读取网关地址报告"))?;
-    let report: GatewayCapabilityReport = report_json
-        .ok_or_else(|| ApiError::new(StatusCode::CONFLICT, "网关尚未上报可用的 LAN 地址"))
-        .and_then(|json| {
-            serde_json::from_str(&json)
-                .map_err(|_| ApiError::new(StatusCode::CONFLICT, "网关地址报告格式无效"))
-        })?;
-    let mut result = ResolvedNextHops::default();
-    for family in required_families {
-        let provided = request.value(side, family);
-        let candidate = provided.or_else(|| {
-            report.local_networks.iter().find_map(|network| {
-                let address = network
-                    .gateway_address
-                    .as_deref()?
-                    .parse::<std::net::IpAddr>()
-                    .ok()?;
-                let same_family = matches!(
-                    (family.as_str(), address),
-                    ("ipv4", std::net::IpAddr::V4(_)) | ("ipv6", std::net::IpAddr::V6(_))
-                );
-                same_family.then(|| address.to_string())
-            })
-        });
-        let candidate = candidate.ok_or_else(|| {
-            ApiError::new(
-                StatusCode::CONFLICT,
-                format!("{side}侧缺少 {family} 下一跳，请填写网关最新 LAN 地址"),
-            )
-        })?;
-        let address = parse_next_hop(&candidate, family)?;
-        let reported = report.local_networks.iter().any(|network| {
-            network
-                .gateway_address
-                .as_deref()
-                .and_then(|value| value.parse::<std::net::IpAddr>().ok())
-                == Some(address)
-        });
-        if !reported {
-            return Err(ApiError::new(
-                StatusCode::CONFLICT,
-                format!("{side}侧下一跳必须来自网关最近上报的 LAN 地址"),
-            ));
-        }
-        match family.as_str() {
-            "ipv4" => result.ipv4 = Some(address.to_string()),
-            "ipv6" => result.ipv6 = Some(address.to_string()),
-            _ => unreachable!("数据库地址族只有 ipv4/ipv6"),
-        }
-    }
-    Ok(result)
-}
-
-/// 校验一条 SiteLink 的全部网段、地址族和下一跳，并返回规范化结果。
-fn validate_site_link_selection(
-    connection: &rusqlite::Transaction<'_>,
-    tenant_id: &str,
-    left_site_id: &str,
-    left_network_ids: &[String],
-    right_site_id: &str,
-    right_network_ids: &[String],
-    next_hops: &SiteLinkNextHops,
-) -> Result<
-    (
-        Vec<LinkNetwork>,
-        Vec<LinkNetwork>,
-        ResolvedNextHops,
-        ResolvedNextHops,
-    ),
-    ApiError,
-> {
-    let left = load_networks_for_link(connection, tenant_id, left_network_ids, left_site_id)?;
-    let right = load_networks_for_link(connection, tenant_id, right_network_ids, right_site_id)?;
-    let left_families = families(&left);
-    let right_families = families(&right);
-    if left_families != right_families {
-        return Err(ApiError::new(
-            StatusCode::CONFLICT,
-            "两侧共享网络的 IPv4/IPv6 地址族集合必须一致",
-        ));
-    }
-    for local in &left {
-        let prefix = local.prefix.parse::<IpNet>().map_err(|_| {
-            ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "左侧共享网络数据无效")
-        })?;
-        let gateway_requirement = GatewayDeviceRequirement {
-            tenant_id,
-            site_id: left_site_id,
-            device_id: &local.device_id,
-            interface_id: local.interface_id.as_deref(),
-            prefix,
-            require_online: true,
-            require_detected_network: local.source != "manual",
-        };
-        ensure_gateway_device(connection, &gateway_requirement)?;
-        for remote in &right {
-            let remote_prefix = remote.prefix.parse::<IpNet>().map_err(|_| {
-                ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "右侧共享网络数据无效")
-            })?;
-            if networks_overlap(prefix, remote_prefix) {
-                return Err(ApiError::new(
-                    StatusCode::CONFLICT,
-                    format!(
-                        "网络地址冲突：{} 与 {} 使用了重叠的网络地址",
-                        prefix, remote_prefix
-                    ),
-                ));
-            }
-        }
-    }
-    for network in &right {
-        let prefix = network.prefix.parse::<IpNet>().map_err(|_| {
-            ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "右侧共享网络数据无效")
-        })?;
-        let gateway_requirement = GatewayDeviceRequirement {
-            tenant_id,
-            site_id: right_site_id,
-            device_id: &network.device_id,
-            interface_id: network.interface_id.as_deref(),
-            prefix,
-            require_online: true,
-            require_detected_network: network.source != "manual",
-        };
-        ensure_gateway_device(connection, &gateway_requirement)?;
-    }
-    let left_hops = resolve_next_hops(
-        connection,
-        "left",
-        &left[0].device_id,
-        &left_families,
-        next_hops,
-    )?;
-    let right_hops = resolve_next_hops(
-        connection,
-        "right",
-        &right[0].device_id,
-        &right_families,
-        next_hops,
-    )?;
-    Ok((left, right, left_hops, right_hops))
-}
-
-/// 创建双向站点互联的 Desired State，并在提交前阻止重叠网段。
-async fn create_site_link(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Json(request): Json<CreateSiteLinkRequest>,
-) -> Result<Json<SiteLinkResponse>, ApiError> {
-    let session_tenant = auth::admin_tenant_id(&state, &headers)?;
-    if request.tenant_id.trim().is_empty()
-        || request.left_site_id.trim().is_empty()
-        || request.right_site_id.trim().is_empty()
-    {
-        return Err(ApiError::new(
-            StatusCode::BAD_REQUEST,
-            "租户和两侧站点不能为空",
-        ));
-    }
-    ensure_tenant_scope(request.tenant_id.trim(), &session_tenant)?;
-    if request.left_site_id == request.right_site_id {
-        return Err(ApiError::new(
-            StatusCode::BAD_REQUEST,
-            "站点互联必须选择两个不同站点",
-        ));
-    }
-    let mut left_network_ids = normalized_network_ids(&request.left_network_ids);
-    let mut right_network_ids = normalized_network_ids(&request.right_network_ids);
-    if left_network_ids.is_empty() || right_network_ids.is_empty() {
-        return Err(ApiError::new(
-            StatusCode::BAD_REQUEST,
-            "两侧至少选择一个共享网络",
-        ));
-    }
-    let mut left_site_id = request.left_site_id.clone();
-    let mut right_site_id = request.right_site_id.clone();
-    let mut left_hop = ResolvedNextHops {
-        ipv4: request.next_hops.value("left", "ipv4"),
-        ipv6: request.next_hops.value("left", "ipv6"),
-    };
-    let mut right_hop = ResolvedNextHops {
-        ipv4: request.next_hops.value("right", "ipv4"),
-        ipv6: request.next_hops.value("right", "ipv6"),
-    };
-    if left_site_id > right_site_id {
-        std::mem::swap(&mut left_site_id, &mut right_site_id);
-        std::mem::swap(&mut left_network_ids, &mut right_network_ids);
-        std::mem::swap(&mut left_hop, &mut right_hop);
-    }
-    let mut canonical_hops = SiteLinkNextHops::default();
-    canonical_hops.left.ipv4 = left_hop.ipv4;
-    canonical_hops.left.ipv6 = left_hop.ipv6;
-    canonical_hops.right.ipv4 = right_hop.ipv4;
-    canonical_hops.right.ipv6 = right_hop.ipv6;
-    let mut connection = state
-        .db
-        .lock()
-        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "数据库锁不可用"))?;
-    let transaction = connection
-        .transaction()
-        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法开始站点互联事务"))?;
-    let (left, right, left_hops, right_hops) = validate_site_link_selection(
-        &transaction,
-        &request.tenant_id,
-        &left_site_id,
-        &left_network_ids,
-        &right_site_id,
-        &right_network_ids,
-        &canonical_hops,
-    )?;
-    let duplicate: i64 = transaction
-        .query_row(
-            "SELECT COUNT(*) FROM site_links WHERE tenant_id = ?1 AND left_site_id = ?2 AND right_site_id = ?3",
-            rusqlite::params![request.tenant_id, left_site_id, right_site_id],
-            |row| row.get(0),
-        )
-        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法检查重复站点互联"))?;
-    if duplicate > 0 {
-        return Err(ApiError::new(
-            StatusCode::CONFLICT,
-            "两个站点之间已经存在互联",
-        ));
-    }
-    let id = Uuid::new_v4().to_string();
-    transaction
-        .execute(
-            "INSERT INTO site_links
-             (id, tenant_id, left_site_id, right_site_id, left_ipv4_next_hop,
-              left_ipv6_next_hop, right_ipv4_next_hop, right_ipv6_next_hop,
-              enabled, apply_status)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 1, 'checking')",
-            rusqlite::params![
-                id,
-                request.tenant_id,
-                left_site_id,
-                right_site_id,
-                left_hops.ipv4,
-                left_hops.ipv6,
-                right_hops.ipv4,
-                right_hops.ipv6,
-            ],
-        )
-        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法保存站点互联"))?;
-    for network in left {
-        transaction
-            .execute(
-                "INSERT INTO site_link_networks (site_link_id, site_network_id, side) VALUES (?1, ?2, 'left')",
-                rusqlite::params![id, network.id],
-            )
-            .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法保存左侧网络映射"))?;
-    }
-    for network in right {
-        transaction
-            .execute(
-                "INSERT INTO site_link_networks (site_link_id, site_network_id, side) VALUES (?1, ?2, 'right')",
-                rusqlite::params![id, network.id],
-            )
-            .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法保存右侧网络映射"))?;
-    }
-    write_audit_event(
-        &transaction,
-        &request.tenant_id,
-        "SITE_LINK_CREATED",
-        "site_link",
-        &id,
-    )?;
-    transaction
-        .commit()
-        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法提交站点互联事务"))?;
-    schedule_policy_reconcile(&state);
-    Ok(Json(read_site_link_response(&connection, &id)?))
-}
-
-/// 事务式替换 SiteLink 两侧网段和下一跳。站点本身来自已有关系，编辑不会
-/// 改变拓扑端点；任何网段变化都会清除旧确认并提升 revision。
-async fn update_site_link(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Path(id): Path<String>,
-    Json(request): Json<UpdateSiteLinkRequest>,
-) -> Result<Json<SiteLinkResponse>, ApiError> {
-    let session_tenant = auth::admin_tenant_id(&state, &headers)?;
-    let tenant_id = request
-        .tenant_id
-        .as_deref()
-        .filter(|tenant| !tenant.trim().is_empty())
-        .unwrap_or(&session_tenant)
-        .to_owned();
-    ensure_tenant_scope(&tenant_id, &session_tenant)?;
-    let mut connection = state
-        .db
-        .lock()
-        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "数据库锁不可用"))?;
-    let transaction = connection.transaction().map_err(|_| {
-        ApiError::new(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "无法开始站点互联编辑事务",
-        )
-    })?;
-    let (left_site_id, right_site_id, old_revision, deletion_requested): (
-        String,
-        String,
-        i64,
-        i64,
-    ) = transaction
-        .query_row(
-            "SELECT left_site_id, right_site_id, apply_revision, deletion_requested
-             FROM site_links WHERE id = ?1 AND tenant_id = ?2",
-            rusqlite::params![id, tenant_id],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-        )
-        .optional()
-        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法读取站点互联"))?
-        .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "站点互联不存在"))?;
-    if deletion_requested != 0 {
-        return Err(ApiError::new(
-            StatusCode::CONFLICT,
-            "站点互联正在等待删除，不能编辑",
-        ));
-    }
-    let existing_ids = |side: &str| -> Result<Vec<String>, ApiError> {
-        let mut statement = transaction
-            .prepare("SELECT site_network_id FROM site_link_networks WHERE site_link_id = ?1 AND side = ?2 ORDER BY site_network_id")
-            .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法读取站点网络映射"))?;
-        let values = statement
-            .query_map(rusqlite::params![id, side], |row| row.get(0))
-            .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法读取站点网络映射"))?
-            .collect::<rusqlite::Result<Vec<String>>>()
-            .map_err(|_| {
-                ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "站点网络映射格式无效")
-            })?;
-        Ok(values)
-    };
-    let left_existing = existing_ids("left")?;
-    let right_existing = existing_ids("right")?;
-    let left_ids = request
-        .left_network_ids
-        .as_deref()
-        .map(normalized_network_ids)
-        .unwrap_or(left_existing);
-    let right_ids = request
-        .right_network_ids
-        .as_deref()
-        .map(normalized_network_ids)
-        .unwrap_or(right_existing);
-    let (left, right, left_hops, right_hops) = validate_site_link_selection(
-        &transaction,
-        &tenant_id,
-        &left_site_id,
-        &left_ids,
-        &right_site_id,
-        &right_ids,
-        &request.next_hops,
-    )?;
-    let network_revision: i64 = transaction
-        .query_row(
-            "SELECT COALESCE(MAX(g.desired_revision), 0)
-             FROM site_link_networks ln JOIN gateway_network_states g
-               ON g.site_network_id = ln.site_network_id WHERE ln.site_link_id = ?1",
-            [&id],
-            |row| row.get(0),
-        )
-        .unwrap_or_default();
-    let revision = old_revision.max(network_revision).saturating_add(1).max(1);
-    transaction
-        .execute(
-            "UPDATE site_links SET left_ipv4_next_hop = ?1, left_ipv6_next_hop = ?2,
-             right_ipv4_next_hop = ?3, right_ipv6_next_hop = ?4,
-             apply_revision = ?5, apply_status = 'checking', apply_error = NULL,
-             updated_at = CURRENT_TIMESTAMP WHERE id = ?6 AND tenant_id = ?7",
-            rusqlite::params![
-                left_hops.ipv4,
-                left_hops.ipv6,
-                right_hops.ipv4,
-                right_hops.ipv6,
-                revision,
-                id,
-                tenant_id,
-            ],
-        )
-        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法保存站点互联下一跳"))?;
-    transaction
-        .execute(
-            "DELETE FROM site_link_networks WHERE site_link_id = ?1",
-            [&id],
-        )
-        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法替换站点网络映射"))?;
-    for network in left {
-        transaction.execute(
-            "INSERT INTO site_link_networks (site_link_id, site_network_id, side) VALUES (?1, ?2, 'left')",
-            rusqlite::params![id, network.id],
-        ).map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法保存左侧网络映射"))?;
-    }
-    for network in right {
-        transaction.execute(
-            "INSERT INTO site_link_networks (site_link_id, site_network_id, side) VALUES (?1, ?2, 'right')",
-            rusqlite::params![id, network.id],
-        ).map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法保存右侧网络映射"))?;
-    }
-    transaction
-        .execute(
-            "DELETE FROM gateway_route_applies WHERE site_link_id = ?1",
-            [&id],
-        )
-        .map_err(|_| {
-            ApiError::new(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "无法清理旧的互联路由确认",
-            )
-        })?;
-    transaction
-        .execute(
-            "DELETE FROM site_link_route_confirmations WHERE site_link_id = ?1",
-            [&id],
-        )
-        .map_err(|_| {
-            ApiError::new(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "无法清理旧的静态路由确认",
-            )
-        })?;
-    write_audit_event(
-        &transaction,
-        &tenant_id,
-        "SITE_LINK_UPDATED",
-        "site_link",
-        &id,
-    )?;
-    transaction.commit().map_err(|_| {
-        ApiError::new(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "无法提交站点互联编辑事务",
-        )
-    })?;
-    schedule_policy_reconcile(&state);
-    Ok(Json(read_site_link_response(&connection, &id)?))
-}
-
-/// 查询站点互联当前应用状态。
-async fn get_site_link(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Path(id): Path<String>,
-) -> Result<Json<SiteLinkResponse>, ApiError> {
-    let tenant_id = auth::admin_tenant_id(&state, &headers)?;
-    let connection = state
-        .db
-        .lock()
-        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "数据库锁不可用"))?;
-    let response = read_site_link_response(&connection, &id)?;
-    ensure_tenant_scope(&response.tenant_id, &tenant_id)?;
-    Ok(Json(response))
-}
-
-/// 请求删除站点互联：生成高于两侧网络 revision 的关闭版本。两侧 Agent
-/// 和 Headscale 都确认当前版本已撤销后，状态事务会自动清理映射与确认记录。
-async fn delete_site_link(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Path(id): Path<String>,
-) -> Result<Json<DeleteResponse>, ApiError> {
-    let session_tenant = auth::admin_tenant_id(&state, &headers)?;
-    let (revision, already_pending) = {
-        let mut connection = state
-            .db
-            .lock()
-            .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "数据库锁不可用"))?;
-        let transaction = connection.transaction().map_err(|_| {
-            ApiError::new(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "无法开始站点互联删除事务",
-            )
-        })?;
-        let (tenant_id, current_revision, network_revision, deletion_requested): (
-            String,
-            i64,
-            i64,
-            i64,
-        ) = transaction
-            .query_row(
-                "SELECT l.tenant_id, l.apply_revision,
-                        COALESCE((SELECT MAX(g.desired_revision)
-                                  FROM site_link_networks ln
-                                  JOIN gateway_network_states g
-                                    ON g.site_network_id = ln.site_network_id
-                                  WHERE ln.site_link_id = l.id), 0),
-                        l.deletion_requested
-                 FROM site_links l WHERE l.id = ?1 AND l.tenant_id = ?2",
-                rusqlite::params![id, session_tenant],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-            )
-            .optional()
-            .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法检查站点互联"))?
-            .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "站点互联不存在"))?;
-        if deletion_requested != 0 {
-            transaction.commit().map_err(|_| {
-                ApiError::new(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "无法提交站点互联删除状态",
-                )
-            })?;
-            (current_revision, true)
-        } else {
-            let revision = current_revision
-                .max(network_revision)
-                .saturating_add(1)
-                .max(1);
-            transaction
-                .execute(
-                    "UPDATE site_links
-                     SET enabled = 0, deletion_requested = 1, apply_revision = ?1,
-                         apply_status = 'checking', apply_error = '等待两侧路由撤销确认',
-                         updated_at = CURRENT_TIMESTAMP
-                     WHERE id = ?2 AND tenant_id = ?3",
-                    rusqlite::params![revision, id, session_tenant],
-                )
-                .map_err(|_| {
-                    ApiError::new(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        "无法保存站点互联删除请求",
-                    )
-                })?;
-            write_audit_event(
-                &transaction,
-                &tenant_id,
-                "SITE_LINK_DELETE_REQUESTED",
-                "site_link",
-                &id,
-            )?;
-            transaction.commit().map_err(|_| {
-                ApiError::new(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "无法提交站点互联删除事务",
-                )
-            })?;
-            (revision, false)
-        }
-    };
-    schedule_policy_reconcile(&state);
-    tracing::info!(site_link_id = %id, revision, "站点互联已进入等待删除状态");
-    Ok(Json(DeleteResponse {
-        deleted: false,
-        pending: true,
-        id,
-        message: if already_pending {
-            "站点互联正在等待两侧 Agent 与 Headscale 完成路由撤销".to_owned()
-        } else {
-            "已请求删除站点互联，等待两侧 Agent 与 Headscale 完成路由撤销".to_owned()
-        },
-    }))
-}
-
-/// 关闭站点互联，使两侧 Agent 撤销对端网段路由。
-async fn disable_site_link(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Path(id): Path<String>,
-) -> Result<Json<SiteLinkResponse>, ApiError> {
-    set_site_link_enabled(state, headers, id, false).await
-}
-
-/// 重新启用站点互联，使两侧 Agent 重新收到对端网段路由。
-async fn enable_site_link(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Path(id): Path<String>,
-) -> Result<Json<SiteLinkResponse>, ApiError> {
-    set_site_link_enabled(state, headers, id, true).await
-}
-
-/// 事务性切换站点互联开关，并递增 link revision 作为路由撤销信号。
-async fn set_site_link_enabled(
-    state: AppState,
-    headers: HeaderMap,
-    id: String,
-    enabled: bool,
-) -> Result<Json<SiteLinkResponse>, ApiError> {
-    let session_tenant = auth::admin_tenant_id(&state, &headers)?;
-    let mut connection = state
-        .db
-        .lock()
-        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "数据库锁不可用"))?;
-    let transaction = connection
-        .transaction()
-        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法开始站点互联事务"))?;
-    let (tenant_id, current_enabled, deletion_requested): (String, i64, i64) = transaction
-        .query_row(
-            "SELECT tenant_id, enabled, deletion_requested FROM site_links
-             WHERE id = ?1 AND tenant_id = ?2",
-            rusqlite::params![id, session_tenant],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-        )
-        .map_err(|_| ApiError::new(StatusCode::NOT_FOUND, "站点互联不存在"))?;
-    if deletion_requested != 0 {
-        return Err(ApiError::new(
-            StatusCode::CONFLICT,
-            "站点互联正在等待删除，不能再修改开关",
-        ));
-    }
-    if (current_enabled != 0) != enabled {
-        transaction
-            .execute(
-                "UPDATE site_links
-                 SET enabled = ?1,
-                     apply_revision = MAX(
-                         apply_revision,
-                         COALESCE((SELECT MAX(g.desired_revision)
-                                   FROM site_link_networks ln
-                                   JOIN gateway_network_states g
-                                     ON g.site_network_id = ln.site_network_id
-                                   WHERE ln.site_link_id = site_links.id), 0)
-                     ) + 1,
-                     apply_status = 'checking', apply_error = NULL,
-                     updated_at = CURRENT_TIMESTAMP
-                 WHERE id = ?2 AND tenant_id = ?3",
-                rusqlite::params![if enabled { 1 } else { 0 }, id, session_tenant],
-            )
-            .map_err(|_| {
-                ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法更新站点互联状态")
-            })?;
-        write_audit_event(
-            &transaction,
-            &tenant_id,
-            if enabled {
-                "SITE_LINK_ENABLED"
-            } else {
-                "SITE_LINK_REMOVED"
-            },
-            "site_link",
-            &id,
-        )?;
-    }
-    transaction
-        .commit()
-        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法提交站点互联事务"))?;
-    schedule_policy_reconcile(&state);
-    Ok(Json(read_site_link_response(&connection, &id)?))
 }
 
 /// 处理身份错配恢复：先在 Headscale 停用旧 Node，再清理本地绑定并重新发起入网。
@@ -16815,8 +15530,7 @@ async fn recover_mesh_identity(
         transaction
             .execute(
                 "UPDATE gateway_route_applies
-             SET local_status = 'pending', control_plane_status = 'pending',
-                 remote_status = 'pending', applied_prefix = NULL,
+             SET local_status = 'pending', control_plane_status = 'pending', applied_prefix = NULL,
                  last_error = '组网身份已恢复，等待重新加入',
                  last_checked_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
              WHERE device_id = ?1",
@@ -16839,23 +15553,7 @@ async fn recover_mesh_identity(
             .map_err(|_| {
                 ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法重置共享网络状态")
             })?;
-        transaction
-            .execute(
-                "UPDATE site_links SET apply_status = 'checking',
-                 apply_error = '组网身份已恢复，等待两侧重新加入',
-                 updated_at = CURRENT_TIMESTAMP
-             WHERE id IN (
-                 SELECT DISTINCT l.id
-                 FROM site_links l
-                 JOIN site_link_networks ln ON ln.site_link_id = l.id
-                 JOIN site_networks n ON n.id = ln.site_network_id
-                 WHERE n.publisher_device_id = ?1
-             )",
-                [&device_id],
-            )
-            .map_err(|_| {
-                ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法重置站点互联状态")
-            })?;
+
         write_audit_event(
             &transaction,
             &tenant_id,
@@ -16899,506 +15597,6 @@ async fn recover_mesh_identity(
         old_node_id: expected_old_node_id,
         message: "旧组网身份已停用，正在重新邀请设备加入异地组网".to_owned(),
     }))
-}
-
-/// 持久化站点一侧“我已完成静态路由配置”的确认。
-async fn confirm_site_link_router(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Path((id, site_id)): Path<(String, String)>,
-) -> Result<Json<SiteLinkResponse>, ApiError> {
-    let session_tenant = auth::admin_tenant_id(&state, &headers)?;
-    let mut connection = state
-        .db
-        .lock()
-        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "数据库锁不可用"))?;
-    let route_preview = read_site_link_response(&connection, &id)?;
-    if route_preview
-        .static_routes
-        .iter()
-        .filter(|route| route.router_site_id == site_id)
-        .any(|route| route.next_hop.is_none())
-    {
-        return Err(ApiError::new(
-            StatusCode::CONFLICT,
-            "本站仍缺少可用的 LAN 下一跳，请先让 Agent 上报对应地址",
-        ));
-    }
-    let transaction = connection
-        .transaction()
-        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法开始路由确认事务"))?;
-    let (tenant_id, deletion_requested): (String, i64) = transaction
-        .query_row(
-            "SELECT tenant_id, deletion_requested FROM site_links
-             WHERE id = ?1 AND tenant_id = ?3
-               AND (left_site_id = ?2 OR right_site_id = ?2)",
-            rusqlite::params![id, site_id, session_tenant],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .map_err(|_| ApiError::new(StatusCode::NOT_FOUND, "站点互联或站点不存在"))?;
-    if deletion_requested != 0 {
-        return Err(ApiError::new(
-            StatusCode::CONFLICT,
-            "站点互联正在等待删除，不能再确认静态路由",
-        ));
-    }
-    transaction
-        .execute(
-            "INSERT INTO site_link_route_confirmations (site_link_id, site_id, confirmed_at)
-             VALUES (?1, ?2, CURRENT_TIMESTAMP)
-             ON CONFLICT(site_link_id, site_id) DO UPDATE SET confirmed_at = CURRENT_TIMESTAMP",
-            rusqlite::params![id, site_id],
-        )
-        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法保存路由确认"))?;
-    write_audit_event(
-        &transaction,
-        &tenant_id,
-        "SITE_LINK_ROUTER_CONFIRMED",
-        "site_link",
-        &id,
-    )?;
-    transaction
-        .commit()
-        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法提交路由确认"))?;
-    Ok(Json(read_site_link_response(&connection, &id)?))
-}
-
-/// 触发一次可重复的 Mesh/能力/路由重新协调，不以单次 ping 宣称 LAN 已可达。
-async fn recheck_site_link(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Path(id): Path<String>,
-) -> Result<Json<RecheckResponse>, ApiError> {
-    let tenant_id = auth::admin_tenant_id(&state, &headers)?;
-    let device_ids: Vec<String> = {
-        let connection = state
-            .db
-            .lock()
-            .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "数据库锁不可用"))?;
-        let deletion_requested = connection
-            .query_row(
-                "SELECT deletion_requested FROM site_links
-                 WHERE id = ?1 AND tenant_id = ?2",
-                rusqlite::params![id, tenant_id],
-                |row| row.get::<_, i64>(0),
-            )
-            .optional()
-            .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法读取站点互联"))?
-            .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "站点互联不存在"))?;
-        if deletion_requested != 0 {
-            return Err(ApiError::new(
-                StatusCode::CONFLICT,
-                "站点互联正在等待删除，不能重复检测",
-            ));
-        }
-        let mut statement = connection
-            .prepare(
-                "SELECT n.publisher_device_id
-                 FROM site_link_networks ln JOIN site_networks n
-                   ON n.id = ln.site_network_id
-                 WHERE ln.site_link_id = ?1 AND n.tenant_id = ?2",
-            )
-            .map_err(|_| {
-                ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法读取站点互联设备")
-            })?;
-        let ids = statement
-            .query_map(rusqlite::params![id.as_str(), tenant_id], |row| row.get(0))
-            .map_err(|_| ApiError::new(StatusCode::NOT_FOUND, "站点互联不存在"))?
-            .collect::<rusqlite::Result<Vec<_>>>()
-            .map_err(|_| {
-                ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "站点互联设备数据无效")
-            })?;
-        ids
-    };
-    if device_ids.is_empty() {
-        return Err(ApiError::new(StatusCode::NOT_FOUND, "站点互联不存在"));
-    }
-    {
-        let connection = state
-            .db
-            .lock()
-            .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "数据库锁不可用"))?;
-        connection
-            .execute(
-                "UPDATE site_links SET apply_status = 'checking', apply_error = NULL,
-                 updated_at = CURRENT_TIMESTAMP
-                 WHERE id = ?1 AND tenant_id = ?2",
-                rusqlite::params![id, tenant_id],
-            )
-            .map_err(|_| {
-                ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法刷新站点互联状态")
-            })?;
-    }
-    for device_id in device_ids {
-        let reconcile_state = state.clone();
-        tokio::spawn(async move {
-            if let Err(error) =
-                ensure_mesh_enrollment_for_device(&reconcile_state, &device_id).await
-            {
-                tracing::debug!(device_id = %device_id, "重新检测时组网入网尚未准备好：{error:#}");
-            }
-            if let Err(error) = reconcile_headscale_routes(&reconcile_state, &device_id).await {
-                tracing::warn!(device_id = %device_id, "重新检测组网路由失败：{error:#}");
-            }
-        });
-    }
-    Ok(Json(RecheckResponse {
-        accepted: true,
-        message: "已开始重新检测组网、能力和路由状态".to_owned(),
-    }))
-}
-
-/// 从 Nexo 数据库读取站点互联的完整状态。
-fn read_site_link_response(
-    connection: &Connection,
-    id: &str,
-) -> Result<SiteLinkResponse, ApiError> {
-    let (
-        id,
-        tenant_id,
-        left_site_id,
-        right_site_id,
-        left_site_name,
-        right_site_name,
-        left_ipv4_next_hop,
-        left_ipv6_next_hop,
-        right_ipv4_next_hop,
-        right_ipv6_next_hop,
-        enabled,
-        apply_status,
-        apply_error,
-        deletion_pending,
-    ) = connection
-        .query_row(
-            "SELECT l.id, l.tenant_id, l.left_site_id, l.right_site_id,
-                    ls.name, rs.name, l.left_ipv4_next_hop, l.left_ipv6_next_hop,
-                    l.right_ipv4_next_hop, l.right_ipv6_next_hop, l.enabled,
-                    l.apply_status, l.apply_error, l.deletion_requested
-             FROM site_links l JOIN sites ls ON ls.id = l.left_site_id
-             JOIN sites rs ON rs.id = l.right_site_id WHERE l.id = ?1",
-            [id],
-            |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, String>(3)?,
-                    row.get::<_, String>(4)?,
-                    row.get::<_, String>(5)?,
-                    row.get::<_, Option<String>>(6)?,
-                    row.get::<_, Option<String>>(7)?,
-                    row.get::<_, Option<String>>(8)?,
-                    row.get::<_, Option<String>>(9)?,
-                    row.get::<_, i64>(10)? != 0,
-                    parse_apply_status(&row.get::<_, String>(11)?),
-                    row.get::<_, Option<String>>(12)?,
-                    row.get::<_, i64>(13)? != 0,
-                ))
-            },
-        )
-        .map_err(|error| {
-            tracing::debug!(error = %error, "读取站点互联路由引导失败");
-            ApiError::new(StatusCode::NOT_FOUND, "站点互联不存在")
-        })?;
-    let read_side = |side: &str| -> Result<Vec<SiteLinkNetworkSummary>, ApiError> {
-        let mut statement = connection
-            .prepare(
-                "SELECT n.id, n.name, g.desired_prefix, n.source, n.address_family,
-                        n.publisher_device_id, d.name, g.apply_status, n.interface_id
-                 FROM site_link_networks ln
-                 JOIN site_networks n ON n.id = ln.site_network_id
-                 JOIN devices d ON d.id = n.publisher_device_id
-                 JOIN gateway_network_states g ON g.site_network_id = n.id
-                 WHERE ln.site_link_id = ?1 AND ln.side = ?2 ORDER BY n.id",
-            )
-            .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法读取互联网段"))?;
-        let rows = statement
-            .query_map(rusqlite::params![id, side], |row| {
-                let network_id: String = row.get(0)?;
-                let device_id: String = row.get(5)?;
-                let prefix: String = row.get(2)?;
-                let interface_id: Option<String> = row.get(8)?;
-                let gateway_address =
-                    find_gateway_address(connection, &device_id, interface_id.as_deref(), &prefix)
-                        .unwrap_or(None);
-                Ok(SiteLinkNetworkSummary {
-                    id: network_id,
-                    name: row.get(1)?,
-                    prefix,
-                    source: if row.get::<_, String>(3)? == "manual" {
-                        "manual".to_owned()
-                    } else {
-                        "detected".to_owned()
-                    },
-                    address_family: row.get(4)?,
-                    publisher_device_id: device_id,
-                    publisher_device_name: row.get(6)?,
-                    gateway_address,
-                    apply_status: parse_apply_status(&row.get::<_, String>(7)?),
-                })
-            })
-            .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法读取互联网段"))?;
-        rows.collect::<rusqlite::Result<Vec<_>>>()
-            .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "互联网络数据格式无效"))
-    };
-    let left_networks = read_side("left")?;
-    let right_networks = read_side("right")?;
-    if left_networks.is_empty() || right_networks.is_empty() {
-        return Err(ApiError::new(StatusCode::NOT_FOUND, "站点互联缺少两侧网段"));
-    }
-    let hop_for = |side: &str, family: &str| -> Option<String> {
-        match (side, family) {
-            ("left", "ipv4") => left_ipv4_next_hop.clone(),
-            ("left", "ipv6") => left_ipv6_next_hop.clone(),
-            ("right", "ipv4") => right_ipv4_next_hop.clone(),
-            ("right", "ipv6") => right_ipv6_next_hop.clone(),
-            _ => None,
-        }
-    };
-    let gateway_for_family =
-        |networks: &[SiteLinkNetworkSummary], family: &str| -> Option<String> {
-            networks
-                .iter()
-                .find(|network| network.address_family == family)
-                .and_then(|network| network.gateway_address.clone())
-        };
-    let left_gateway_address = left_networks
-        .iter()
-        .find_map(|network| network.gateway_address.clone())
-        .or_else(|| hop_for("left", &left_networks[0].address_family));
-    let right_gateway_address = right_networks
-        .iter()
-        .find_map(|network| network.gateway_address.clone())
-        .or_else(|| hop_for("right", &right_networks[0].address_family));
-    let left_confirmation = site_link_route_confirmation(connection, &id, &left_site_id)?;
-    let right_confirmation = site_link_route_confirmation(connection, &id, &right_site_id)?;
-    let mut static_routes = Vec::new();
-    for network in &right_networks {
-        static_routes.push(StaticRouteGuide {
-            purpose: StaticRoutePurpose::SiteNetwork,
-            router_site_id: left_site_id.clone(),
-            destination_site_id: right_site_id.clone(),
-            router_site_name: left_site_name.clone(),
-            destination_site_name: right_site_name.clone(),
-            destination_label: right_site_name.clone(),
-            destination_prefix: network.prefix.clone(),
-            next_hop: hop_for("left", &network.address_family)
-                .or_else(|| gateway_for_family(&left_networks, &network.address_family)),
-            router_confirmed: left_confirmation.is_some(),
-        });
-    }
-    for network in &left_networks {
-        static_routes.push(StaticRouteGuide {
-            purpose: StaticRoutePurpose::SiteNetwork,
-            router_site_id: right_site_id.clone(),
-            destination_site_id: left_site_id.clone(),
-            router_site_name: right_site_name.clone(),
-            destination_site_name: left_site_name.clone(),
-            destination_label: left_site_name.clone(),
-            destination_prefix: network.prefix.clone(),
-            next_hop: hop_for("right", &network.address_family)
-                .or_else(|| gateway_for_family(&right_networks, &network.address_family)),
-            router_confirmed: right_confirmation.is_some(),
-        });
-    }
-    // SiteLink 关闭 SNAT 后，局域网设备需要知道如何把官方 Tailscale
-    // 客户端地址段返回给本站 Agent；普通未参与 SiteLink 的共享网络仍由
-    // Agent SNAT，不会生成这类额外要求。
-    let mut push_client_return_route = |side: &str,
-                                        site_id: &str,
-                                        site_name: &str,
-                                        networks: &[SiteLinkNetworkSummary],
-                                        confirmed: bool| {
-        for (family, prefix) in [("ipv4", "100.64.0.0/10"), ("ipv6", "fd7a:115c:a1e0::/48")] {
-            if networks
-                .iter()
-                .any(|network| network.address_family == family)
-            {
-                static_routes.push(StaticRouteGuide {
-                    purpose: StaticRoutePurpose::MeshClientReturn,
-                    router_site_id: site_id.to_owned(),
-                    // 组网客户端地址段是全局虚拟目标，不属于另一侧站点；
-                    // 使用空 ID 保留旧字段形状，由 purpose/destination_label 识别它。
-                    destination_site_id: String::new(),
-                    router_site_name: site_name.to_owned(),
-                    destination_site_name: "组网客户端".to_owned(),
-                    destination_label: "组网客户端".to_owned(),
-                    destination_prefix: prefix.to_owned(),
-                    next_hop: hop_for(side, family)
-                        .or_else(|| gateway_for_family(networks, family)),
-                    router_confirmed: confirmed,
-                });
-            }
-        }
-    };
-    push_client_return_route(
-        "left",
-        &left_site_id,
-        &left_site_name,
-        &left_networks,
-        left_confirmation.is_some(),
-    );
-    push_client_return_route(
-        "right",
-        &right_site_id,
-        &right_site_name,
-        &right_networks,
-        right_confirmation.is_some(),
-    );
-    let route_statuses = read_site_link_route_statuses(
-        connection,
-        &id,
-        &left_site_id,
-        &right_site_id,
-        &left_networks,
-        &right_networks,
-    )?;
-    let route_confirmations = [
-        left_confirmation.map(|confirmed_at| RouteConfirmationResponse {
-            site_id: left_site_id.clone(),
-            confirmed_at,
-        }),
-        right_confirmation.map(|confirmed_at| RouteConfirmationResponse {
-            site_id: right_site_id.clone(),
-            confirmed_at,
-        }),
-    ]
-    .into_iter()
-    .flatten()
-    .collect();
-    let (health_status, health_error) = site_link_health(
-        connection,
-        &id,
-        (&left_networks, &left_site_id),
-        (&right_networks, &right_site_id),
-        enabled,
-        apply_status,
-        apply_error.as_deref(),
-    )?;
-    Ok(SiteLinkResponse {
-        id,
-        tenant_id,
-        left_site_id,
-        right_site_id,
-        left_site_name,
-        right_site_name,
-        left_gateway_address,
-        right_gateway_address,
-        left_networks,
-        right_networks,
-        static_routes,
-        route_statuses,
-        route_confirmations,
-        enabled,
-        apply_status,
-        apply_error,
-        deletion_pending,
-        health_status,
-        health_error,
-    })
-}
-
-/// 将数据库中的逐路由应用记录聚合成 UI 可直接展示的阶段状态；按目标
-/// 网段去重，避免多网段站点因本地网段数量产生笛卡尔积重复行。
-fn read_site_link_route_statuses(
-    connection: &Connection,
-    link_id: &str,
-    left_site_id: &str,
-    right_site_id: &str,
-    left_networks: &[SiteLinkNetworkSummary],
-    right_networks: &[SiteLinkNetworkSummary],
-) -> Result<Vec<SiteLinkRouteStatus>, ApiError> {
-    type RouteApplyRow = (String, String, String, Option<String>, Option<i64>);
-    let mut statuses = Vec::new();
-    let mut append = |router_site_id: &str,
-                      destination_site_id: &str,
-                      local_networks: &[SiteLinkNetworkSummary],
-                      remote_networks: &[SiteLinkNetworkSummary]|
-     -> Result<(), ApiError> {
-        let device_id = local_networks
-            .first()
-            .map(|network| network.publisher_device_id.as_str())
-            .unwrap_or_default();
-        for remote in remote_networks {
-            let row: Option<RouteApplyRow> = connection
-                .query_row(
-                    "SELECT local_status, control_plane_status, remote_status, last_error,
-                            unixepoch(last_checked_at)
-                     FROM gateway_route_applies
-                     WHERE device_id = ?1 AND network_id = ?2 AND site_link_id = ?3",
-                    rusqlite::params![device_id, remote.id, link_id],
-                    |row| {
-                        Ok((
-                            row.get(0)?,
-                            row.get(1)?,
-                            row.get(2)?,
-                            row.get(3)?,
-                            row.get(4)?,
-                        ))
-                    },
-                )
-                .optional()
-                .map_err(|_| {
-                    ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法读取逐路由状态")
-                })?;
-            let (device_status, control_plane_status, remote_status, error, checked_at) = row
-                .unwrap_or_else(|| {
-                    (
-                        "pending".to_owned(),
-                        "pending".to_owned(),
-                        "pending".to_owned(),
-                        Some("等待设备发布该远端网段".to_owned()),
-                        None,
-                    )
-                });
-            statuses.push(SiteLinkRouteStatus {
-                network_id: remote.id.clone(),
-                router_site_id: router_site_id.to_owned(),
-                destination_site_id: destination_site_id.to_owned(),
-                destination_prefix: remote.prefix.clone(),
-                address_family: remote.address_family.clone(),
-                device_status,
-                control_plane_status,
-                remote_status,
-                error,
-                checked_at,
-            });
-        }
-        Ok(())
-    };
-    append(left_site_id, right_site_id, left_networks, right_networks)?;
-    append(right_site_id, left_site_id, right_networks, left_networks)?;
-    Ok(statuses)
-}
-
-fn site_link_route_confirmation(
-    connection: &Connection,
-    link_id: &str,
-    site_id: &str,
-) -> Result<Option<i64>, ApiError> {
-    connection
-        .query_row(
-            "SELECT unixepoch(confirmed_at) FROM site_link_route_confirmations
-             WHERE site_link_id = ?1 AND site_id = ?2",
-            rusqlite::params![link_id, site_id],
-            |row| row.get(0),
-        )
-        .optional()
-        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "无法读取静态路由确认"))
-}
-
-/// 读取共享网络绑定的网卡名称，用于从能力报告中找到对应的 Agent 地址。
-fn find_network_interface(
-    connection: &Connection,
-    network_id: &str,
-) -> Result<Option<String>, ApiError> {
-    connection
-        .query_row(
-            "SELECT interface_id FROM site_networks WHERE id = ?1",
-            [network_id],
-            |row| row.get(0),
-        )
-        .map_err(|_| ApiError::new(StatusCode::NOT_FOUND, "站点共享网络不存在"))
 }
 
 /// 从最近一次能力报告读取指定网卡和网段对应的 Agent 局域网地址。
@@ -17500,7 +15698,6 @@ fn gateway_network_health(
         input.device_id,
         input.interface_id,
         input.prefix,
-        false,
         input.require_detected_network,
     )?;
     if device_health == GatewayHealthStatus::Failed {
@@ -17518,7 +15715,7 @@ fn gateway_network_health(
                    AND (?2 IS NULL OR interface_id = ?2) AND id IN (
                      SELECT site_network_id FROM gateway_network_states
                      WHERE desired_prefix = ?3)
-                 ) AND site_link_id = '' AND local_status = 'applied'
+                 ) AND local_status = 'applied'
                  AND control_plane_status = 'serving'",
                 rusqlite::params![input.device_id, input.interface_id, input.prefix],
                 |row| row.get(0),
@@ -17540,144 +15737,13 @@ fn gateway_network_health(
     }
 }
 
-/// 计算站点互联的综合健康状态；两侧任一网关异常都会反映到互联状态。
-fn site_link_health(
-    connection: &Connection,
-    link_id: &str,
-    left: (&[SiteLinkNetworkSummary], &str),
-    right: (&[SiteLinkNetworkSummary], &str),
-    enabled: bool,
-    apply_status: ApplyStatus,
-    apply_error: Option<&str>,
-) -> Result<(GatewayHealthStatus, Option<String>), ApiError> {
-    if apply_status == ApplyStatus::Failed {
-        return Ok((
-            GatewayHealthStatus::Failed,
-            Some(apply_error.unwrap_or("站点互联应用失败").to_owned()),
-        ));
-    }
-    // Link 关闭后仍需等待两侧路由撤销 ACK；在此之前继续显示检查中，
-    // 避免 UI 或验收脚本把旧内核路由误认为已经清理。
-    if apply_status == ApplyStatus::Disabled {
-        return Ok((GatewayHealthStatus::Disabled, None));
-    }
-    if enabled && !mesh_application_allowed_with_connection(connection) {
-        return Ok((
-            GatewayHealthStatus::Degraded,
-            Some(mesh_restriction_message().to_owned()),
-        ));
-    }
-    let inspect_side = |networks: &[SiteLinkNetworkSummary]| -> Result<(GatewayHealthStatus, Option<String>), ApiError> {
-        let mut degraded = None;
-        for network in networks {
-            let interface_id = find_network_interface(connection, &network.id)?;
-            let (health, error) = inspect_gateway_device(
-                connection,
-                &network.publisher_device_id,
-                interface_id.as_deref(),
-                &network.prefix,
-                true,
-                network.source == "detected",
-            )?;
-            if health == GatewayHealthStatus::Failed {
-                return Ok((health, error));
-            }
-            if health == GatewayHealthStatus::Degraded && degraded.is_none() {
-                degraded = Some(error);
-            }
-        }
-        Ok(degraded
-            .map(|error| (GatewayHealthStatus::Degraded, error))
-            .unwrap_or((GatewayHealthStatus::Ready, None)))
-    };
-    let (left_health, left_error) = inspect_side(left.0)?;
-    let (right_health, right_error) = inspect_side(right.0)?;
-    if left_health == GatewayHealthStatus::Failed {
-        return Ok((left_health, left_error));
-    }
-    if right_health == GatewayHealthStatus::Failed {
-        return Ok((right_health, right_error));
-    }
-    // 离线是比“尚未加入组网”更直接的可处理原因；先显示离线一侧，
-    // 避免左侧仍在等待组网时遮蔽右侧已经断开的事实。
-    if left_health == GatewayHealthStatus::Degraded
-        && left_error.as_deref() == Some("网关设备当前不在线")
-    {
-        return Ok((left_health, left_error));
-    }
-    if right_health == GatewayHealthStatus::Degraded
-        && right_error.as_deref() == Some("网关设备当前不在线")
-    {
-        return Ok((right_health, right_error));
-    }
-    if left_health == GatewayHealthStatus::Degraded {
-        return Ok((left_health, left_error));
-    }
-    if right_health == GatewayHealthStatus::Degraded {
-        return Ok((right_health, right_error));
-    }
-    if apply_status == ApplyStatus::Ready {
-        let confirmed: i64 = connection
-            .query_row(
-                "SELECT COUNT(*) FROM site_link_route_confirmations
-                 WHERE site_link_id = ?1",
-                [link_id],
-                |row| row.get(0),
-            )
-            .unwrap_or_default();
-        if confirmed < 2 {
-            return Ok((
-                GatewayHealthStatus::Degraded,
-                Some("等待两侧完成静态路由配置确认".to_owned()),
-            ));
-        }
-        let routes_ready = |local: &[SiteLinkNetworkSummary],
-                            remote: &[SiteLinkNetworkSummary]|
-         -> Result<bool, ApiError> {
-            let device_id = local
-                .first()
-                .map(|network| network.publisher_device_id.as_str())
-                .unwrap_or_default();
-            for network in remote {
-                let ready: bool = connection
-                    .query_row(
-                        "SELECT EXISTS(SELECT 1 FROM gateway_route_applies
-                      WHERE device_id = ?1 AND network_id = ?2 AND site_link_id = ?3
-                        AND local_status = 'applied' AND control_plane_status = 'serving'
-                        AND remote_status = 'accepted')",
-                        rusqlite::params![device_id, network.id, link_id],
-                        |row| row.get(0),
-                    )
-                    .unwrap_or(false);
-                if !ready {
-                    return Ok(false);
-                }
-            }
-            Ok(true)
-        };
-        if routes_ready(left.0, right.0)? && routes_ready(right.0, left.0)? {
-            Ok((GatewayHealthStatus::Ready, None))
-        } else {
-            Ok((
-                GatewayHealthStatus::Degraded,
-                Some("等待两侧设备接受远端网络路由".to_owned()),
-            ))
-        }
-    } else {
-        Ok((
-            GatewayHealthStatus::Degraded,
-            Some("等待两侧设备确认站点互联已生效".to_owned()),
-        ))
-    }
-}
-
 /// 检查单台网关设备是否仍具备指定能力和本地网段。
 fn inspect_gateway_device(
     connection: &Connection,
     device_id: &str,
     _interface_id: Option<&str>,
     prefix: &str,
-    site_gateway: bool,
+
     require_detected_network: bool,
 ) -> Result<(GatewayHealthStatus, Option<String>), ApiError> {
     let row = connection
@@ -17741,11 +15807,7 @@ fn inspect_gateway_device(
             "设备网关能力报告格式无效",
         )
     })?;
-    let (capability, reason) = if site_gateway {
-        (report.site_gateway, report.site_gateway_reason)
-    } else {
-        (report.subnet_gateway, report.subnet_gateway_reason)
-    };
+    let (capability, reason) = (report.subnet_gateway, report.subnet_gateway_reason);
     if capability == CapabilityState::Unavailable
         && reason != Some(GatewayCapabilityReason::IpForwardingDisabled)
     {
@@ -17799,57 +15861,18 @@ fn gateway_forwarding_error(report: &GatewayCapabilityReport, prefix: IpNet) -> 
     Some(format!("设备未开启 {family} 转发"))
 }
 
-/// 站点互联两侧选中的共享网络及其网关设备。
-struct LinkNetwork {
-    id: String,
-    prefix: String,
-    device_id: String,
-    interface_id: Option<String>,
-    source: String,
-    address_family: String,
-}
-
-/// 创建或更新 SiteLink 时对单侧网关的校验输入。
+/// 保存共享网段时对承载设备的统一校验输入。
 ///
 /// 设备归属、能力报告和地址族转发必须在同一处复核；调用方只负责把
-/// 站点关系中的网络快照转换为这个结构，避免不同 API 路径出现校验漂移。
+/// 用户选择的网络快照转换为这个结构，避免不同 API 路径出现校验漂移。
 struct GatewayDeviceRequirement<'a> {
     tenant_id: &'a str,
-    site_id: &'a str,
+
     device_id: &'a str,
     interface_id: Option<&'a str>,
     prefix: IpNet,
     require_online: bool,
     require_detected_network: bool,
-}
-
-fn load_network_for_link(
-    connection: &rusqlite::Transaction<'_>,
-    tenant_id: &str,
-    network_id: &str,
-    site_id: &str,
-) -> Result<LinkNetwork, ApiError> {
-    connection
-        .query_row(
-            "SELECT n.id, g.desired_prefix, n.publisher_device_id,
-                    n.interface_id, n.source, n.address_family
-             FROM gateway_network_states g JOIN site_networks n
-             ON n.id = g.site_network_id
-             WHERE g.site_network_id = ?1 AND n.tenant_id = ?2 AND n.site_id = ?3
-             AND n.enabled = 1 AND n.deletion_requested = 0",
-            rusqlite::params![network_id, tenant_id, site_id],
-            |row| {
-                Ok(LinkNetwork {
-                    id: row.get(0)?,
-                    prefix: row.get(1)?,
-                    device_id: row.get(2)?,
-                    interface_id: row.get(3)?,
-                    source: row.get(4)?,
-                    address_family: row.get(5)?,
-                })
-            },
-        )
-        .map_err(|_| ApiError::new(StatusCode::NOT_FOUND, "站点共享网络不存在或不属于指定站点"))
 }
 
 /// 校验网关设备归属、在线状态和 Agent 最近上报的能力报告。
@@ -17860,12 +15883,9 @@ fn ensure_gateway_device(
     let result = connection.query_row(
         "SELECT d.status, d.capabilities_json, r.report_json FROM devices d
          LEFT JOIN device_capability_reports r ON r.device_id = d.id
-         WHERE d.id = ?1 AND d.tenant_id = ?2 AND d.site_id = ?3",
-        rusqlite::params![
-            requirement.device_id,
-            requirement.tenant_id,
-            requirement.site_id
-        ],
+         WHERE d.id = ?1 AND d.tenant_id = ?2
+           AND NOT EXISTS (SELECT 1 FROM tailscale_device_metadata m WHERE m.device_id = d.id)",
+        rusqlite::params![requirement.device_id, requirement.tenant_id,],
         |row| {
             Ok((
                 row.get::<_, String>(0)?,
@@ -17875,11 +15895,11 @@ fn ensure_gateway_device(
         },
     );
     let (status, capabilities_json, report_json) = result
-        .map_err(|_| ApiError::new(StatusCode::NOT_FOUND, "网关设备不存在或不属于指定站点"))?;
+        .map_err(|_| ApiError::new(StatusCode::NOT_FOUND, "Agent 不存在或不属于当前工作空间"))?;
     if requirement.require_online && status != "online" {
         return Err(ApiError::new(
             StatusCode::CONFLICT,
-            "网关设备当前不在线，暂时无法建立站点互联",
+            "设备当前不在线，请等待上线后重试",
         ));
     }
     let capabilities: Vec<DeviceCapability> =
@@ -17889,11 +15909,7 @@ fn ensure_gateway_device(
                 "设备能力声明无效，请让 Agent 重新连接",
             )
         })?;
-    let required_capability = if requirement.require_online {
-        DeviceCapability::SiteGateway
-    } else {
-        DeviceCapability::SubnetGateway
-    };
+    let required_capability = DeviceCapability::SubnetGateway;
     if !capabilities.contains(&required_capability) {
         return Err(ApiError::new(
             StatusCode::CONFLICT,
@@ -17918,15 +15934,6 @@ fn ensure_gateway_device(
         return Err(ApiError::new(
             StatusCode::CONFLICT,
             gateway_capability_message(report.subnet_gateway_reason),
-        ));
-    }
-    if requirement.require_online
-        && report.site_gateway != CapabilityState::Ready
-        && report.site_gateway_reason != Some(GatewayCapabilityReason::IpForwardingDisabled)
-    {
-        return Err(ApiError::new(
-            StatusCode::CONFLICT,
-            gateway_capability_message(report.site_gateway_reason),
         ));
     }
     if requirement.require_detected_network
@@ -18279,7 +16286,7 @@ mod tests {
             Path("tenant-one-device".to_owned()),
             Json(UpdateDeviceRequest {
                 name: "不应修改".to_owned(),
-                site_id: None,
+                mesh_name: None,
             }),
         )
         .await
@@ -18456,7 +16463,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn external_localhost_node_requires_a_real_name_before_claim() {
+    async fn external_localhost_node_is_claimed_and_gets_short_mesh_name() {
         let headscale = Arc::new(OfficialClientHeadscale {
             nodes: Mutex::new(vec![HeadscaleNode {
                 id: "external-localhost".to_owned(),
@@ -18473,30 +16480,21 @@ mod tests {
             .expect("管理员应能读取 localhost 节点")
             .0;
         assert!(nodes[0].needs_name);
-        let rejected = claim_tailscale_external_node(
+        let claimed = claim_tailscale_external_node(
             State(state.clone()),
             admin_headers(),
             Path("external-localhost".to_owned()),
             None,
         )
         .await
-        .expect_err("localhost 节点必须先命名");
-        assert_eq!(rejected.status, StatusCode::BAD_REQUEST);
-        let claimed = claim_tailscale_external_node(
-            State(state),
-            admin_headers(),
-            Path("external-localhost".to_owned()),
-            Some(Json(ClaimTailscaleNodeRequest {
-                name: Some("我的 iPhone".to_owned()),
-            })),
-        )
-        .await
-        .expect("填写名称后应能认领")
+        .expect("管理员确认归属不应要求用户先手动重命名")
         .0;
-        assert_eq!(claimed.name, "我的 iPhone");
-        assert_ne!(
+        assert_eq!(claimed.name, "localhost");
+        assert_eq!(claimed.mesh_name.as_deref(), Some("client"));
+        assert_eq!(claimed.active_mesh_name.as_deref(), Some("client"));
+        assert_eq!(
             headscale.nodes.lock().expect("应读取认领后的节点名称")[0].name,
-            "localhost"
+            "client"
         );
     }
 
@@ -19358,8 +17356,116 @@ mod tests {
         assert_eq!(retained, 1);
     }
 
+    #[test]
+    fn device_network_migration_preserves_subnets_and_removes_only_site_link_state() {
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch(V012_BASELINE_MIGRATION).unwrap();
+        apply_oidc_accounts_migration(&db).unwrap();
+        apply_route_confirmations_migration(&db).unwrap();
+        apply_mesh_connections_migration(&db).unwrap();
+        db.execute_batch(r#"
+            INSERT INTO tenants (id,name) VALUES ('migration-tenant','家庭');
+            INSERT INTO sites (id,tenant_id,name) VALUES ('a','migration-tenant','甲'),('b','migration-tenant','乙');
+            INSERT INTO devices (id,tenant_id,site_id,name,capabilities_json)
+                VALUES ('agent','migration-tenant','a','原设备','["mesh","subnet_gateway","site_gateway"]');
+            INSERT INTO mesh_identities (nexo_device_id,tenant_id,headscale_node_id,state)
+                VALUES ('agent','migration-tenant','unchanged-node','ready');
+            INSERT INTO site_networks (id,tenant_id,site_id,name,publisher_device_id,address_family,source)
+                VALUES ('lan','migration-tenant','a','原网段','agent','ipv4','manual');
+            INSERT INTO gateway_network_states (site_network_id,desired_prefix,desired_revision,apply_status)
+                VALUES ('lan','10.1.0.0/24',7,'ready');
+            INSERT INTO subnet_access (id,tenant_id,site_network_id) VALUES ('access','migration-tenant','lan');
+            INSERT INTO site_links (id,tenant_id,left_site_id,right_site_id) VALUES ('link','migration-tenant','a','b');
+            INSERT INTO site_link_networks (site_link_id,site_network_id,side) VALUES ('link','lan','left');
+            INSERT INTO site_link_route_confirmations (site_link_id,site_id,confirmed_at) VALUES ('link','a',CURRENT_TIMESTAMP);
+            INSERT INTO gateway_route_applies (device_id,network_id,site_link_id,desired_revision,local_status)
+                VALUES ('agent','lan','',7,'applied'),('agent','lan','link',7,'applied');
+            INSERT INTO public_domains (id,tenant_id,domain,secret_dir) VALUES ('domain','migration-tenant','example.com','test-domain');
+            INSERT INTO tunnels (id,tenant_id,device_id,name,protocol,local_address,local_port,public_domain_id)
+                VALUES ('web','migration-tenant','agent','原服务','https','127.0.0.1',8800,'domain');
+        "#).unwrap();
+        apply_device_networks_migration(&db).unwrap();
+        apply_device_networks_migration(&db).unwrap();
+        assert_eq!(db.query_row("SELECT COUNT(*) FROM sqlite_master WHERE name IN ('sites','site_links','site_link_networks','site_link_route_confirmations')",[],|row|row.get::<_,i64>(0)).unwrap(),0);
+        let identity: (String,String,i64) = db.query_row("SELECT m.headscale_node_id,d.capabilities_json,g.desired_revision FROM devices d JOIN mesh_identities m ON m.nexo_device_id=d.id JOIN gateway_network_states g ON g.site_network_id='lan' WHERE d.id='agent'",[],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?))).unwrap();
+        assert_eq!(identity.0, "unchanged-node");
+        assert_eq!(identity.1, r#"["mesh","subnet_gateway"]"#);
+        assert_eq!(identity.2, 8, "重复执行迁移不能再次增加 revision");
+        assert_eq!(
+            db.query_row(
+                "SELECT COUNT(*) FROM gateway_route_applies WHERE local_status='pending'",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+            1
+        );
+        assert_eq!(db.query_row("SELECT COUNT(*) FROM tunnels t JOIN public_domains p ON p.id=t.public_domain_id WHERE t.id='web' AND t.device_id='agent'",[],|row|row.get::<_,i64>(0)).unwrap(),1);
+        assert_eq!(
+            db.query_row(
+                "SELECT COUNT(*) FROM subnet_access WHERE site_network_id='lan'",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+            1
+        );
+        assert_eq!(
+            db.query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap(),
+            0
+        );
+    }
+
     fn test_state() -> AppState {
         test_state_with_headscale(Arc::new(HeadscaleAdapter))
+    }
+
+    #[test]
+    fn subnet_deletion_waits_for_matching_local_and_control_withdrawal() {
+        let state = test_state();
+        let mut db = state.db.lock().unwrap();
+        db.execute_batch("INSERT INTO devices (id,tenant_id,name) VALUES ('delete-agent','tenant-1','待删除网关');
+            INSERT INTO site_networks (id,tenant_id,name,publisher_device_id,address_family,source,enabled,deletion_requested)
+                VALUES ('delete-lan','tenant-1','原网段','delete-agent','ipv4','manual',0,1);
+            INSERT INTO gateway_network_states (site_network_id,desired_prefix,desired_revision)
+                VALUES ('delete-lan','10.9.0.0/24',5);
+            INSERT INTO subnet_access (id,tenant_id,site_network_id) VALUES ('delete-access','tenant-1','delete-lan');
+            INSERT INTO gateway_route_applies (device_id,network_id,desired_revision,local_status,control_plane_status)
+                VALUES ('delete-agent','delete-lan',4,'disabled','disabled');").unwrap();
+        for (revision, local, control, remains) in [
+            (4, "disabled", "disabled", 1),
+            (5, "pending", "disabled", 1),
+            (5, "disabled", "pending", 1),
+            (5, "disabled", "disabled", 0),
+        ] {
+            let tx = db.transaction().unwrap();
+            tx.execute("UPDATE gateway_route_applies SET desired_revision=?1,local_status=?2,control_plane_status=?3",
+                rusqlite::params![revision,local,control]).unwrap();
+            refresh_network_deletions(&tx).unwrap();
+            assert_eq!(
+                tx.query_row("SELECT COUNT(*) FROM site_networks", [], |row| row
+                    .get::<_, i64>(0))
+                    .unwrap(),
+                remains
+            );
+            tx.commit().unwrap();
+        }
+        assert_eq!(
+            db.query_row("SELECT COUNT(*) FROM subnet_access", [], |row| row
+                .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        let desired = load_gateway_desired_state_with_mesh_allowed(&db, "delete-agent", true)
+            .unwrap()
+            .unwrap();
+        assert!(
+            desired.routes.is_empty(),
+            "最后一个网段删除后仍应下发完整空配置"
+        );
     }
 
     fn test_state_with_headscale(headscale: Arc<dyn HeadscaleControlPlane>) -> AppState {
@@ -19370,6 +17476,9 @@ mod tests {
         apply_oidc_accounts_migration(&connection).expect("应初始化 OIDC 账号映射结构");
         apply_route_confirmations_migration(&connection).expect("应初始化路由确认迁移");
         apply_mesh_connections_migration(&connection).expect("应初始化连接观测迁移");
+        apply_device_networks_migration(&connection).expect("应初始化设备子网迁移");
+        apply_mesh_names_migration(&connection).expect("应初始化设备访问名称迁移");
+        ensure_mesh_name_values(&connection).expect("应初始化测试设备访问名称");
         ensure_server_ca(&connection).expect("应初始化测试 CA");
         ensure_server_control_identity(&connection).expect("应初始化测试控制证书");
         connection
@@ -19487,111 +17596,153 @@ mod tests {
             .expect("应创建批量 Tunnel 测试夹具");
     }
 
-    fn insert_gateway_deletion_fixture(state: &AppState) {
-        state
-            .db
-            .lock()
-            .expect("数据库锁应可用")
-            .execute_batch(
-                "INSERT INTO sites (id, tenant_id, name) VALUES
-                    ('site-a', 'tenant-1', '家庭'),
-                    ('site-b', 'tenant-1', '办公室');
-                 INSERT INTO devices
-                    (id, tenant_id, site_id, name, status, capabilities_json)
-                    VALUES
-                    ('device-a', 'tenant-1', 'site-a', '家庭网关', 'online',
-                     '[\"subnet_gateway\",\"site_gateway\"]'),
-                    ('device-b', 'tenant-1', 'site-b', '办公室网关', 'online',
-                     '[\"subnet_gateway\",\"site_gateway\"]');
-                 INSERT INTO site_networks
-                    (id, tenant_id, site_id, name, publisher_device_id, interface_id,
-                     address_family, current_prefix)
-                    VALUES
-                    ('network-a', 'tenant-1', 'site-a', '家庭 LAN', 'device-a', 'eth0',
-                     'ipv4', '192.168.10.0/24'),
-                    ('network-b', 'tenant-1', 'site-b', '办公室 LAN', 'device-b', 'eth0',
-                     'ipv4', '192.168.20.0/24');
-                 INSERT INTO gateway_network_states
-                    (site_network_id, desired_prefix, desired_revision, apply_status)
-                    VALUES
-                    ('network-a', '192.168.10.0/24', 4, 'ready'),
-                    ('network-b', '192.168.20.0/24', 4, 'ready');
-                 INSERT INTO site_links
-                    (id, tenant_id, left_site_id, right_site_id, apply_revision, apply_status)
-                    VALUES ('link-a-b', 'tenant-1', 'site-a', 'site-b', 4, 'ready');
-                 INSERT INTO site_link_networks (site_link_id, site_network_id, side)
-                    VALUES ('link-a-b', 'network-a', 'left'),
-                           ('link-a-b', 'network-b', 'right');",
-            )
-            .expect("应创建网络资源删除测试数据");
-    }
-
-    fn finalize_resource_deletions_for_test(state: &AppState) {
-        let connection = state.db.lock().expect("数据库锁应可用");
-        let transaction = connection
-            .unchecked_transaction()
-            .expect("应开始删除收敛事务");
-        finalize_requested_resource_deletions(&transaction).expect("删除状态应能收敛");
-        transaction.commit().expect("应提交删除收敛事务");
+    #[test]
+    fn mesh_name_normalization_is_short_ascii_and_rejects_reserved_values() {
+        assert_eq!(
+            normalize_mesh_name("  Home-NAS-01  "),
+            Ok("home-nas-01".to_owned())
+        );
+        assert_eq!(
+            normalize_mesh_name("NAS_01").unwrap_err(),
+            "组网访问名只能使用字母、数字和连字符"
+        );
+        assert_eq!(
+            normalize_mesh_name("-nas").unwrap_err(),
+            "组网访问名不能以连字符开头或结尾"
+        );
+        assert_eq!(
+            normalize_mesh_name(&"n".repeat(MAX_MESH_NAME_LENGTH + 1)).unwrap_err(),
+            "组网访问名不能超过 32 个字符"
+        );
+        assert!(normalize_mesh_name("localhost").is_err());
+        assert!(normalize_mesh_name("LOCALHOST-2").is_err());
+        assert!(normalize_mesh_name("localhost-office").is_ok());
     }
 
     #[test]
-    fn mesh_hostname_is_dns_safe_stable_and_unique_for_same_names() {
-        let chinese = mesh_hostname(
-            "default",
-            "家庭网关",
-            "550e8400-e29b-41d4-a716-446655440000",
-        );
-        assert_eq!(chinese, "default-device-550e8400e29b41d4a716446655440000");
-        assert_eq!(
-            chinese,
-            mesh_hostname(
-                "default",
-                "家庭网关",
-                "550e8400-e29b-41d4-a716-446655440000"
+    fn mesh_name_unique_constraint_maps_to_stable_conflict() {
+        let connection = Connection::open_in_memory().expect("应打开内存数据库");
+        connection
+            .execute_batch(
+                "CREATE TABLE devices (id TEXT PRIMARY KEY, mesh_name TEXT);
+                 CREATE UNIQUE INDEX idx_devices_mesh_name_ci
+                    ON devices (LOWER(mesh_name));
+                 INSERT INTO devices (id, mesh_name) VALUES ('first', 'nas');",
             )
-        );
+            .expect("应创建访问名唯一索引");
+        let error = connection
+            .execute(
+                "INSERT INTO devices (id, mesh_name) VALUES ('second', 'NAS')",
+                [],
+            )
+            .expect_err("大小写冲突应触发 SQLite 唯一约束");
+        let mapped = device_update_database_error(error, "设备编辑失败");
+        assert_eq!(mapped.status, StatusCode::CONFLICT);
+        assert_eq!(mapped.code.as_deref(), Some("mesh_name_conflict"));
+    }
 
-        let first = mesh_hostname(
-            "Tenant One",
-            "Home NAS",
-            "00000000-0000-0000-0000-000000000001",
-        );
-        let second = mesh_hostname(
-            "Tenant One",
-            "Home NAS",
-            "00000000-0000-0000-0000-000000000002",
-        );
+    #[test]
+    fn mesh_name_base_uses_ascii_words_and_device_type_fallbacks() {
+        assert_eq!(mesh_name_base("家庭 NAS", false, None), "nas");
+        assert_eq!(mesh_name_base("家庭网关", false, None), "agent");
+        assert_eq!(mesh_name_base("纯中文手机", true, Some("ios")), "client");
+        assert_eq!(mesh_name_base("localhost", true, Some("android")), "client");
+        assert_eq!(mesh_name_base("localhost", true, Some("unknown")), "client");
+    }
+
+    #[test]
+    fn mesh_name_allocator_avoids_global_conflicts_with_stable_suffixes() {
+        let connection = Connection::open_in_memory().expect("应打开内存数据库");
+        connection
+            .execute_batch(V012_BASELINE_MIGRATION)
+            .expect("应初始化测试数据库");
+        apply_oidc_accounts_migration(&connection).expect("应初始化 OIDC 迁移");
+        apply_route_confirmations_migration(&connection).expect("应初始化路由确认迁移");
+        apply_mesh_connections_migration(&connection).expect("应初始化连接观测迁移");
+        apply_device_networks_migration(&connection).expect("应初始化设备网络迁移");
+        apply_mesh_names_migration(&connection).expect("应初始化名称迁移");
+        connection
+            .execute_batch(
+                "INSERT INTO tenants (id, name) VALUES ('mesh-tenant', '名称测试');
+                 INSERT INTO devices (id, tenant_id, name, mesh_name, status)
+                 VALUES ('device-nas', 'mesh-tenant', '家庭 NAS', 'nas', 'online'),
+                        ('device-external', 'mesh-tenant', '外部设备', NULL, 'online');
+                 INSERT INTO mesh_identities
+                    (nexo_device_id, tenant_id, headscale_node_id, hostname)
+                 VALUES ('device-external', 'mesh-tenant', 'node-external', 'nas-2');
+                 INSERT INTO tailscale_external_nodes
+                    (node_id, node_name, node_json, discovered_at, last_seen_at)
+                 VALUES ('node-isolated', 'nas-3', '{}', 1, 1);",
+            )
+            .expect("应创建名称冲突夹具");
+        let transaction = connection
+            .unchecked_transaction()
+            .expect("应开始名称分配事务");
         assert_eq!(
-            first,
-            "tenant-one-home-nas-00000000000000000000000000000001"
+            allocate_mesh_name(&transaction, "NAS", false, None, None).expect("应跳过所有全局冲突"),
+            "nas-4"
         );
-        assert_ne!(first, second);
-        for hostname in [first, second] {
-            assert!(hostname.len() <= 63);
-            assert!(hostname
-                .chars()
-                .all(|character| character.is_ascii_lowercase()
-                    || character.is_ascii_digit()
-                    || character == '-'));
-            assert!(hostname.chars().next().is_some_and(|character| character
-                .is_ascii_lowercase()
-                || character.is_ascii_digit()));
-            assert!(hostname.chars().last().is_some_and(|character| character
-                .is_ascii_lowercase()
-                || character.is_ascii_digit()));
-        }
+        transaction.commit().expect("应提交名称分配事务");
+    }
 
-        let empty = mesh_hostname("", "!@#", "");
-        assert_eq!(empty, "tenant-device-node");
-
-        let long = mesh_hostname(
-            &"Tenant".repeat(30),
-            &"Display Name".repeat(30),
-            "550e8400-e29b-41d4-a716-446655440000",
+    #[test]
+    fn mesh_name_migration_is_idempotent_and_preserves_identity_and_addresses() {
+        let connection = Connection::open_in_memory().expect("应打开内存数据库");
+        connection
+            .execute_batch(V012_BASELINE_MIGRATION)
+            .expect("应初始化测试数据库");
+        apply_oidc_accounts_migration(&connection).expect("应初始化 OIDC 迁移");
+        apply_route_confirmations_migration(&connection).expect("应初始化路由确认迁移");
+        apply_mesh_connections_migration(&connection).expect("应初始化连接观测迁移");
+        apply_device_networks_migration(&connection).expect("应初始化设备网络迁移");
+        connection
+            .execute_batch(
+                "INSERT INTO tenants (id, name) VALUES ('migration-mesh', '名称迁移');
+                 INSERT INTO devices (id, tenant_id, name, status)
+                 VALUES ('device-b', 'migration-mesh', 'Home NAS', 'online'),
+                        ('device-a', 'migration-mesh', 'Home NAS', 'online');
+                 INSERT INTO mesh_identities
+                    (nexo_device_id, tenant_id, headscale_node_id, hostname,
+                     tailscale_ipv4, online)
+                 VALUES ('device-a', 'migration-mesh', 'node-a', 'old-a', '100.64.0.11', 1),
+                        ('device-b', 'migration-mesh', 'node-b', 'old-b', '100.64.0.12', 1);",
+            )
+            .expect("应创建历史设备夹具");
+        apply_mesh_names_migration(&connection).expect("应执行名称迁移");
+        ensure_mesh_name_values(&connection).expect("应分配历史设备名称");
+        let first: Vec<(String, String, String, String)> = connection
+            .prepare(
+                "SELECT d.id, d.mesh_name, m.hostname, m.tailscale_ipv4
+                 FROM devices d JOIN mesh_identities m ON m.nexo_device_id = d.id
+                 ORDER BY d.created_at ASC, d.id ASC",
+            )
+            .expect("应准备历史设备查询")
+            .query_map([], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            })
+            .expect("应读取历史设备")
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .expect("历史设备结果应有效");
+        assert_eq!(first[0].0, "device-a");
+        assert_eq!(first[0].1, "home-nas");
+        assert_eq!(first[1].1, "home-nas-2");
+        assert_eq!(first[0].2, "old-a");
+        assert_eq!(first[0].3, "100.64.0.11");
+        ensure_mesh_name_values(&connection).expect("重复启动应保持幂等");
+        let second: Vec<(String, String)> = connection
+            .prepare("SELECT id, mesh_name FROM devices ORDER BY id")
+            .expect("应准备名称查询")
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .expect("应读取名称")
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .expect("名称结果应有效");
+        assert_eq!(
+            second,
+            vec![
+                ("device-a".to_owned(), "home-nas".to_owned()),
+                ("device-b".to_owned(), "home-nas-2".to_owned())
+            ]
         );
-        assert!(long.len() <= 63);
-        assert!(long.ends_with("-550e8400e29b41d4a716446655440000"));
     }
 
     #[test]
@@ -19695,6 +17846,8 @@ mod tests {
     #[test]
     fn client_config_does_not_publish_a_fixed_registration_url() {
         let response = TailscaleClientConfigResponse {
+            magic_dns_enabled: true,
+            dns_base_domain: "mesh.nexo.internal".to_owned(),
             login_server: "https://mesh.example.com".to_owned(),
             browser_authorization_url: None,
             supported_platforms: Vec::new(),
@@ -19867,16 +18020,10 @@ mod tests {
             let connection = state.db.lock().expect("数据库锁应可用");
             connection
                 .execute_batch(
-                    "INSERT INTO sites (id, tenant_id, name) VALUES
-                         ('site-a', 'tenant-1', '甲站点'),
-                         ('site-b', 'tenant-1', '乙站点');
+                    "
                      INSERT INTO devices (id, tenant_id, name, last_seen_at)
                          VALUES ('device-time', 'tenant-1', '时间测试设备', '2030-01-01 00:00:00');
-                     INSERT INTO site_links (id, tenant_id, left_site_id, right_site_id)
-                         VALUES ('link-time', 'tenant-1', 'site-a', 'site-b');
-                     INSERT INTO site_link_route_confirmations
-                         (site_link_id, site_id, confirmed_at)
-                         VALUES ('link-time', 'site-a', '2030-01-01 00:00:00');",
+                     ",
                 )
                 .expect("应创建 API 时间测试数据");
         }
@@ -19890,15 +18037,6 @@ mod tests {
             .find(|device| device.id == "device-time")
             .expect("应返回时间测试设备");
         assert_eq!(device.last_seen_at, Some(1_893_456_000));
-        assert_eq!(
-            site_link_route_confirmation(
-                &state.db.lock().expect("数据库锁应可用"),
-                "link-time",
-                "site-a",
-            )
-            .expect("应读取静态路由确认时间"),
-            Some(1_893_456_000)
-        );
     }
 
     #[test]
@@ -20361,86 +18499,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn site_deletion_enforces_tenant_scope_and_reports_all_dependencies() {
-        let state = test_state();
-        insert_gateway_deletion_fixture(&state);
-        state
-            .db
-            .lock()
-            .expect("数据库锁应可用")
-            .execute_batch(
-                "INSERT INTO tenants (id, name) VALUES ('tenant-2', '其他租户');
-                 INSERT INTO sites (id, tenant_id, name)
-                    VALUES ('site-other', 'tenant-2', '其他租户站点');",
-            )
-            .expect("应创建其他租户站点");
-
-        let hidden = delete_site(
-            State(state.clone()),
-            admin_headers(),
-            Path("site-other".to_owned()),
-        )
-        .await
-        .expect_err("当前租户不应删除其他租户站点");
-        assert_eq!(hidden.status, StatusCode::NOT_FOUND);
-
-        let dependency = delete_site(
-            State(state.clone()),
-            admin_headers(),
-            Path("site-a".to_owned()),
-        )
-        .await
-        .expect_err("仍有业务依赖的站点不应删除");
-        assert_eq!(dependency.status, StatusCode::CONFLICT);
-        assert!(dependency.message.contains("1 台设备"));
-        assert!(dependency.message.contains("1 个共享网络"));
-        assert!(dependency.message.contains("1 个互联关系"));
-    }
-
-    #[tokio::test]
-    async fn empty_site_deletion_revokes_unfinished_enrollments() {
-        let state = test_state();
-        state
-            .db
-            .lock()
-            .expect("数据库锁应可用")
-            .execute_batch(
-                "INSERT INTO sites (id, tenant_id, name)
-                    VALUES ('site-empty', 'tenant-1', '空站点');
-                 INSERT INTO pending_enrollments
-                    (id, tenant_id, site_id, token_digest, status, expires_at)
-                    VALUES ('enrollment-empty', 'tenant-1', 'site-empty',
-                            'empty-token-digest', 'pending', 1893456000);",
-            )
-            .expect("应创建空站点与未完成入网请求");
-
-        let response = delete_site(
-            State(state.clone()),
-            admin_headers(),
-            Path("site-empty".to_owned()),
-        )
-        .await
-        .expect("空站点应可删除")
-        .0;
-        assert!(response.deleted);
-        assert!(!response.pending);
-        let remaining: (i64, i64) = state
-            .db
-            .lock()
-            .expect("数据库锁应可用")
-            .query_row(
-                "SELECT
-                    (SELECT COUNT(*) FROM sites WHERE id = 'site-empty'),
-                    (SELECT COUNT(*) FROM pending_enrollments
-                     WHERE id = 'enrollment-empty')",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .expect("应检查站点和入网请求已清理");
-        assert_eq!(remaining, (0, 0));
-    }
-
-    #[tokio::test]
     async fn online_device_deletion_revokes_headscale_and_local_identity_state() {
         let headscale = Arc::new(DeletionHeadscale::default());
         let state = test_state_with_headscale(headscale.clone());
@@ -20449,11 +18507,8 @@ mod tests {
             .lock()
             .expect("数据库锁应可用")
             .execute_batch(
-                "INSERT INTO sites (id, tenant_id, name)
-                    VALUES ('site-device', 'tenant-1', '设备站点');
-                 INSERT INTO devices
-                    (id, tenant_id, site_id, name, status, capabilities_json)
-                    VALUES ('device-delete', 'tenant-1', 'site-device', '在线设备',
+                "
+                 INSERT INTO devices (id, tenant_id, name, status, capabilities_json) VALUES ('device-delete', 'tenant-1', '在线设备',
                             'online', '[\"tunnel\"]');
                  INSERT INTO device_identities
                     (device_id, certificate_pem, certificate_fingerprint, expires_at)
@@ -20666,45 +18721,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn active_site_gateway_still_blocks_device_deletion() {
-        let state = test_state();
-        state
-            .db
-            .lock()
-            .expect("数据库锁应可用")
-            .execute_batch(
-                "INSERT INTO sites (id, tenant_id, name, active_site_gateway_device_id)
-                    VALUES ('gateway-site', 'tenant-1', '网关站点', 'gateway-device');
-                 INSERT INTO devices (id, tenant_id, site_id, name, status)
-                    VALUES ('gateway-device', 'tenant-1', 'gateway-site', '活动网关', 'online');",
-            )
-            .expect("应创建活动站点网关夹具");
-        let error = delete_device(
-            State(state.clone()),
-            admin_headers(),
-            Path("gateway-device".to_owned()),
-        )
-        .await
-        .expect_err("活动站点网关仍应阻止设备删除");
-        assert_eq!(error.status, StatusCode::CONFLICT);
-        assert!(error.message.contains("1 个活动站点网关"));
-        let remains: (i64, Option<String>) = state
-            .db
-            .lock()
-            .expect("数据库锁应可用")
-            .query_row(
-                "SELECT
-                    (SELECT COUNT(*) FROM devices WHERE id = 'gateway-device'),
-                    (SELECT active_site_gateway_device_id FROM sites WHERE id = 'gateway-site')",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .expect("应检查活动网关依赖未改变");
-        assert_eq!(remains, (1, Some("gateway-device".to_owned())));
-    }
-
-    #[tokio::test]
-    async fn device_edit_renames_headscale_and_rolls_back_on_failure() {
+    async fn device_edit_keeps_display_name_independent_and_retries_mesh_name() {
         let headscale = Arc::new(DeletionHeadscale::default());
         let state = test_state_with_headscale(headscale.clone());
         state
@@ -20712,9 +18729,8 @@ mod tests {
             .lock()
             .expect("数据库锁应可用")
             .execute_batch(
-                "INSERT INTO sites (id, tenant_id, name) VALUES ('edit-site', 'tenant-1', '编辑站点');
-                 INSERT INTO devices (id, tenant_id, site_id, name, status)
-                    VALUES ('edit-device', 'tenant-1', 'edit-site', '旧名称', 'online');
+                "
+                 INSERT INTO devices (id, tenant_id, name, status) VALUES ('edit-device', 'tenant-1', '旧名称', 'online');
                  INSERT INTO mesh_identities
                     (nexo_device_id, tenant_id, headscale_node_id, state, hostname)
                     VALUES ('edit-device', 'tenant-1', 'edit-node', 'ready', 'old-host');",
@@ -20726,45 +18742,72 @@ mod tests {
             Path("edit-device".to_owned()),
             Json(UpdateDeviceRequest {
                 name: "新名称".to_owned(),
-                site_id: Some("edit-site".to_owned()),
+                mesh_name: Some("nas".to_owned()),
             }),
         )
         .await
-        .expect("设备改名应成功")
+        .expect("设备显示名和访问名应保存")
         .0;
         assert_eq!(updated.name, "新名称");
-        let expected_hostname = mesh_hostname("tenant-1", "新名称", "edit-device");
+        assert_eq!(updated.mesh_name.as_deref(), Some("nas"));
+        assert_eq!(updated.active_mesh_name.as_deref(), Some("nas"));
+        assert_eq!(updated.mesh_name_status, "ready");
         assert_eq!(
             *headscale
                 .renamed_nodes
                 .lock()
                 .expect("应读取 Headscale 改名记录"),
-            vec![("edit-node".to_owned(), expected_hostname.clone())]
+            vec![("edit-node".to_owned(), "nas".to_owned())]
         );
-        let local: (String, String) = state
+        let local: (String, String, String) = state
             .db
             .lock()
             .expect("数据库锁应可用")
             .query_row(
-                "SELECT d.name, m.hostname FROM devices d
+                "SELECT d.name, d.mesh_name, m.hostname FROM devices d
                  JOIN mesh_identities m ON m.nexo_device_id = d.id
                  WHERE d.id = 'edit-device'",
                 [],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .expect("应读取改名后的本地资料");
-        assert_eq!(local, ("新名称".to_owned(), expected_hostname));
+        assert_eq!(
+            local,
+            ("新名称".to_owned(), "nas".to_owned(), "nas".to_owned())
+        );
+
+        state
+            .db
+            .lock()
+            .expect("数据库锁应可用")
+            .execute(
+                "INSERT INTO devices (id, tenant_id, name, mesh_name, status)
+                 VALUES ('mesh-name-conflict', 'tenant-1', '冲突设备', 'reserved', 'online')",
+                [],
+            )
+            .expect("应创建访问名冲突夹具");
+        let conflict = update_device(
+            State(state.clone()),
+            admin_headers(),
+            Path("edit-device".to_owned()),
+            Json(UpdateDeviceRequest {
+                name: "不应改名".to_owned(),
+                mesh_name: Some("RESERVED".to_owned()),
+            }),
+        )
+        .await
+        .expect_err("访问名大小写冲突应被拒绝");
+        assert_eq!(conflict.status, StatusCode::CONFLICT);
+        assert_eq!(conflict.code.as_deref(), Some("mesh_name_conflict"));
 
         state
             .db
             .lock()
             .expect("数据库锁应可用")
             .execute_batch(
-                "INSERT INTO sites (id, tenant_id, name) VALUES ('blocked-site', 'tenant-1', '依赖站点');
-                 INSERT INTO site_networks
-                    (id, tenant_id, site_id, name, publisher_device_id, interface_id,
-                     address_family, current_prefix)
-                    VALUES ('edit-network', 'tenant-1', 'edit-site', '编辑网络',
+                "
+                 INSERT INTO site_networks (id, tenant_id, name, publisher_device_id, interface_id,
+                     address_family, current_prefix) VALUES ('edit-network', 'tenant-1', '编辑网络',
                             'edit-device', 'eth0', 'ipv4', '192.168.50.0/24');",
             )
             .expect("应创建跨站点依赖夹具");
@@ -20774,13 +18817,22 @@ mod tests {
             Path("edit-device".to_owned()),
             Json(UpdateDeviceRequest {
                 name: "再次改名".to_owned(),
-                site_id: Some("blocked-site".to_owned()),
+                mesh_name: None,
             }),
         )
         .await
-        .expect_err("承载共享网络的设备不得跨站点移动");
-        assert_eq!(dependency.status, StatusCode::CONFLICT);
-        assert!(dependency.message.contains("共享网络"));
+        .expect("承载共享网段的设备仍可修改名称");
+        assert_eq!(dependency.0.name, "再次改名");
+        assert_eq!(dependency.0.mesh_name.as_deref(), Some("nas"));
+        assert_eq!(
+            headscale
+                .renamed_nodes
+                .lock()
+                .expect("应读取独立访问名改名记录")
+                .len(),
+            1,
+            "只修改显示名时不得再次重命名 Headscale 节点"
+        );
 
         let failing_headscale = Arc::new(DeletionHeadscale {
             fail_node_rename: true,
@@ -20800,29 +18852,49 @@ mod tests {
                             'ready', 'old-host');",
             )
             .expect("应创建改名失败夹具");
-        let rename_error = update_device(
+        let rename_response = update_device(
             State(failing_state.clone()),
             admin_headers(),
             Path("rename-failure-device".to_owned()),
             Json(UpdateDeviceRequest {
                 name: "不应落库".to_owned(),
-                site_id: None,
+                mesh_name: Some("new-name".to_owned()),
             }),
         )
         .await
-        .expect_err("Headscale 改名失败时设备资料不得修改");
-        assert_eq!(rename_error.status, StatusCode::BAD_GATEWAY);
-        let unchanged_name: String = failing_state
+        .expect("Headscale 暂不可用时仍应保存期望访问名");
+        assert_eq!(rename_response.0.name, "不应落库");
+        assert_eq!(rename_response.0.mesh_name.as_deref(), Some("new-name"));
+        assert_eq!(
+            rename_response.0.active_mesh_name.as_deref(),
+            Some("old-host")
+        );
+        assert_eq!(
+            rename_response.0.mesh_fqdn.as_deref(),
+            Some("old-host.mesh.nexo.internal")
+        );
+        assert_eq!(rename_response.0.mesh_name_status, "applying");
+        let pending_name: (String, String, String) = failing_state
             .db
             .lock()
             .expect("数据库锁应可用")
             .query_row(
-                "SELECT name FROM devices WHERE id = 'rename-failure-device'",
+                "SELECT name, mesh_name,
+                        (SELECT hostname FROM mesh_identities
+                         WHERE nexo_device_id = 'rename-failure-device')
+                 FROM devices WHERE id = 'rename-failure-device'",
                 [],
-                |row| row.get(0),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .expect("应检查改名失败后的本地资料");
-        assert_eq!(unchanged_name, "保持旧名");
+        assert_eq!(
+            pending_name,
+            (
+                "不应落库".to_owned(),
+                "new-name".to_owned(),
+                "old-host".to_owned()
+            )
+        );
     }
 
     #[tokio::test]
@@ -20870,212 +18942,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn network_deletion_obeys_order_and_waits_for_exact_revision() {
-        let state = test_state();
-        insert_gateway_deletion_fixture(&state);
-
-        let device_dependency = delete_device(
-            State(state.clone()),
-            admin_headers(),
-            Path("device-a".to_owned()),
-        )
-        .await
-        .expect_err("共享网络仍存在时不得删除发布设备");
-        assert_eq!(device_dependency.status, StatusCode::CONFLICT);
-        assert!(device_dependency.message.contains("1 个共享网络"));
-
-        let network_dependency = delete_site_network(
-            State(state.clone()),
-            admin_headers(),
-            Path("network-a".to_owned()),
-        )
-        .await
-        .expect_err("互联关系仍存在时不得删除共享网络");
-        assert_eq!(network_dependency.status, StatusCode::CONFLICT);
-        assert!(network_dependency.message.contains("1 个互联关系"));
-
-        let first_link = delete_site_link(
-            State(state.clone()),
-            admin_headers(),
-            Path("link-a-b".to_owned()),
-        )
-        .await
-        .expect("站点互联应进入等待删除")
-        .0;
-        let repeated_link = delete_site_link(
-            State(state.clone()),
-            admin_headers(),
-            Path("link-a-b".to_owned()),
-        )
-        .await
-        .expect("重复删除站点互联应保持幂等")
-        .0;
-        assert!(first_link.pending && repeated_link.pending);
-        let link_revision: i64 = state
-            .db
-            .lock()
-            .expect("数据库锁应可用")
-            .query_row(
-                "SELECT apply_revision FROM site_links WHERE id = 'link-a-b'",
-                [],
-                |row| row.get(0),
-            )
-            .expect("应读取 Link 删除 revision");
-        assert_eq!(link_revision, 5);
-
-        state
-            .db
-            .lock()
-            .expect("数据库锁应可用")
-            .execute_batch(
-                "INSERT INTO gateway_route_applies
-                    (device_id, network_id, site_link_id, desired_revision,
-                     local_status, control_plane_status, remote_status)
-                 VALUES
-                    ('device-a', 'network-b', 'link-a-b', 4,
-                     'disabled', 'disabled', 'disabled'),
-                    ('device-b', 'network-a', 'link-a-b', 4,
-                     'disabled', 'disabled', 'disabled');",
-            )
-            .expect("应写入旧 Link revision 的撤销状态");
-        finalize_resource_deletions_for_test(&state);
-        let old_link_remaining: i64 = state
-            .db
-            .lock()
-            .expect("数据库锁应可用")
-            .query_row(
-                "SELECT COUNT(*) FROM site_links WHERE id = 'link-a-b'",
-                [],
-                |row| row.get(0),
-            )
-            .expect("应检查旧 revision 未提前删除 Link");
-        assert_eq!(old_link_remaining, 1);
-
-        state
-            .db
-            .lock()
-            .expect("数据库锁应可用")
-            .execute(
-                "UPDATE gateway_route_applies SET desired_revision = 5
-                 WHERE site_link_id = 'link-a-b'",
-                [],
-            )
-            .expect("应推进 Link 到当前删除 revision");
-        finalize_resource_deletions_for_test(&state);
-        let link_remaining: i64 = state
-            .db
-            .lock()
-            .expect("数据库锁应可用")
-            .query_row(
-                "SELECT COUNT(*) FROM site_links WHERE id = 'link-a-b'",
-                [],
-                |row| row.get(0),
-            )
-            .expect("应检查 Link 已完成删除");
-        assert_eq!(link_remaining, 0);
-
-        let first_network = delete_site_network(
-            State(state.clone()),
-            admin_headers(),
-            Path("network-a".to_owned()),
-        )
-        .await
-        .expect("共享网络应进入等待删除")
-        .0;
-        let repeated_network = delete_site_network(
-            State(state.clone()),
-            admin_headers(),
-            Path("network-a".to_owned()),
-        )
-        .await
-        .expect("重复删除共享网络应保持幂等")
-        .0;
-        assert!(first_network.pending && repeated_network.pending);
-        let network_revision: i64 = state
-            .db
-            .lock()
-            .expect("数据库锁应可用")
-            .query_row(
-                "SELECT desired_revision FROM gateway_network_states
-                 WHERE site_network_id = 'network-a'",
-                [],
-                |row| row.get(0),
-            )
-            .expect("应读取共享网络删除 revision");
-        assert_eq!(network_revision, 5);
-
-        state
-            .db
-            .lock()
-            .expect("数据库锁应可用")
-            .execute(
-                "INSERT INTO gateway_route_applies
-                    (device_id, network_id, site_link_id, desired_revision,
-                     local_status, control_plane_status, remote_status)
-                 VALUES ('device-a', 'network-a', '', 4,
-                         'disabled', 'disabled', 'disabled')",
-                [],
-            )
-            .expect("应写入旧 Network revision 的撤销状态");
-        finalize_resource_deletions_for_test(&state);
-        let old_network_remaining: i64 = state
-            .db
-            .lock()
-            .expect("数据库锁应可用")
-            .query_row(
-                "SELECT COUNT(*) FROM site_networks WHERE id = 'network-a'",
-                [],
-                |row| row.get(0),
-            )
-            .expect("应检查旧 revision 未提前删除共享网络");
-        assert_eq!(old_network_remaining, 1);
-
-        state
-            .db
-            .lock()
-            .expect("数据库锁应可用")
-            .execute(
-                "UPDATE gateway_route_applies SET desired_revision = 5
-                 WHERE device_id = 'device-a' AND network_id = 'network-a'
-                   AND site_link_id = ''",
-                [],
-            )
-            .expect("应推进 Network 到当前删除 revision");
-        finalize_resource_deletions_for_test(&state);
-        let network_remaining: i64 = state
-            .db
-            .lock()
-            .expect("数据库锁应可用")
-            .query_row(
-                "SELECT COUNT(*) FROM site_networks WHERE id = 'network-a'",
-                [],
-                |row| row.get(0),
-            )
-            .expect("应检查共享网络已完成删除");
-        assert_eq!(network_remaining, 0);
-
-        let audit_counts: (i64, i64, i64, i64) = state
-            .db
-            .lock()
-            .expect("数据库锁应可用")
-            .query_row(
-                "SELECT
-                    (SELECT COUNT(*) FROM audit_events
-                     WHERE event_type = 'SITE_LINK_DELETE_REQUESTED'),
-                    (SELECT COUNT(*) FROM audit_events
-                     WHERE event_type = 'SITE_LINK_DELETED'),
-                    (SELECT COUNT(*) FROM audit_events
-                     WHERE event_type = 'SITE_NETWORK_DELETE_REQUESTED'),
-                    (SELECT COUNT(*) FROM audit_events
-                     WHERE event_type = 'SITE_NETWORK_DELETED')",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-            )
-            .expect("应读取网络资源删除审计");
-        assert_eq!(audit_counts, (1, 1, 1, 1));
-    }
-
-    #[tokio::test]
     async fn overview_requires_admin_session() {
         let state = test_state();
         let error = overview(State(state.clone()), HeaderMap::new())
@@ -21116,7 +18982,7 @@ mod tests {
                 admin_headers(),
                 Json(CreateSiteNetworkRequest {
                     tenant_id: "default".to_owned(),
-                    site_id: "site-missing".to_owned(),
+
                     name: "默认路由".to_owned(),
                     publisher_device_id: "device-missing".to_owned(),
                     interface_id: "eth0".to_owned(),
@@ -21130,31 +18996,34 @@ mod tests {
             assert!(error.message.contains("默认路由"));
         }
 
-        let error = create_site(
+        let error = create_site_network(
             State(state),
             admin_headers(),
-            Json(CreateSiteRequest {
+            Json(CreateSiteNetworkRequest {
                 tenant_id: "missing-tenant".to_owned(),
                 name: "错误租户".to_owned(),
+                publisher_device_id: "device-missing".to_owned(),
+                interface_id: "eth0".to_owned(),
+                prefix: "10.0.0.0/24".to_owned(),
+                source: SiteNetworkSourceRequest::Detected,
             }),
         )
         .await
-        .expect_err("不存在的租户不应创建站点");
-        assert_eq!(error.status, StatusCode::NOT_FOUND);
-        assert_eq!(error.message, "租户不存在");
+        .expect_err("其他租户不应创建共享网段");
+        assert_eq!(error.status, StatusCode::FORBIDDEN);
     }
 
     #[test]
     fn route_report_requires_real_local_apply_before_headscale_reconcile() {
         let enabled_route = GatewayRouteApplyResult {
             network_id: "network-a".to_owned(),
-            site_link_id: None,
+
             prefix: "192.168.10.0/24".to_owned(),
             revision: 1,
             enabled: true,
             local_applied: false,
             control_plane_status: None,
-            remote_applied: false,
+
             error_message: None,
         };
         assert!(!report_allows_headscale_reconcile(
@@ -21179,13 +19048,13 @@ mod tests {
                 revision: 2,
                 routes: vec![GatewayRouteApplyResult {
                     network_id: "network-a".to_owned(),
-                    site_link_id: None,
+
                     prefix: "192.168.10.0/24".to_owned(),
                     revision: 2,
                     enabled: false,
                     local_applied: false,
                     control_plane_status: None,
-                    remote_applied: false,
+
                     error_message: None,
                 }],
                 mesh_identity: None,
@@ -21197,24 +19066,24 @@ mod tests {
                 routes: vec![
                     GatewayRouteApplyResult {
                         network_id: "network-v4".to_owned(),
-                        site_link_id: None,
+
                         prefix: "192.168.10.0/24".to_owned(),
                         revision: 3,
                         enabled: true,
                         local_applied: true,
                         control_plane_status: None,
-                        remote_applied: false,
+
                         error_message: None,
                     },
                     GatewayRouteApplyResult {
                         network_id: "network-v6".to_owned(),
-                        site_link_id: None,
+
                         prefix: "2001:db8:10::/64".to_owned(),
                         revision: 3,
                         enabled: true,
                         local_applied: false,
                         control_plane_status: None,
-                        remote_applied: false,
+
                         error_message: Some("设备未开启 IPv6 转发".to_owned()),
                     },
                 ],
@@ -21246,19 +19115,14 @@ mod tests {
             ],
             subnet_gateway: CapabilityState::Ready,
             subnet_gateway_reason: None,
-            site_gateway: CapabilityState::Ready,
-            site_gateway_reason: None,
         };
         {
             let connection = state.db.lock().expect("数据库锁应可用");
             connection
                 .execute_batch(
-                    "INSERT INTO sites (id, tenant_id, name)
-                        VALUES ('site-family', 'tenant-1', '双栈站点');
-                     INSERT INTO devices
-                        (id, tenant_id, site_id, name, status, capabilities_json)
-                        VALUES ('device-family', 'tenant-1', 'site-family', '双栈网关',
-                                'online', '[\"subnet_gateway\",\"site_gateway\"]');
+                    "
+                     INSERT INTO devices (id, tenant_id, name, status, capabilities_json) VALUES ('device-family', 'tenant-1', '双栈网关',
+                                'online', '[\"subnet_gateway\"]');
                      INSERT INTO mesh_identities
                         (nexo_device_id, tenant_id, headscale_node_id, state, online)
                         VALUES ('device-family', 'tenant-1', '42', 'ready', 1);",
@@ -21278,7 +19142,7 @@ mod tests {
             admin_headers(),
             Json(CreateSiteNetworkRequest {
                 tenant_id: "tenant-1".to_owned(),
-                site_id: "site-family".to_owned(),
+
                 name: "IPv4 LAN".to_owned(),
                 publisher_device_id: "device-family".to_owned(),
                 interface_id: "eth0".to_owned(),
@@ -21293,7 +19157,7 @@ mod tests {
             admin_headers(),
             Json(CreateSiteNetworkRequest {
                 tenant_id: "tenant-1".to_owned(),
-                site_id: "site-family".to_owned(),
+
                 name: "IPv6 LAN".to_owned(),
                 publisher_device_id: "device-family".to_owned(),
                 interface_id: "eth1".to_owned(),
@@ -21322,7 +19186,7 @@ mod tests {
             admin_headers(),
             Json(CreateSiteNetworkRequest {
                 tenant_id: "tenant-1".to_owned(),
-                site_id: "site-family".to_owned(),
+
                 name: "IPv6 LAN".to_owned(),
                 publisher_device_id: "device-family".to_owned(),
                 interface_id: "eth1".to_owned(),
@@ -21338,61 +19202,11 @@ mod tests {
             "device-family",
             Some("eth0"),
             "192.168.10.0/24",
-            false,
             true,
         )
         .expect("应计算现有 IPv4 网络健康状态");
         assert_eq!(health, GatewayHealthStatus::Failed);
         assert_eq!(message.as_deref(), Some("设备未开启 IPv4 转发"));
-    }
-
-    #[tokio::test]
-    async fn site_link_rejects_networks_from_different_address_families() {
-        let state = test_state();
-        state
-            .db
-            .lock()
-            .expect("数据库锁应可用")
-            .execute_batch(
-                "INSERT INTO sites (id, tenant_id, name) VALUES
-                    ('site-v4', 'tenant-1', 'IPv4 站点'),
-                    ('site-v6', 'tenant-1', 'IPv6 站点');
-                 INSERT INTO devices
-                    (id, tenant_id, site_id, name, status, capabilities_json) VALUES
-                    ('device-v4', 'tenant-1', 'site-v4', 'IPv4 网关', 'online',
-                     '[\"subnet_gateway\",\"site_gateway\"]'),
-                    ('device-v6', 'tenant-1', 'site-v6', 'IPv6 网关', 'online',
-                     '[\"subnet_gateway\",\"site_gateway\"]');
-                 INSERT INTO site_networks
-                    (id, tenant_id, site_id, name, publisher_device_id, interface_id,
-                     address_family, current_prefix) VALUES
-                    ('network-v4', 'tenant-1', 'site-v4', 'IPv4 LAN', 'device-v4', 'eth0',
-                     'ipv4', '192.168.10.0/24'),
-                    ('network-v6', 'tenant-1', 'site-v6', 'IPv6 LAN', 'device-v6', 'eth0',
-                     'ipv6', '2001:db8:20::/64');
-                 INSERT INTO gateway_network_states
-                    (site_network_id, desired_prefix, desired_revision) VALUES
-                    ('network-v4', '192.168.10.0/24', 1),
-                    ('network-v6', '2001:db8:20::/64', 1);",
-            )
-            .expect("应创建异族站点网络");
-
-        let error = create_site_link(
-            State(state),
-            admin_headers(),
-            Json(CreateSiteLinkRequest {
-                tenant_id: "tenant-1".to_owned(),
-                left_site_id: "site-v4".to_owned(),
-                left_network_ids: vec!["network-v4".to_owned()],
-                right_site_id: "site-v6".to_owned(),
-                right_network_ids: vec!["network-v6".to_owned()],
-                next_hops: SiteLinkNextHops::default(),
-            }),
-        )
-        .await
-        .expect_err("跨地址族站点互联必须被拒绝");
-        assert_eq!(error.status, StatusCode::CONFLICT);
-        assert_eq!(error.message, "两侧共享网络的 IPv4/IPv6 地址族集合必须一致");
     }
 
     #[tokio::test]
@@ -21403,7 +19217,7 @@ mod tests {
             admin_headers(),
             Json(CreateEnrollmentRequest {
                 tenant_id: "tenant-1".to_owned(),
-                site_id: None,
+
                 ttl_seconds: Some(900),
                 device_name: Some("Web 指定 NAS".to_owned()),
             }),
@@ -21468,17 +19282,20 @@ mod tests {
         .0;
         assert_eq!(approved.status, EnrollmentStatus::Approved);
         let approved_device_id = approved.device_id.clone().expect("审批应返回设备 ID");
-        let approved_name: String = state
+        let approved_name: (String, String) = state
             .db
             .lock()
             .expect("数据库锁应可用")
             .query_row(
-                "SELECT name FROM devices WHERE id = ?1",
+                "SELECT name, mesh_name FROM devices WHERE id = ?1",
                 [&approved_device_id],
-                |row| row.get(0),
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .expect("应能读取设备名称");
-        assert_eq!(approved_name, "Web 指定 NAS");
+        assert_eq!(
+            approved_name,
+            ("Web 指定 NAS".to_owned(), "web-nas".to_owned())
+        );
 
         let delivered = poll_agent_enrollment(
             State(state.clone()),
@@ -21531,18 +19348,14 @@ mod tests {
             let connection = state.db.lock().expect("数据库锁应可用");
             connection
                 .execute_batch(
-                    "INSERT INTO sites (id, tenant_id, name) VALUES ('site-a', 'tenant-1', '家庭');
-                     INSERT INTO devices
-                        (id, tenant_id, site_id, name, status, capabilities_json)
-                        VALUES ('device-a', 'tenant-1', 'site-a', '家庭网关', 'online',
+                    "
+                     INSERT INTO devices (id, tenant_id, name, status, capabilities_json) VALUES ('device-a', 'tenant-1', '家庭网关', 'online',
                                 '[\"subnet_gateway\"]');
                      INSERT INTO mesh_identities
                         (nexo_device_id, tenant_id, headscale_node_id, state)
                         VALUES ('device-a', 'tenant-1', '17', 'ready');
-                     INSERT INTO site_networks
-                        (id, tenant_id, site_id, name, publisher_device_id, interface_id,
-                         address_family, current_prefix)
-                        VALUES ('network-a', 'tenant-1', 'site-a', '家庭 LAN', 'device-a',
+                     INSERT INTO site_networks (id, tenant_id, name, publisher_device_id, interface_id,
+                         address_family, current_prefix) VALUES ('network-a', 'tenant-1', '家庭 LAN', 'device-a',
                                 'eth0', 'ipv4', '192.168.10.0/24');
                      INSERT INTO gateway_network_states
                         (site_network_id, desired_prefix, desired_revision, apply_status)
@@ -21583,72 +19396,17 @@ mod tests {
     }
 
     #[test]
-    fn gateway_desired_state_contains_local_and_remote_routes() {
-        let state = test_state();
-        let connection = state.db.lock().expect("数据库锁应可用");
-        connection
-            .execute_batch(
-                "INSERT INTO sites (id, tenant_id, name) VALUES
-                    ('site-a', 'tenant-1', '家庭'),
-                    ('site-b', 'tenant-1', '办公室');
-                 INSERT INTO devices
-                    (id, tenant_id, site_id, name, status, capabilities_json)
-                    VALUES
-                    ('device-a', 'tenant-1', 'site-a', '家庭网关', 'online',
-                     '[\"subnet_gateway\",\"site_gateway\"]'),
-                    ('device-b', 'tenant-1', 'site-b', '办公室网关', 'online',
-                     '[\"subnet_gateway\",\"site_gateway\"]');
-                 INSERT INTO site_networks
-                    (id, tenant_id, site_id, name, publisher_device_id, interface_id,
-                     address_family, current_prefix)
-                    VALUES
-                    ('network-a', 'tenant-1', 'site-a', '家庭 LAN', 'device-a', 'eth0',
-                     'ipv4', '192.168.10.0/24'),
-                    ('network-b', 'tenant-1', 'site-b', '办公室 LAN', 'device-b', 'eth0',
-                     'ipv4', '192.168.20.0/24');
-                 INSERT INTO gateway_network_states
-                    (site_network_id, desired_prefix, desired_revision)
-                    VALUES
-                    ('network-a', '192.168.10.0/24', 1),
-                    ('network-b', '192.168.20.0/24', 2);
-                 INSERT INTO site_links (id, tenant_id, left_site_id, right_site_id)
-                    VALUES ('link-a-b', 'tenant-1', 'site-a', 'site-b');
-                 INSERT INTO site_link_networks (site_link_id, site_network_id, side)
-                    VALUES ('link-a-b', 'network-a', 'left'),
-                           ('link-a-b', 'network-b', 'right');",
-            )
-            .expect("应创建网关 Desired State 测试数据");
-
-        let state_for_device = load_gateway_desired_state(&connection, "device-a")
-            .expect("应能汇总设备网关 Desired State")
-            .expect("设备应收到网关配置");
-        assert_eq!(state_for_device.revision, 2);
-        assert_eq!(state_for_device.routes.len(), 2);
-        assert_eq!(state_for_device.routes[0].network_id, "network-a");
-        assert_eq!(state_for_device.routes[0].site_link_id, None);
-        assert_eq!(state_for_device.routes[1].network_id, "network-b");
-        assert_eq!(
-            state_for_device.routes[1].site_link_id.as_deref(),
-            Some("link-a-b")
-        );
-    }
-
-    #[test]
     fn gateway_apply_ack_updates_applied_state_only_for_confirmed_networks() {
         let state = test_state();
         {
             let connection = state.db.lock().expect("数据库锁应可用");
             connection
                 .execute_batch(
-                    "INSERT INTO sites (id, tenant_id, name) VALUES ('site-a', 'tenant-1', '家庭');
-                     INSERT INTO devices
-                        (id, tenant_id, site_id, name, status, capabilities_json)
-                        VALUES ('device-a', 'tenant-1', 'site-a', '家庭网关', 'online',
+                    "
+                     INSERT INTO devices (id, tenant_id, name, status, capabilities_json) VALUES ('device-a', 'tenant-1', '家庭网关', 'online',
                                 '[\"subnet_gateway\"]');
-                     INSERT INTO site_networks
-                        (id, tenant_id, site_id, name, publisher_device_id, interface_id,
-                         address_family, current_prefix)
-                        VALUES ('network-a', 'tenant-1', 'site-a', '家庭 LAN', 'device-a',
+                     INSERT INTO site_networks (id, tenant_id, name, publisher_device_id, interface_id,
+                         address_family, current_prefix) VALUES ('network-a', 'tenant-1', '家庭 LAN', 'device-a',
                                 'eth0', 'ipv4', '192.168.10.0/24');
                      INSERT INTO gateway_network_states
                         (site_network_id, desired_prefix, desired_revision)
@@ -21749,15 +19507,11 @@ mod tests {
             let connection = state.db.lock().expect("数据库锁应可用");
             connection
                 .execute_batch(
-                    "INSERT INTO sites (id, tenant_id, name) VALUES ('site-a', 'tenant-1', '家庭');
-                     INSERT INTO devices
-                        (id, tenant_id, site_id, name, status, capabilities_json)
-                        VALUES ('device-a', 'tenant-1', 'site-a', '家庭网关', 'online',
+                    "
+                     INSERT INTO devices (id, tenant_id, name, status, capabilities_json) VALUES ('device-a', 'tenant-1', '家庭网关', 'online',
                                 '[\"subnet_gateway\"]');
-                     INSERT INTO site_networks
-                        (id, tenant_id, site_id, name, publisher_device_id, interface_id,
-                         address_family, current_prefix)
-                        VALUES ('network-a', 'tenant-1', 'site-a', '家庭 LAN', 'device-a',
+                     INSERT INTO site_networks (id, tenant_id, name, publisher_device_id, interface_id,
+                         address_family, current_prefix) VALUES ('network-a', 'tenant-1', '家庭 LAN', 'device-a',
                                 'eth0', 'ipv4', '192.168.10.0/24');
                      INSERT INTO gateway_network_states
                         (site_network_id, desired_prefix, desired_revision, apply_status)
@@ -21822,105 +19576,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn disabling_site_link_uses_revision_newer_than_network_revision() {
-        let state = test_state();
-        {
-            let connection = state.db.lock().expect("数据库锁应可用");
-            connection
-                .execute_batch(
-                    "INSERT INTO sites (id, tenant_id, name) VALUES
-                        ('site-a', 'tenant-1', '家庭'),
-                        ('site-b', 'tenant-1', '办公室');
-                     INSERT INTO devices
-                        (id, tenant_id, site_id, name, status, capabilities_json)
-                        VALUES
-                        ('device-a', 'tenant-1', 'site-a', '家庭网关', 'online',
-                         '[\"site_gateway\"]'),
-                        ('device-b', 'tenant-1', 'site-b', '办公室网关', 'online',
-                         '[\"site_gateway\"]');
-                     INSERT INTO site_networks
-                        (id, tenant_id, site_id, name, publisher_device_id, interface_id,
-                         address_family, current_prefix)
-                        VALUES
-                        ('network-a', 'tenant-1', 'site-a', '家庭 LAN', 'device-a', 'eth0',
-                         'ipv4', '192.168.10.0/24'),
-                        ('network-b', 'tenant-1', 'site-b', '办公室 LAN', 'device-b', 'eth0',
-                         'ipv4', '192.168.20.0/24');
-                     INSERT INTO gateway_network_states
-                        (site_network_id, desired_prefix, desired_revision)
-                        VALUES
-                        ('network-a', '192.168.10.0/24', 1),
-                        ('network-b', '192.168.20.0/24', 1);
-                     INSERT INTO site_links (id, tenant_id, left_site_id, right_site_id)
-                        VALUES ('link-a-b', 'tenant-1', 'site-a', 'site-b');
-                     INSERT INTO site_link_networks (site_link_id, site_network_id, side)
-                        VALUES ('link-a-b', 'network-a', 'left'),
-                               ('link-a-b', 'network-b', 'right');",
-                )
-                .expect("应创建站点互联关闭测试数据");
-        }
-
-        let disabled = disable_site_link(
-            State(state.clone()),
-            admin_headers(),
-            Path("link-a-b".to_owned()),
-        )
-        .await
-        .expect("管理员应能关闭站点互联")
-        .0;
-        assert!(!disabled.enabled);
-        assert_eq!(disabled.apply_status, ApplyStatus::Checking);
-
-        let connection = state.db.lock().expect("数据库锁应可用");
-        let desired = load_gateway_desired_state(&connection, "device-a")
-            .expect("应能加载站点互联撤销 Desired State")
-            .expect("关闭后的互联撤销路由仍需下发");
-        assert_eq!(desired.revision, 2);
-        let remote_route = desired
-            .routes
-            .iter()
-            .find(|route| route.site_link_id.as_deref() == Some("link-a-b"))
-            .expect("应保留站点互联撤销路由");
-        assert!(!remote_route.enabled);
-        assert_eq!(remote_route.revision, 2);
-        drop(connection);
-
-        // 共享网络本身仍可保持启用，因此 Link 的 DISABLED 只能由两侧
-        // Agent 对该 Link 撤销路由的逐项 ACK 推进，不能读取网络总状态推断。
-        {
-            let connection = state.db.lock().expect("数据库锁应可用");
-            connection
-                .execute_batch(
-                    "INSERT INTO gateway_route_applies
-                        (device_id, network_id, site_link_id, desired_revision,
-                         local_status, control_plane_status, remote_status)
-                     VALUES
-                        ('device-a', 'network-b', 'link-a-b', 2,
-                         'disabled', 'disabled', 'disabled'),
-                        ('device-b', 'network-a', 'link-a-b', 2,
-                         'disabled', 'disabled', 'disabled');",
-                )
-                .expect("应保存两侧 Link 撤销 ACK");
-            let transaction = connection
-                .unchecked_transaction()
-                .expect("应开始 Link 状态收敛事务");
-            refresh_site_link_apply_status(&transaction).expect("应收敛 Link 撤销状态");
-            transaction.commit().expect("应提交 Link 撤销状态");
-        }
-        let link_status: String = state
-            .db
-            .lock()
-            .expect("数据库锁应可用")
-            .query_row(
-                "SELECT apply_status FROM site_links WHERE id = 'link-a-b'",
-                [],
-                |row| row.get(0),
-            )
-            .expect("应能读取 Link 撤销状态");
-        assert_eq!(link_status, "disabled");
-    }
-
-    #[tokio::test]
     async fn control_channel_marks_authenticated_device_online() {
         let state = test_state();
         let created = create_enrollment(
@@ -21928,7 +19583,7 @@ mod tests {
             admin_headers(),
             Json(CreateEnrollmentRequest {
                 tenant_id: "tenant-1".to_owned(),
-                site_id: None,
+
                 ttl_seconds: Some(900),
                 device_name: None,
             }),
@@ -22092,295 +19747,12 @@ mod tests {
         task.abort();
     }
 
-    #[tokio::test]
-    async fn gateway_desired_state_rejects_overlapping_site_networks() {
-        let state = test_state();
-        {
-            let connection = state.db.lock().expect("数据库锁应可用");
-            connection
-                .execute_batch(
-                    "INSERT INTO sites (id, tenant_id, name) VALUES
-                        ('site-a', 'tenant-1', '家庭'),
-                        ('site-b', 'tenant-1', '办公室');
-                     INSERT INTO devices
-                        (id, tenant_id, site_id, name, status, capabilities_json)
-                        VALUES
-                        ('device-a', 'tenant-1', 'site-a', '家庭网关', 'online',
-                         '[\"subnet_gateway\",\"site_gateway\"]'),
-                        ('device-b', 'tenant-1', 'site-b', '办公室网关', 'online',
-                         '[\"subnet_gateway\",\"site_gateway\"]');",
-                )
-                .expect("应创建测试站点和设备");
-            let report_a = GatewayCapabilityReport {
-                platform: "linux".to_owned(),
-                tun_available: true,
-                net_admin_available: true,
-                ipv4_forwarding: true,
-                ipv6_forwarding: true,
-                local_networks: vec![DetectedLocalNetwork {
-                    interface_id: "eth0".to_owned(),
-                    prefix: "192.168.10.0/24".to_owned(),
-                    gateway_address: Some("192.168.10.2".to_owned()),
-                }],
-                subnet_gateway: CapabilityState::Ready,
-                subnet_gateway_reason: None,
-                site_gateway: CapabilityState::Ready,
-                site_gateway_reason: None,
-            };
-            let report_b = GatewayCapabilityReport {
-                local_networks: vec![
-                    DetectedLocalNetwork {
-                        interface_id: "eth0".to_owned(),
-                        prefix: "192.168.20.0/24".to_owned(),
-                        gateway_address: Some("192.168.20.2".to_owned()),
-                    },
-                    DetectedLocalNetwork {
-                        interface_id: "eth0".to_owned(),
-                        prefix: "192.168.10.0/24".to_owned(),
-                        gateway_address: Some("192.168.20.2".to_owned()),
-                    },
-                ],
-                ..report_a.clone()
-            };
-            connection
-                .execute(
-                    "INSERT INTO device_capability_reports (device_id, report_json)
-                     VALUES (?1, ?2), (?3, ?4)",
-                    rusqlite::params![
-                        "device-a",
-                        serde_json::to_string(&report_a).unwrap(),
-                        "device-b",
-                        serde_json::to_string(&report_b).unwrap(),
-                    ],
-                )
-                .expect("应保存网关能力报告");
-        }
-        let sites = list_sites(State(state.clone()), admin_headers())
-            .await
-            .expect("管理员应能读取站点目录")
-            .0;
-        assert_eq!(
-            sites
-                .iter()
-                .map(|site| site.name.as_str())
-                .collect::<Vec<_>>(),
-            ["办公室", "家庭"]
-        );
-        let left = create_site_network(
-            State(state.clone()),
-            admin_headers(),
-            Json(CreateSiteNetworkRequest {
-                tenant_id: "tenant-1".to_owned(),
-                site_id: "site-a".to_owned(),
-                name: "家庭网络".to_owned(),
-                publisher_device_id: "device-a".to_owned(),
-                interface_id: "eth0".to_owned(),
-                prefix: "192.168.10.0/24".to_owned(),
-                source: SiteNetworkSourceRequest::Detected,
-            }),
-        )
-        .await
-        .expect("应创建家庭共享网络")
-        .0;
-        let right = create_site_network(
-            State(state.clone()),
-            admin_headers(),
-            Json(CreateSiteNetworkRequest {
-                tenant_id: "tenant-1".to_owned(),
-                site_id: "site-b".to_owned(),
-                name: "办公室网络".to_owned(),
-                publisher_device_id: "device-b".to_owned(),
-                interface_id: "eth0".to_owned(),
-                prefix: "192.168.20.0/24".to_owned(),
-                source: SiteNetworkSourceRequest::Detected,
-            }),
-        )
-        .await
-        .expect("应创建办公室共享网络")
-        .0;
-        let networks = list_site_networks(State(state.clone()), admin_headers())
-            .await
-            .expect("管理员应能读取共享网络列表")
-            .0;
-        assert_eq!(networks.len(), 2);
-        assert!(networks
-            .iter()
-            .all(|network| network.health_status == GatewayHealthStatus::Degraded));
-        assert!(networks.iter().all(|network| {
-            network.health_error.as_deref()
-                == Some("域名与 HTTPS 尚未就绪，新的组网加入和网关应用已暂停")
-        }));
-        assert_eq!(
-            networks
-                .iter()
-                .find(|network| network.id == left.id)
-                .map(|network| (
-                    network.site_name.as_str(),
-                    network.publisher_device_name.as_str(),
-                    network.gateway_address.as_deref(),
-                )),
-            Some(("家庭", "家庭网关", Some("192.168.10.2")))
-        );
-        let link = create_site_link(
-            State(state.clone()),
-            admin_headers(),
-            Json(CreateSiteLinkRequest {
-                tenant_id: "tenant-1".to_owned(),
-                left_site_id: "site-a".to_owned(),
-                left_network_ids: vec![left.id.clone()],
-                right_site_id: "site-b".to_owned(),
-                right_network_ids: vec![right.id.clone()],
-                next_hops: SiteLinkNextHops::default(),
-            }),
-        )
-        .await
-        .expect("不重叠的站点网络应能创建互联")
-        .0;
-        assert_eq!(link.apply_status, ApplyStatus::Checking);
-        assert_eq!(link.health_status, GatewayHealthStatus::Degraded);
-        assert_eq!(
-            link.health_error.as_deref(),
-            Some("域名与 HTTPS 尚未就绪，新的组网加入和网关应用已暂停")
-        );
-        assert_eq!(link.left_site_name, "家庭");
-        assert_eq!(link.right_site_name, "办公室");
-        assert_eq!(
-            link.left_networks
-                .first()
-                .map(|network| network.prefix.as_str()),
-            Some("192.168.10.0/24")
-        );
-        assert_eq!(
-            link.right_networks
-                .first()
-                .map(|network| network.prefix.as_str()),
-            Some("192.168.20.0/24")
-        );
-        assert_eq!(link.left_gateway_address.as_deref(), Some("192.168.10.2"));
-        assert_eq!(link.right_gateway_address.as_deref(), Some("192.168.20.2"));
-        let site_routes = link
-            .static_routes
-            .iter()
-            .filter(|route| route.purpose == StaticRoutePurpose::SiteNetwork)
-            .cloned()
-            .collect::<Vec<_>>();
-        assert_eq!(
-            site_routes,
-            vec![
-                StaticRouteGuide {
-                    purpose: StaticRoutePurpose::SiteNetwork,
-                    router_site_id: "site-a".to_owned(),
-                    destination_site_id: "site-b".to_owned(),
-                    router_site_name: "家庭".to_owned(),
-                    destination_site_name: "办公室".to_owned(),
-                    destination_label: "办公室".to_owned(),
-                    destination_prefix: "192.168.20.0/24".to_owned(),
-                    next_hop: Some("192.168.10.2".to_owned()),
-                    router_confirmed: false,
-                },
-                StaticRouteGuide {
-                    purpose: StaticRoutePurpose::SiteNetwork,
-                    router_site_id: "site-b".to_owned(),
-                    destination_site_id: "site-a".to_owned(),
-                    router_site_name: "办公室".to_owned(),
-                    destination_site_name: "家庭".to_owned(),
-                    destination_label: "家庭".to_owned(),
-                    destination_prefix: "192.168.10.0/24".to_owned(),
-                    next_hop: Some("192.168.20.2".to_owned()),
-                    router_confirmed: false,
-                },
-            ]
-        );
-        let client_return_routes = link
-            .static_routes
-            .iter()
-            .filter(|route| route.purpose == StaticRoutePurpose::MeshClientReturn)
-            .cloned()
-            .collect::<Vec<_>>();
-        assert_eq!(client_return_routes.len(), 2);
-        assert!(client_return_routes.iter().all(|route| {
-            route.destination_prefix == "100.64.0.0/10"
-                && route.destination_label == "组网客户端"
-                && route.next_hop.is_some()
-        }));
-        {
-            let connection = state.db.lock().expect("数据库锁应可用");
-            connection
-                .execute(
-                    "UPDATE devices SET status = 'offline' WHERE id = 'device-b'",
-                    [],
-                )
-                .expect("应能模拟远端网关离线");
-        }
-        let degraded_link =
-            get_site_link(State(state.clone()), admin_headers(), Path(link.id.clone()))
-                .await
-                .expect("离线网关仍应返回站点互联状态")
-                .0;
-        assert_eq!(degraded_link.apply_status, ApplyStatus::Checking);
-        assert_eq!(degraded_link.health_status, GatewayHealthStatus::Degraded);
-        assert_eq!(
-            degraded_link.health_error.as_deref(),
-            Some("域名与 HTTPS 尚未就绪，新的组网加入和网关应用已暂停")
-        );
-        {
-            let connection = state.db.lock().expect("数据库锁应可用");
-            connection
-                .execute(
-                    "UPDATE devices SET status = 'online' WHERE id = 'device-b'",
-                    [],
-                )
-                .expect("应恢复测试网关在线状态");
-        }
-        let links = list_site_links(State(state.clone()), admin_headers())
-            .await
-            .expect("管理员应能读取站点互联列表")
-            .0;
-        assert_eq!(links.len(), 1);
-        assert_eq!(links[0].id, link.id);
-
-        let conflict = create_site_network(
-            State(state.clone()),
-            admin_headers(),
-            Json(CreateSiteNetworkRequest {
-                tenant_id: "tenant-1".to_owned(),
-                site_id: "site-b".to_owned(),
-                name: "冲突网络".to_owned(),
-                publisher_device_id: "device-b".to_owned(),
-                interface_id: "eth0".to_owned(),
-                prefix: "192.168.10.0/24".to_owned(),
-                source: SiteNetworkSourceRequest::Detected,
-            }),
-        )
-        .await
-        .expect("测试设备应能报告第二个本地网络")
-        .0;
-        let error = create_site_link(
-            State(state),
-            admin_headers(),
-            Json(CreateSiteLinkRequest {
-                tenant_id: "tenant-1".to_owned(),
-                left_site_id: "site-a".to_owned(),
-                left_network_ids: vec![left.id],
-                right_site_id: "site-b".to_owned(),
-                right_network_ids: vec![conflict.id],
-                next_hops: SiteLinkNextHops::default(),
-            }),
-        )
-        .await
-        .expect_err("重叠网段不应建立站点互联");
-        assert_eq!(error.status, StatusCode::CONFLICT);
-        assert!(error.message.contains("网络地址冲突"));
-    }
-
     fn insert_connection_fixture(state: &AppState) {
         let connection = state.db.lock().expect("数据库锁应可用");
         connection
             .execute_batch(
-                "INSERT INTO sites (id, tenant_id, name) VALUES ('site-home', 'tenant-1', '家庭');
-                 INSERT INTO devices
-                 (id, tenant_id, site_id, name, status, capabilities_json)
-                 VALUES ('gateway-home', 'tenant-1', 'site-home', '家庭网关', 'online',
+                "
+                 INSERT INTO devices (id, tenant_id, name, status, capabilities_json) VALUES ('gateway-home', 'tenant-1', '家庭网关', 'online',
                          '[\"mesh\",\"subnet_gateway\"]');
                  INSERT INTO devices
                  (id, tenant_id, name, status, capabilities_json)
@@ -22389,10 +19761,8 @@ mod tests {
                  (nexo_device_id, tenant_id, headscale_node_id, state, tailscale_ipv4, online)
                  VALUES ('gateway-home', 'tenant-1', '101', 'ready', '100.64.0.1', 1),
                         ('phone', 'tenant-1', '202', 'ready', '100.64.0.2', 1);
-                 INSERT INTO site_networks
-                 (id, tenant_id, site_id, name, publisher_device_id, interface_id,
-                  address_family, source, enabled)
-                 VALUES ('home-lan', 'tenant-1', 'site-home', '家庭网络', 'gateway-home',
+                 INSERT INTO site_networks (id, tenant_id, name, publisher_device_id, interface_id,
+                  address_family, source, enabled) VALUES ('home-lan', 'tenant-1', '家庭网络', 'gateway-home',
                          'eth0', 'ipv4', 'direct_interface', 1);
                  INSERT INTO gateway_network_states
                  (site_network_id, desired_prefix, desired_revision, apply_status)
@@ -22519,17 +19889,13 @@ mod tests {
             ],
             subnet_gateway: CapabilityState::Ready,
             subnet_gateway_reason: None,
-            site_gateway: CapabilityState::Ready,
-            site_gateway_reason: None,
         };
         {
             let connection = state.db.lock().expect("数据库锁应可用");
             connection
                 .execute_batch(
-                    "INSERT INTO sites (id, tenant_id, name) VALUES ('site-home', 'tenant-1', '家庭');
-                     INSERT INTO devices
-                     (id, tenant_id, site_id, name, status, capabilities_json)
-                     VALUES ('gateway-home', 'tenant-1', 'site-home', '家庭网关', 'online',
+                    "
+                     INSERT INTO devices (id, tenant_id, name, status, capabilities_json) VALUES ('gateway-home', 'tenant-1', '家庭网关', 'online',
                              '[\"mesh\",\"subnet_gateway\"]');",
                 )
                 .expect("应创建网关夹具");
@@ -22595,6 +19961,159 @@ mod tests {
         assert_eq!(access_count, 1);
     }
 
+    /// 同一次保存的所有选择必须一起成功；离线、重试和遗漏行均不得改变资源身份。
+    #[tokio::test]
+    async fn device_subnet_selection_is_atomic_idempotent_and_scoped() {
+        let state = test_state();
+        let report = GatewayCapabilityReport {
+            platform: "linux".into(),
+            tun_available: true,
+            net_admin_available: true,
+            ipv4_forwarding: true,
+            ipv6_forwarding: false,
+            local_networks: vec![DetectedLocalNetwork {
+                interface_id: "eth0".into(),
+                prefix: "10.10.0.0/24".into(),
+                gateway_address: None,
+            }],
+            subnet_gateway: CapabilityState::Ready,
+            subnet_gateway_reason: None,
+        };
+        {
+            let db = state.db.lock().unwrap();
+            db.execute_batch("INSERT INTO devices (id, tenant_id, name, status, capabilities_json)
+                VALUES ('selection-agent','tenant-1','家庭','offline','[\"mesh\",\"subnet_gateway\"]');
+                INSERT INTO tenants (id,name) VALUES ('other-tenant','其他工作空间');
+                INSERT INTO devices (id,tenant_id,name) VALUES ('other-agent','other-tenant','其他设备');").unwrap();
+            db.execute("INSERT INTO device_capability_reports (device_id,report_json) VALUES ('selection-agent',?1)",
+                [serde_json::to_string(&report).unwrap()]).unwrap();
+        }
+        let selection =
+            serde_json::json!({"interface_id":"eth0","prefix":"10.10.0.0/24","enabled":true});
+        let save = |device: &str, selections: serde_json::Value| {
+            device_networks::save(
+                State(state.clone()),
+                admin_headers(),
+                Path(device.to_owned()),
+                Json(serde_json::from_value(serde_json::json!({"networks":selections})).unwrap()),
+            )
+        };
+        for invalid in [
+            serde_json::json!({"prefix":"::/0","enabled":true}),
+            serde_json::json!({"interface_id":"eth0","prefix":"10.11.0.0/24","enabled":true}),
+            selection.clone(),
+        ] {
+            assert!(
+                save("selection-agent", serde_json::json!([selection, invalid]))
+                    .await
+                    .is_err()
+            );
+            let count: i64 = state
+                .db
+                .lock()
+                .unwrap()
+                .query_row("SELECT COUNT(*) FROM site_networks", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(count, 0, "后续行失败不得留下前面已创建的网段");
+        }
+        let created = save("selection-agent", serde_json::json!([selection]))
+            .await
+            .unwrap()
+            .0
+            .remove(0);
+        assert_eq!(created.status_reason, "device_offline");
+        let repeated = save("selection-agent", serde_json::json!([selection]))
+            .await
+            .unwrap()
+            .0
+            .remove(0);
+        assert_eq!(created.id, repeated.id);
+        assert_eq!(created.desired_revision, repeated.desired_revision);
+        assert!(save("other-agent", serde_json::json!([selection]))
+            .await
+            .is_err());
+        assert!(save(
+            "selection-agent",
+            serde_json::json!([{"id":"foreign-id","prefix":"10.10.0.0/24","enabled":false}])
+        )
+        .await
+        .is_err());
+        let _ = save("selection-agent", serde_json::json!([]))
+            .await
+            .unwrap();
+        let disabled = save(
+            "selection-agent",
+            serde_json::json!([{"id":created.id,"prefix":created.desired_prefix,"enabled":false}]),
+        )
+        .await
+        .unwrap()
+        .0
+        .remove(0);
+        assert!(!disabled.enabled);
+        assert_eq!(disabled.desired_revision, created.desired_revision + 1);
+        let restored = save("selection-agent", serde_json::json!([selection]))
+            .await
+            .unwrap()
+            .0
+            .remove(0);
+        assert!(restored.enabled);
+        assert_eq!(restored.id, created.id);
+        let checked = device_networks::recheck(
+            State(state.clone()),
+            admin_headers(),
+            Path(created.id.clone()),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(checked.desired_revision, restored.desired_revision + 1);
+        let manual = create_site_network(
+            State(state.clone()),
+            admin_headers(),
+            Json(CreateSiteNetworkRequest {
+                tenant_id: "tenant-1".into(),
+                name: "手动网络".into(),
+                publisher_device_id: "selection-agent".into(),
+                interface_id: String::new(),
+                prefix: "10.12.0.0/24".into(),
+                source: SiteNetworkSourceRequest::Manual,
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(manual.source, "manual");
+        let overlap = create_site_network(
+            State(state.clone()),
+            admin_headers(),
+            Json(CreateSiteNetworkRequest {
+                tenant_id: "tenant-1".into(),
+                name: "重叠网络".into(),
+                publisher_device_id: "selection-agent".into(),
+                interface_id: String::new(),
+                prefix: "10.12.0.0/25".into(),
+                source: SiteNetworkSourceRequest::Manual,
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(overlap.status, StatusCode::CONFLICT);
+        let _ = save("selection-agent", serde_json::json!([selection]))
+            .await
+            .unwrap();
+        let db = state.db.lock().unwrap();
+        assert!(
+            read_site_network_response(&db, &manual.id).unwrap().enabled,
+            "未提交的手动网段必须保留"
+        );
+        assert_eq!(
+            db.query_row("SELECT COUNT(*) FROM subnet_access", [], |row| row
+                .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+    }
+
     #[tokio::test]
     async fn auth_key_nodes_auto_assign_and_unknown_nodes_remain_isolated() {
         let headscale = Arc::new(OfficialClientHeadscale::default());
@@ -22615,6 +20134,11 @@ mod tests {
                 id: "999".to_owned(),
                 name: "unknown-node".to_owned(),
                 online: true,
+                pre_auth_key: Some(HeadscalePreAuthKey {
+                    id: "untrusted-key".into(),
+                    key: Some("test-secret-must-not-persist".into()),
+                    ..Default::default()
+                }),
                 ..Default::default()
             },
         ]);
@@ -22636,15 +20160,24 @@ mod tests {
             .await
             .expect("节点同步应成功");
         let connection = state.db.lock().expect("数据库锁应可用");
-        let assigned: (String, String, String) = connection
+        let assigned: (String, String, String, String, String) = connection
             .query_row(
-                "SELECT d.tenant_id, meta.registration_method, identity.headscale_node_id
+                "SELECT d.tenant_id, meta.registration_method, identity.headscale_node_id,
+                        d.mesh_name, identity.hostname
                  FROM devices d
                  JOIN tailscale_device_metadata meta ON meta.device_id = d.id
                  JOIN mesh_identities identity ON identity.nexo_device_id = d.id
                  WHERE identity.headscale_node_id = '501'",
                 [],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
             )
             .expect("Auth Key 节点应自动归属");
         assert_eq!(
@@ -22652,7 +20185,9 @@ mod tests {
             (
                 "tenant-1".to_owned(),
                 "auth_key".to_owned(),
-                "501".to_owned()
+                "501".to_owned(),
+                "phone-auth-key".to_owned(),
+                "phone-auth-key".to_owned()
             )
         );
         let isolated: String = connection
@@ -22663,5 +20198,13 @@ mod tests {
             )
             .expect("未知节点应进入隔离表");
         assert_eq!(isolated, "isolated");
+        let snapshot: String = connection
+            .query_row(
+                "SELECT node_json FROM tailscale_external_nodes WHERE node_id='999'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(!snapshot.contains("test-secret-must-not-persist"));
     }
 }

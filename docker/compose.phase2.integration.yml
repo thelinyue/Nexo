@@ -75,7 +75,6 @@ services:
       - >-
         cp /run/nexo-phase2-certs/mesh-ca.crt /usr/local/share/ca-certificates/nexo-phase2.crt
         && update-ca-certificates >/dev/null
-        && iptables -A FORWARD -o eth0 -d 192.168.20.0/24 -j REJECT
         && exec /usr/local/bin/nexo-agent
     extra_hosts:
       - "mesh.phase2.test:172.29.0.2"
@@ -90,7 +89,7 @@ services:
       NEXO_DEVICE_NAME: 家庭网关
       NEXO_TAILSCALE_APPLY: "true"
       NEXO_TAILSCALED_ENABLED: "true"
-      NEXO_AGENT_CAPABILITIES: mesh,subnet_gateway,site_gateway,tunnel
+      NEXO_AGENT_CAPABILITIES: mesh,subnet_gateway,tunnel
       NEXO_STATE_DIR: /data/nexo-agent
     volumes:
       - ${NEXO_PHASE2_CERT_DIR:?NEXO_PHASE2_CERT_DIR 未设置}:/run/nexo-phase2-certs:ro
@@ -117,7 +116,6 @@ services:
       - >-
         cp /run/nexo-phase2-certs/mesh-ca.crt /usr/local/share/ca-certificates/nexo-phase2.crt
         && update-ca-certificates >/dev/null
-        && iptables -A FORWARD -o eth0 -d 192.168.10.0/24 -j REJECT
         && exec /usr/local/bin/nexo-agent
     extra_hosts:
       - "mesh.phase2.test:172.29.0.2"
@@ -132,7 +130,7 @@ services:
       NEXO_DEVICE_NAME: 办公网关
       NEXO_TAILSCALE_APPLY: "true"
       NEXO_TAILSCALED_ENABLED: "true"
-      NEXO_AGENT_CAPABILITIES: mesh,subnet_gateway,site_gateway,tunnel
+      NEXO_AGENT_CAPABILITIES: mesh,subnet_gateway,tunnel
       NEXO_STATE_DIR: /data/nexo-agent
     volumes:
       - ${NEXO_PHASE2_CERT_DIR:?NEXO_PHASE2_CERT_DIR 未设置}:/run/nexo-phase2-certs:ro
@@ -150,10 +148,6 @@ services:
     command:
       - --address
       - 192.168.10.100
-      - --remote-prefix
-      - 192.168.20.0/24
-      - --next-hop
-      - 192.168.10.2
     cap_add: [NET_ADMIN]
     networks:
       home-lan:
@@ -167,10 +161,6 @@ services:
     command:
       - --address
       - 192.168.20.100
-      - --remote-prefix
-      - 192.168.10.0/24
-      - --next-hop
-      - 192.168.20.2
     cap_add: [NET_ADMIN]
     networks:
       office-lan:
@@ -188,6 +178,20 @@ services:
     networks:
       control:
         ipv4_address: 172.29.0.50
+
+  tailscale-client:
+    build:
+      context: .
+      dockerfile: Dockerfile.integration-client
+    cap_add: [NET_ADMIN]
+    devices: [/dev/net/tun:/dev/net/tun]
+    extra_hosts:
+      - "mesh.phase2.test:172.29.0.2"
+      - "nexo.phase2.test:172.29.0.2"
+    volumes:
+      - ${NEXO_PHASE2_CERT_DIR:?NEXO_PHASE2_CERT_DIR 未设置}:/run/nexo-phase2-certs:ro
+    networks:
+      control: {}
 
 networks:
   control:

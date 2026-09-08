@@ -312,7 +312,7 @@ type GatewayReport = {
   ipv4_forwarding: boolean;
   ipv6_forwarding: boolean;
   subnet_gateway: "ready" | "unavailable";
-  site_gateway: "ready" | "unavailable";
+
   local_networks?: LocalNetwork[];
 };
 
@@ -322,16 +322,11 @@ type LocalNetwork = {
   gateway_address: string | null;
 };
 
-type Site = {
-  id: string;
-  tenant_id: string;
-  name: string;
-};
 
 type Device = {
   id: string;
   tenant_id: string;
-  site_id: string | null;
+
   name: string;
   os: string | null;
   architecture: string | null;
@@ -340,6 +335,10 @@ type Device = {
   gateway_report: GatewayReport | null;
   mesh_status?: "joining" | "connected" | "mesh_offline" | "needs_recovery" | "failed" | "disabled" | "not_joined";
   mesh_address?: string | null;
+  mesh_name?: string | null;
+  active_mesh_name?: string | null;
+  mesh_fqdn?: string | null;
+  mesh_name_status?: "not_joined" | "applying" | "ready" | string;
   connection_type?: "nexo_agent" | "tailscale_client" | string;
   owner_user_id?: string | null;
   owner_username?: string | null;
@@ -358,7 +357,7 @@ type Enrollment = {
   enrollment_id: string;
   status: "pending" | "awaiting_approval" | "approved" | "consumed" | "expired" | "revoked";
   tenant_id: string;
-  site_id: string | null;
+
   device_name: string | null;
   os: string | null;
   architecture: string | null;
@@ -374,6 +373,8 @@ type CreatedEnrollment = {
 };
 
 type TailscaleClientConfig = {
+  magic_dns_enabled: boolean;
+  dns_base_domain: string;
   login_server: string;
   browser_authorization_url: string | null;
   supported_platforms: string[];
@@ -448,68 +449,17 @@ type AccessPolicyPreview = {
   error: string | null;
 };
 
-type StaticRouteGuide = {
-  purpose?: "site_network" | "mesh_client_return" | string;
-  router_site_id: string;
-  destination_site_id: string;
-  router_site_name: string;
-  destination_site_name: string;
-  destination_label?: string;
-  destination_prefix: string;
-  next_hop: string | null;
-  router_confirmed?: boolean;
-};
 
-type SiteLink = {
-  id: string;
-  tenant_id: string;
-  left_site_id: string;
-  right_site_id: string;
-  left_site_name: string;
-  right_site_name: string;
-  left_networks: SiteLinkNetworkSummary[];
-  right_networks: SiteLinkNetworkSummary[];
-  static_routes: StaticRouteGuide[];
-  route_statuses: SiteLinkRouteStatus[];
-  route_confirmations?: { site_id: string; confirmed_at: number }[];
-  enabled: boolean;
-  apply_status: "disabled" | "checking" | "applying" | "ready" | "retrying" | "failed";
-  apply_error: string | null;
-  health_status: "ready" | "degraded" | "failed" | "disabled";
-  health_error: string | null;
-  deletion_pending: boolean;
-};
 
-type SiteLinkNetworkSummary = {
-  id: string;
-  name: string;
-  prefix: string;
-  source: "detected" | "manual" | string;
-  address_family: "ipv4" | "ipv6" | string;
-  publisher_device_id: string;
-  publisher_device_name: string;
-  gateway_address: string | null;
-  apply_status: SiteLink["apply_status"];
-};
 
-type SiteLinkRouteStatus = {
-  network_id: string;
-  router_site_id: string;
-  destination_site_id: string;
-  destination_prefix: string;
-  address_family: "ipv4" | "ipv6" | string;
-  device_status: string;
-  control_plane_status: string;
-  remote_status: string;
-  error: string | null;
-  checked_at: number | null;
-};
 
 type SiteNetwork = {
+  status_reason: string;
+  updated_at: number;
   id: string;
   tenant_id: string;
-  site_id: string;
-  site_name: string;
+
+
   name: string;
   publisher_device_name: string;
   publisher_device_id: string;
@@ -519,9 +469,9 @@ type SiteNetwork = {
   desired_prefix: string;
   applied_prefix: string | null;
   enabled: boolean;
-  apply_status: SiteLink["apply_status"];
+  apply_status: "disabled" | "checking" | "applying" | "ready" | "retrying" | "failed";
   apply_error: string | null;
-  health_status: SiteLink["health_status"];
+  health_status: "ready" | "degraded" | "failed" | "disabled";
   health_error: string | null;
   deletion_pending: boolean;
 };
@@ -559,9 +509,7 @@ function Dashboard({
   const [mobileNavigationOpen, setMobileNavigationOpen] = useState(false);
   const [overview, setOverview] = useState<Overview>(emptyOverview);
   const [devices, setDevices] = useState<Device[]>([]);
-  const [sites, setSites] = useState<Site[]>([]);
   const [siteNetworks, setSiteNetworks] = useState<SiteNetwork[]>([]);
-  const [siteLinks, setSiteLinks] = useState<SiteLink[]>([]);
   const [meshConnections, setMeshConnections] = useState<MeshConnection[]>([]);
   const [accessRules, setAccessRules] = useState<AccessRule[]>([]);
   const [accessWorkspaces, setAccessWorkspaces] = useState<AccessWorkspace[]>([]);
@@ -574,13 +522,7 @@ function Dashboard({
   const [tunnels, setTunnels] = useState<Tunnel[]>([]);
   const [publicDomains, setPublicDomains] = useState<PublicDomain[]>([]);
   const [loading, setLoading] = useState(false);
-  const [actionLinkId, setActionLinkId] = useState<string | null>(null);
-  const [actionNetworkId, setActionNetworkId] = useState<string | null>(null);
-  const [networkFormSiteId, setNetworkFormSiteId] = useState<string | null>(null);
-  const [linkFormSiteId, setLinkFormSiteId] = useState<string | null>(null);
-  const [editingSiteLink, setEditingSiteLink] = useState<SiteLink | null>(null);
   const [showTunnelForm, setShowTunnelForm] = useState(false);
-  const [showSiteForm, setShowSiteForm] = useState(false);
   const [editingTunnel, setEditingTunnel] = useState<Tunnel | null>(null);
   const [editTrigger, setEditTrigger] = useState<HTMLButtonElement | null>(null);
   const [deletingTunnel, setDeletingTunnel] = useState<Tunnel | null>(null);
@@ -628,26 +570,29 @@ function Dashboard({
         return body as T;
       };
       if (route === "#/overview") {
-        const [nextOverview, nextEnrollments, nextTunnels, nextNetworks, nextLinks] = await Promise.all([
+        const [nextOverview, nextEnrollments, nextTunnels, nextNetworks] = await Promise.all([
           read<Overview>("/api/v1/overview", "暂时无法读取概览"),
           read<Enrollment[]>("/api/v1/enrollments", "暂时无法读取入网请求"),
           read<Tunnel[]>("/api/v1/tunnels", "暂时无法读取公网服务"),
           read<SiteNetwork[]>("/api/v1/site-networks", "暂时无法读取共享网络"),
-          read<SiteLink[]>("/api/v1/site-links", "暂时无法读取站点互联"),
+
         ]);
         setOverview(nextOverview); setEnrollments(nextEnrollments); setTunnels(nextTunnels);
-        setSiteNetworks(nextNetworks); setSiteLinks(nextLinks);
+        setSiteNetworks(nextNetworks);
       } else if (route === "#/network/devices") {
-        const [nextDevices, nextSites, nextEnrollments, nextMeshStatus, nextNetworks, nextTunnels] = await Promise.all([
+        const [nextDevices, nextEnrollments, nextMeshStatus, nextNetworks, nextTunnels] = await Promise.all([
           read<Device[]>("/api/v1/devices", "暂时无法读取设备"),
-          read<Site[]>("/api/v1/sites", "暂时无法读取站点"),
+
           read<Enrollment[]>("/api/v1/enrollments", "暂时无法读取入网请求"),
           read<MeshStatus>("/api/v1/mesh/status", "暂时无法读取设备互联状态"),
           read<SiteNetwork[]>("/api/v1/site-networks", "暂时无法读取共享网段"),
           read<Tunnel[]>("/api/v1/tunnels", "暂时无法读取公网服务"),
         ]);
-        setDevices(nextDevices); setSites(nextSites); setEnrollments(nextEnrollments); setMeshStatus(nextMeshStatus);
+        setDevices(nextDevices);  setEnrollments(nextEnrollments); setMeshStatus(nextMeshStatus);
         setSiteNetworks(nextNetworks); setTunnels(nextTunnels);
+        setMeshConnections(await read<MeshConnection[]>("/api/v1/mesh/connections", "暂时无法读取连接情况"));
+        const domainsResponse = await request("/api/v1/public-domains");
+        if (domainsResponse.ok) setPublicDomains(await domainsResponse.json());
         const clientConfigResponse = await request("/api/v1/mesh/client-config");
         const clientConfigBody: unknown = await clientConfigResponse.json().catch(() => null);
         if (!clientConfigResponse.ok) throw new Error(readApiError(clientConfigBody, "暂时无法读取客户端配置"));
@@ -688,37 +633,21 @@ function Dashboard({
         const domainsBody: unknown = await domainsResponse.json().catch(() => null);
         if (domainsResponse.ok) setPublicDomains(Array.isArray(domainsBody) ? domainsBody as PublicDomain[] : []);
       } else if (route === "#/network/private") {
-        const [nextSites, nextDevices, nextNetworks, nextLinks, nextConnections] = await Promise.all([
-          read<Site[]>("/api/v1/sites", "暂时无法读取站点"),
+        const [nextDevices, nextNetworks, nextConnections] = await Promise.all([
+
           read<Device[]>("/api/v1/devices", "暂时无法读取设备"),
           read<SiteNetwork[]>("/api/v1/site-networks", "暂时无法读取共享网络"),
-          read<SiteLink[]>("/api/v1/site-links", "暂时无法读取站点互联"),
+
           read<MeshConnection[]>("/api/v1/mesh/connections", "暂时无法读取连接路径"),
         ]);
-        setSites(nextSites); setDevices(nextDevices); setSiteNetworks(nextNetworks); setSiteLinks(nextLinks);
+         setDevices(nextDevices); setSiteNetworks(nextNetworks);
         setMeshConnections(nextConnections);
       } else if (route === "#/network/settings/keys") {
-        const [clientConfigResponse, authKeysResponse, nextDevices] = await Promise.all([
-          request("/api/v1/mesh/client-config"),
-          request("/api/v1/mesh/auth-keys"),
-          read<Device[]>("/api/v1/devices", "暂时无法读取设备"),
-        ]);
-        const clientConfigBody: unknown = await clientConfigResponse.json().catch(() => null);
-        const authKeysBody: unknown = await authKeysResponse.json().catch(() => null);
-        if (!clientConfigResponse.ok) throw new Error(readApiError(clientConfigBody, "暂时无法读取客户端配置"));
-        if (!authKeysResponse.ok) throw new Error(readApiError(authKeysBody, "暂时无法读取客户端密钥"));
-        setTailscaleClientConfig(clientConfigBody as TailscaleClientConfig);
-        setTailscaleAuthKeys(authKeysBody as TailscaleAuthKey[]);
-        setDevices(nextDevices);
-        if (auth.role === "system_admin") {
-          const externalNodesResponse = await request("/api/v1/mesh/external-nodes");
-          const externalNodesBody: unknown = await externalNodesResponse.json().catch(() => null);
-          if (!externalNodesResponse.ok) throw new Error(readApiError(externalNodesBody, "暂时无法同步隔离设备"));
-          setTailscaleExternalNodes(externalNodesBody as TailscaleExternalNode[]);
-        }
+        setTailscaleAuthKeys(await read<TailscaleAuthKey[]>("/api/v1/mesh/auth-keys", "暂时无法读取客户端密钥"));
       } else if (route === "#/network/settings/service") {
         const nextMeshStatus = await read<MeshStatus>("/api/v1/mesh/status", "暂时无法读取组网服务状态");
         setMeshStatus(nextMeshStatus);
+        setTailscaleClientConfig(await read<TailscaleClientConfig>("/api/v1/mesh/client-config", "暂时无法读取组网名称解析"));
       }
     } catch (requestError) {
       setError(requestError instanceof Error ? requestError.message : "暂时无法读取页面数据");
@@ -738,8 +667,11 @@ function Dashboard({
         throw new Error(readApiError(body, "暂时无法批准设备"));
       }
       await refreshCurrentPage();
+      return null;
     } catch (requestError) {
-      setError(requestError instanceof Error ? requestError.message : "暂时无法批准设备");
+      const message = requestError instanceof Error ? requestError.message : "暂时无法批准设备";
+      setError(message);
+      return message;
     }
   }, [request, refreshCurrentPage]);
 
@@ -766,100 +698,32 @@ function Dashboard({
     }
   }, [request, refreshCurrentPage]);
 
-  const recheckSiteLink = useCallback(async (link: SiteLink) => {
-    setError(null);
-    try {
-      const response = await request(`/api/v1/site-links/${encodeURIComponent(link.id)}/recheck`, {
-        method: "POST",
-      });
-      const body: unknown = await response.json().catch(() => null);
-      if (!response.ok) throw new Error(readApiError(body, "暂时无法重新检测站点互联"));
-      await refreshCurrentPage();
-    } catch (requestError) {
-      setError(requestError instanceof Error ? requestError.message : "暂时无法重新检测站点互联");
-    }
-  }, [request, refreshCurrentPage]);
 
-  const confirmRoute = useCallback(async (link: SiteLink, siteId: string) => {
-    setError(null);
-    try {
-      const response = await request(`/api/v1/site-links/${encodeURIComponent(link.id)}/router-confirmations/${encodeURIComponent(siteId)}`, {
-        method: "POST",
-      });
-      const body: unknown = await response.json().catch(() => null);
-      if (!response.ok) throw new Error(readApiError(body, "暂时无法保存路由确认"));
-      await refreshCurrentPage();
-    } catch (requestError) {
-      setError(requestError instanceof Error ? requestError.message : "暂时无法保存路由确认");
-    }
-  }, [request, refreshCurrentPage]);
 
   /** 共享网络开关复用服务端 Desired State，避免 UI 本地状态与 Agent 脱节。 */
-  const toggleSiteNetwork = useCallback(async (network: SiteNetwork) => {
-    if (network.enabled && !window.confirm(`确定停止共享“${network.name}”吗？`)) {
-      return;
-    }
-    setActionNetworkId(network.id);
-    setError(null);
-    try {
-      const response = await request(`/api/v1/site-networks/${encodeURIComponent(network.id)}/${network.enabled ? "disable" : "enable"}`, {
-        method: "POST",
-      });
-      const body = (await response.json().catch(() => null)) as { error?: string } | SiteNetwork | null;
-      if (!response.ok) {
-        throw new Error(body && "error" in body ? body.error ?? "暂时无法更新共享网络" : "暂时无法更新共享网络");
-      }
-      await refreshCurrentPage();
-    } catch (requestError) {
-      setError(requestError instanceof Error ? requestError.message : "暂时无法更新共享网络");
-    } finally {
-      setActionNetworkId(null);
-    }
-  }, [request, refreshCurrentPage]);
 
-  /** 站点互联开关沿用服务端 Desired State，成功后重新读取两侧应用状态。 */
-  const toggleSiteLink = useCallback(async (link: SiteLink) => {
-    if (link.enabled && !window.confirm(`确定关闭“${link.left_site_name} ↔ ${link.right_site_name}”吗？`)) {
-      return;
-    }
-    setActionLinkId(link.id);
-    setError(null);
-    try {
-      const response = await request(`/api/v1/site-links/${encodeURIComponent(link.id)}/${link.enabled ? "disable" : "enable"}`, {
-        method: "POST",
-      });
-      const body = (await response.json().catch(() => null)) as { error?: string } | SiteLink | null;
-      if (!response.ok) {
-        throw new Error(body && "error" in body ? body.error ?? "暂时无法更新站点互联" : "暂时无法更新站点互联");
-      }
-      await refreshCurrentPage();
-    } catch (requestError) {
-      setError(requestError instanceof Error ? requestError.message : "暂时无法更新站点互联");
-    } finally {
-      setActionLinkId(null);
-    }
-  }, [request, refreshCurrentPage]);
 
   useEffect(() => {
     void refreshCurrentPage();
   }, [refreshCurrentPage]);
 
   /**
-   * 网关状态由 Agent ACK 最终收敛；只在存在待应用 revision 时轮询，避免常驻后台请求。
-   * 失败状态不会自动重置，用户仍能看到明确错误并决定是否重新启用。
+   * 设备在线状态与连接观测持续更新。串行轮询避免慢请求堆积；资源快照
+   * 更新不卸载详情表单，因此保留用户输入及当前焦点。
    */
-  const hasPendingGatewayChanges = [...siteNetworks, ...siteLinks].some((item) =>
-    item.apply_status === "checking" || item.apply_status === "applying" || item.apply_status === "retrying",
-  );
   useEffect(() => {
-    if (!hasPendingGatewayChanges || route !== "#/network/private") {
+    if (!["#/network/private", "#/network/devices", "#/network/public"].includes(route)) {
       return;
     }
-    const timer = window.setInterval(() => {
-      void refreshCurrentPage();
-    }, 4000);
-    return () => window.clearInterval(timer);
-  }, [hasPendingGatewayChanges, refreshCurrentPage, route]);
+    let cancelled = false;
+    let timer: number;
+    const poll = async () => {
+      if (!document.hidden) await refreshCurrentPage();
+      if (!cancelled) timer = window.setTimeout(() => void poll(), 4000);
+    };
+    timer = window.setTimeout(() => void poll(), 4000);
+    return () => { cancelled = true; window.clearTimeout(timer); };
+  }, [refreshCurrentPage, route]);
 
   const hasPendingPublicDomainChanges = publicDomains.some((domain) =>
     ["pending", "checking", "configuring", "retrying", "rate_limited"].includes(domain.apply_status.toLowerCase()),
@@ -874,10 +738,10 @@ function Dashboard({
 
   const pendingDeletionIds = [
     ...siteNetworks.filter((item) => item.deletion_pending).map((item) => `network:${item.id}`),
-    ...siteLinks.filter((item) => item.deletion_pending).map((item) => `link:${item.id}`),
+
   ];
   const hasVisiblePendingDeletion = pendingDeletionIds.length > 0
-    && (route === "#/overview" || route === "#/network/private" || route === "#/network/public");
+    && route === "#/overview";
   useEffect(() => {
     if (!hasVisiblePendingDeletion) return;
     const timer = window.setInterval(() => void refreshCurrentPage(), 4000);
@@ -945,7 +809,7 @@ function Dashboard({
               enrollments={enrollments}
               tunnels={tunnels}
               siteNetworks={siteNetworks}
-              siteLinks={siteLinks}
+
               error={error}
               onRefresh={refreshCurrentPage}
             />
@@ -954,9 +818,11 @@ function Dashboard({
             <DevicesPage
               auth={auth}
               devices={devices}
-              sites={sites}
+
               siteNetworks={siteNetworks}
               tunnels={tunnels}
+              publicDomains={publicDomains}
+              meshConnections={meshConnections}
               enrollments={enrollments}
               meshStatus={meshStatus}
               clientConfig={tailscaleClientConfig}
@@ -1006,52 +872,8 @@ function Dashboard({
             />
           )}
           {route === "#/network/private" && (
-            <PrivateAccessPage
-              sites={sites}
-              devices={devices}
-              publicDomains={publicDomains}
-              siteNetworks={siteNetworks}
-              siteLinks={siteLinks}
-              meshConnections={meshConnections}
-              error={error}
-              request={request}
-              showSiteForm={showSiteForm}
-              networkFormSiteId={networkFormSiteId}
-              linkFormSiteId={linkFormSiteId}
-              editingSiteLink={editingSiteLink}
-              onToggleSiteForm={() => setShowSiteForm((visible) => !visible)}
-              onOpenNetworkForm={setNetworkFormSiteId}
-              onCloseNetworkForm={() => setNetworkFormSiteId(null)}
-              onOpenLinkForm={setLinkFormSiteId}
-              onCloseLinkForm={() => { setLinkFormSiteId(null); setEditingSiteLink(null); }}
-              onEditLink={(link) => { setEditingSiteLink(link); setLinkFormSiteId(link.left_site_id); }}
-              onToggleNetwork={toggleSiteNetwork}
-              onToggleLink={toggleSiteLink}
-              onRecheckLink={recheckSiteLink}
-              onConfirmRoute={confirmRoute}
-              actionNetworkId={actionNetworkId}
-              actionLinkId={actionLinkId}
-              deletingResource={deletingResource}
-              onDeleteSite={(site) => void deleteResource(
-                `site:${site.id}`,
-                `/api/v1/sites/${encodeURIComponent(site.id)}`,
-                `确定删除站点“${site.name}”吗？仅空站点可以删除，此操作无法撤销。`,
-                "暂时无法删除站点",
-              )}
-              onDeleteNetwork={(network) => void deleteResource(
-                `network:${network.id}`,
-                `/api/v1/site-networks/${encodeURIComponent(network.id)}`,
-                `确定删除共享网络“${network.name}”吗？路由会先撤销，确认完成后永久删除。`,
-                "暂时无法删除共享网络",
-              )}
-              onDeleteLink={(link) => void deleteResource(
-                `link:${link.id}`,
-                `/api/v1/site-links/${encodeURIComponent(link.id)}`,
-                `确定删除“${link.left_site_name} ↔ ${link.right_site_name}”的互联关系吗？两侧路由撤销后将永久删除。`,
-                "暂时无法删除站点互联",
-              )}
-              onRefresh={refreshCurrentPage}
-            />
+            <PrivateAccessPage devices={devices} siteNetworks={siteNetworks} meshConnections={meshConnections}
+              error={error} request={request} onRefresh={refreshCurrentPage} />
           )}
           {route.startsWith("#/network/settings/") && (
             <NetworkSettingsPage
@@ -1076,13 +898,14 @@ function Dashboard({
       </main>
 
       {editingTunnel && (
-        <EditTunnelDialog
-          tunnel={editingTunnel}
+        <TunnelDetailSheet
+          auth={auth}
+          onRefresh={refreshCurrentPage}
+          tunnel={tunnels.find(item => item.id === editingTunnel.id) ?? editingTunnel}
           devices={devices}
           publicDomains={publicDomains}
           request={request}
           returnFocus={editTrigger}
-          onUpdated={applyTunnelUpdate}
           onClose={() => { setEditingTunnel(null); setEditTrigger(null); }}
         />
       )}
@@ -1098,7 +921,7 @@ function Dashboard({
       {editingDevice && (
         <EditDeviceDialog
           device={editingDevice}
-          sites={sites}
+
           request={request}
           returnFocus={editDeviceTrigger}
           onUpdated={applyDeviceUpdate}
@@ -1116,6 +939,213 @@ function Dashboard({
       )}
     </div>
   );
+}
+
+type DevicePageProps = {
+  auth: AuthStatus; devices: Device[]; siteNetworks: SiteNetwork[]; tunnels: Tunnel[];
+  publicDomains: PublicDomain[]; meshConnections: MeshConnection[]; enrollments: Enrollment[];
+  meshStatus: MeshStatus | null; clientConfig: TailscaleClientConfig | null; externalNodes: TailscaleExternalNode[];
+  error: string | null; showEnrollmentForm: boolean; onToggleEnrollmentForm: () => void;
+  onCloseEnrollmentForm: () => void; onApprove: (item: Enrollment) => Promise<string | null>;
+  request: ApiRequest; onRefresh: () => Promise<void>; deletingResource: string | null;
+  onEditDevice: (device: Device, trigger: HTMLButtonElement | null) => void;
+  onDeleteDevice: (device: Device, trigger: HTMLButtonElement) => void;
+};
+
+/** 设备是唯一操作入口；轮询只替换资源快照，不重置列表筛选或详情位置。 */
+function DevicesPage(props: DevicePageProps) {
+  const [search, setSearch] = useState("");
+  const [kind, setKind] = useState("all");
+  const [status, setStatus] = useState("all");
+  const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [trigger, setTrigger] = useState<HTMLButtonElement | null>(null);
+  const [claimError, setClaimError] = useState<string | null>(null);
+  const [claiming, setClaiming] = useState<string | null>(null);
+  const matches = (name: string, searchFields = "") => `${name} ${searchFields}`.toLowerCase().includes(search.trim().toLowerCase());
+  const deviceSearchFields = (device: Device) => [
+    device.mesh_name,
+    device.active_mesh_name,
+    device.mesh_fqdn,
+    device.mesh_address,
+    device.tailscale_ipv4,
+    device.tailscale_ipv6,
+  ].filter(Boolean).join(" ");
+  const visible = props.devices.filter((device) => matches(device.name, deviceSearchFields(device)) && (kind === "all" || device.connection_type === kind) && (status === "all" || device.status === status));
+  const pending = props.enrollments.filter((item) => item.status === "awaiting_approval" && matches(item.device_name ?? "") && (kind === "all" || kind === "nexo_agent") && (status === "all" || status === "pending"));
+  const external = props.auth.role === "system_admin" ? props.externalNodes.filter((item) => matches(item.name, item.addresses.join(" ")) && (kind === "all" || kind === "tailscale_client") && (status === "all" || status === "unassigned")) : [];
+  const selected = props.devices.find((device) => device.id === selectedId);
+  const claim = async (node: TailscaleExternalNode) => {
+    setClaiming(node.node_id); setClaimError(null);
+    try {
+      const response = await props.request(`/api/v1/mesh/external-nodes/${encodeURIComponent(node.node_id)}/claim`, { method: "POST" });
+      const body: unknown = await response.json();
+      if (!response.ok) throw new Error(readApiError(body, "暂时无法确认设备归属"));
+      await props.onRefresh();
+    } catch (error) { setClaimError(error instanceof Error ? error.message : "暂时无法确认设备归属"); }
+    finally { setClaiming(null); }
+  };
+  return <>
+    <PageHeader eyebrow="网络" title="设备" subtitle="查看设备，并管理它的子网和公网服务。" action={<button className="primary-button" onClick={props.onToggleEnrollmentForm}><Plus size={16} aria-hidden="true" />添加设备</button>} />
+    <PageError error={props.error} onRetry={props.onRefresh} />
+    <section className="panel page-panel">
+      <div className="device-filters"><label><span className="sr-only">搜索设备</span><input placeholder="搜索名称、访问名、域名或 IP 地址" aria-label="搜索设备" value={search} onChange={(event) => setSearch(event.target.value)} /></label><label><span className="sr-only">设备类型</span><select aria-label="设备类型筛选" value={kind} onChange={(event) => setKind(event.target.value)}><option value="all">所有类型</option><option value="nexo_agent">Nexo Agent</option><option value="tailscale_client">Tailscale 客户端</option></select></label><label><span className="sr-only">设备状态</span><select aria-label="设备状态筛选" value={status} onChange={(event) => setStatus(event.target.value)}><option value="all">所有状态</option><option value="online">在线</option><option value="offline">离线</option><option value="pending">待批准</option><option value="unassigned">待归属</option></select></label></div>
+      <div className="unified-device-table" role="table" aria-label="设备列表">
+        <div className="unified-device-head" role="row"><span role="columnheader">名称</span><span role="columnheader">类型</span><span role="columnheader">组网地址</span><span role="columnheader">状态</span></div>
+        {visible.map((device) => <div className="unified-device-row" role="row" key={device.id}><div role="cell"><button className="device-name-button" onClick={(event) => {setSelectedId(device.id); setTrigger(event.currentTarget);}}>{device.name}</button></div><span role="cell">{device.connection_type === "nexo_agent" ? "Nexo Agent" : "Tailscale 客户端"}</span><code role="cell">{device.tailscale_ipv4 ?? device.mesh_address ?? "地址待分配"}</code><span role="cell" className={`status-pill ${device.status === "online" ? "ready" : "disabled"}`}><i />{device.status === "online" ? "在线" : "离线"}</span></div>)}
+        {pending.map((item) => <div className="unified-device-row" role="row" key={item.enrollment_id}><strong role="cell">{item.device_name ?? "新设备"}</strong><span role="cell">Nexo Agent</span><span role="cell">待批准</span><div role="cell"><button className="secondary-button" disabled={claiming === item.enrollment_id} onClick={async () => {setClaiming(item.enrollment_id);try {await props.onApprove(item);} finally {setClaiming(null);}}}>批准设备</button></div></div>)}
+        {external.map((node) => <div className="unified-device-row" role="row" key={node.node_id}><div role="cell"><strong>{node.name}</strong></div><span role="cell">Tailscale 客户端</span><span role="cell">待归属</span><div role="cell"><button className="secondary-button" disabled={claiming === node.node_id} onClick={() => void claim(node)}>归属当前工作空间</button></div></div>)}
+      </div>
+      {visible.length + pending.length + external.length === 0 && <EmptyState icon={MonitorSmartphone} title="没有匹配的设备" detail="调整筛选，或添加设备开始使用。" />}
+      {claimError && <p className="form-error" role="alert">{claimError}</p>}
+    </section>
+    {selected && <DeviceDetailSheet {...props} device={selected} returnFocus={trigger} onClose={() => setSelectedId(null)} />}
+    {props.showEnrollmentForm && <AddDeviceSheet tenantId={props.auth.workspace_id ?? "default"} enrollments={props.enrollments} onApprove={props.onApprove} clientConfig={props.clientConfig} request={props.request} onCreated={props.onRefresh} onClose={props.onCloseEnrollmentForm} />}
+  </>;
+}
+
+function DeviceDetailSheet(props: DevicePageProps & { device: Device; returnFocus: HTMLElement | null; onClose: () => void }) {
+  const [page, setPage] = useState<"details" | "subnets" | "rename" | "create" | "delete">("details");
+  const [service, setService] = useState<Tunnel | null>(null);
+  const [networkId, setNetworkId] = useState<string | null>(null);
+  const [copyStatus, setCopyStatus] = useState<string | null>(null);
+  const detailPosition = useRef({scrollTop: 0, action: "", moreOpen: false});
+  const detailRoot = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (page !== "details" || service || networkId) return;
+    const frame = window.requestAnimationFrame(() => {
+      const root = detailRoot.current;
+      if (!root) return;
+      const more = root.querySelector('details');
+      if (more) more.open = detailPosition.current.moreOpen;
+      const action = [...root.querySelectorAll<HTMLButtonElement>('button')].find(button => button.textContent === detailPosition.current.action);
+      action?.focus({preventScroll:true});
+      const body = root.closest('.form-dialog-body');
+      if (body) body.scrollTop = detailPosition.current.scrollTop;
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [page, service, networkId]);
+  const back = () => setPage("details");
+  const networks = props.siteNetworks.filter((item) => item.publisher_device_id === props.device.id);
+  const services = props.tunnels.filter((item) => item.device_id === props.device.id);
+  const selectedNetwork = networks.find((item) => item.id === networkId);
+  const meshName = props.device.mesh_name ?? props.device.active_mesh_name;
+  const activeMeshName = props.device.active_mesh_name;
+  const meshFqdn = props.device.mesh_fqdn;
+  const meshNameApplying = props.device.mesh_name_status === "applying";
+  const copyMeshValue = async (label: string, value: string | null | undefined) => {
+    if (!value) return;
+    try {
+      if (!navigator.clipboard) throw new Error("clipboard-unavailable");
+      await navigator.clipboard.writeText(value);
+      setCopyStatus(`${label}已复制`);
+    } catch {
+      setCopyStatus("复制失败，请检查浏览器剪贴板权限");
+    }
+  };
+  if (page === "subnets") return <SharedNetworksEditor device={props.device} networks={networks} request={props.request} onRefresh={props.onRefresh} onClose={back} />;
+  if (page === "rename") return <EditDeviceDialog device={props.device} request={props.request} returnFocus={null} onUpdated={() => {void props.onRefresh();back();}} onClose={back} />;
+  if (page === "delete") return <DeleteDeviceDialog device={props.device} request={props.request} returnFocus={null} onDeleted={() => {void props.onRefresh();props.onClose();}} onClose={back} />;
+  if (service) return <TunnelDetailSheet auth={props.auth} onRefresh={props.onRefresh} tunnel={props.tunnels.find((item) => item.id === service.id) ?? service} devices={props.devices} publicDomains={props.publicDomains} request={props.request} returnFocus={null} onClose={() => setService(null)} />;
+  if (selectedNetwork) return <NetworkDetailSheet network={selectedNetwork} connections={props.meshConnections.filter((item) => item.site_network_id === selectedNetwork.id)} request={props.request} returnFocus={null} onRefresh={props.onRefresh} onClose={() => setNetworkId(null)} />;
+  if (page === "create") return <FormDialog confirmDiscard title="添加公网服务" eyebrow={props.device.name} description="从这台设备发布服务。" onClose={back}><CreateTunnelForm auth={props.auth} devices={[props.device]} publicDomains={props.publicDomains} request={props.request} onDomainsChanged={props.onRefresh} onCancel={back} onCreated={async () => {await props.onRefresh();back();}} /></FormDialog>;
+  return <FormDialog title={props.device.name} eyebrow="设备详情" description={`${props.device.connection_type === "nexo_agent" ? "Nexo Agent" : "Tailscale 客户端"} · ${props.device.mesh_address ?? props.device.tailscale_ipv4 ?? "地址待分配"}`} returnFocus={props.returnFocus} onClose={props.onClose}>
+    <div ref={detailRoot} onClickCapture={(event) => {
+      const button = (event.target as HTMLElement).closest('button');
+      if (!button) return;
+      detailPosition.current = {scrollTop: event.currentTarget.closest('.form-dialog-body')?.scrollTop ?? 0, action:button.textContent ?? "", moreOpen: Boolean(event.currentTarget.querySelector('details')?.open)};
+    }}>
+
+    <div className="detail-section"><div className="panel-heading"><h3>子网 · {networks.length}</h3>{props.device.connection_type === "nexo_agent" && <button className="secondary-button" onClick={() => setPage("subnets")}>编辑子网</button>}</div>{networks.map((item) => <button className="detail-resource" key={item.id} onClick={() => setNetworkId(item.id)}><span>{item.desired_prefix}</span><NetworkState network={item} /></button>)}{networks.length === 0 && <p className="form-hint">{props.device.connection_type === "nexo_agent" ? "选择本机网段后，当前工作空间的设备即可访问。" : "此设备可访问已授权的共享网段。"}</p>}</div>
+    <section className="detail-section mesh-access-section" aria-labelledby="mesh-access-heading">
+      <div className="panel-heading mesh-access-heading"><div><h3 id="mesh-access-heading">组网访问</h3><p className="form-hint">使用短访问名或完整域名访问这台设备。</p></div>{meshNameApplying && <span className="status-pill working"><i />正在更新访问名</span>}</div>
+      <div className="mesh-access-values">
+        <div className="mesh-access-value"><span>短访问名</span><div><code>{meshName ?? "等待分配"}</code><button className="icon-button compact-icon-button" type="button" disabled={!meshName} title="复制短访问名" aria-label="复制短访问名" onClick={() => void copyMeshValue("短访问名", meshName)}><Copy size={16} aria-hidden="true" /></button></div>{meshNameApplying && activeMeshName && activeMeshName !== meshName && <small>当前有效：{activeMeshName}</small>}</div>
+        <div className="mesh-access-value"><span>{meshNameApplying && activeMeshName ? "当前完整域名" : "完整域名"}</span><div><code>{meshFqdn ?? "加入组网后生成"}</code><button className="icon-button compact-icon-button" type="button" disabled={!meshFqdn} title="复制完整域名" aria-label="复制完整域名" onClick={() => void copyMeshValue("完整域名", meshFqdn)}><Copy size={16} aria-hidden="true" /></button></div></div>
+      </div>
+      {meshNameApplying && <p className="mesh-access-hint">访问名更新完成前，当前完整域名仍然有效；后台会自动继续处理。</p>}
+      {copyStatus && <p className="mesh-access-feedback" role="status">{copyStatus}</p>}
+    </section>
+    <div className="detail-section"><div className="panel-heading"><h3>公网服务 · {services.length}</h3>{props.device.connection_type === "nexo_agent" && <button className="secondary-button" onClick={() => setPage("create")}>添加服务</button>}</div>{services.map((item) => <button className="detail-resource" key={item.id} onClick={() => setService(item)}><span>{item.name}<small>{item.public_address ?? "地址待生成"}</small></span><span>{item.apply_status === "ready" ? "正常" : item.enabled ? "处理中" : "已关闭"}</span></button>)}{services.length === 0 && <p className="form-hint">暂无公网服务。</p>}</div>
+    <details className="detail-section"><summary>设备信息与更多操作</summary><p>组网 IPv4：<code>{props.device.tailscale_ipv4 ?? props.device.mesh_address ?? "暂无"}</code></p><p>组网 IPv6：<code>{props.device.tailscale_ipv6 ?? "暂无"}</code></p><p>系统：{props.device.os ?? "未知"} · Agent：{props.device.agent_version ?? "不适用"}</p><p>最近连接：{props.device.last_seen_at ? formatSessionTime(props.device.last_seen_at) : "暂无记录"}</p><div className="dialog-actions"><button className="secondary-button" onClick={() => setPage("rename")}><Pencil size={15} aria-hidden="true" />编辑设备</button><button className="danger-button" onClick={() => setPage("delete")}>删除设备</button></div></details>
+    </div>
+  </FormDialog>;
+}
+
+/** 配置状态与客户端路径独立呈现，避免已启用或 P2P 被误认为服务可达。 */
+function NetworkState({ network }: { network: SiteNetwork }) {
+  const reason = network.status_reason;
+  const label = network.apply_status === "disabled" ? "已关闭" : reason === "device_offline" ? "需处理" : network.apply_status === "failed" || network.health_status === "failed" ? "需处理" : network.apply_status === "ready" && network.health_status === "ready" ? "正常" : "处理中";
+  return <span className={`status-pill ${label === "正常" ? "ready" : label === "需处理" ? "error" : label === "已关闭" ? "disabled" : "working"}`}><i />{label}</span>;
+}
+
+function PrivateAccessPage({devices, siteNetworks, meshConnections, error, request, onRefresh}: {devices: Device[]; siteNetworks: SiteNetwork[]; meshConnections: MeshConnection[]; error: string | null; request: ApiRequest; onRefresh: () => Promise<void>}) {
+  const [deviceId, setDeviceId] = useState<string | null>(null);
+  const [networkId, setNetworkId] = useState<string | null>(null);
+  const [manual, setManual] = useState(false);
+  const agents = devices.filter((item) => item.connection_type === "nexo_agent");
+  const device = agents.find((item) => item.id === deviceId);
+  const network = siteNetworks.find((item) => item.id === networkId);
+  return <><PageHeader eyebrow="网络" title="私网访问" subtitle="共享家庭网段，供当前工作空间的设备访问。" /> <PageError error={error} onRetry={onRefresh} />
+    <section className="panel page-panel"><div className="panel-heading"><h2>共享子网 · {siteNetworks.length}</h2><button className="secondary-button" onClick={() => setManual(true)}>手动添加网段</button></div>
+      {agents.map((agent) => <div className="detail-resource" key={agent.id}><span>{agent.name}</span><button className="secondary-button" onClick={() => setDeviceId(agent.id)}>管理子网</button></div>)}
+      {siteNetworks.map((item) => <div className="private-network-row" key={item.id}><div><strong>{item.desired_prefix}</strong><span>{item.publisher_device_name}</span></div><NetworkState network={item} /><button className="secondary-button" onClick={() => setNetworkId(item.id)}>查看详情</button></div>)}
+      {agents.length === 0 && <EmptyState icon={Network} title="还没有 Agent" detail="先添加一台 Nexo Agent，再选择家庭网段。" />}
+    </section>
+    {device && <SharedNetworksEditor device={device} networks={siteNetworks.filter((item) => item.publisher_device_id === device.id)} request={request} onRefresh={onRefresh} onClose={() => setDeviceId(null)} />}
+    {network && <NetworkDetailSheet network={network} connections={meshConnections.filter((item) => item.site_network_id === network.id)} request={request} returnFocus={null} onRefresh={onRefresh} onClose={() => setNetworkId(null)} />}
+    {manual && <FormDialog confirmDiscard title="手动添加网段" eyebrow="私网访问" description="用于 Agent 能访问、但无法自动检测的网段。" onClose={() => setManual(false)}><CreateSiteNetworkForm devices={agents} request={request} onCancel={() => setManual(false)} onCreated={async () => {await onRefresh();setManual(false);}} /></FormDialog>}
+  </>;
+}
+
+function SharedNetworksEditor({device, networks, request, onRefresh, onClose}: {device: Device; networks: SiteNetwork[]; request: ApiRequest; onRefresh: () => Promise<void>; onClose: () => void}) {
+  // 编辑快照保持稳定，轮询不会覆盖用户正在勾选的集合。
+  const [rows] = useState(() => [...networks.map((item) => ({id:item.id,interface_id:item.interface_id,prefix:item.desired_prefix,enabled:item.enabled,source:item.source})), ...(device.gateway_report?.local_networks ?? []).filter((item) => !networks.some((network) => network.desired_prefix === item.prefix)).map((item) => ({id:undefined,interface_id:item.interface_id,prefix:item.prefix,enabled:false,source:"detected"}))]);
+  const [selection, setSelection] = useState(rows.map((item) => item.enabled));
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const dirty = selection.some((value,index) => value !== rows[index].enabled);
+  const close = () => {if (!dirty || window.confirm("放弃尚未保存的子网修改？")) onClose();};
+  return <FormDialog title="编辑子网" eyebrow={device.name} description="保存后自动配置，允许当前工作空间内的设备访问所选网段。" onClose={() => {if (!busy) close();}}>
+    <form onSubmit={async (event) => {event.preventDefault();setBusy(true);setError(null);try {const response=await request(`/api/v1/devices/${encodeURIComponent(device.id)}/shared-networks`,{method:"PUT",headers:{"content-type":"application/json"},body:JSON.stringify({networks:rows.map((item,index)=>({...item,enabled:selection[index]}))})});const body:unknown=await response.json();if(!response.ok)throw new Error(readApiError(body,"暂时无法保存子网"));await onRefresh();onClose();}catch(error){setError(error instanceof Error?error.message:"暂时无法保存子网");}finally{setBusy(false);}}}>
+      <fieldset className="network-checklist" disabled={busy}><legend>可共享网段</legend>{rows.map((row,index)=> {
+        const missing=row.source!=="manual"&&!device.gateway_report?.local_networks.some(item=>item.prefix===row.prefix);
+        const forwarding=device.gateway_report?forwardingRequirement(device.gateway_report,row.prefix):null;
+        const blocked=device.gateway_report?forwarding ?? (missing?"未检测到此网段，已保留原配置":null):"等待设备上报网络信息";
+        return <div key={`${row.interface_id}:${row.prefix}`}><label><input type="checkbox" checked={selection[index]} disabled={Boolean(blocked)&&!selection[index]} onChange={(event)=>setSelection(selection.map((value,i)=>i===index?event.target.checked:value))}/><span><strong>{row.prefix}</strong><small>{blocked ?? (row.interface_id || "手动网段")}</small></span></label>{blocked && <details className="form-hint"><summary>查看处理方法</summary>{forwarding ? <><p>请在运行 Agent 的 Linux 主机开启对应地址族转发，然后等待设备更新。</p><code>{row.prefix.includes(":")?"sudo sysctl -w net.ipv6.conf.all.forwarding=1":"sudo sysctl -w net.ipv4.ip_forward=1"}</code><p>重启后持续生效需将该设置写入主机的 sysctl 配置。</p></> : <p>{device.gateway_report ? "检查 Agent 的网卡是否连接到该局域网、地址是否发生变化；恢复后会自动更新。已有配置会保留，也可以取消勾选以关闭。" : "请确认 Agent 已在线并完成网络信息上报，页面会自动更新。"}</p>}</details>}</div>;
+      })}{rows.length===0&&<p>等待 Agent 上报本地网段。</p>}</fieldset>
+      {error&&<p className="form-error" role="alert">{error}</p>}<div className="dialog-actions"><button type="button" className="secondary-button" onClick={close} disabled={busy}>取消</button><button className="primary-button" disabled={busy||!dirty}>{busy?"保存中…":"保存"}</button></div>
+    </form>
+  </FormDialog>;
+}
+
+function AddDeviceSheet({tenantId, enrollments, onApprove, clientConfig, request, onCreated, onClose}: {tenantId:string; enrollments:Enrollment[]; onApprove:(item:Enrollment)=>Promise<string | null>; clientConfig:TailscaleClientConfig|null; request:ApiRequest; onCreated:()=>Promise<void>; onClose:()=>void}) {
+  const [kind,setKind]=useState("tailscale");
+  const [platform,setPlatform]=useState("ios");
+  const [copied,setCopied]=useState(false);
+  const [error,setError]=useState<string|null>(null);
+  return <FormDialog title="添加设备" eyebrow="网络" description="手机和电脑使用 Tailscale；共享子网或发布服务使用 Nexo Agent。" onClose={onClose}>
+    <div className="device-kind-switch" role="tablist" aria-label="设备用途"><button role="tab" aria-selected={kind==="tailscale"} onClick={()=>setKind("tailscale")}>手机或电脑</button><button role="tab" aria-selected={kind==="agent"} onClick={()=>setKind("agent")}>共享网络或发布服务</button></div>
+    <div hidden={kind!=="agent"}><CreateEnrollmentForm tenantId={tenantId} enrollments={enrollments} onApprove={onApprove} request={request} onCreated={onCreated} onDone={onClose}/></div>
+    <div hidden={kind!=="tailscale"} className="tailscale-enrollment-guide"><label><span>操作系统</span><select value={platform} onChange={(event)=>setPlatform(event.target.value)}><option value="ios">iPhone / iPad</option><option value="android">Android</option><option value="windows">Windows</option><option value="macos">macOS</option><option value="linux">Linux</option></select></label>
+      <ol className="official-client-steps"><li><strong>安装 Tailscale</strong><a href="https://tailscale.com/download" target="_blank" rel="noreferrer">打开官方下载页面</a></li><li><strong>使用 Nexo 控制服务器登录</strong><span>{platform==="ios"?"在账户登录的选项菜单中选择自定义协调服务器。":platform==="linux"?"使用下方命令发起登录，在浏览器完成身份验证。":"在客户端登录选项中选择自定义服务器；也可通过 Tailscale CLI 指定登录服务器。"}</span><div className="copyable-value"><code>{platform==="linux"?`sudo tailscale up --login-server=${clientConfig?.login_server??""}`:clientConfig?.login_server??"正在读取地址…"}</code><button className="secondary-button" disabled={!clientConfig?.login_server} onClick={async()=>{try{await navigator.clipboard.writeText(platform==="linux"?`sudo tailscale up --login-server=${clientConfig!.login_server}`:clientConfig!.login_server);setCopied(true);}catch{setError("无法复制，请手动选择服务器地址。");}}}>{copied?"已复制":"复制"}</button></div></li><li><strong>登录后自动加入所属工作空间</strong><span>设备加入后可访问已授权的子网，无需在手机上再次批准路由。</span></li></ol>
+      {platform==="linux"&&<p className="form-hint">Linux 访问共享子网时执行 <code>sudo tailscale set --accept-routes</code>。</p>}{error&&<p className="form-error" role="alert">{error}</p>}
+    </div>
+  </FormDialog>;
+}
+
+/** 密钥页仅管理凭证，设备加入与归属统一留在设备页。 */
+function ClientKeysPanel({authKeys,request,onRefresh}: {authKeys:TailscaleAuthKey[];request:ApiRequest;onRefresh:()=>Promise<void>}) {
+  const [creating,setCreating]=useState(false);const [label,setLabel]=useState("");const [days,setDays]=useState("7");const [reusable,setReusable]=useState(false);const [ephemeral,setEphemeral]=useState(false);const [tags,setTags]=useState("");const [customHours,setCustomHours]=useState("24");const [key,setKey]=useState<string|null>(null);const [busy,setBusy]=useState(false);const [error,setError]=useState<string|null>(null);
+  const close=()=>{if(!busy&& (key||!label&&!tags&&days==="7"&&!reusable&&!ephemeral||window.confirm("放弃尚未保存的密钥设置？"))){setCreating(false);setKey(null);setLabel("");setTags("");setDays("7");setReusable(false);setEphemeral(false);setError(null);}};
+  return <><section className="panel page-panel"><div className="panel-heading"><h2>客户端密钥 · {authKeys.length}</h2><button className="primary-button" onClick={()=>setCreating(true)}>创建密钥</button></div>{authKeys.map(item=><div className="detail-resource" key={item.id}><div><strong>{item.label}</strong><small>{item.reusable?"可重复使用":"单次使用"} · {item.ephemeral?"临时设备":"持久设备"}</small></div><span>{item.state==="issued"?"正常":"已关闭"}</span><button className="secondary-button" disabled={busy||item.state!=="issued"} onClick={async()=>{if(!window.confirm(`吊销“${item.label}”？已登录的设备不会因此退出。`))return;setBusy(true);setError(null);try{const response=await request(`/api/v1/mesh/auth-keys/${encodeURIComponent(item.id)}/revoke`,{method:"POST"});if(!response.ok)throw new Error(readApiError(await response.json(),"无法吊销密钥"));await onRefresh();}catch(e){setError(e instanceof Error?e.message:"无法吊销密钥");}finally{setBusy(false);}}}>吊销</button></div>)}{!authKeys.length&&<EmptyState icon={KeyRound} title="还没有客户端密钥" detail="无交互登录的设备可以使用短期密钥加入。"/>}{error&&!creating&&<p role="alert" className="form-error">{error}</p>}</section>
+    {creating&&<FormDialog title="创建客户端密钥" eyebrow="网络设置" description="密钥只显示一次，请妥善保存。" onClose={close}>{key?<div className="secret-reveal"><code>{key}</code><button className="secondary-button" onClick={async()=>{try{await navigator.clipboard.writeText(key);}catch{setError("无法复制，请手动选择密钥。");}}}>复制密钥</button><button className="primary-button" onClick={close}>完成</button></div>:<form onSubmit={async event=>{event.preventDefault();setBusy(true);setError(null);try{const response=await request("/api/v1/mesh/auth-keys",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({label:label.trim()||"客户端密钥",ttl_seconds:Math.round(days==="custom"?Number(customHours)*3600:Number(days)*86400),reusable,ephemeral,tags:tags.split(",").map(x=>x.trim()).filter(Boolean)})});const body=await response.json();if(!response.ok)throw new Error(readApiError(body,"无法创建密钥"));setKey(body.key);await onRefresh();}catch(e){setError(e instanceof Error?e.message:"无法创建密钥");}finally{setBusy(false);}}}><fieldset className="form-grid" disabled={busy}><label><span>名称</span><input value={label} onChange={e=>setLabel(e.target.value)}/></label><label><span>有效期</span><select value={days} onChange={e=>setDays(e.target.value)}><option value={1/24}>1 小时</option><option value="1">1 天</option><option value="7">7 天</option><option value="30">30 天</option><option value="custom">自定义时长</option></select></label>{days==="custom"&&<label><span>有效小时数</span><input type="number" min={1/60} max="720" step="any" required value={customHours} onChange={e=>setCustomHours(e.target.value)}/><small>允许 1 分钟至 30 天，可填写小数小时。</small></label>}<label className="checkbox-field"><input type="checkbox" checked={reusable} onChange={e=>setReusable(e.target.checked)}/>可重复使用</label><label className="checkbox-field"><input type="checkbox" checked={ephemeral} onChange={e=>setEphemeral(e.target.checked)}/>临时设备</label><label><span>标签（可选）</span><input value={tags} onChange={e=>setTags(e.target.value)} placeholder="tag:team"/></label></fieldset><div className="dialog-actions"><button type="button" className="secondary-button" onClick={close} disabled={busy}>取消</button><button className="primary-button" disabled={busy}>{busy?"创建中…":"创建密钥"}</button></div></form>}{error&&<p role="alert" className="form-error">{error}</p>}</FormDialog>}
+  </>;
+}
+
+function CreateSiteNetworkForm({devices,request,onCancel,onCreated}: {devices:Device[];request:ApiRequest;onCancel:()=>void;onCreated:()=>Promise<void>}) {
+  const [deviceId,setDeviceId]=useState(devices[0]?.id??"");const [prefix,setPrefix]=useState("");const [name,setName]=useState("");const [busy,setBusy]=useState(false);const [error,setError]=useState<string|null>(null);
+  const close=()=>{if(!prefix&&!name||window.confirm("放弃尚未保存的网段？"))onCancel();};
+  return <form onSubmit={async event=>{event.preventDefault();const device=devices.find(item=>item.id===deviceId);if(!device)return;setBusy(true);setError(null);try{const response=await request("/api/v1/site-networks",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({tenant_id:device.tenant_id,publisher_device_id:device.id,name:name.trim()||prefix.trim(),prefix:prefix.trim(),source:"manual"})});const body=await response.json();if(!response.ok)throw new Error(readApiError(body,"无法添加网段"));await onCreated();}catch(e){setError(e instanceof Error?e.message:"无法添加网段");}finally{setBusy(false);}}}><fieldset className="form-grid" disabled={busy}><label><span>设备</span><select value={deviceId} onChange={e=>setDeviceId(e.target.value)} required>{devices.map(item=><option key={item.id} value={item.id}>{item.name}</option>)}</select></label><label><span>网段 CIDR</span><input value={prefix} onChange={e=>setPrefix(e.target.value)} placeholder="10.0.0.0/24" required/></label><label><span>名称（可选）</span><input value={name} onChange={e=>setName(e.target.value)}/></label></fieldset>{error&&<p className="form-error" role="alert">{error}</p>}<div className="dialog-actions"><button className="secondary-button" type="button" onClick={close} disabled={busy}>取消</button><button className="primary-button" disabled={busy||!deviceId}>保存</button></div></form>;
 }
 
 function BrandMark() {
@@ -1291,7 +1321,7 @@ function OverviewPage({
   enrollments,
   tunnels,
   siteNetworks,
-  siteLinks,
+
   error,
   onRefresh,
 }: {
@@ -1300,20 +1330,18 @@ function OverviewPage({
   enrollments: Enrollment[];
   tunnels: Tunnel[];
   siteNetworks: SiteNetwork[];
-  siteLinks: SiteLink[];
+
   error: string | null;
   onRefresh: () => Promise<void>;
 }) {
   const pendingEnrollments = enrollments.filter((item) => item.status === "awaiting_approval").length;
   const failedTunnels = tunnels.filter((item) => item.apply_status === "failed").length;
   const failedNetworks = siteNetworks.filter((item) => item.apply_status === "failed").length;
-  const failedLinks = siteLinks.filter((item) => item.apply_status === "failed").length;
-  const failedResources = failedTunnels + failedNetworks + failedLinks;
+  const failedResources = failedTunnels + failedNetworks;
   const applyingTunnels = tunnels.filter((item) => ["checking", "applying", "retrying"].includes(item.apply_status)).length;
   const applyingNetworks = siteNetworks.filter((item) => ["checking", "applying", "retrying"].includes(item.apply_status)).length;
-  const applyingLinks = siteLinks.filter((item) => ["checking", "applying", "retrying"].includes(item.apply_status)).length;
-  const applyingResources = applyingTunnels + applyingNetworks + applyingLinks;
-  const failedHref: AppRoute = failedTunnels ? "#/network/public" : failedNetworks || failedLinks ? "#/network/private" : "#/overview";
+  const applyingResources = applyingTunnels + applyingNetworks;
+  const failedHref: AppRoute = failedTunnels ? "#/network/public" : failedNetworks ? "#/network/private" : "#/overview";
   const applyingHref: AppRoute = applyingTunnels ? "#/network/public" : "#/network/private";
   return (
     <>
@@ -1346,7 +1374,7 @@ function OverviewPage({
           <div className="quick-links">
             <QuickLink icon={MonitorSmartphone} title="设备" detail="加入和管理所有组网设备" href="#/network/devices" />
             <QuickLink icon={Globe2} title="公网服务" detail="管理 Web 服务与 TCP 端口" href="#/network/public" />
-            <QuickLink icon={Network} title="私网访问" detail="共享家庭网段或配置站点互联" href="#/network/private" />
+            <QuickLink icon={Network} title="私网访问" detail="管理共享家庭网段" href="#/network/private" />
           </div>
         </article>
       </section>
@@ -1375,249 +1403,12 @@ function QuickLink({ icon: Icon, title, detail, href }: { icon: LucideIcon; titl
   );
 }
 
-function DevicesPage({
-  auth,
-  devices,
-  sites,
-  siteNetworks,
-  tunnels,
-  enrollments,
-  meshStatus,
-  clientConfig,
-  externalNodes,
-  error,
-  showEnrollmentForm,
-  onToggleEnrollmentForm,
-  onCloseEnrollmentForm,
-  onApprove,
-  request,
-  onRefresh,
-  deletingResource,
-  onEditDevice,
-  onDeleteDevice,
-}: {
-  auth: AuthStatus;
-  devices: Device[];
-  sites: Site[];
-  siteNetworks: SiteNetwork[];
-  tunnels: Tunnel[];
-  enrollments: Enrollment[];
-  meshStatus: MeshStatus | null;
-  clientConfig: TailscaleClientConfig | null;
-  externalNodes: TailscaleExternalNode[];
-  error: string | null;
-  showEnrollmentForm: boolean;
-  onToggleEnrollmentForm: () => void;
-  onCloseEnrollmentForm: () => void;
-  onApprove: (enrollment: Enrollment) => Promise<void>;
-  request: ApiRequest;
-  onRefresh: () => Promise<void>;
-  deletingResource: string | null;
-  onEditDevice: (device: Device, trigger: HTMLButtonElement | null) => void;
-  onDeleteDevice: (device: Device, trigger: HTMLButtonElement) => void;
-}) {
-  const pending = enrollments.filter((item) => item.status === "awaiting_approval");
-  return (
-    <>
-      <PageHeader
-        eyebrow="网络"
-        title="设备"
-        subtitle="Agent 和 Tailscale 客户端在同一处加入、查看和管理。"
-        action={(
-          <button className="primary-button" type="button" onClick={onToggleEnrollmentForm} aria-expanded={showEnrollmentForm}>
-            <Plus size={16} aria-hidden="true" />添加设备
-          </button>
-        )}
-      />
-      <PageError error={error} onRetry={onRefresh} />
-      <section className="panel page-panel">
-        <div className="panel-heading"><div><p className="eyebrow">所有设备</p><h2 id="device-list-heading" tabIndex={-1}>{devices.length} 台设备</h2></div><span className={`status-pill ${meshStatus?.status === "normal" ? "ready" : "working"}`}><i />{meshStatus?.status === "normal" ? "组网正常" : "组网处理中"}</span></div>
-        {devices.length === 0 ? <EmptyState icon={Server} title="还没有设备" detail="添加 Nexo Agent 或 Tailscale 客户端开始组网。" /> : <div className="device-list">{devices.map((device) => <DeviceRow key={device.id} device={device} sites={sites} networkCount={siteNetworks.filter((network) => network.publisher_device_id === device.id).length} publicServiceCount={tunnels.filter((tunnel) => tunnel.device_id === device.id).length} deleting={deletingResource === `device:${device.id}`} onEdit={(trigger) => onEditDevice(device, trigger)} onDelete={(trigger) => onDeleteDevice(device, trigger)} />)}</div>}
-      </section>
-      {pending.length > 0 && <section className="panel page-panel">
-        <div className="panel-heading"><div><p className="eyebrow">需要确认</p><h2>{pending.length} 个 Agent 入网请求</h2></div></div>
-        <div className="enrollment-list">{pending.map((item) => <div className="enrollment-row" key={item.enrollment_id}><div><strong>{item.device_name ?? "未命名设备"}</strong><span>{[item.os, item.architecture, item.agent_version].filter(Boolean).join(" · ") || "设备信息待上报"}</span></div><button className="primary-button" type="button" onClick={() => void onApprove(item)}><CheckCircle2 size={16} aria-hidden="true" />批准设备</button></div>)}</div>
-      </section>}
-      {auth.role === "system_admin" && externalNodes.length > 0 && <div className="notice warning" role="status"><AlertTriangle size={18} aria-hidden="true" /><div><strong>{externalNodes.length} 台设备尚未归属工作空间</strong><span>请在“网络设置 → 客户端密钥”的高级诊断中处理隔离设备。</span></div><a className="notice-action" href="#/network/settings/keys">查看</a></div>}
-      {showEnrollmentForm && <AddDeviceSheet sites={sites} clientConfig={clientConfig} request={request} onCreated={onRefresh} onClose={onCloseEnrollmentForm} />}
-    </>
-  );
-}
 
 /** 添加设备保持为一个连续 Sheet；切换类型不会关闭面板，已填写内容由各自
  * 子表单保留，关闭后焦点由 FormDialog 返回到“添加设备”触发按钮。 */
-function AddDeviceSheet({ sites, clientConfig, request, onCreated, onClose }: { sites: Site[]; clientConfig: TailscaleClientConfig | null; request: ApiRequest; onCreated: () => Promise<void>; onClose: () => void }) {
-  const [kind, setKind] = useState<"agent" | "tailscale">("agent");
-  const [copied, setCopied] = useState(false);
-  return (
-    <FormDialog eyebrow="添加设备" title={kind === "agent" ? "添加 Nexo Agent" : "添加 Tailscale 客户端"} description="选择设备类型，并按对应流程加入当前工作空间。" onClose={onClose} variant="sheet">
-      <div className="device-kind-switch" role="tablist" aria-label="设备类型">
-        <button type="button" role="tab" aria-selected={kind === "agent"} className={kind === "agent" ? "selected" : ""} onClick={() => setKind("agent")}><Server size={16} aria-hidden="true" />Nexo Agent</button>
-        <button type="button" role="tab" aria-selected={kind === "tailscale"} className={kind === "tailscale" ? "selected" : ""} onClick={() => setKind("tailscale")}><MonitorSmartphone size={16} aria-hidden="true" />Tailscale 客户端</button>
-      </div>
-      {kind === "agent" ? <CreateEnrollmentForm sites={sites} request={request} onCreated={onCreated} onDone={onClose} /> : <div className="tailscale-enrollment-guide">
-        <div className="copyable-value"><code>{clientConfig?.login_server ?? "正在读取组网入口…"}</code><button className="icon-button" type="button" aria-label={copied ? "组网入口已复制" : "复制组网入口"} disabled={!clientConfig?.login_server} onClick={async () => { await navigator.clipboard.writeText(clientConfig?.login_server ?? ""); setCopied(true); window.setTimeout(() => setCopied(false), 1600); }}>{copied ? <CheckCircle2 size={16} aria-hidden="true" /> : <Copy size={16} aria-hidden="true" />}</button></div>
-        <ol className="official-client-steps"><li><strong>在 Tailscale 中设置设备名称</strong><span>使用可识别的名称，避免系统隐私设置显示为 localhost。</span></li><li><strong>选择自定义协调服务器</strong><span>粘贴上方组网入口并完成 Nexo 登录。</span></li><li><strong>返回设备列表</strong><span>OIDC 和客户端密钥加入的设备会自动归属签发工作空间。</span></li></ol>
-        <a className="secondary-button" href="#/network/settings/keys">使用客户端密钥</a>
-      </div>}
-    </FormDialog>
-  );
-}
 
 /** 官方客户端控制面：浏览器授权由 Headscale 完成，Nexo 负责凭证、隔离节点
  * 和工作空间认领。Auth Key 明文只在创建成功时展示，刷新后不会再次出现。 */
-function OfficialClientPanel({
-  isSystemAdmin,
-  devices,
-  clientConfig,
-  authKeys,
-  externalNodes,
-  request,
-  onRefresh,
-  onEditDevice,
-}: {
-  isSystemAdmin: boolean;
-  devices: Device[];
-  clientConfig: TailscaleClientConfig | null;
-  authKeys: TailscaleAuthKey[];
-  externalNodes: TailscaleExternalNode[];
-  request: ApiRequest;
-  onRefresh: () => Promise<void>;
-  onEditDevice: (device: Device, trigger: HTMLButtonElement | null) => void;
-}) {
-  const [label, setLabel] = useState("我的客户端");
-  const [ttl, setTtl] = useState("604800");
-  const [reusable, setReusable] = useState(false);
-  const [ephemeral, setEphemeral] = useState(false);
-  const [tags, setTags] = useState("");
-  const [createdKey, setCreatedKey] = useState<TailscaleAuthKey | null>(null);
-  const [busy, setBusy] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-  const [message, setMessage] = useState<string | null>(null);
-  const [claimNames, setClaimNames] = useState<Record<string, string>>({});
-  const [loginServerCopied, setLoginServerCopied] = useState(false);
-  const officialDevices = devices.filter((device) => device.connection_type === "tailscale_client");
-  const createKey = async (event: FormEvent) => {
-    event.preventDefault();
-    setBusy(true); setError(null); setMessage(null); setCreatedKey(null);
-    try {
-      const response = await request("/api/v1/mesh/auth-keys", {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({
-          label,
-          ttl_seconds: Number(ttl),
-          reusable,
-          ephemeral,
-          tags: tags.split(",").map((tag) => tag.trim()).filter(Boolean),
-        }),
-      });
-      const body: unknown = await response.json().catch(() => null);
-      if (!response.ok) throw new Error(readApiError(body, "暂时无法创建客户端密钥"));
-      setCreatedKey(body as TailscaleAuthKey);
-      await onRefresh();
-    } catch (requestError) {
-      setError(requestError instanceof Error ? requestError.message : "暂时无法创建客户端密钥");
-    } finally {
-      setBusy(false);
-    }
-  };
-  const revokeKey = async (key: TailscaleAuthKey) => {
-    if (!window.confirm(`确定吊销“${key.label}”吗？已使用的客户端不会被自动退出。`)) return;
-    setBusy(true); setError(null);
-    try {
-      const response = await request(`/api/v1/mesh/auth-keys/${encodeURIComponent(key.id)}/revoke`, { method: "POST" });
-      const body: unknown = await response.json().catch(() => null);
-      if (!response.ok) throw new Error(readApiError(body, "暂时无法吊销客户端密钥"));
-      setMessage("客户端密钥已吊销");
-      await onRefresh();
-    } catch (requestError) {
-      setError(requestError instanceof Error ? requestError.message : "暂时无法吊销客户端密钥");
-    } finally {
-      setBusy(false);
-    }
-  };
-  const claimNode = async (node: TailscaleExternalNode) => {
-    const requestedName = (claimNames[node.node_id] ?? node.name).trim();
-    if (!requestedName || isPlaceholderDeviceName(requestedName)) {
-      setError("请先填写可识别的设备名称，不能使用 localhost");
-      return;
-    }
-    setBusy(true); setError(null);
-    try {
-      const response = await request(`/api/v1/mesh/external-nodes/${encodeURIComponent(node.node_id)}/claim`, {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ name: requestedName }),
-      });
-      const body: unknown = await response.json().catch(() => null);
-      if (!response.ok) throw new Error(readApiError(body, "暂时无法认领外部节点"));
-      setMessage(`已认领“${requestedName}”，设备已加入当前工作空间`);
-      await onRefresh();
-    } catch (requestError) {
-      setError(requestError instanceof Error ? requestError.message : "暂时无法认领外部节点");
-    } finally {
-      setBusy(false);
-    }
-  };
-  return (
-    <div className="official-client-layout">
-      <section className="panel page-panel official-client-hero">
-        <div className="panel-heading">
-          <div><p className="eyebrow">Tailscale 客户端</p><h2>使用同一套网络入口连接设备</h2></div>
-          <span className="status-pill ready"><i />协议支持</span>
-        </div>
-        <div className="official-client-facts">
-          <div><span>登录服务器</span><div className="copyable-value"><code>{clientConfig?.login_server ?? "正在读取…"}</code><button className="icon-button" type="button" aria-label={loginServerCopied ? "登录服务器地址已复制" : "复制登录服务器地址"} title={loginServerCopied ? "已复制" : "复制登录服务器地址"} disabled={!clientConfig?.login_server} onClick={async () => { try { await navigator.clipboard.writeText(clientConfig?.login_server ?? ""); setLoginServerCopied(true); window.setTimeout(() => setLoginServerCopied(false), 1600); } catch { setError("浏览器无法访问剪贴板，请手动选择登录服务器地址"); } }}>
-            {loginServerCopied ? <CheckCircle2 size={16} aria-hidden="true" /> : <Copy size={16} aria-hidden="true" />}
-          </button></div></div>
-          <div><span>授权方式</span><strong>由客户端发起</strong></div>
-          <div><span>平台</span><strong>{clientConfig?.supported_platforms.join("、") ?? "Linux、Windows、macOS、iOS、Android、tvOS"}</strong></div>
-        </div>
-        <p className="form-hint">Tailscale 客户端完成登录后会先进入隔离状态；确认归属后才进入当前工作空间。只有 Nexo Agent 设备可承载共享网段或公网服务。</p>
-      </section>
-      <section className="panel page-panel official-client-guide">
-        <div className="panel-heading"><div><p className="eyebrow">iPhone / iPad</p><h2>按官方流程连接</h2></div><span className="status-pill ready"><i />登录地址已就绪</span></div>
-        <ol className="official-client-steps">
-          <li><strong>先设置设备名称</strong><span>在 Tailscale 中填写设备名称，避免 iOS 因隐私限制显示为 localhost。</span></li>
-          <li><strong>打开登录</strong><span>点右上角账户图标，选择“登录…”，再打开右上角选项菜单。</span></li>
-          <li><strong>使用自定义协调服务器</strong><span>选择“使用自定义协调服务器”，粘贴上方登录服务器地址并完成 Nexo 登录。</span></li>
-          <li><strong>回到这里确认三件事</strong><span>确认设备已加入、设备在线；再到“私网访问”确认共享网段，最后用真实局域网服务验证可达。</span></li>
-        </ol>
-      </section>
-      <section className="panel page-panel official-client-status">
-        <div className="panel-heading"><div><p className="eyebrow">连接检查</p><h2>{officialDevices.length} 台 Tailscale 客户端</h2></div><button className="secondary-button compact-button" type="button" disabled={busy} onClick={() => void onRefresh()}><RefreshCw size={15} aria-hidden="true" />重新检查</button></div>
-        {officialDevices.length === 0 ? <EmptyState icon={MonitorSmartphone} title="登录后设备会出现在这里" detail="完成客户端登录和工作空间确认后，返回此页检查状态。" /> : <div className="official-device-status-list">{officialDevices.map((device) => <div className="official-device-status" key={device.id}><div><strong>{device.name}</strong><span>{device.tailscale_ipv4 ?? device.mesh_address ?? "组网地址待同步"}</span></div><div className="official-device-stages"><span className="status-pill ready"><i />已加入</span><span className={`status-pill ${device.status === "online" ? "ready" : "working"}`}><i />{device.status === "online" ? "设备在线" : "等待上线"}</span><span className="status-pill working"><i />共享网段待实际验证</span></div>{device.needs_name && <button className="secondary-button compact-button" type="button" onClick={() => onEditDevice(device, null)}><Pencil size={15} aria-hidden="true" />设置名称</button>}</div>)}</div>}
-      </section>
-      <div className="official-client-grid">
-        <section className="panel page-panel">
-          <div className="panel-heading"><div><p className="eyebrow">客户端密钥</p><h2>生成客户端密钥</h2></div></div>
-          <form className="inline-form" onSubmit={(event) => void createKey(event)} aria-busy={busy}>
-            <label><span>名称</span><input value={label} onChange={(event) => setLabel(event.target.value)} required /></label>
-            <div className="form-grid official-key-options">
-              <label><span>有效期（秒）</span><input type="number" min="60" max="2592000" value={ttl} onChange={(event) => setTtl(event.target.value)} required /></label>
-              <label className="checkbox-field"><input type="checkbox" checked={reusable} onChange={(event) => setReusable(event.target.checked)} /><span>可重复使用</span></label>
-              <label className="checkbox-field"><input type="checkbox" checked={ephemeral} onChange={(event) => setEphemeral(event.target.checked)} /><span>临时设备</span></label>
-            </div>
-            <label><span>标签（逗号分隔）</span><input value={tags} onChange={(event) => setTags(event.target.value)} placeholder="tag:team" /></label>
-            <button className="primary-button" type="submit" disabled={busy}><KeyRound size={16} aria-hidden="true" />{busy ? "正在创建…" : "生成密钥"}</button>
-          </form>
-          {createdKey?.key && <div className="secret-reveal" role="status"><strong>只显示这一次</strong><code>{createdKey.key}</code><button className="secondary-button compact-button" type="button" onClick={() => void navigator.clipboard.writeText(createdKey.key ?? "")}><Copy size={15} aria-hidden="true" />复制密钥</button></div>}
-          {error && <p className="form-error" role="alert">{error}</p>}
-          {message && <p className="form-success" role="status">{message}</p>}
-        </section>
-        <section className="panel page-panel">
-          <div className="panel-heading"><div><p className="eyebrow">已发布密钥</p><h2>{authKeys.length} 个客户端密钥</h2></div></div>
-          {authKeys.length === 0 ? <EmptyState icon={KeyRound} title="还没有客户端密钥" detail="生成一个短时密钥后，在 Tailscale 客户端中粘贴使用。" /> : <div className="auth-key-list">{authKeys.map((key) => <div className="auth-key-row" key={key.id}><div><strong>{key.label}</strong><span>{key.reusable ? "可重复使用" : "单次使用"} · {key.ephemeral ? "临时设备" : "持久设备"}</span></div><span className={`status-pill ${key.state === "issued" ? "ready" : "disabled"}`}><i />{key.state === "issued" ? "正常" : "已关闭"}</span><button className="icon-button" type="button" aria-label={`吊销${key.label}`} title="吊销客户端密钥" disabled={busy || key.state !== "issued"} onClick={() => void revokeKey(key)}><Trash2 size={16} aria-hidden="true" /></button></div>)}</div>}
-        </section>
-      </div>
-      {isSystemAdmin && <section className="panel page-panel">
-        <div className="panel-heading"><div><p className="eyebrow">隔离节点</p><h2>等待认领的 Tailscale 客户端</h2></div><button className="secondary-button compact-button" type="button" disabled={busy} onClick={() => void onRefresh()}><RefreshCw size={15} aria-hidden="true" />同步节点</button></div>
-        {externalNodes.length === 0 ? <EmptyState icon={ShieldCheck} title="没有待认领节点" detail="完成浏览器授权或客户端登录后，节点会在这里等待确认。" /> : <div className="external-node-list">{externalNodes.map((node) => <div className="external-node-row" key={node.node_id}><div><strong>{node.name}</strong><span>{node.addresses.join(" · ") || "地址待同步"}</span>{node.needs_name && <small className="device-name-warning">Headscale 返回了 localhost，请先填写设备名称</small>}</div><span className={`status-pill ${node.online ? "ready" : "disabled"}`}><i />{node.online ? "在线" : "离线"}</span>{node.needs_name ? <div className="external-node-claim"><label><span>设备名称</span><input value={claimNames[node.node_id] ?? ""} placeholder="例如：我的 iPhone" onChange={(event) => setClaimNames((current) => ({ ...current, [node.node_id]: event.target.value }))} /></label><button className="primary-button compact-button" type="button" disabled={busy} onClick={() => void claimNode(node)}><CheckCircle2 size={15} aria-hidden="true" />命名并认领</button></div> : <button className="primary-button compact-button" type="button" disabled={busy} onClick={() => void claimNode(node)}><CheckCircle2 size={15} aria-hidden="true" />认领</button>}</div>)}</div>}
-      </section>}
-    </div>
-  );
-}
 
 /** 访问控制只编辑结构化字段；策略文本和影响范围由服务端生成并校验。 */
 function AccessControlPage({
@@ -1785,8 +1576,8 @@ function NetworkSettingsPage({ route, auth, domains, meshStatus, devices, client
   return <>
     <SectionTabs label="网络设置" route={route} items={tabs} />
     {route === "#/network/settings/domains" && <DomainsPage domains={domains} error={error} request={request} onRefresh={onRefresh} />}
-    {route === "#/network/settings/keys" && <><PageHeader eyebrow="网络设置" title="客户端密钥" subtitle="管理 Tailscale 客户端加入入口和短期密钥。" /><PageError error={error} onRetry={onRefresh} /><OfficialClientPanel isSystemAdmin={auth.role === "system_admin"} devices={devices} clientConfig={clientConfig} authKeys={authKeys} externalNodes={externalNodes} request={request} onRefresh={onRefresh} onEditDevice={onEditDevice} /></>}
-    {route === "#/network/settings/service" && <><PageHeader eyebrow="网络设置" title="组网服务" subtitle="查看设备协调服务状态和客户端入口。" /><PageError error={error} onRetry={onRefresh} /><section className="panel page-panel"><div className="panel-heading"><div><p className="eyebrow">运行状态</p><h2>{meshStatus?.message ?? "正在检查组网服务"}</h2></div><span className={`status-pill ${meshStatus?.status === "normal" ? "ready" : "working"}`}><i />{meshStatus?.status === "normal" ? "正常" : "需处理"}</span></div></section>{auth.role === "system_admin" && <details className="advanced-network panel page-panel"><summary><span><strong>高级诊断</strong><small>Headscale 组件状态与故障排查入口</small></span><ChevronDown size={18} aria-hidden="true" /></summary><div className="advanced-network-body"><p className="panel-note">Headscale 仅作为底层组网组件显示在系统管理员诊断中。</p><button className="secondary-button" type="button" onClick={() => void onRefresh()}><RefreshCw size={16} aria-hidden="true" />重新检查</button></div></details>}</>}
+    {route === "#/network/settings/keys" && <><PageHeader eyebrow="网络设置" title="客户端密钥" subtitle="管理用于设备登录的短期密钥。" /><PageError error={error} onRetry={onRefresh} /><ClientKeysPanel authKeys={authKeys} request={request} onRefresh={onRefresh} /></>}
+    {route === "#/network/settings/service" && <><PageHeader eyebrow="网络设置" title="组网服务" subtitle="查看设备协调服务状态和客户端入口。" /><PageError error={error} onRetry={onRefresh} /><section className="panel page-panel"><div className="panel-heading"><div><p className="eyebrow">运行状态</p><h2>{meshStatus?.message ?? "正在检查组网服务"}</h2></div><span className={`status-pill ${meshStatus?.status === "normal" ? "ready" : "working"}`}><i />{meshStatus?.status === "normal" ? "正常" : "需处理"}</span></div></section><section className="panel page-panel"><h2>组网名称解析</h2><p>MagicDNS：{clientConfig ? (clientConfig.magic_dns_enabled ? "已开启" : "已关闭") : "正在读取"}</p><p>设备域名：<code>{clientConfig?.dns_base_domain ?? "正在读取"}</code></p><p className="form-hint">用于 Nexo 网络内的设备名称解析。公网服务域名在“域名与 HTTPS”中管理。</p></section>{auth.role === "system_admin" && <details className="advanced-network panel page-panel"><summary><span><strong>高级诊断</strong><small>Headscale 组件状态与故障排查入口</small></span><ChevronDown size={18} aria-hidden="true" /></summary><div className="advanced-network-body"><p className="panel-note">Headscale 仅作为底层组网组件显示在系统管理员诊断中。</p><button className="secondary-button" type="button" onClick={() => void onRefresh()}><RefreshCw size={16} aria-hidden="true" />重新检查</button></div></details>}</>}
   </>;
 }
 
@@ -1966,7 +1757,7 @@ function PublicAccessPage({
         )}
       </section>
       {showCreate && (
-        <FormDialog eyebrow="公网服务" title="添加服务" description="选择设备和本地服务，将 Web 服务或 TCP 端口开放到公网。" onClose={onCloseCreate} variant="sheet">
+        <FormDialog eyebrow="公网服务" confirmDiscard title="添加服务" description="选择设备和本地服务，将 Web 服务或 TCP 端口开放到公网。" onClose={onCloseCreate} variant="sheet">
           <CreateTunnelForm auth={auth} devices={devices} publicDomains={publicDomains} request={request} onDomainsChanged={onRefresh} onCancel={onCloseCreate} onCreated={async () => { onCloseCreate(); await onRefresh(); }} />
         </FormDialog>
       )}
@@ -2816,267 +2607,9 @@ function PublicDomainPrimaryDialog({
   return <FormDialog eyebrow="主域名迁移" title={`将 ${domain.domain} 设为主域名`} description="切换会保留旧域名和别名，直到所有设备完成确认；迁移激活后不能取消。" onClose={() => { if (!active && !busy) onClose(); }} returnFocus={returnFocus} role="alertdialog"><form className="domain-primary-form" aria-busy={busy || active} onSubmit={submit}><div className="migration-impact"><strong>切换前检查</strong><p>目标域名的根证书和泛域名证书状态正常。Web 服务会迁移到新主域名，在线设备立即处理，离线设备上线后继续。</p><p>mesh.{domain.domain} 必须保持仅 DNS；Nexo 会保留旧入口，直到设备逐台确认。</p></div>{migration && <div className="migration-progress" role="status" aria-live="polite"><div><span>{statusLabel}</span><strong>{migration.acknowledged_devices}/{migration.total_devices} 台设备已确认</strong></div><progress max={Math.max(migration.total_devices, 1)} value={migration.acknowledged_devices} /><small>{migration.last_error ?? "任务可恢复，页面轮询会在离开时停止。"}</small></div>}{!migration && <label className="confirmation-check"><input type="checkbox" checked={confirmed} onChange={(event) => setConfirmed(event.target.checked)} /><span>我已阅读影响并确认启动不可取消的迁移</span></label>}{error && <p className="form-error" role="alert">{error}</p>}<div className="dialog-actions"><button className="secondary-button" type="button" onClick={onClose} disabled={active || busy}>取消</button>{!migration && <button className="primary-button" type="submit" disabled={busy}>{busy ? "启动中…" : "开始迁移"}</button>}{migration && !active && <button className="primary-button" type="button" onClick={onClose}>关闭</button>}</div></form></FormDialog>;
 }
 
-function NetworksPage({
-  sites,
-  devices,
-  publicDomains,
-  siteNetworks,
-  siteLinks,
-  error,
-  request,
-  showSiteForm,
-  networkFormSiteId,
-  linkFormSiteId,
-  editingSiteLink,
-  onToggleSiteForm,
-  onOpenNetworkForm,
-  onCloseNetworkForm,
-  onOpenLinkForm,
-  onCloseLinkForm,
-  onEditLink,
-  onToggleNetwork,
-  onToggleLink,
-  onRecheckLink,
-  onConfirmRoute,
-  actionNetworkId,
-  actionLinkId,
-  deletingResource,
-  onDeleteSite,
-  onDeleteNetwork,
-  onDeleteLink,
-  onRefresh,
-  embedded = false,
-}: {
-  sites: Site[];
-  devices: Device[];
-  publicDomains: PublicDomain[];
-  siteNetworks: SiteNetwork[];
-  siteLinks: SiteLink[];
-  error: string | null;
-  request: ApiRequest;
-  showSiteForm: boolean;
-  networkFormSiteId: string | null;
-  linkFormSiteId: string | null;
-  editingSiteLink: SiteLink | null;
-  onToggleSiteForm: () => void;
-  onOpenNetworkForm: (siteId: string) => void;
-  onCloseNetworkForm: () => void;
-  onOpenLinkForm: (siteId: string) => void;
-  onCloseLinkForm: () => void;
-  onEditLink: (link: SiteLink) => void;
-  onToggleNetwork: (network: SiteNetwork) => Promise<void>;
-  onToggleLink: (link: SiteLink) => Promise<void>;
-  onRecheckLink: (link: SiteLink) => Promise<void>;
-  onConfirmRoute: (link: SiteLink, siteId: string) => Promise<void>;
-  actionNetworkId: string | null;
-  actionLinkId: string | null;
-  deletingResource: string | null;
-  onDeleteSite: (site: Site) => void;
-  onDeleteNetwork: (network: SiteNetwork) => void;
-  onDeleteLink: (link: SiteLink) => void;
-  onRefresh: () => Promise<void>;
-  embedded?: boolean;
-}) {
-  const [expandedSiteIds, setExpandedSiteIds] = useState<Set<string>>(() => new Set());
-  const [networkView, setNetworkView] = useState<"topology" | "sites">("topology");
-  const [selectedTopologyLink, setSelectedTopologyLink] = useState<SiteLink | null>(null);
-  const [selectedMobileLink, setSelectedMobileLink] = useState<SiteLink | null>(null);
-  const [selectedMobileSiteId, setSelectedMobileSiteId] = useState<string | null>(null);
-  const networkFormSite = sites.find((site) => site.id === networkFormSiteId);
-  const linkFormSite = sites.find((site) => site.id === linkFormSiteId);
-  const primaryDomain = publicDomains.find((domain) => domain.is_primary);
-  const meshEntryReady = Boolean(primaryDomain
-    && dnsCheckLabel(primaryDomain.dns_check.wildcard).kind === "ready"
-    && primaryDomain.wildcard_certificate.status.toLowerCase() === "ready");
 
-  /** 展开状态按站点独立保存，便于同时对照两个站点的互联状态。 */
-  const toggleSite = (siteId: string) => {
-    setExpandedSiteIds((current) => {
-      const next = new Set(current);
-      if (next.has(siteId)) next.delete(siteId);
-      else next.add(siteId);
-      return next;
-    });
-  };
 
-  const action = (
-    <button className="primary-button" type="button" onClick={onToggleSiteForm} aria-expanded={showSiteForm}><Plus size={16} aria-hidden="true" />新建站点</button>
-  );
-  return (
-    <>
-      {!embedded && <PageHeader eyebrow="私网访问" title="站点互联" subtitle="按站点管理高级网关、共享网络、互联关系和静态路由。" action={action} />}
-      {!embedded && <PageError error={error} onRetry={onRefresh} />}
-      <section className={`domain-dependency-notice ${meshEntryReady ? "ready" : "warning"}`}>
-        <div><strong>{meshEntryReady ? `组网入口 mesh.${primaryDomain?.domain} 已就绪` : "组网公网入口尚未就绪"}</strong><span>{meshEntryReady ? "设备继续使用统一的安全控制地址。" : "现有局域网路由配置会保留；新增设备公网接入前请完成主域名和 HTTPS 配置。"}</span></div>
-        <a className="secondary-button compact-button" href="#/network/settings/domains">管理域名</a>
-      </section>
-      <div className="network-view-switch" role="tablist" aria-label="站点互联视图">
-        <button type="button" role="tab" aria-selected={networkView === "topology"} className={networkView === "topology" ? "selected" : ""} onClick={() => setNetworkView("topology")}><Network size={15} aria-hidden="true" />互联拓扑</button>
-        <button type="button" role="tab" aria-selected={networkView === "sites"} className={networkView === "sites" ? "selected" : ""} onClick={() => setNetworkView("sites")}><Building2 size={15} aria-hidden="true" />站点与网段</button>
-      </div>
-      {showSiteForm && <CreateSiteForm request={request} onCreated={onRefresh} onDone={onToggleSiteForm} />}
-      <NetworkTopology
-        sites={sites}
-        siteNetworks={siteNetworks}
-        siteLinks={siteLinks}
-        selectedLink={selectedTopologyLink}
-        onSelectLink={setSelectedTopologyLink}
-        onSelectSite={(siteId) => { setNetworkView("sites"); setExpandedSiteIds((current) => new Set(current).add(siteId)); }}
-        onToggleLink={onToggleLink}
-        onRecheckLink={onRecheckLink}
-        onEditLink={onEditLink}
-        onDeleteLink={onDeleteLink}
-        actionPending={actionLinkId}
-      />
-      <section className={`panel page-panel network-sites-panel network-relations-view${networkView === "sites" ? "" : " desktop-hidden"}`}>
-        {sites.length === 0 ? <EmptyState icon={Building2} title="还没有站点" detail="创建家庭、办公室等站点后，才能配置共享网络。" /> : (
-          <div className="network-site-list">
-            <div className="network-site-columns" aria-hidden="true">
-              <span>站点</span><span>网关设备</span><span>共享网络</span><span>互联关系</span><span />
-            </div>
-            {sites.map((site) => {
-              const siteDevices = devices.filter((device) => device.site_id === site.id);
-              const gatewayDevices = siteDevices.filter((device) =>
-                device.gateway_report?.subnet_gateway === "ready" || device.gateway_report?.site_gateway === "ready",
-              );
-              const subnetGatewayDevices = siteDevices.filter((device) =>
-                device.gateway_report?.subnet_gateway === "ready" && (device.gateway_report.local_networks?.length ?? 0) > 0,
-              );
-              const networks = siteNetworks.filter((network) => network.site_id === site.id);
-              const links = siteLinks.filter((link) => link.left_site_id === site.id || link.right_site_id === site.id);
-              const networkIssues = networks.filter(hasGatewayIssue).length;
-              const linkIssues = links.filter(hasGatewayIssue).length;
-              const connectedSites = new Set(links.map((link) => link.left_site_id === site.id ? link.right_site_id : link.left_site_id));
-              const enabledNetworks = networks.filter((network) => network.enabled);
-              const targetSites = sites.filter((candidate) => candidate.id !== site.id && candidate.tenant_id === site.tenant_id && siteNetworks.some((network) => network.site_id === candidate.id && network.enabled));
-              const canAddNetwork = subnetGatewayDevices.length > 0;
-              const canConnect = enabledNetworks.length > 0 && targetSites.length > 0;
-              const expanded = expandedSiteIds.has(site.id);
-              const detailsId = `site-network-details-${site.id}`;
-              return (
-                <article className={`network-site${expanded ? " expanded" : ""}`} key={site.id}>
-                  <div className="network-site-summary">
-                    <div className="network-site-identity"><span className="site-icon"><Building2 size={18} aria-hidden="true" /></span><div className="network-site-identity-text"><strong>{site.name}</strong><span>{siteDevices.length} 台设备</span></div></div>
-                    <div className="network-site-fact"><span className="network-site-label">网关设备</span><strong>{gatewayDevices.length ? gatewayDevices.map((device) => device.name).join("、") : "尚未就绪"}</strong></div>
-                    <div className="network-site-fact"><span className="network-site-label">共享网络</span><strong>{networks.length} 个{networkIssues ? ` · ${networkIssues} 个异常` : " · 无异常"}</strong></div>
-                    <div className="network-site-fact"><span className="network-site-label">互联关系</span><strong>{connectedSites.size} 个站点{linkIssues ? ` · ${linkIssues} 个异常` : " · 无异常"}</strong></div>
-                    <div className="network-site-controls">
-                      <button className="delete-icon-button" type="button" aria-label={`删除站点${site.name}`} title="删除站点" disabled={deletingResource === `site:${site.id}`} onClick={() => onDeleteSite(site)}>
-                        <Trash2 size={17} aria-hidden="true" />
-                      </button>
-                      <button className="network-site-toggle" type="button" aria-expanded={expanded} aria-controls={detailsId} aria-label={`${expanded ? "收起" : "展开"}${site.name}`} onClick={() => toggleSite(site.id)}>
-                        <ChevronDown size={18} aria-hidden="true" />
-                      </button>
-                    </div>
-                  </div>
-                  {expanded && (
-                    <div className="network-site-details" id={detailsId}>
-                      <section className="network-inline-section" aria-labelledby={`${detailsId}-networks`}>
-                        <div className="network-inline-heading"><div><h2 id={`${detailsId}-networks`}>共享网络</h2><p>本站向已连接站点开放的局域网网段。</p></div><button className="secondary-button compact-button" type="button" onClick={() => onOpenNetworkForm(site.id)} disabled={!canAddNetwork}><Plus size={15} aria-hidden="true" />添加共享网络</button></div>
-                        {!canAddNetwork && <p className="network-prerequisite">需要本站有一台共享网络能力就绪、且已探测到本地网段的设备。</p>}
-                        {networks.length === 0 ? <p className="network-inline-empty">本站还没有共享网络。</p> : <div className="network-list">{networks.map((network) => <SiteNetworkRow key={network.id} network={network} actionPending={actionNetworkId === network.id || deletingResource === `network:${network.id}`} onToggle={() => void onToggleNetwork(network)} onDelete={() => onDeleteNetwork(network)} />)}</div>}
-                      </section>
-                      <section className="network-inline-section" aria-labelledby={`${detailsId}-links`}>
-                        <div className="network-inline-heading"><div><h2 id={`${detailsId}-links`}>互联关系</h2><p>本站与其他站点的连接，以及本站需要配置的静态路由。</p></div><button className="secondary-button compact-button" type="button" onClick={() => onOpenLinkForm(site.id)} disabled={!canConnect}><Plus size={15} aria-hidden="true" />连接站点</button></div>
-                        {!canConnect && <p className="network-prerequisite">{enabledNetworks.length === 0 ? "请先为本站添加并启用一个共享网络。" : "需要另一个站点具备已启用的共享网络。"}</p>}
-                        {links.length === 0 ? <p className="network-inline-empty">本站还没有连接其他站点。</p> : <div className="link-list">{links.map((link) => <SiteLinkCard key={link.id} link={link} currentSiteId={site.id} actionPending={actionLinkId === link.id || deletingResource === `link:${link.id}`} onToggle={() => void onToggleLink(link)} onRecheck={() => void onRecheckLink(link)} onConfirmRoute={(siteId) => void onConfirmRoute(link, siteId)} onEdit={() => onEditLink(link)} onDelete={() => onDeleteLink(link)} onOpenDetails={() => { setSelectedMobileLink(link); setSelectedMobileSiteId(site.id); }} />)}</div>}
-                      </section>
-                    </div>
-                  )}
-                </article>
-              );
-            })}
-          </div>
-        )}
-      </section>
-      {networkFormSite && (
-        <FormDialog eyebrow="共享网络" title="添加共享网络" description={`为“${networkFormSite.name}”选择网关设备及其最近探测到的本地网段。`} onClose={onCloseNetworkForm}>
-          <CreateSiteNetworkForm sourceSiteId={networkFormSite.id} sites={sites} devices={devices} request={request} onCancel={onCloseNetworkForm} onCreated={async () => { onCloseNetworkForm(); await onRefresh(); }} />
-        </FormDialog>
-      )}
-      {linkFormSite && (
-        <FormDialog eyebrow="站点互联" title={editingSiteLink ? "编辑互联关系" : "连接站点"} description={`从“${linkFormSite.name}”配置两侧网关、网段和下一跳。`} onClose={onCloseLinkForm}>
-          <CreateSiteLinkForm sourceSiteId={linkFormSite.id} sites={sites} devices={devices} siteNetworks={siteNetworks} request={request} initialLink={editingSiteLink} onCancel={onCloseLinkForm} onCreated={async () => { onCloseLinkForm(); await onRefresh(); }} />
-        </FormDialog>
-      )}
-      {selectedMobileLink && (
-        <MobileSiteLinkDetail
-          link={selectedMobileLink}
-          currentSiteId={selectedMobileSiteId ?? selectedMobileLink.left_site_id}
-          actionPending={actionLinkId === selectedMobileLink.id || deletingResource === `link:${selectedMobileLink.id}`}
-          onClose={() => { setSelectedMobileLink(null); setSelectedMobileSiteId(null); }}
-          onToggle={() => void onToggleLink(selectedMobileLink)}
-          onRecheck={() => void onRecheckLink(selectedMobileLink)}
-          onConfirmRoute={(siteId) => void onConfirmRoute(selectedMobileLink, siteId)}
-          onEdit={() => onEditLink(selectedMobileLink)}
-          onDelete={() => onDeleteLink(selectedMobileLink)}
-        />
-      )}
-    </>
-  );
-}
 
-function PrivateAccessPage({ meshConnections, ...networkProps }: Parameters<typeof NetworksPage>[0] & { meshConnections: MeshConnection[] }) {
-  const [selectedNetwork, setSelectedNetwork] = useState<SiteNetwork | null>(null);
-  const [detailTrigger, setDetailTrigger] = useState<HTMLButtonElement | null>(null);
-  const enabled = networkProps.siteNetworks.filter((network) => network.enabled && !network.deletion_pending);
-  return (
-    <>
-      <PageHeader eyebrow="网络" title="私网访问" subtitle="选择 Agent 检测到的家庭或办公网段，确认一次即可供当前工作空间设备访问。" />
-      <PageError error={networkProps.error} onRetry={networkProps.onRefresh} />
-      <DetectedNetworksPanel devices={networkProps.devices} siteNetworks={networkProps.siteNetworks} request={networkProps.request} onRefresh={networkProps.onRefresh} />
-      <section className="panel page-panel">
-        <div className="panel-heading"><div><p className="eyebrow">已共享网段</p><h2>{enabled.length} 个可访问网段</h2></div><span className="status-pill ready"><i />默认启用 SNAT</span></div>
-        {enabled.length === 0 ? <EmptyState icon={Network} title="还没有共享网段" detail="从上方选择 Agent 检测到的私有网段。" /> : <div className="private-network-list">{enabled.map((network) => {
-          const connections = meshConnections.filter((item) => item.site_network_id === network.id);
-          const summary = summarizeConnectionTypes(connections);
-          return <div className="private-network-row" key={network.id}><div><strong>{network.name}</strong><span>{network.desired_prefix} · {network.publisher_device_name}</span></div><span className={`status-pill ${connectionStatusKind(summary.type)}`}><i />{summary.label}</span><button className="secondary-button compact-button" type="button" onClick={(event) => { setDetailTrigger(event.currentTarget); setSelectedNetwork(network); }}>查看</button></div>;
-        })}</div>}
-      </section>
-      <details className="advanced-network panel page-panel">
-        <summary><span><strong>站点互联 · 高级</strong><small>无 SNAT、静态回程路由和多站点拓扑</small></span><ChevronDown size={18} aria-hidden="true" /></summary>
-        <div className="advanced-network-body"><button className="secondary-button" type="button" onClick={networkProps.onToggleSiteForm}><Plus size={16} aria-hidden="true" />新建站点</button><NetworksPage {...networkProps} embedded /></div>
-      </details>
-      {selectedNetwork && <NetworkDetailSheet network={selectedNetwork} connections={meshConnections.filter((item) => item.site_network_id === selectedNetwork.id)} request={networkProps.request} returnFocus={detailTrigger} onRefresh={networkProps.onRefresh} onClose={() => { setSelectedNetwork(null); setDetailTrigger(null); }} />}
-    </>
-  );
-}
-
-function DetectedNetworksPanel({ devices, siteNetworks, request, onRefresh }: { devices: Device[]; siteNetworks: SiteNetwork[]; request: ApiRequest; onRefresh: () => Promise<void> }) {
-  const agents = devices.filter((device) => device.connection_type === "nexo_agent" && device.site_id && (device.gateway_report?.local_networks?.length ?? 0) > 0);
-  const [deviceId, setDeviceId] = useState("");
-  const [selected, setSelected] = useState<Set<string>>(new Set());
-  const [busy, setBusy] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-  useEffect(() => {
-    if (!agents.some((device) => device.id === deviceId)) setDeviceId(agents[0]?.id ?? "");
-  }, [agents, deviceId]);
-  const device = agents.find((item) => item.id === deviceId);
-  const detected = (device?.gateway_report?.local_networks ?? []).filter((network) => !siteNetworks.some((item) => item.publisher_device_id === deviceId && item.desired_prefix === network.prefix));
-  const toggle = (key: string) => setSelected((current) => { const next = new Set(current); if (next.has(key)) next.delete(key); else next.add(key); return next; });
-  const enable = async () => {
-    if (!device || selected.size === 0) return;
-    const networks = detected.filter((item) => selected.has(`${item.interface_id}:${item.prefix}`));
-    if (!window.confirm(`启用 ${networks.length} 个共享网段，并允许当前工作空间设备访问？`)) return;
-    setBusy(true); setError(null);
-    try {
-      const response = await request("/api/v1/site-networks/enable-detected", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ device_id: device.id, networks }) });
-      const body: unknown = await response.json().catch(() => null);
-      if (!response.ok) throw new Error(readApiError(body, "暂时无法启用共享网段"));
-      setSelected(new Set());
-      await onRefresh();
-    } catch (requestError) {
-      setError(requestError instanceof Error ? requestError.message : "暂时无法启用共享网段");
-    } finally { setBusy(false); }
-  };
-  return <section className="panel page-panel detected-networks"><div className="panel-heading"><div><p className="eyebrow">检测到的私有网段</p><h2>选择并启用</h2></div></div>{agents.length === 0 ? <EmptyState icon={WifiOff} title="没有可用的 Agent 网段" detail="Agent 归属站点并上报私有网段后会显示在这里。" /> : <><label className="detected-agent"><span>承载 Agent</span><select value={deviceId} onChange={(event) => { setDeviceId(event.target.value); setSelected(new Set()); }}>{agents.map((agent) => <option value={agent.id} key={agent.id}>{agent.name}</option>)}</select></label><fieldset className="network-checklist"><legend>可共享网段</legend>{detected.length === 0 ? <p className="network-inline-empty">该 Agent 检测到的网段均已启用。</p> : detected.map((network) => { const key = `${network.interface_id}:${network.prefix}`; const blocked = forwardingRequirement(device!.gateway_report!, network.prefix); return <label key={key}><input type="checkbox" checked={selected.has(key)} disabled={Boolean(blocked)} onChange={() => toggle(key)} /><span><strong>{network.prefix}</strong><small>{network.interface_id}{blocked ? ` · ${blocked}` : " · 可直接共享"}</small></span></label>; })}</fieldset><div className="detected-actions"><span>普通共享网段使用 SNAT，无需配置家庭路由器回程。</span><button className="primary-button" type="button" disabled={busy || selected.size === 0} onClick={() => void enable()}><CheckCircle2 size={16} aria-hidden="true" />{busy ? "启用中" : "启用所选网段"}</button></div></>}{error && <p className="form-error" role="alert">{error}</p>}</section>;
-}
-
-function summarizeConnectionTypes(connections: MeshConnection[]): { type: string; label: string } {
-  const priority = ["direct", "peer_relay", "derp", "idle", "unknown"];
-  const type = priority.find((candidate) => connections.some((item) => item.connection_type === candidate)) ?? "unknown";
-  return { type, label: connections.length ? connectionTypeLabel(type) : "未知" };
-}
 
 function connectionTypeLabel(type: string): string {
   if (type === "direct") return "P2P 直连";
@@ -3090,9 +2623,36 @@ function connectionStatusKind(type: string): string {
   return type === "direct" ? "ready" : type === "unknown" ? "working" : "disabled";
 }
 
+function networkStatusExplanation(network: SiteNetwork): string {
+  const reasons: Record<string, string> = {
+    disabled: "网段已关闭，设备广告与控制面路由已撤回。",
+    device_offline: "设备离线，上线后自动继续。",
+    disabling: "正在撤回设备广告和控制面路由。",
+    ipv4_forwarding_disabled: "设备未开启 IPv4 转发，请在 Agent 主机开启 net.ipv4.ip_forward。",
+    ipv6_forwarding_disabled: "设备未开启 IPv6 转发，请在 Agent 主机开启 net.ipv6.conf.all.forwarding。",
+    network_missing: "Agent 未检测到原有网段。已保留配置，请检查网卡和本地网络。",
+    apply_failed: "配置需要处理，请查看下方原因，修复后重新检查。",
+    ready: "配置与必要批准已完成；此状态不代表已实测所有家庭服务。",
+    applying: "正在配置，后台自动完成设备广告、路由批准和工作空间授权。",
+  };
+  return reasons[network.status_reason] ?? "正在读取配置状态。";
+}
+
 function NetworkDetailSheet({ network, connections, request, returnFocus, onRefresh, onClose }: { network: SiteNetwork; connections: MeshConnection[]; request: ApiRequest; returnFocus: HTMLButtonElement | null; onRefresh: () => Promise<void>; onClose: () => void }) {
   const [checkingId, setCheckingId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+  const apply = async (remove: boolean) => {
+    if (remove && !window.confirm(`删除共享网段 ${network.desired_prefix}？已保存的授权将撤销。`)) return;
+    setBusy(true); setError(null);
+    try {
+      const response = await request(`/api/v1/site-networks/${encodeURIComponent(network.id)}${remove ? "" : "/recheck"}`, {method: remove ? "DELETE" : "POST"});
+      if (!response.ok) throw new Error(readApiError(await response.json(), "暂时无法应用操作"));
+      await onRefresh();
+      if (remove) onClose();
+    } catch (error) {setError(error instanceof Error ? error.message : "暂时无法应用操作");}
+    finally {setBusy(false);}
+  };
   const check = async (clientDeviceId: string) => {
     setCheckingId(clientDeviceId); setError(null);
     try {
@@ -3111,93 +2671,22 @@ function NetworkDetailSheet({ network, connections, request, returnFocus, onRefr
     } catch (requestError) { setError(requestError instanceof Error ? requestError.message : "连接检测失败"); }
     finally { setCheckingId(null); }
   };
-  return <FormDialog eyebrow="共享网段" title={network.name} description={`${network.desired_prefix} · 由 ${network.publisher_device_name} 承载`} variant="sheet" returnFocus={returnFocus} onClose={onClose}><div className="connection-detail-list">{connections.length === 0 ? <EmptyState icon={Network} title="尚无连接观测" detail="客户端产生流量后，路径状态会在 15 秒内更新。" /> : connections.map((connection) => <div className="connection-detail-row" key={connection.client_device_id}><div><strong>{connection.client_device_name}</strong><span>到 {connection.gateway_device_name}</span></div><span className={`status-pill ${connectionStatusKind(connection.connection_type)}`}><i />{connectionTypeLabel(connection.connection_type)}</span><button className="secondary-button compact-button" type="button" disabled={checkingId === connection.client_device_id} onClick={() => void check(connection.client_device_id)}><RefreshCw size={15} aria-hidden="true" />{checkingId === connection.client_device_id ? "检测中" : "检测"}</button></div>)}</div>{error && <p className="form-error" role="alert">{error}</p>}</FormDialog>;
-}
-
-function hasGatewayIssue(item: SiteNetwork | SiteLink): boolean {
-  return item.apply_status === "failed" || item.health_status === "failed" || item.health_status === "degraded";
-}
-
-/** 桌面端只读拓扑：节点与连线可聚焦、可点击，位置由当前站点顺序计算。 */
-function NetworkTopology({
-  sites,
-  siteNetworks,
-  siteLinks,
-  selectedLink,
-  onSelectLink,
-  onSelectSite,
-  onToggleLink,
-  onRecheckLink,
-  onEditLink,
-  onDeleteLink,
-  actionPending,
-}: {
-  sites: Site[];
-  siteNetworks: SiteNetwork[];
-  siteLinks: SiteLink[];
-  selectedLink: SiteLink | null;
-  onSelectLink: (link: SiteLink | null) => void;
-  onSelectSite: (siteId: string) => void;
-  onToggleLink: (link: SiteLink) => Promise<void>;
-  onRecheckLink: (link: SiteLink) => Promise<void>;
-  onEditLink: (link: SiteLink) => void;
-  onDeleteLink: (link: SiteLink) => void;
-  actionPending: string | null;
-}) {
-  const width = 1000;
-  // 4 列以内保持一行；5-12 个站点分成 2-3 行，避免节点名称在桌面端互相遮挡。
-  const columns = Math.min(4, Math.max(1, sites.length));
-  const rows = Math.ceil(sites.length / columns);
-  const height = rows === 1 ? 280 : rows === 2 ? 420 : 560;
-  const positionFor = (index: number) => {
-    const column = index % columns;
-    const row = Math.floor(index / columns);
-    const x = columns === 1 ? width / 2 : 110 + (column * (width - 220)) / (columns - 1);
-    const y = rows === 1 ? height / 2 : 72 + (row * (height - 144)) / (rows - 1);
-    return { x, y };
-  };
-  const siteIndex = new Map(sites.map((site, index) => [site.id, index]));
-  return (
-    <section className="panel page-panel network-topology" aria-labelledby="network-topology-heading">
-      <div className="topology-heading"><div><h2 id="network-topology-heading">互联拓扑</h2><p>选择节点查看站点网段，选择连线查看逐阶段状态。</p></div><span className="topology-scale">{sites.length} 个站点 · {siteLinks.length} 条关系</span></div>
-      {sites.length < 2 ? <p className="network-inline-empty">至少需要两个站点才能显示互联拓扑。</p> : <div className="topology-layout">
-        <div className="topology-canvas" style={{ aspectRatio: `${width} / ${height}` }}>
-          <svg className="topology-lines" viewBox={`0 0 ${width} ${height}`} aria-hidden="true" focusable="false">
-            {siteLinks.map((link) => {
-              const left = positionFor(siteIndex.get(link.left_site_id) ?? 0);
-              const right = positionFor(siteIndex.get(link.right_site_id) ?? 0);
-              return <line key={link.id} x1={left.x} y1={left.y} x2={right.x} y2={right.y} className={selectedLink?.id === link.id ? "selected" : ""} />;
-            })}
-          </svg>
-          <div className="topology-nodes">
-            {sites.map((site, index) => {
-              const networks = siteNetworks.filter((network) => network.site_id === site.id);
-              const position = positionFor(index);
-              return <button key={site.id} type="button" className="topology-node" style={{ left: `${(position.x / width) * 100}%`, top: `${(position.y / height) * 100}%` }} onClick={() => onSelectSite(site.id)} aria-label={`查看站点${site.name}`}>
-                <Building2 size={18} aria-hidden="true" /><strong>{site.name}</strong><span>{networks.length} 个共享网段</span>
-              </button>;
-            })}
-          </div>
-          <div className="topology-link-buttons">
-            {siteLinks.map((link) => {
-              const left = positionFor(siteIndex.get(link.left_site_id) ?? 0);
-              const right = positionFor(siteIndex.get(link.right_site_id) ?? 0);
-              return <button key={link.id} type="button" className={`topology-link-button${selectedLink?.id === link.id ? " selected" : ""}`} style={{ left: `${(((left.x + right.x) / 2) / width) * 100}%`, top: `${(((left.y + right.y) / 2) / height) * 100}%` }} onClick={() => onSelectLink(selectedLink?.id === link.id ? null : link)} aria-label={`查看${link.left_site_name}与${link.right_site_name}的互联`}>
-                <span className={`link-status ${siteLinkStatus(link.apply_status).kind}`}><i />{siteLinkStatus(link.apply_status).label}</span>
-              </button>;
-            })}
-          </div>
-        </div>
-        {selectedLink && <aside className="topology-detail" aria-label="互联详情">
-          <div className="topology-detail-heading"><div><span className="eyebrow">互联详情</span><h3>{selectedLink.left_site_name} ↔ {selectedLink.right_site_name}</h3></div><button className="icon-button" type="button" aria-label="关闭互联详情" title="关闭" onClick={() => onSelectLink(null)}><X size={17} aria-hidden="true" /></button></div>
-          <div className="topology-network-pairs"><div><strong>{selectedLink.left_site_name}</strong>{selectedLink.left_networks.map((network) => <code key={network.id}>{network.prefix}</code>)}</div><ArrowRight size={16} aria-hidden="true" /><div><strong>{selectedLink.right_site_name}</strong>{selectedLink.right_networks.map((network) => <code key={network.id}>{network.prefix}</code>)}</div></div>
-          <div className="topology-status-list">{selectedLink.route_statuses.map((status) => <div key={`${status.router_site_id}-${status.network_id}`}><span>{status.destination_prefix}</span><small>{routeStageLabel("device", status.device_status)} · {routeStageLabel("control", status.control_plane_status)} · {routeStageLabel("remote", status.remote_status)}{status.error ? ` · ${status.error}` : ""}</small></div>)}</div>
-          <div className="topology-detail-actions"><button className="secondary-button compact-button" type="button" onClick={() => onEditLink(selectedLink)}>编辑</button><button className="secondary-button compact-button" type="button" disabled={actionPending === selectedLink.id} onClick={() => void onRecheckLink(selectedLink)}>重试</button><button className="secondary-button compact-button" type="button" disabled={actionPending === selectedLink.id} onClick={() => void onToggleLink(selectedLink)}>{selectedLink.enabled ? "停用" : "启用"}</button><button className="delete-icon-button" type="button" aria-label="删除互联关系" title="删除" onClick={() => onDeleteLink(selectedLink)}><Trash2 size={16} aria-hidden="true" /></button></div>
-        </aside>}
-      </div>}
+  return <FormDialog eyebrow="共享网段" title={network.name} description={`${network.desired_prefix} · 由 ${network.publisher_device_name} 承载`} variant="sheet" returnFocus={returnFocus} onClose={() => {if (!busy) onClose();}}>
+    <section className="device-detail-section" aria-busy={busy}>
+      <h3>配置状态</h3><NetworkState network={network} />
+      <p>{networkStatusExplanation(network)}</p>
+      {!["ready", "disabled"].includes(network.status_reason) && Date.now() / 1000 - network.updated_at > 60 && <p className="form-hint">耗时较长，请查看配置详情；后台会继续处理。</p>}
+      {(network.apply_error || network.health_error) && <p className="form-hint">{network.apply_error ?? network.health_error}</p>}
+      <div className="dialog-actions"><button className="secondary-button" disabled={busy} onClick={() => void apply(false)}>{busy ? "处理中…" : "重新检查"}</button><button className="secondary-button danger-button" disabled={busy || network.deletion_pending} onClick={() => void apply(true)}>{network.deletion_pending ? "正在删除" : "删除网段"}</button></div>
     </section>
-  );
+    <section className="device-detail-section"><h3>客户端连接</h3><p className="form-hint">连接方式按客户端到 Agent 分别显示。中继连接同样保持端到端加密。</p>
+      <div className="connection-detail-list">{connections.length === 0 ? <EmptyState icon={Network} title="尚无连接观测" detail="客户端产生流量后，路径状态会在 15 秒内更新。" /> : connections.map((connection) => <div className="connection-detail-row" key={connection.client_device_id}><div><strong>{connection.client_device_name}</strong><span>到 {connection.gateway_device_name}</span></div><span className={`status-pill ${connectionStatusKind(connection.connection_type)}`}><i />{connectionTypeLabel(connection.connection_type)}</span><button className="secondary-button compact-button" type="button" disabled={checkingId === connection.client_device_id} onClick={() => void check(connection.client_device_id)}><RefreshCw size={15} aria-hidden="true" />{checkingId === connection.client_device_id ? "检测中" : "检测"}</button></div>)}</div>
+    </section>{error && <p className="form-error" role="alert">{error}</p>}
+  </FormDialog>;
 }
+
+
+
 
 /**
  * 表单与危险确认共用的模态外壳。原生 dialog 负责焦点约束；关闭时把焦点
@@ -3212,6 +2701,7 @@ function FormDialog({
   returnFocus: explicitReturnFocus,
   role,
   compact = false,
+  confirmDiscard = false,
   wide = false,
   variant = "sheet",
   initialFocusSelector,
@@ -3224,6 +2714,7 @@ function FormDialog({
   returnFocus?: HTMLElement | null;
   role?: "dialog" | "alertdialog";
   compact?: boolean;
+  confirmDiscard?: boolean;
   wide?: boolean;
   variant?: "modal" | "sheet";
   initialFocusSelector?: string;
@@ -3231,6 +2722,8 @@ function FormDialog({
   const dialogRef = useRef<HTMLDialogElement>(null);
   const returnFocus = useRef<HTMLElement | null>(explicitReturnFocus ?? document.activeElement as HTMLElement | null);
   const titleId = useRef(`dialog-${Math.random().toString(36).slice(2)}`);
+  const dirty = useRef(false);
+  const canClose = () => !confirmDiscard || !dirty.current || window.confirm("放弃尚未保存的修改？");
   const submitting = () => dialogRef.current?.querySelector('[aria-busy="true"]') !== null;
   useEffect(() => {
     const dialog = dialogRef.current;
@@ -3249,13 +2742,21 @@ function FormDialog({
       className={`form-dialog ${variant === "sheet" ? "form-sheet" : ""}`}
       role={role}
       aria-labelledby={titleId.current}
-      onCancel={(event) => { event.preventDefault(); if (!submitting()) onClose(); }}
-      onClick={(event) => { if (event.target === event.currentTarget && !submitting()) onClose(); }}
+      onChangeCapture={() => {dirty.current = true;}}
+      onClickCapture={(event) => {
+        const button = (event.target as HTMLElement).closest('button');
+        if (button?.type === "button" && button.textContent?.trim() === "取消" && !submitting()) {
+          if (!canClose()) {event.preventDefault();event.stopPropagation();}
+          else dirty.current = false;
+        }
+      }}
+      onCancel={(event) => { event.preventDefault(); if (!submitting() && canClose()) onClose(); }}
+      onClick={(event) => { if (event.target === event.currentTarget && !submitting() && canClose()) onClose(); }}
     >
       <div className={`form-dialog-surface${compact ? " compact" : ""}${wide ? " wide" : ""}`} onClick={(event) => event.stopPropagation()}>
         <header className="form-dialog-header">
           <div><p className="eyebrow">{eyebrow}</p><h2 id={titleId.current}>{title}</h2><p>{description}</p></div>
-          <button className="icon-button" type="button" aria-label={`关闭${title}窗口`} onClick={() => { if (!submitting()) onClose(); }}>
+          <button className="icon-button" type="button" aria-label={`关闭${title}窗口`} onClick={() => { if (!submitting() && canClose()) onClose(); }}>
             <X size={20} aria-hidden="true" />
           </button>
         </header>
@@ -3265,37 +2766,6 @@ function FormDialog({
   );
 }
 
-function CreateSiteForm({ request, onCreated, onDone }: { request: ApiRequest; onCreated: () => Promise<void>; onDone: () => void }) {
-  const [name, setName] = useState("");
-  const [submitting, setSubmitting] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-  return (
-    <form className="site-create-form" aria-busy={submitting} onSubmit={async (event) => {
-      event.preventDefault();
-      if (!name.trim()) { setError("请输入站点名称"); return; }
-      setSubmitting(true); setError(null);
-      try {
-        const response = await request("/api/v1/sites", {
-          method: "POST",
-          headers: { "content-type": "application/json" },
-          body: JSON.stringify({ tenant_id: "default", name: name.trim() }),
-        });
-        const body: unknown = await response.json().catch(() => null);
-        if (!response.ok) throw new Error(readApiError(body, "暂时无法创建站点"));
-        setName("");
-        await onCreated();
-        onDone();
-      } catch (requestError) {
-        setError(requestError instanceof Error ? requestError.message : "暂时无法创建站点");
-      } finally { setSubmitting(false); }
-    }}>
-      <label><span>站点名称</span><input autoFocus value={name} onChange={(event) => setName(event.target.value)} placeholder="例如：家庭" required /></label>
-      <button className="primary-button" type="submit" disabled={submitting}><Plus size={16} aria-hidden="true" />{submitting ? "创建中" : "创建站点"}</button>
-      <button className="secondary-button" type="button" onClick={onDone} disabled={submitting}>取消</button>
-      {error && <p className="form-error" role="alert">{error}</p>}
-    </form>
-  );
-}
 
 function SettingsPage({
   auth,
@@ -3424,80 +2894,32 @@ function Metric({ label, value, hint }: { label: string; value: number; hint: st
   );
 }
 
-function DeviceRow({ device, sites, networkCount, publicServiceCount, deleting, onEdit, onDelete }: { device: Device; sites: Site[]; networkCount: number; publicServiceCount: number; deleting: boolean; onEdit: (trigger: HTMLButtonElement) => void; onDelete: (trigger: HTMLButtonElement) => void }) {
-  const online = device.status === "online";
-  const subnetReady = device.gateway_report?.subnet_gateway === "ready";
-  const siteReady = device.gateway_report?.site_gateway === "ready";
-  const familyAvailability = device.gateway_report ? gatewayFamilyAvailability(device.gateway_report) : null;
-  const siteName = device.site_id ? sites.find((site) => site.id === device.site_id)?.name ?? "未知站点" : "未分配站点";
-  const tailscaleAddresses = Array.from(new Set([
-    device.tailscale_ipv4,
-    device.tailscale_ipv6,
-    device.mesh_address,
-  ].filter((address): address is string => Boolean(address))));
-  const connectionLabel = device.connection_type === "tailscale_client" ? "Tailscale 客户端" : "Nexo Agent";
-  const registrationLabel = device.registration_method === "auth_key" ? "客户端密钥" : device.registration_method === "oidc" ? "OIDC" : device.registration_method === "browser" ? "浏览器授权" : null;
-  return (
-    <div className="device-row">
-      <span className={`device-avatar ${online ? "online" : ""}`}>{device.name.slice(0, 1).toUpperCase()}</span>
-      <div className="device-identity">
-        <strong>{device.name}</strong>
-        <span>{siteName} · {[device.os, device.architecture, device.agent_version].filter(Boolean).join(" · ") || "设备信息待上报"}</span>
-      </div>
-      <div className="device-capabilities">
-        <span className={`device-status ${online ? "online" : "offline"}`}><i />{online ? "在线" : "离线"}</span>
-        <span className="capability">{connectionLabel}</span>
-        {device.owner_username && <span className="capability">所有者：{device.owner_username}</span>}
-        {registrationLabel && <span className="capability">注册：{registrationLabel}</span>}
-        <span className={`capability ${device.mesh_status === "connected" ? "ready" : ""}`}>组网：{meshStatusLabel(device.mesh_status)}</span>
-        {device.needs_name && <span className="capability warning">需要设置设备名称</span>}
-        {tailscaleAddresses.map((address) => <span className="capability" key={address}>{address}</span>)}
-        {device.tags?.length ? <span className="capability">标签：{device.tags.join("、")}</span> : null}
-        {device.expires_at && <span className="capability">有效期至 {formatSessionTime(device.expires_at)}</span>}
-        <span className="capability">共享网段 {networkCount}</span>
-        <span className="capability">公网服务 {publicServiceCount}</span>
-        {device.gateway_report && (
-          <span className={`capability ${subnetReady ? "ready" : ""}`}>共享网络 {subnetReady && familyAvailability ? familyAvailability : "待检查"}</span>
-        )}
-        {device.gateway_report && (
-          <span className={`capability ${siteReady ? "ready" : ""}`}>站点互联 {siteReady && familyAvailability ? familyAvailability : "待检查"}</span>
-        )}
-      </div>
-      <button className="icon-button" type="button" aria-label={`编辑设备${device.name}`} title="编辑设备" disabled={deleting} onClick={(event) => onEdit(event.currentTarget)}>
-        <Pencil size={17} aria-hidden="true" />
-      </button>
-      <button className="delete-icon-button" type="button" aria-label={deleting ? `正在删除设备${device.name}` : `删除设备${device.name}`} aria-busy={deleting} title="删除设备" disabled={deleting} onClick={(event) => onDelete(event.currentTarget)}>
-        <Trash2 size={17} aria-hidden="true" />
-      </button>
-    </div>
-  );
-}
 
-/** 设备资料编辑窗；名称和所属站点是本地资料，提交时由 Server 再校验站点归属。 */
+/** 设备资料编辑同时提交显示名称和独立的 MagicDNS 访问名称。 */
 function EditDeviceDialog({
   device,
-  sites,
   request,
   returnFocus,
   onUpdated,
   onClose,
 }: {
   device: Device;
-  sites: Site[];
+
   request: ApiRequest;
   returnFocus: HTMLButtonElement | null;
   onUpdated: (updated: Device) => void;
   onClose: () => void;
 }) {
   const [name, setName] = useState(device.name);
-  const [siteId, setSiteId] = useState(device.site_id ?? "");
+  const [meshName, setMeshName] = useState(device.mesh_name ?? "");
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
   return (
     <FormDialog
       eyebrow="设备管理"
+      confirmDiscard
       title="编辑设备"
-      description="修改设备名称或所属站点。正在承载共享网络或站点网关的设备不能跨站点移动。"
+      description="显示名称用于管理界面，组网访问名用于 MagicDNS；两者互不影响。"
       returnFocus={returnFocus}
       onClose={onClose}
     >
@@ -3511,13 +2933,17 @@ function EditDeviceDialog({
           setError("设备名称不能使用 localhost，请填写可识别的设备名称");
           return;
         }
+        if (!meshName.trim()) {
+          setError("组网访问名不能为空");
+          return;
+        }
         setSubmitting(true);
         setError(null);
         try {
           const response = await request(`/api/v1/devices/${encodeURIComponent(device.id)}`, {
             method: "PUT",
             headers: { "content-type": "application/json" },
-            body: JSON.stringify({ name: name.trim(), site_id: siteId || null }),
+            body: JSON.stringify({ name: name.trim(), mesh_name: meshName.trim() }),
           });
           const body: unknown = await response.json().catch(() => null);
           if (!response.ok) throw new Error(readApiError(body, "暂时无法保存设备资料"));
@@ -3530,8 +2956,8 @@ function EditDeviceDialog({
       }}>
         <fieldset className="form-grid device-edit-grid" disabled={submitting}>
           <legend className="sr-only">设备编辑信息</legend>
-          <label><span>设备名称</span><input autoFocus value={name} onChange={(event) => setName(event.target.value)} required /></label>
-          <label><span>所属站点</span><select value={siteId} onChange={(event) => setSiteId(event.target.value)}><option value="">未分配站点</option>{sites.map((site) => <option key={site.id} value={site.id}>{site.name}</option>)}</select></label>
+          <label><span>显示名称</span><input autoFocus value={name} onChange={(event) => setName(event.target.value)} required /></label>
+          <label><span>组网访问名</span><div className="field-control"><input value={meshName} onChange={(event) => setMeshName(event.target.value)} autoCapitalize="none" autoCorrect="off" spellCheck={false} aria-describedby="mesh-name-help" required /><small id="mesh-name-help">仅支持字母、数字和内部连字符，最多 32 个字符；保存后统一使用小写。</small></div></label>
         </fieldset>
         {error && <p className="form-error" role="alert">{error}</p>}
         <div className="dialog-actions">
@@ -3591,7 +3017,7 @@ function DeleteDeviceDialog({
       }}>
         <div className="delete-confirmation-copy">
           <AlertTriangle size={20} aria-hidden="true" />
-          <p>删除设备不会删除公网服务，它们会立即停止公网入口。若设备仍承载共享网络或活动站点网关，服务端仍会阻止删除。</p>
+          <p>删除设备不会删除公网服务，它们会立即停止公网入口。若设备仍承载共享网络，服务端仍会阻止删除。</p>
         </div>
         {error && <p className="form-error" role="alert">{error}</p>}
         <div className="dialog-actions">
@@ -3621,388 +3047,7 @@ function gatewayFamilyAvailability(report: GatewayReport): string | null {
   return null;
 }
 
-/**
- * 共享网络创建表单：只呈现站点、设备和 Agent 已探测到的本地网段。
- * 表单提交后由服务端再次校验能力和网段，避免浏览器状态成为配置真源。
- */
-function CreateSiteNetworkForm({
-  sourceSiteId,
-  sites,
-  devices,
-  request,
-  onCancel,
-  onCreated,
-}: {
-  sourceSiteId: string;
-  sites: Site[];
-  devices: Device[];
-  request: ApiRequest;
-  onCancel: () => void;
-  onCreated: () => Promise<void>;
-}) {
-  const siteId = sourceSiteId;
-  const [source, setSource] = useState<"detected" | "manual">("detected");
-  const [deviceId, setDeviceId] = useState("");
-  const [networkKey, setNetworkKey] = useState("");
-  const [manualPrefix, setManualPrefix] = useState("");
-  const [manualError, setManualError] = useState<string | null>(null);
-  const [name, setName] = useState("");
-  const [submitting, setSubmitting] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-  const selectedSite = sites.find((site) => site.id === siteId);
-  const eligibleDevices = devices.filter(
-    (device) => device.site_id === siteId && device.gateway_report?.subnet_gateway === "ready",
-  );
-  const selectedDevice = eligibleDevices.find((device) => device.id === deviceId);
-  const localNetworks = selectedDevice?.gateway_report?.local_networks ?? [];
-  const selectedNetworkCandidate = localNetworks.find((network) => `${network.interface_id}|${network.prefix}` === networkKey);
-  const selectedNetwork = selectedNetworkCandidate
-    && selectedDevice?.gateway_report
-    && !forwardingRequirement(selectedDevice.gateway_report, selectedNetworkCandidate.prefix)
-    ? selectedNetworkCandidate
-    : undefined;
 
-  const validateManualPrefix = (value: string): string | null => {
-    const trimmed = value.trim();
-    if (!trimmed) return "请输入要共享的 CIDR";
-    const slash = trimmed.lastIndexOf("/");
-    if (slash <= 0 || slash === trimmed.length - 1) return "请输入合法的 IPv4 或 IPv6 CIDR";
-    const address = trimmed.slice(0, slash);
-    const prefixLength = Number(trimmed.slice(slash + 1));
-    const ipv6 = address.includes(":");
-    const max = ipv6 ? 128 : 32;
-    if (!Number.isInteger(prefixLength) || prefixLength < 1 || prefixLength > max) return "不能使用默认路由或无效前缀长度";
-    if (!ipv6 && (!/^\d{1,3}(\.\d{1,3}){3}$/.test(address) || address.split(".").some((part) => Number(part) > 255))) return "请输入合法的 IPv4 CIDR";
-    if (ipv6 && !/^[0-9a-f:]+$/i.test(address)) return "请输入合法的 IPv6 CIDR";
-    return null;
-  };
-
-  /** Agent 能力更新后清空失效选择，避免提交已经不存在的设备状态。 */
-  useEffect(() => {
-    if (deviceId && !eligibleDevices.some((device) => device.id === deviceId)) {
-      setDeviceId("");
-      setNetworkKey("");
-    }
-  }, [deviceId, eligibleDevices]);
-
-  useEffect(() => {
-    if (networkKey && !localNetworks.some((network) => {
-      const matches = `${network.interface_id}|${network.prefix}` === networkKey;
-      return matches && selectedDevice?.gateway_report
-        && !forwardingRequirement(selectedDevice.gateway_report, network.prefix);
-    })) {
-      setNetworkKey("");
-    }
-  }, [localNetworks, networkKey, selectedDevice]);
-
-  return (
-    <form
-      className="inline-form network-form-table"
-      aria-busy={submitting}
-      onSubmit={async (event) => {
-        event.preventDefault();
-        const cidrError = source === "manual" ? validateManualPrefix(manualPrefix) : null;
-        setManualError(cidrError);
-        if (!selectedSite || !selectedDevice || !name.trim() || (source === "detected" && !selectedNetwork) || cidrError) {
-          setError("请填写显示名称，并选择站点、网关设备和有效的共享网段");
-          return;
-        }
-        setSubmitting(true);
-        setError(null);
-        try {
-          const response = await request("/api/v1/site-networks", {
-            method: "POST",
-            headers: {
-              "content-type": "application/json",
-            },
-            body: JSON.stringify({
-              tenant_id: selectedSite.tenant_id,
-              site_id: selectedSite.id,
-                name: name.trim(),
-                publisher_device_id: selectedDevice.id,
-                source,
-                interface_id: source === "detected" ? selectedNetwork?.interface_id ?? "" : "",
-                prefix: source === "detected" ? selectedNetwork?.prefix ?? "" : manualPrefix.trim(),
-            }),
-          });
-          const body: unknown = await response.json().catch(() => null);
-          if (!response.ok) {
-            throw new Error(readApiError(body, "暂时无法创建共享网络"));
-          }
-          setName("");
-          setNetworkKey("");
-          setManualPrefix("");
-          setManualError(null);
-          await onCreated();
-        } catch (requestError) {
-          setError(requestError instanceof Error ? requestError.message : "暂时无法创建共享网络");
-        } finally {
-          setSubmitting(false);
-        }
-      }}
-    >
-      <fieldset className="form-grid" disabled={submitting}>
-        <legend className="sr-only">共享网络信息</legend>
-        <label>
-          <span>显示名称</span>
-          <input value={name} onChange={(event) => setName(event.target.value)} placeholder="家庭网络" required />
-        </label>
-        <div className="network-source-switch" role="radiogroup" aria-label="共享网段来源">
-          <span>网段来源</span>
-          <div className="segmented-control">
-            <button type="button" role="radio" aria-checked={source === "detected"} className={source === "detected" ? "selected" : ""} onClick={() => { setSource("detected"); setError(null); }}>自动探测</button>
-            <button type="button" role="radio" aria-checked={source === "manual"} className={source === "manual" ? "selected" : ""} onClick={() => { setSource("manual"); setError(null); }}>手动填写</button>
-          </div>
-        </div>
-        <label>
-          <span>站点</span>
-          <select value={siteId} disabled aria-label="来源站点">
-            {selectedSite && <option value={selectedSite.id}>{selectedSite.name}</option>}
-          </select>
-        </label>
-        <label>
-          <span>网关设备</span>
-          <select
-            value={deviceId}
-            onChange={(event) => { setDeviceId(event.target.value); setNetworkKey(""); }}
-            required
-            disabled={!siteId || eligibleDevices.length === 0}
-          >
-            <option value="">{siteId ? "选择网关设备" : "先选择站点"}</option>
-            {eligibleDevices.map((device) => <option key={device.id} value={device.id}>{device.name}</option>)}
-          </select>
-        </label>
-        {source === "detected" ? <label>
-          <span>本地网络</span>
-          <select
-            value={networkKey}
-            onChange={(event) => setNetworkKey(event.target.value)}
-            required
-            disabled={!deviceId || localNetworks.length === 0}
-          >
-            <option value="">{deviceId ? "选择已探测网段" : "先选择设备"}</option>
-            {localNetworks.map((network) => {
-              const value = `${network.interface_id}|${network.prefix}`;
-              const requirement = selectedDevice?.gateway_report
-                ? forwardingRequirement(selectedDevice.gateway_report, network.prefix)
-                : null;
-              return <option key={value} value={value} disabled={Boolean(requirement)}>{network.prefix} · {network.interface_id}{requirement ? ` · ${requirement}` : ""}</option>;
-            })}
-          </select>
-        </label> : <label>
-          <span>共享 CIDR</span>
-          <input value={manualPrefix} onChange={(event) => { setManualPrefix(event.target.value); setManualError(null); setError(null); }} onBlur={() => setManualError(validateManualPrefix(manualPrefix))} placeholder="192.168.50.0/24 或 2001:db8:50::/64" aria-invalid={Boolean(manualError)} aria-describedby={manualError ? "manual-cidr-error" : undefined} required />
-          {manualError && <small className="field-error" id="manual-cidr-error">{manualError}</small>}
-        </label>}
-      </fieldset>
-      {error && <p className="form-error" role="alert">{error}</p>}
-      <div className="form-footer">
-        <span className="form-hint">
-          {sites.length === 0 ? "还没有可用站点。" : eligibleDevices.length === 0 ? "该站点暂无可用于共享网络的设备。" : source === "detected" ? "自动探测会严格匹配 Agent 最近报告的网卡和网段。" : "手动 CIDR 表示该网关可达的网络，服务端会再次检查转发能力。"}
-        </span>
-        <div className="form-actions">
-          <button className="secondary-button" type="button" onClick={onCancel} disabled={submitting}>取消</button>
-          <button className="primary-button" type="submit" disabled={submitting || !selectedSite || !selectedDevice || (source === "detected" ? !selectedNetwork : !manualPrefix.trim())}>
-            {submitting ? "创建中…" : "创建共享网络"}
-          </button>
-        </div>
-      </div>
-    </form>
-  );
-}
-
-/**
- * SiteLink 三步表单：先确定两侧唯一网关，再选择网段集合，最后逐地址族
- * 确认下一跳。服务端仍是最终校验者，编辑时会清理旧的静态路由确认。
- */
-function CreateSiteLinkForm({
-  sourceSiteId,
-  sites,
-  devices,
-  siteNetworks,
-  request,
-  onCancel,
-  onCreated,
-  initialLink,
-}: {
-  sourceSiteId: string;
-  sites: Site[];
-  devices: Device[];
-  siteNetworks: SiteNetwork[];
-  request: ApiRequest;
-  onCancel: () => void;
-  onCreated: () => Promise<void>;
-  initialLink?: SiteLink | null;
-}) {
-  const availableNetworks = siteNetworks.filter((network) => network.enabled);
-  const leftSiteId = initialLink?.left_site_id ?? sourceSiteId;
-  const leftSite = sites.find((site) => site.id === leftSiteId);
-  const candidateTargetSites = sites.filter((site) =>
-    site.id !== leftSiteId
-    && site.tenant_id === leftSite?.tenant_id
-    && availableNetworks.some((network) => network.site_id === site.id),
-  );
-  const [rightSiteId, setRightSiteId] = useState(initialLink?.right_site_id ?? candidateTargetSites[0]?.id ?? "");
-  const [leftGatewayId, setLeftGatewayId] = useState(initialLink?.left_networks?.[0]?.publisher_device_id ?? "");
-  const [rightGatewayId, setRightGatewayId] = useState(initialLink?.right_networks?.[0]?.publisher_device_id ?? "");
-  const [leftNetworkIds, setLeftNetworkIds] = useState<string[]>(initialLink?.left_networks?.map((network) => network.id) ?? []);
-  const [rightNetworkIds, setRightNetworkIds] = useState<string[]>(initialLink?.right_networks?.map((network) => network.id) ?? []);
-  const [step, setStep] = useState(1);
-  const [leftIpv4, setLeftIpv4] = useState("");
-  const [leftIpv6, setLeftIpv6] = useState("");
-  const [rightIpv4, setRightIpv4] = useState("");
-  const [rightIpv6, setRightIpv6] = useState("");
-  const [submitting, setSubmitting] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-  const leftGatewayOptions = devices.filter((device) => device.site_id === leftSiteId && device.gateway_report?.site_gateway === "ready");
-  const rightGatewayOptions = devices.filter((device) => device.site_id === rightSiteId && device.gateway_report?.site_gateway === "ready");
-  const leftNetworks = availableNetworks.filter((network) => network.site_id === leftSiteId && (!leftGatewayId || network.publisher_device_id === leftGatewayId));
-  const selectedLeftNetworks = leftNetworks.filter((network) => leftNetworkIds.includes(network.id));
-  const targetSites = candidateTargetSites;
-  const rightNetworks = availableNetworks.filter((network) => network.site_id === rightSiteId && (!rightGatewayId || network.publisher_device_id === rightGatewayId));
-  const selectedRightNetworks = rightNetworks.filter((network) => rightNetworkIds.includes(network.id));
-  const rightSite = sites.find((site) => site.id === rightSiteId);
-  const selectedLeftFamilies = new Set(selectedLeftNetworks.map((network) => networkAddressFamily(network.desired_prefix)));
-  const selectedRightFamilies = new Set(selectedRightNetworks.map((network) => networkAddressFamily(network.desired_prefix)));
-  const familyMismatch = selectedLeftFamilies.size !== selectedRightFamilies.size || [...selectedLeftFamilies].some((family) => !selectedRightFamilies.has(family));
-  const selectedLeftDevice = leftGatewayOptions.find((device) => device.id === leftGatewayId);
-  const selectedRightDevice = rightGatewayOptions.find((device) => device.id === rightGatewayId);
-  const gatewayAddress = (device: Device | undefined, family: "ipv4" | "ipv6") => device?.gateway_report?.local_networks?.find((network) => network.gateway_address && networkAddressFamily(network.gateway_address) === family)?.gateway_address ?? "";
-
-  useEffect(() => {
-    if (!leftGatewayId && leftGatewayOptions[0]) setLeftGatewayId(leftGatewayOptions[0].id);
-  }, [leftGatewayId, leftGatewayOptions]);
-  useEffect(() => {
-    if (!rightGatewayId && rightGatewayOptions[0]) setRightGatewayId(rightGatewayOptions[0].id);
-  }, [rightGatewayId, rightGatewayOptions]);
-  useEffect(() => {
-    if (!leftIpv4 && selectedLeftFamilies.has("ipv4")) setLeftIpv4(gatewayAddress(selectedLeftDevice, "ipv4"));
-    if (!leftIpv6 && selectedLeftFamilies.has("ipv6")) setLeftIpv6(gatewayAddress(selectedLeftDevice, "ipv6"));
-    if (!rightIpv4 && selectedRightFamilies.has("ipv4")) setRightIpv4(gatewayAddress(selectedRightDevice, "ipv4"));
-    if (!rightIpv6 && selectedRightFamilies.has("ipv6")) setRightIpv6(gatewayAddress(selectedRightDevice, "ipv6"));
-  }, [leftIpv4, leftIpv6, rightIpv4, rightIpv6, selectedLeftDevice, selectedRightDevice, selectedLeftFamilies, selectedRightFamilies]);
-
-  /**
-   * 轮询期间共享网络可能被关闭或删除；目标站点失效时回到当前可用项，
-   * 来源站点始终由打开弹窗的站点行锁定。
-   */
-  useEffect(() => {
-    if (!rightSiteId && targetSites.length > 0) {
-      setRightSiteId(targetSites[0].id);
-      setRightNetworkIds([]);
-    }
-    if (rightSiteId && !targetSites.some((site) => site.id === rightSiteId)) {
-      setRightSiteId(targetSites[0]?.id ?? "");
-      setRightNetworkIds([]);
-    }
-  }, [rightSiteId, targetSites]);
-
-  useEffect(() => {
-    setLeftNetworkIds((ids) => ids.filter((id) => leftNetworks.some((network) => network.id === id)));
-    setRightNetworkIds((ids) => ids.filter((id) => rightNetworks.some((network) => network.id === id)));
-  }, [leftNetworks, rightNetworks]);
-
-  const toggleNetwork = (side: "left" | "right", id: string) => {
-    const setter = side === "left" ? setLeftNetworkIds : setRightNetworkIds;
-    setter((ids) => ids.includes(id) ? ids.filter((current) => current !== id) : [...ids, id]);
-  };
-
-  return (
-    <form
-      className="inline-form network-form-table"
-      aria-busy={submitting}
-      onSubmit={async (event) => {
-        event.preventDefault();
-        if (step < 3) {
-          if (step === 1 && (!leftGatewayId || !rightGatewayId || !rightSite)) { setError("请先选择两侧站点和唯一网关"); return; }
-          if (step === 2 && (!leftNetworkIds.length || !rightNetworkIds.length || familyMismatch)) { setError(familyMismatch ? "两侧网段的 IPv4/IPv6 地址族集合必须一致" : "每侧至少选择一个共享网络"); return; }
-          setError(null); setStep((current) => current + 1); return;
-        }
-        if (!leftSite || !rightSite || !leftNetworkIds.length || !rightNetworkIds.length || familyMismatch) {
-          setError("请完成两侧网关、网段和地址族复核"); return;
-        }
-        if (leftSite.id === rightSite.id) {
-          setError("站点互联需要选择两个不同站点");
-          return;
-        }
-        if (leftSite.tenant_id !== rightSite.tenant_id) {
-          setError("暂不支持跨租户建立站点互联");
-          return;
-        }
-        if ((selectedLeftFamilies.has("ipv4") && !leftIpv4) || (selectedLeftFamilies.has("ipv6") && !leftIpv6) || (selectedRightFamilies.has("ipv4") && !rightIpv4) || (selectedRightFamilies.has("ipv6") && !rightIpv6)) { setError("请为每个实际使用的地址族确认下一跳"); return; }
-        setSubmitting(true);
-        setError(null);
-        try {
-          const response = await request(initialLink ? `/api/v1/site-links/${encodeURIComponent(initialLink.id)}` : "/api/v1/site-links", {
-            method: initialLink ? "PATCH" : "POST",
-            headers: {
-              "content-type": "application/json",
-            },
-            body: JSON.stringify({
-              tenant_id: leftSite.tenant_id,
-              left_site_id: leftSite.id,
-              left_network_ids: leftNetworkIds,
-              right_site_id: rightSite.id,
-              right_network_ids: rightNetworkIds,
-              next_hops: { left: { ipv4: leftIpv4 || null, ipv6: leftIpv6 || null }, right: { ipv4: rightIpv4 || null, ipv6: rightIpv6 || null } },
-            }),
-          });
-          const body: unknown = await response.json().catch(() => null);
-          if (!response.ok) {
-            throw new Error(readApiError(body, "暂时无法创建站点互联"));
-          }
-          await onCreated();
-        } catch (requestError) {
-          setError(requestError instanceof Error ? requestError.message : "暂时无法创建站点互联");
-        } finally {
-          setSubmitting(false);
-        }
-      }}
-    >
-      <fieldset className="form-grid form-grid-link" disabled={submitting}>
-        <legend className="sr-only">站点互联信息</legend>
-        <label>
-          <span>左侧站点</span>
-          <select value={leftSiteId} disabled aria-label="来源站点">
-            {leftSite && <option value={leftSite.id}>{leftSite.name}</option>}
-          </select>
-        </label>
-        <label>
-          <span>目标站点</span>
-          <select value={rightSiteId} onChange={(event) => { setRightSiteId(event.target.value); setRightGatewayId(""); setRightNetworkIds([]); }} required>
-            <option value="">选择站点</option>
-            {targetSites.map((site) => <option key={site.id} value={site.id}>{site.name}</option>)}
-          </select>
-        </label>
-        {step === 1 && <>
-          <label><span>左侧 Site Gateway</span><select value={leftGatewayId} onChange={(event) => { setLeftGatewayId(event.target.value); setLeftNetworkIds([]); }} required><option value="">选择网关</option>{leftGatewayOptions.map((device) => <option key={device.id} value={device.id}>{device.name}</option>)}</select></label>
-          <label><span>右侧 Site Gateway</span><select value={rightGatewayId} onChange={(event) => { setRightGatewayId(event.target.value); setRightNetworkIds([]); }} required><option value="">选择网关</option>{rightGatewayOptions.map((device) => <option key={device.id} value={device.id}>{device.name}</option>)}</select></label>
-        </>}
-        {step === 2 && <>
-          <fieldset className="network-checklist"><legend>左侧网段</legend>{leftNetworks.map((network) => <label key={network.id}><input type="checkbox" checked={leftNetworkIds.includes(network.id)} onChange={() => toggleNetwork("left", network.id)} /><span>{network.name} · {network.desired_prefix}</span></label>)}</fieldset>
-          <fieldset className="network-checklist"><legend>右侧网段</legend>{rightNetworks.map((network) => <label key={network.id}><input type="checkbox" checked={rightNetworkIds.includes(network.id)} onChange={() => toggleNetwork("right", network.id)} /><span>{network.name} · {network.desired_prefix}</span></label>)}</fieldset>
-        </>}
-        {step === 3 && <div className="next-hop-grid">
-          {selectedLeftFamilies.has("ipv4") && <label><span>左侧 IPv4 下一跳</span><input value={leftIpv4} onChange={(event) => setLeftIpv4(event.target.value)} placeholder="网关 LAN IPv4" required /></label>}
-          {selectedLeftFamilies.has("ipv6") && <label><span>左侧 IPv6 下一跳</span><input value={leftIpv6} onChange={(event) => setLeftIpv6(event.target.value)} placeholder="网关 LAN IPv6" required /></label>}
-          {selectedRightFamilies.has("ipv4") && <label><span>右侧 IPv4 下一跳</span><input value={rightIpv4} onChange={(event) => setRightIpv4(event.target.value)} placeholder="网关 LAN IPv4" required /></label>}
-          {selectedRightFamilies.has("ipv6") && <label><span>右侧 IPv6 下一跳</span><input value={rightIpv6} onChange={(event) => setRightIpv6(event.target.value)} placeholder="网关 LAN IPv6" required /></label>}
-        </div>}
-      </fieldset>
-      {error && <p className="form-error" role="alert">{error}</p>}
-      <div className="form-footer">
-        <span className="form-hint">第 {step} / 3 步 · {step === 1 ? "每侧只能使用一台 Site Gateway。" : step === 2 ? "两侧地址族集合必须一致，重叠网段会被服务端拒绝。" : "下一跳仅用于静态路由指引，不代表真实 LAN 已连通。"}</span>
-        <div className="form-actions">
-          <button className="secondary-button" type="button" onClick={onCancel} disabled={submitting}>取消</button>
-          {step > 1 && <button className="secondary-button" type="button" onClick={() => setStep((current) => current - 1)} disabled={submitting}>上一步</button>}
-          <button className="primary-button" type="submit" disabled={submitting}>
-            {submitting ? "保存中…" : step < 3 ? "下一步" : initialLink ? "保存互联关系" : "建立站点互联"}
-          </button>
-        </div>
-      </div>
-    </form>
-  );
-}
 
 const RELEASE_AGENT_IMAGE = "ghcr.io/thelinyue/nexo-agent:0.1.17";
 
@@ -4036,18 +3081,23 @@ services:
  * 一次性 Token 不写入浏览器存储；用户离开当前结果后只能重新生成。
  */
 function CreateEnrollmentForm({
-  sites,
+  tenantId,
+  enrollments,
+  onApprove,
+
   request,
   onCreated,
   onDone,
 }: {
-  sites: Site[];
+  tenantId: string;
+  enrollments: Enrollment[];
+  onApprove: (item: Enrollment) => Promise<string | null>;
+
   request: ApiRequest;
   onCreated: () => Promise<void>;
   onDone: () => void;
 }) {
   const [deviceName, setDeviceName] = useState("");
-  const [siteId, setSiteId] = useState("");
   const [serverUrl, setServerUrl] = useState(() => window.location.origin);
   const [created, setCreated] = useState<CreatedEnrollment | null>(null);
   const [submitting, setSubmitting] = useState(false);
@@ -4058,6 +3108,9 @@ function CreateEnrollmentForm({
   const compose = created ? buildAgentCompose(normalizedServerUrl, created.token) : "";
 
   if (created) {
+    const enrollment = enrollments.find((item) => item.enrollment_id === created.enrollment_id);
+    const joined = enrollment?.status === "consumed";
+    const expired = enrollment?.status === "expired" || (!joined && Date.now() / 1000 >= created.expires_at);
     return (
       <div className="enrollment-setup" aria-live="polite">
         <div className="enrollment-result-heading">
@@ -4065,13 +3118,15 @@ function CreateEnrollmentForm({
             <strong>Docker Compose 配置已生成</strong>
             <span>凭证将在 {new Date(created.expires_at * 1000).toLocaleTimeString()} 前有效，且只能使用一次。</span>
           </div>
-          <span className="entry-state ready"><i />等待设备连接</span>
+          <span className={`entry-state ${joined ? "ready" : "applying"}`}><i />{joined ? "设备已加入" : expired ? "入网凭证已过期" : enrollment?.status === "awaiting_approval" ? "待批准" : enrollment?.status === "approved" ? "正在领取设备身份" : "等待设备连接"}</span>
         </div>
         <textarea className="enrollment-compose" aria-label="Docker Compose 配置" value={compose} readOnly spellCheck={false} />
         <div className="form-footer enrollment-result-actions">
           <span className="form-hint">复制到设备后运行 <code>docker compose up -d</code>。设备领取身份后可以删除 Token。</span>
           <div className="panel-heading-actions">
-            <button className="secondary-button" type="button" onClick={onDone}>完成</button>
+            <button className="secondary-button" type="button" onClick={onDone}>{joined ? "完成" : "关闭"}</button>
+            {expired && <button className="primary-button" type="button" onClick={() => setCreated(null)}>重新生成</button>}
+            {!expired && enrollment?.status === "awaiting_approval" && <button className="primary-button" type="button" disabled={submitting} onClick={async () => {setSubmitting(true);setError(null);try {setError(await onApprove(enrollment));} finally {setSubmitting(false);}}}>批准设备</button>}
             <button
               className="primary-button"
               type="button"
@@ -4089,6 +3144,8 @@ function CreateEnrollmentForm({
           </div>
         </div>
         {copyState === "failed" && <p className="form-error" role="alert">浏览器无法访问剪贴板，请手动选择上方内容。</p>}
+        {error && <p className="form-error" role="alert">{error}</p>}
+        {enrollment?.status === "awaiting_approval" && <p className="form-hint">核对设备：{enrollment.device_name} · {enrollment.os} · {enrollment.architecture} · {enrollment.agent_version}</p>}
       </div>
     );
   }
@@ -4114,15 +3171,15 @@ function CreateEnrollmentForm({
           setError("Nexo 服务地址不能包含路径、查询参数或锚点");
           return;
         }
-        const selectedSite = sites.find((site) => site.id === siteId);
+
         setSubmitting(true);
         try {
           const response = await request("/api/v1/enrollments", {
             method: "POST",
             headers: { "content-type": "application/json" },
             body: JSON.stringify({
-              tenant_id: selectedSite?.tenant_id ?? sites[0]?.tenant_id ?? "default",
-              site_id: siteId || null,
+              tenant_id: tenantId,
+
               ttl_seconds: 900,
               device_name: deviceName.trim(),
             }),
@@ -4141,15 +3198,9 @@ function CreateEnrollmentForm({
       <div className="form-grid enrollment-form-grid">
         <label>
           <span>设备名称</span>
-          <input value={deviceName} onChange={(event) => setDeviceName(event.target.value)} placeholder="家庭 NAS" required autoFocus />
+          <input value={deviceName} onChange={(event) => setDeviceName(event.target.value)} placeholder="家庭 NAS" required />
         </label>
-        <label>
-          <span>所属站点（可选）</span>
-          <select value={siteId} onChange={(event) => setSiteId(event.target.value)}>
-            <option value="">暂不指定</option>
-            {sites.map((site) => <option key={site.id} value={site.id}>{site.name}</option>)}
-          </select>
-        </label>
+
         <label>
           <span>Nexo 服务地址</span>
           <input value={serverUrl} onChange={(event) => setServerUrl(event.target.value)} inputMode="url" placeholder="http://192.168.1.10:8280" required />
@@ -4197,6 +3248,8 @@ function CreateTunnelForm({
   onDomainsChanged,
   onCancel,
   onCreated,
+  existing,
+  onUpdated,
 }: {
   auth: AuthStatus;
   devices: Device[];
@@ -4205,19 +3258,38 @@ function CreateTunnelForm({
   onDomainsChanged: () => Promise<void>;
   onCancel: () => void;
   onCreated: () => Promise<void>;
+  existing?: Tunnel;
+  onUpdated?: (tunnel: Tunnel) => void;
 }) {
   const readyDomains = publicDomains.filter((item) => publicDomainStatus(item.apply_status).kind === "ready");
-  const [deviceId, setDeviceId] = useState(devices[0]?.id ?? "");
-  const [name, setName] = useState("");
-  const [protocol, setProtocol] = useState<Tunnel["protocol"]>("http");
-  const [localAddress, setLocalAddress] = useState("127.0.0.1");
-  const [localPort, setLocalPort] = useState("8800");
-  const [hostname, setHostname] = useState("");
-  const [publicDomainId, setPublicDomainId] = useState(readyDomains.find((item) => item.is_primary)?.id ?? readyDomains[0]?.id ?? "");
-  const [publicPort, setPublicPort] = useState("");
-  const [originProtocol, setOriginProtocol] = useState<"http" | "https">("http");
+  const [deviceId, setDeviceId] = useState(existing?.device_id ?? devices[0]?.id ?? "");
+  const [name, setName] = useState(existing?.name ?? "");
+  const [protocol, setProtocol] = useState<Tunnel["protocol"]>(existing?.protocol ?? "https");
+  const [localUrl, setLocalUrl] = useState(existing ? `${existing.origin_protocol ?? "http"}://${existing.local_address.includes(":") ? `[${existing.local_address}]` : existing.local_address}:${existing.local_port}` : "http://127.0.0.1:8800");
+  const [localAddress, setLocalAddress] = useState(existing?.local_address ?? "127.0.0.1");
+  const [localPort, setLocalPort] = useState(String(existing?.local_port ?? 8800));
+  const [hostname, setHostname] = useState(existing?.hostname ?? "");
+  const [publicDomainId, setPublicDomainId] = useState(existing?.public_domain_id ?? readyDomains.find((item) => item.is_primary)?.id ?? readyDomains[0]?.id ?? "");
+  const [publicPort, setPublicPort] = useState(existing?.public_port ? String(existing.public_port) : "");
+  const originProtocol = existing?.origin_protocol ?? "http";
   const [submitting, setSubmitting] = useState(false);
   const [configuringDomain, setConfiguringDomain] = useState(false);
+  const [domainOpened, setDomainOpened] = useState(false);
+  const serviceForm = useRef<HTMLFormElement>(null);
+  const domainReturn = useRef<{element: HTMLElement | null; scrollTop: number}>({element:null, scrollTop:0});
+  // 原地配置域名后回到原操作位置；后台刷新不触碰焦点和草稿。
+  useEffect(() => {
+    if (configuringDomain || !domainOpened) return;
+    const frame = requestAnimationFrame(() => {
+      const form = serviceForm.current;
+      const target = domainReturn.current.element;
+      if (target?.isConnected) target.focus({preventScroll:true});
+      else form?.querySelector<HTMLElement>('input, select, button')?.focus({preventScroll:true});
+      const body = form?.closest('.form-dialog-body');
+      if (body) body.scrollTop = domainReturn.current.scrollTop;
+    });
+    return () => cancelAnimationFrame(frame);
+  }, [configuringDomain, domainOpened]);
   const [error, setError] = useState<string | null>(null);
   const [validation, setValidation] = useState<{ field: "device" | "domain" | "localPort" | "publicPort"; message: string } | null>(null);
   const device = devices.find((item) => item.id === deviceId);
@@ -4228,43 +3300,50 @@ function CreateTunnelForm({
     if (publicDomainId && readyDomains.some((item) => item.id === publicDomainId)) return;
     setPublicDomainId(readyDomains.find((item) => item.is_primary)?.id ?? readyDomains[0]?.id ?? "");
   }, [publicDomainId, readyDomains]);
-  if (configuringDomain) {
-    return <div className="inline-domain-setup">
+  const domainEditor = domainOpened && <div hidden={!configuringDomain} className="inline-domain-setup">
       <div className="inline-domain-heading"><button className="secondary-button compact-button" type="button" onClick={() => setConfiguringDomain(false)}><ArrowLeft size={15} aria-hidden="true" />返回服务</button><div><strong>配置域名与 HTTPS</strong><span>保存后返回，已填写的服务信息会保留。</span></div></div>
       <PublicDomainEditor domain={null} request={request} onCancel={() => setConfiguringDomain(false)} onSaved={async () => { await onDomainsChanged(); setConfiguringDomain(false); }} />
     </div>;
-  }
   return (
-    <form className="inline-form network-form-table" aria-busy={submitting} onSubmit={async (event) => {
+    <>{domainEditor}<form ref={serviceForm} hidden={configuringDomain} className="inline-form network-form-table" aria-busy={submitting} onSubmit={async (event) => {
       event.preventDefault();
       if (!device) { setValidation({ field: "device", message: "请先选择设备" }); return; }
       if (protocol !== "tcp" && !publicDomainId) { setValidation({ field: "domain", message: "Web 服务需要一个状态正常的域名" }); return; }
-      const ports = validateTunnelPorts(localPort, publicPort);
+      let host = localAddress.trim(), port = localPort, origin = originProtocol;
+      if (protocol !== "tcp") {
+        try { const url = new URL(localUrl); if (!["http:", "https:"].includes(url.protocol) || url.username || url.password || url.pathname !== "/" || url.search || url.hash) throw new Error(); host = url.hostname.replace(/^\[|\]$/g, ""); port = url.port || (url.protocol === "https:" ? "443" : "80"); origin = url.protocol === "https:" ? "https" : "http"; }
+        catch {setError("请输入完整的 HTTP 或 HTTPS 本地地址，不包含路径、账号或查询参数。");return;}
+      }
+      const ports = validateTunnelPorts(port, publicPort);
       if ("error" in ports) {
         setValidation({ field: ports.error.startsWith("本地") ? "localPort" : "publicPort", message: ports.error });
         return;
       }
       setSubmitting(true); setError(null); setValidation(null);
       try {
-        const response = await request("/api/v1/tunnels", {
-          method: "POST",
+        const response = await request(existing ? `/api/v1/tunnels/${encodeURIComponent(existing.id)}` : "/api/v1/tunnels", {
+          method: existing ? "PUT" : "POST",
           headers: { "content-type": "application/json" },
           body: JSON.stringify({
             tenant_id: device.tenant_id,
             device_id: device.id,
             name: name.trim() || (protocol === "tcp" ? "TCP 端口" : "Web 服务"),
             protocol,
-            local_address: localAddress.trim(),
+            local_address: host,
             local_port: ports.localPort,
             public_port: protocol === "tcp" ? ports.publicPort : null,
             hostname: protocol === "tcp" ? null : hostname.trim(),
-            origin_protocol: protocol === "tcp" ? null : originProtocol,
+            origin_protocol: protocol === "tcp" ? null : origin,
+            origin_tls_server_name: protocol !== "tcp" && origin === "https" ? existing?.origin_tls_server_name ?? null : null,
+            origin_tls_verification: protocol !== "tcp" && origin === "https" ? existing?.origin_tls_verification ?? "system" : "system",
+            service_name: protocol === "tcp" ? null : existing?.service_name ?? hostname.trim(),
             public_domain_id: protocol === "tcp" ? null : publicDomainId || null,
           }),
         });
         const body: unknown = await response.json().catch(() => null);
         if (!response.ok) throw new Error(readApiError(body, "暂时无法添加公网服务"));
-        setName(""); setHostname(""); setPublicPort(""); await onCreated();
+        if (existing) onUpdated?.(body as Tunnel);
+        await onCreated();
       } catch (requestError) {
         setError(requestError instanceof Error ? requestError.message : "暂时无法添加公网服务");
       } finally { setSubmitting(false); }
@@ -4273,148 +3352,83 @@ function CreateTunnelForm({
         <legend className="sr-only">公网服务信息</legend>
         <label><span>显示名称（可选）</span><input value={name} onChange={(event) => setName(event.target.value)} placeholder="例如：家庭媒体库" /></label>
         <label><span>设备</span><select value={deviceId} onChange={(event) => setDeviceId(event.target.value)} required><option value="">选择设备</option>{devices.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</select>{validation?.field === "device" && <small className="field-error" role="alert">{validation.message}</small>}</label>
-        <label><span>公网协议</span><select value={protocol} onChange={(event) => { const value = event.target.value as Tunnel["protocol"]; setProtocol(value); if (value === "https") setOriginProtocol("https"); }}><option value="http">HTTP</option><option value="https">HTTPS</option><option value="tcp">TCP</option></select></label>
-        {protocol === "tcp" ? (
-          <label><span>本地地址</span><input value={localAddress} onChange={(event) => setLocalAddress(event.target.value)} required /></label>
-        ) : (
-          <label>
-            <span>本地服务</span>
-            <div className="local-service-control">
-              <select aria-label="本地服务协议" value={originProtocol} onChange={(event) => setOriginProtocol(event.target.value as "http" | "https")}><option value="http">HTTP</option><option value="https">HTTPS</option></select>
-              <input aria-label="本地地址" value={localAddress} onChange={(event) => setLocalAddress(event.target.value)} required />
-            </div>
-          </label>
-        )}
-        <label><span>本地端口</span><input inputMode="numeric" value={localPort} onChange={(event) => setLocalPort(event.target.value)} required />{validation?.field === "localPort" && <small className="field-error" role="alert">{validation.message}</small>}</label>
-        {protocol === "tcp" ? <label><span>公网端口（可选）</span><input inputMode="numeric" value={publicPort} onChange={(event) => setPublicPort(event.target.value)} placeholder="自动分配" />{validation?.field === "publicPort" && <small className="field-error" role="alert">{validation.message}</small>}</label> : <label><span>子域名前缀</span><input value={hostname} onChange={(event) => setHostname(event.target.value)} placeholder="例如：media" required /></label>}
+        <label><span>服务类型</span><select value={protocol === "tcp" ? "tcp" : "web"} onChange={(event) => setProtocol(event.target.value === "tcp" ? "tcp" : "https")}><option value="web">Web 服务</option><option value="tcp">TCP 服务</option></select></label>
+        {protocol === "tcp" ? <><label><span>本地地址</span><input value={localAddress} onChange={(event) => setLocalAddress(event.target.value)} required /></label><label><span>本地端口</span><input inputMode="numeric" value={localPort} onChange={(event) => setLocalPort(event.target.value)} required /></label></> : <label><span>本地服务地址</span><input type="url" value={localUrl} onChange={(event) => setLocalUrl(event.target.value)} placeholder="http://10.0.0.10:8096" required /><small>填写设备可以访问的 HTTP 或 HTTPS 地址。</small></label>}
+        {protocol === "tcp" ? <details><summary>指定公网端口（可选）</summary><label><span>公网端口（可选）</span><input inputMode="numeric" value={publicPort} onChange={(event) => setPublicPort(event.target.value)} placeholder="自动分配" />{validation?.field === "publicPort" && <small className="field-error" role="alert">{validation.message}</small>}</label></details> : <label><span>子域名前缀</span><input value={hostname} onChange={(event) => setHostname(event.target.value)} placeholder="例如：media" required /></label>}
         {protocol !== "tcp" && <label><span>公网域名</span><select value={publicDomainId} onChange={(event) => setPublicDomainId(event.target.value)} disabled={readyDomains.length === 0}><option value="">选择可用域名</option>{readyDomains.map((item) => <option key={item.id} value={item.id}>{item.domain}{item.is_primary ? "（主域名）" : ""}</option>)}</select>{validation?.field === "domain" && <small className="field-error" role="alert">{validation.message}</small>}</label>}
       </fieldset>
-      {protocol !== "tcp" && readyDomains.length === 0 && <div className="inline-domain-required" role="status"><AlertTriangle size={18} aria-hidden="true" /><div><strong>Web 服务需要可用域名</strong><span>{auth.role === "system_admin" ? "先在此处完成域名与 HTTPS 配置，返回后服务草稿会继续保留。" : "请联系系统管理员完成域名与 HTTPS 配置。TCP 服务仍可直接创建。"}</span></div>{auth.role === "system_admin" && <button className="secondary-button" type="button" onClick={() => setConfiguringDomain(true)}>配置域名</button>}</div>}
+      {protocol !== "tcp" && publicDomainId && <p className="public-address-preview">公网地址：<code>https://{hostname || "服务名称"}.{readyDomains.find(item => item.id === publicDomainId)?.domain}</code></p>}
+      {protocol !== "tcp" && readyDomains.length === 0 && <div className="inline-domain-required" role="status"><AlertTriangle size={18} aria-hidden="true" /><div><strong>Web 服务需要可用域名</strong><span>{auth.role === "system_admin" ? "先在此处完成域名与 HTTPS 配置，返回后服务草稿会继续保留。" : "请联系系统管理员完成域名与 HTTPS 配置。TCP 服务仍可直接创建。"}</span></div>{auth.role === "system_admin" && <button className="secondary-button" type="button" onClick={(event) => {domainReturn.current={element:event.currentTarget,scrollTop:serviceForm.current?.closest('.form-dialog-body')?.scrollTop ?? 0};setDomainOpened(true);setConfiguringDomain(true);}}>配置域名</button>}</div>}
       {error && <p className="form-error" role="alert">{error}</p>}
+      {validation?.field === "localPort" && <p className="form-error" role="alert">{validation.message}</p>}
       <div className="form-footer">
         <span className="form-hint">{protocol === "tcp" ? "公网端口范围：20000-29999。" : "子域名前缀会与入口域名组合为完整访问地址。"}</span>
         <div className="form-actions">
           <button className="secondary-button" type="button" onClick={onCancel} disabled={submitting}>取消</button>
-          <button className="primary-button" type="submit" disabled={submitting || !device || (protocol !== "tcp" && readyDomains.length === 0)}>{submitting ? "添加中…" : "添加服务"}</button>
+          <button className="primary-button" type="submit" disabled={submitting || !device || (protocol !== "tcp" && readyDomains.length === 0)}>{submitting ? "保存中…" : existing ? "保存修改" : "添加服务"}</button>
         </div>
       </div>
-    </form>
+    </form></>
   );
 }
 
-/** 公网服务编辑弹窗：基础字段可修改，未展示的 TLS 元数据按适用性原样保留。 */
-function EditTunnelDialog({
-  tunnel,
-  devices,
-  publicDomains,
-  request,
-  returnFocus,
-  onUpdated,
-  onClose,
-}: {
-  tunnel: Tunnel;
-  devices: Device[];
-  publicDomains: PublicDomain[];
-  request: ApiRequest;
-  returnFocus: HTMLButtonElement | null;
-  onUpdated: (updated: Tunnel) => void;
-  onClose: () => void;
+/** 创建与编辑使用同一表单，确保 URL 解析、域名返回及 TLS 保留规则一致。 */
+function EditTunnelDialog({tunnel, devices, publicDomains, auth, request, returnFocus, onUpdated, onRefresh, onClose}: {
+  tunnel: Tunnel; devices: Device[]; publicDomains: PublicDomain[]; auth: AuthStatus;
+  request: ApiRequest; returnFocus: HTMLButtonElement | null;
+  onUpdated: (updated: Tunnel) => void; onRefresh: () => Promise<void>; onClose: () => void;
 }) {
-  const [deviceId, setDeviceId] = useState(tunnel.device_id);
-  const [name, setName] = useState(tunnel.name);
-  const [protocol, setProtocol] = useState<Tunnel["protocol"]>(tunnel.protocol);
-  const [localAddress, setLocalAddress] = useState(tunnel.local_address);
-  const [localPort, setLocalPort] = useState(String(tunnel.local_port));
-  const [hostname, setHostname] = useState(tunnel.hostname ?? "");
-  const [publicDomainId, setPublicDomainId] = useState(tunnel.public_domain_id ?? publicDomains.find((item) => item.is_primary)?.id ?? publicDomains[0]?.id ?? "");
-  const [publicPort, setPublicPort] = useState(tunnel.public_port === null ? "" : String(tunnel.public_port));
-  const [originProtocol, setOriginProtocol] = useState<"http" | "https">(tunnel.origin_protocol ?? "http");
-  const [submitting, setSubmitting] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-  const [validation, setValidation] = useState<{ field: "device" | "name" | "address" | "hostname" | "localPort" | "publicPort"; message: string } | null>(null);
+  return <FormDialog confirmDiscard eyebrow="公网服务" title={`编辑 ${tunnel.name}`} description="修改本地服务与公网地址。" returnFocus={returnFocus} onClose={onClose}>
+    <CreateTunnelForm existing={tunnel} auth={auth} devices={devices} publicDomains={publicDomains} request={request} onDomainsChanged={onRefresh} onCancel={onClose} onUpdated={onUpdated} onCreated={async () => {onClose();}} />
+  </FormDialog>;
+}
 
-  return (
-    <FormDialog
-      eyebrow="公网服务"
-      title="编辑服务"
-      description="修改公网地址与设备本地服务之间的连接信息。"
-      onClose={onClose}
-      returnFocus={returnFocus}
-    >
-      <form className="inline-form network-form-table" aria-busy={submitting} onSubmit={async (event) => {
-        event.preventDefault();
-        const device = devices.find((item) => item.id === deviceId);
-        if (!device) { setValidation({ field: "device", message: "请选择有效设备" }); return; }
-        if (!name.trim()) { setValidation({ field: "name", message: "显示名称不能为空" }); return; }
-        if (!localAddress.trim()) { setValidation({ field: "address", message: "本地地址不能为空" }); return; }
-        if (protocol !== "tcp" && !hostname.trim()) { setValidation({ field: "hostname", message: "子域名前缀不能为空" }); return; }
-        const ports = validateTunnelPorts(localPort, publicPort);
-        if ("error" in ports) {
-          setValidation({ field: ports.error.startsWith("本地") ? "localPort" : "publicPort", message: ports.error });
-          return;
-        }
-        const keepsTlsSettings = protocol !== "tcp" && originProtocol === "https";
-        setSubmitting(true);
-        setError(null); setValidation(null);
-        try {
-          const response = await request(`/api/v1/tunnels/${encodeURIComponent(tunnel.id)}`, {
-            method: "PUT",
-            headers: { "content-type": "application/json" },
-            body: JSON.stringify({
-              tenant_id: tunnel.tenant_id,
-              device_id: device.id,
-              name: name.trim(),
-              protocol,
-              local_address: localAddress.trim(),
-              local_port: ports.localPort,
-              public_port: protocol === "tcp" ? ports.publicPort : null,
-              hostname: protocol === "tcp" ? null : hostname.trim(),
-              origin_protocol: protocol === "tcp" ? null : originProtocol,
-              origin_tls_server_name: keepsTlsSettings ? tunnel.origin_tls_server_name : null,
-              origin_tls_verification: keepsTlsSettings ? tunnel.origin_tls_verification : "system",
-              service_name: protocol === "tcp" ? null : (tunnel.service_name ?? hostname.trim()),
-              public_domain_id: protocol === "tcp" ? null : publicDomainId || null,
-            }),
-          });
-          const body: unknown = await response.json().catch(() => null);
-          if (!response.ok) throw new Error(readApiError(body, "暂时无法保存公网服务"));
-          onUpdated(body as Tunnel);
-          onClose();
-        } catch (requestError) {
-          setError(requestError instanceof Error ? requestError.message : "暂时无法保存公网服务");
-        } finally {
-          setSubmitting(false);
-        }
-      }}>
-        <fieldset className="form-grid tunnel-edit-grid" disabled={submitting}>
-          <legend className="sr-only">公网服务编辑信息</legend>
-          <label><span>显示名称</span><input autoFocus value={name} onChange={(event) => setName(event.target.value)} required />{validation?.field === "name" && <small className="field-error" role="alert">{validation.message}</small>}</label>
-          <label><span>设备</span><select value={deviceId} onChange={(event) => setDeviceId(event.target.value)} required>{devices.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</select>{validation?.field === "device" && <small className="field-error" role="alert">{validation.message}</small>}</label>
-          <label><span>公网协议</span><select value={protocol} onChange={(event) => { const value = event.target.value as Tunnel["protocol"]; setProtocol(value); if (value === "https") setOriginProtocol("https"); }}><option value="http">HTTP</option><option value="https">HTTPS</option><option value="tcp">TCP</option></select></label>
-          {protocol === "tcp" ? (
-            <label><span>本地地址</span><input value={localAddress} onChange={(event) => setLocalAddress(event.target.value)} required />{validation?.field === "address" && <small className="field-error" role="alert">{validation.message}</small>}</label>
-          ) : (
-            <label>
-              <span>本地服务</span>
-              <div className="local-service-control">
-                <select aria-label="本地服务协议" value={originProtocol} onChange={(event) => setOriginProtocol(event.target.value as "http" | "https")}><option value="http">HTTP</option><option value="https">HTTPS</option></select>
-                <input aria-label="本地地址" value={localAddress} onChange={(event) => setLocalAddress(event.target.value)} required />
-              </div>
-              {validation?.field === "address" && <small className="field-error" role="alert">{validation.message}</small>}
-            </label>
-          )}
-          <label><span>本地端口</span><input inputMode="numeric" value={localPort} onChange={(event) => setLocalPort(event.target.value)} required />{validation?.field === "localPort" && <small className="field-error" role="alert">{validation.message}</small>}</label>
-          {protocol === "tcp" ? <label><span>公网端口（可选）</span><input inputMode="numeric" value={publicPort} onChange={(event) => setPublicPort(event.target.value)} placeholder="自动分配" />{validation?.field === "publicPort" && <small className="field-error" role="alert">{validation.message}</small>}</label> : <label><span>子域名前缀</span><input value={hostname} onChange={(event) => setHostname(event.target.value)} required />{validation?.field === "hostname" && <small className="field-error" role="alert">{validation.message}</small>}</label>}
-          {protocol !== "tcp" && <label><span>公网域名</span><select value={publicDomainId} onChange={(event) => setPublicDomainId(event.target.value)} disabled={publicDomains.length === 0}><option value="">使用主域名</option>{publicDomains.map((item) => <option key={item.id} value={item.id}>{item.domain}{item.is_primary ? "（主域名）" : ""}</option>)}</select></label>}
-        </fieldset>
-        {error && <p className="form-error" role="alert">{error}</p>}
-        <div className="dialog-actions">
-          <button className="secondary-button" type="button" disabled={submitting} onClick={onClose}>取消</button>
-          <button className="primary-button" type="submit" disabled={submitting}>{submitting ? "保存中…" : "保存修改"}</button>
-        </div>
-      </form>
-    </FormDialog>
-  );
+/** 设备与全局列表共用详情；任务切换只保留一个可交互的 Sheet。 */
+function TunnelDetailSheet({tunnel, devices, publicDomains, auth, request, returnFocus, onRefresh, onClose}: {
+  tunnel: Tunnel; devices: Device[]; publicDomains: PublicDomain[]; auth: AuthStatus;
+  request: ApiRequest; returnFocus: HTMLButtonElement | null; onRefresh: () => Promise<void>; onClose: () => void;
+}) {
+  const [mode, setMode] = useState<"details" | "edit" | "delete">("details");
+  const detailRoot = useRef<HTMLElement>(null);
+  const returnPosition = useRef({action:"",scrollTop:0});
+  useEffect(() => {
+    if (mode !== "details") return;
+    const frame = requestAnimationFrame(() => {
+      const root = detailRoot.current;
+      [...(root?.querySelectorAll<HTMLButtonElement>('button') ?? [])].find(button => button.textContent === returnPosition.current.action)?.focus({preventScroll:true});
+      const body = root?.closest('.form-dialog-body');
+      if (body) body.scrollTop = returnPosition.current.scrollTop;
+    });
+    return () => cancelAnimationFrame(frame);
+  }, [mode]);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const back = () => setMode("details");
+  if (mode === "edit") return <EditTunnelDialog {...{tunnel, devices, publicDomains, auth, request, onRefresh}} returnFocus={null} onUpdated={() => {void onRefresh();}} onClose={back} />;
+  if (mode === "delete") return <DeleteTunnelDialog tunnel={tunnel} request={request} returnFocus={null} onDeleted={() => {void onRefresh();onClose();}} onClose={back} />;
+  const address = navigableWebAddress(tunnel.public_address);
+  return <FormDialog eyebrow="公网服务" title={tunnel.name} description={`${tunnel.protocol === "tcp" ? "TCP" : "Web"} · ${tunnel.device_name ?? "未分配设备"}`} returnFocus={returnFocus} onClose={() => {if (!busy) onClose();}}>
+    <section ref={detailRoot} className="device-detail-section" aria-busy={busy} onClickCapture={(event) => {
+      const button = (event.target as HTMLElement).closest('button');
+      if (button) returnPosition.current={action:button.textContent ?? "",scrollTop:event.currentTarget.closest('.form-dialog-body')?.scrollTop ?? 0};
+    }}>
+      <p>{!tunnel.device_id ? "需处理：请选择承载设备" : !tunnel.enabled ? "已关闭" : tunnel.apply_status === "ready" ? "正常" : tunnel.apply_status === "failed" ? "需处理" : "处理中"}</p>
+      {tunnel.apply_error && <p className="form-hint">{tunnel.apply_error}</p>}
+      <p>本地服务：<code>{tunnel.local_address}:{tunnel.local_port}</code></p>
+      <p>公网地址：{address ? <a href={address} target="_blank" rel="noreferrer">{address}</a> : <code>{tunnel.public_address ?? "正在配置"}</code>}</p>
+      <div className="dialog-actions">
+        <button className="secondary-button" disabled={!tunnel.public_address} onClick={async () => {try {await navigator.clipboard.writeText(tunnel.public_address!);} catch {setError("无法复制，请手动选择公网地址。");}}}>复制地址</button>
+        <button className="secondary-button" disabled={busy || tunnel.deletion_pending} onClick={() => setMode("edit")}>编辑</button>
+        <button className="secondary-button" disabled={busy || !tunnel.device_id || tunnel.deletion_pending} onClick={async () => {
+          setBusy(true);setError(null);
+          try {const response = await request(`/api/v1/tunnels/${encodeURIComponent(tunnel.id)}/${tunnel.enabled ? "disable" : "enable"}`, {method:"POST"});
+            if (!response.ok) throw new Error(readApiError(await response.json(),"无法更新服务")); await onRefresh();
+          } catch (e) {setError(e instanceof Error ? e.message : "无法更新服务");} finally {setBusy(false);}
+        }}>{busy ? "处理中…" : tunnel.enabled ? "关闭服务" : "启用服务"}</button>
+        <button className="secondary-button danger-button" disabled={busy || tunnel.deletion_pending} onClick={() => setMode("delete")}>删除服务</button>
+      </div>{error && <p className="form-error" role="alert">{error}</p>}
+    </section>
+  </FormDialog>;
 }
 
 /** 仅把浏览器能够安全导航的 HTTP/HTTPS 地址暴露为链接。 */
@@ -4684,7 +3698,7 @@ function TunnelRow({
       </div>
       <div className="network-actions">
         <span className={`link-status ${statusKind}`}><i />{tunnel.deletion_pending ? "处理中" : !assigned ? "需处理" : tunnel.enabled ? (tunnel.apply_status === "ready" ? "正常" : tunnel.apply_status === "failed" ? "需处理" : "处理中") : "已关闭"}</span>
-        <button className="link-action" type="button" disabled={actionDisabled} onClick={(event) => onEdit(event.currentTarget)}>编辑</button>
+        <button className="link-action" type="button" disabled={actionDisabled} onClick={(event) => onEdit(event.currentTarget)}>查看详情</button>
         <button className="link-action" type="button" disabled={actionDisabled || !assigned} title={!assigned ? "请先选择设备" : undefined} onClick={async () => {
           setPending(true);
           setError(null);
@@ -4710,288 +3724,11 @@ function TunnelRow({
   );
 }
 
-/** 站点互联摘要卡片：只显示用户需要的站点、网段、下一跳和应用状态。 */
-function SiteLinkCard({
-  link,
-  currentSiteId,
-  actionPending,
-  onToggle,
-  onRecheck,
-  onConfirmRoute,
-  onEdit,
-  onDelete,
-  onOpenDetails,
-}: {
-  link: SiteLink;
-  currentSiteId: string;
-  actionPending: boolean;
-  onToggle: () => void;
-  onRecheck: () => void;
-  onConfirmRoute: (siteId: string) => void;
-  onEdit: () => void;
-  onDelete: () => void;
-  onOpenDetails: () => void;
-}) {
-  const status = link.deletion_pending ? { label: "处理中", kind: "working" } : siteLinkStatus(link.apply_status);
-  const actionsDisabled = actionPending || link.deletion_pending;
-  const health = gatewayHealthStatus(link.health_status, link.left_networks.some((network) => network.source === "manual") || link.right_networks.some((network) => network.source === "manual"));
-  const currentSiteName = link.left_site_id === currentSiteId ? link.left_site_name : link.right_site_name;
-  const otherSiteName = link.left_site_id === currentSiteId ? link.right_site_name : link.left_site_name;
-  const currentRoutes = link.static_routes.filter((route) => route.router_site_id === currentSiteId);
-  const siteRoutes = currentRoutes.filter((route) => route.purpose !== "mesh_client_return");
-  const clientReturnRoutes = currentRoutes.filter((route) => route.purpose === "mesh_client_return");
-  const allRoutesConfirmed = currentRoutes.length > 0 && currentRoutes.every((route) => route.router_confirmed);
-  const missingNextHop = currentRoutes.some((route) => !route.next_hop);
-  const [copiedRoute, setCopiedRoute] = useState<string | null>(null);
-  const copyRoute = async (route: StaticRouteGuide) => {
-    if (!route.next_hop) return;
-    try {
-      await navigator.clipboard.writeText(`${route.destination_prefix} via ${route.next_hop}`);
-      const key = `${route.router_site_id}-${route.purpose}-${route.destination_prefix}`;
-      setCopiedRoute(key);
-      window.setTimeout(() => setCopiedRoute((current) => current === key ? null : current), 1600);
-    } catch {
-      // 页面仍保留可选择的文本，剪贴板不可用时不阻断路由确认流程。
-    }
-  };
-  return (
-    <div className="site-link-card">
-      <div className="site-link-heading">
-        <div className="site-link-title">
-          <strong>{currentSiteName}</strong>
-          <span>↔</span>
-          <strong>{otherSiteName}</strong>
-        </div>
-        <div className="site-link-actions">
-          <span className={`link-status ${status.kind}`}><i />{status.label}</span>
-          <span className={`link-status ${health.kind}`}><i />{health.label}</span>
-          <button
-            className="link-action"
-            type="button"
-            onClick={onToggle}
-            disabled={actionsDisabled}
-            aria-label={link.enabled ? "关闭站点互联" : "重新启用站点互联"}
-          >
-            {actionPending ? "处理中…" : link.deletion_pending ? "等待删除" : link.enabled ? "关闭" : "启用"}
-          </button>
-          <button className="link-action" type="button" onClick={onEdit} disabled={actionsDisabled}>编辑</button>
-          <button className="link-action" type="button" onClick={onRecheck} disabled={actionsDisabled}>重新检测</button>
-          <button className="link-action mobile-detail-trigger" type="button" onClick={onOpenDetails} disabled={actionsDisabled}>查看详情</button>
-          <button className="delete-icon-button" type="button" aria-label={`删除${link.left_site_name}到${link.right_site_name}的站点互联`} title={link.deletion_pending ? "等待删除" : "删除站点互联"} disabled={actionsDisabled} onClick={onDelete}>
-            <Trash2 size={17} aria-hidden="true" />
-          </button>
-        </div>
-      </div>
-      {link.apply_error && <p className="link-error">{link.apply_error}</p>}
-      {link.health_error && link.health_error !== link.apply_error && <p className="link-health-error">网关状态：{link.health_error}</p>}
-      <div className="route-guide-list">
-        <RouteGuideGroup title="访问另一站点" routes={siteRoutes} copiedRoute={copiedRoute} onCopy={copyRoute} />
-        <RouteGuideGroup title="允许组网设备访问本站" routes={clientReturnRoutes} copiedRoute={copiedRoute} onCopy={copyRoute} />
-        {currentRoutes.length === 0 && <p className="network-inline-empty">本站暂时没有需要确认的静态路由。</p>}
-        {currentRoutes.length > 0 && (allRoutesConfirmed ? <span className="route-confirmed">本站全部路由已确认</span> : <div className="route-confirmation-action"><button className="route-confirm-button" type="button" aria-label="确认全部路由已配置（确认路由已配置）" disabled={actionsDisabled || missingNextHop} onClick={() => onConfirmRoute(currentSiteId)}>确认全部路由已配置</button>{missingNextHop && <small>等待 Agent 上报本站对应地址后才能确认。</small>}</div>)}
-      </div>
-    </div>
-  );
-}
 
-function RouteGuideGroup({
-  title,
-  routes,
-  copiedRoute,
-  onCopy,
-}: {
-  title: string;
-  routes: StaticRouteGuide[];
-  copiedRoute: string | null;
-  onCopy: (route: StaticRouteGuide) => Promise<void>;
-}) {
-  if (routes.length === 0) return null;
-  return <section className="route-guide-group"><h3>{title}</h3>{routes.map((route) => {
-    const key = `${route.router_site_id}-${route.purpose}-${route.destination_prefix}`;
-    return <div className="route-guide" key={key}>
-      <span className="route-site">{route.router_site_name}</span>
-      <span className="route-arrow">→</span>
-      <span className="route-destination">{route.destination_label ?? route.destination_site_name} · {route.destination_prefix}</span>
-      <span className="route-via">下一跳：{route.next_hop ?? "等待设备地址"}</span>
-      {route.next_hop && <button className="icon-button route-copy-button" type="button" aria-label={copiedRoute === key ? "路由已复制" : `复制${route.destination_prefix}的路由`} title={copiedRoute === key ? "已复制" : "复制路由"} onClick={() => void onCopy(route)}>{copiedRoute === key ? <CheckCircle2 size={15} aria-hidden="true" /> : <Copy size={15} aria-hidden="true" />}</button>}
-    </div>;
-  })}</section>;
-}
 
-/** 移动端互联详情底部面板；关系列表保留可扫描摘要，详细状态在触发点附近展开。 */
-function MobileSiteLinkDetail({
-  link,
-  currentSiteId,
-  actionPending,
-  onClose,
-  onToggle,
-  onRecheck,
-  onConfirmRoute,
-  onEdit,
-  onDelete,
-}: {
-  link: SiteLink;
-  currentSiteId: string;
-  actionPending: boolean;
-  onClose: () => void;
-  onToggle: () => void;
-  onRecheck: () => void;
-  onConfirmRoute: (siteId: string) => void;
-  onEdit: () => void;
-  onDelete: () => void;
-}) {
-  const status = link.deletion_pending ? { label: "处理中", kind: "working" } : siteLinkStatus(link.apply_status);
-  const health = gatewayHealthStatus(link.health_status, link.left_networks.some((network) => network.source === "manual") || link.right_networks.some((network) => network.source === "manual"));
-  const actionsDisabled = actionPending || link.deletion_pending;
-  const currentRoutes = link.static_routes.filter((route) => route.router_site_id === currentSiteId);
-  const siteRoutes = currentRoutes.filter((route) => route.purpose !== "mesh_client_return");
-  const clientReturnRoutes = currentRoutes.filter((route) => route.purpose === "mesh_client_return");
-  const allRoutesConfirmed = currentRoutes.length > 0 && currentRoutes.every((route) => route.router_confirmed);
-  const missingNextHop = currentRoutes.some((route) => !route.next_hop);
-  const [copiedRoute, setCopiedRoute] = useState<string | null>(null);
-  const copyRoute = async (route: StaticRouteGuide) => {
-    if (!route.next_hop) return;
-    try {
-      await navigator.clipboard.writeText(`${route.destination_prefix} via ${route.next_hop}`);
-      const key = `${route.router_site_id}-${route.purpose}-${route.destination_prefix}`;
-      setCopiedRoute(key);
-      window.setTimeout(() => setCopiedRoute((current) => current === key ? null : current), 1600);
-    } catch {
-      // 移动端剪贴板权限可能被系统拒绝，保留可选择文本并继续允许确认。
-    }
-  };
-  return (
-    <aside className="mobile-site-link-detail" aria-label="互联详情">
-      <div className="mobile-detail-heading">
-        <div>
-          <span className="eyebrow">互联详情</span>
-          <h2>{link.left_site_name} ↔ {link.right_site_name}</h2>
-          <div className="mobile-detail-statuses"><span className={`link-status ${status.kind}`}><i />{status.label}</span><span className={`link-status ${health.kind}`}><i />{health.label}</span></div>
-        </div>
-        <button className="icon-button" type="button" aria-label="关闭互联详情" title="关闭" onClick={onClose}><X size={17} aria-hidden="true" /></button>
-      </div>
-      <div className="mobile-detail-network-pairs">
-        <div><strong>{link.left_site_name}</strong>{link.left_networks.map((network) => <code key={network.id}>{network.prefix}</code>)}</div>
-        <ArrowRight size={16} aria-hidden="true" />
-        <div><strong>{link.right_site_name}</strong>{link.right_networks.map((network) => <code key={network.id}>{network.prefix}</code>)}</div>
-      </div>
-      <div className="mobile-detail-status-list">
-        {link.route_statuses.map((route) => (
-          <div key={`${route.router_site_id}-${route.network_id}`}>
-            <strong>{route.destination_prefix}</strong>
-            <span>{routeStageLabel("device", route.device_status)} · {routeStageLabel("control", route.control_plane_status)} · {routeStageLabel("remote", route.remote_status)}</span>
-            {route.error && <small>{route.error}</small>}
-          </div>
-        ))}
-        {link.route_statuses.length === 0 && <p className="network-inline-empty">暂时没有逐路由状态。</p>}
-      </div>
-      <div className="mobile-detail-route-guide">
-        <RouteGuideGroup title="访问另一站点" routes={siteRoutes} copiedRoute={copiedRoute} onCopy={copyRoute} />
-        <RouteGuideGroup title="允许组网设备访问本站" routes={clientReturnRoutes} copiedRoute={copiedRoute} onCopy={copyRoute} />
-        {currentRoutes.length === 0 && <p className="network-inline-empty">本站暂时没有需要确认的静态路由。</p>}
-        {!allRoutesConfirmed && currentRoutes.length > 0 && <button className="secondary-button compact-button" type="button" aria-label="确认本站全部路由已配置（确认路由已配置）" disabled={actionsDisabled || missingNextHop} onClick={() => onConfirmRoute(currentSiteId)}>确认本站全部路由已配置</button>}
-        {missingNextHop && currentRoutes.length > 0 && <small className="route-confirmation-hint">等待 Agent 上报本站对应地址后才能确认。</small>}
-        {allRoutesConfirmed && <span className="route-confirmed">本站全部路由已确认</span>}
-      </div>
-      <div className="mobile-detail-actions">
-        <button className="secondary-button compact-button" type="button" onClick={onEdit} disabled={actionsDisabled}>编辑</button>
-        <button className="secondary-button compact-button" type="button" onClick={onRecheck} disabled={actionsDisabled}>重试</button>
-        <button className="secondary-button compact-button" type="button" onClick={onToggle} disabled={actionsDisabled}>{link.enabled ? "停用" : "启用"}</button>
-        <button className="delete-icon-button" type="button" aria-label="删除互联关系" title="删除" onClick={onDelete} disabled={actionsDisabled}><Trash2 size={16} aria-hidden="true" /></button>
-      </div>
-    </aside>
-  );
-}
 
-/** 共享网络行：用已确认网段和应用阶段替代底层路由术语。 */
-function SiteNetworkRow({
-  network,
-  actionPending,
-  onToggle,
-  onDelete,
-}: {
-  network: SiteNetwork;
-  actionPending: boolean;
-  onToggle: () => void;
-  onDelete: () => void;
-}) {
-  const status = network.deletion_pending ? { label: "处理中", kind: "working" } : siteLinkStatus(network.apply_status);
-  const actionsDisabled = actionPending || network.deletion_pending;
-  const health = gatewayHealthStatus(network.health_status, network.source === "manual");
-  return (
-    <div className="network-row">
-      <div className="network-identity">
-        <strong>{network.name}</strong>
-        <span>{network.site_name} · {network.publisher_device_name} · {network.source === "manual" ? "手动声明" : "自动探测"}</span>
-      </div>
-      <div className="network-prefix">
-        <span>共享网段</span>
-        <code>{network.desired_prefix}</code>
-        <small className="network-applied">
-          {network.applied_prefix
-            ? `设备已应用：${network.applied_prefix}`
-            : network.enabled
-              ? "设备应用状态：等待确认"
-              : "当前未共享"}
-        </small>
-        <small>下一跳：{network.gateway_address ?? "等待设备地址"}</small>
-      </div>
-      {network.apply_error && <p className="network-error">{network.apply_error}</p>}
-      <div className="network-actions">
-        <span className={`link-status ${status.kind}`}><i />{status.label}</span>
-        <span className={`link-status ${health.kind}`}><i />{health.label}</span>
-        <button
-          className="link-action"
-          type="button"
-          onClick={onToggle}
-          disabled={actionsDisabled}
-          aria-label={network.enabled ? "停止共享本地网络" : "重新共享本地网络"}
-        >
-          {actionPending ? "处理中…" : network.deletion_pending ? "等待删除" : network.enabled ? "停止共享" : "重新启用"}
-        </button>
-        <button className="delete-icon-button" type="button" aria-label={`删除共享网络${network.name}`} title={network.deletion_pending ? "等待删除" : "删除共享网络"} disabled={actionsDisabled} onClick={onDelete}>
-          <Trash2 size={17} aria-hidden="true" />
-        </button>
-      </div>
-      {network.health_error && network.health_error !== network.apply_error && <p className="network-health-error">网关状态：{network.health_error}</p>}
-    </div>
-  );
-}
 
-/** 网关健康状态翻译；与 Desired / Applied 状态并列，避免把设备在线当成路由可用。 */
-function gatewayHealthStatus(status: SiteLink["health_status"], manual = false): { label: string; kind: string } {
-  switch (status) {
-    case "ready":
-      return { label: manual ? "配置就绪" : "网关正常", kind: "ready" };
-    case "degraded":
-      return { label: manual ? "配置检查中" : "部分可用", kind: "working" };
-    case "failed":
-      return { label: "网关异常", kind: "failed" };
-    case "disabled":
-      return { label: "未启用", kind: "disabled" };
-    default:
-      return { label: "状态检查中", kind: "working" };
-  }
-}
 
-function meshStatusLabel(status: Device["mesh_status"]): string {
-  switch (status) {
-    case "joining":
-      return "加入中";
-    case "connected":
-      return "已连接";
-    case "mesh_offline":
-      return "暂时离线";
-    case "needs_recovery":
-      return "需要恢复";
-    case "failed":
-      return "异常";
-    case "disabled":
-      return "未启用";
-    default:
-      return "未加入";
-  }
-}
 
 /** 与 Server 保持一致，只把明确的 localhost 占位名标为需要用户命名。 */
 function isPlaceholderDeviceName(value: string): boolean {
@@ -4999,42 +3736,8 @@ function isPlaceholderDeviceName(value: string): boolean {
   return normalized === "localhost" || /^localhost-\d+$/.test(normalized);
 }
 
-function siteLinkStatus(status: SiteLink["apply_status"]): { label: string; kind: string } {
-  switch (status) {
-    case "ready":
-      return { label: "正常", kind: "ready" };
-    case "checking":
-      return { label: "处理中", kind: "working" };
-    case "applying":
-      return { label: "处理中", kind: "working" };
-    case "retrying":
-      return { label: "处理中", kind: "working" };
-    case "failed":
-      return { label: "需处理", kind: "failed" };
-    case "disabled":
-      return { label: "已关闭", kind: "disabled" };
-    default:
-      return { label: "处理中", kind: "working" };
-  }
-}
 
 /** 将路由记录中的内部阶段转换成管理员可直接理解的产品文案。 */
-function routeStageLabel(stage: "device" | "control" | "remote", value: string): string {
-  if (value === "failed" || value === "upgrade_required") return stage === "device" ? "设备发布失败" : "阶段失败";
-  if (value === "disabled") return "已停用";
-  if (stage === "device") {
-    if (value === "applied") return "设备已发布";
-    return "等待设备发布";
-  }
-  if (stage === "control") {
-    if (value === "serving") return "路由服务中";
-    if (value === "approved") return "控制端已批准";
-    if (value === "discovered") return "控制端已发现";
-    return "等待控制端批准";
-  }
-  if (value === "accepted") return "对端已接受";
-  return "等待对端接受";
-}
 
 function AuthShell({ children }: { children: ReactNode }) {
   return <main className="auth-shell"><div className="auth-panel"><div className="brand-mark auth-brand"><span className="brand-icon">N</span><span><strong>Nexo</strong><small>联巢</small></span></div>{children}</div></main>;

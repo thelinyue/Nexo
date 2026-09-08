@@ -88,10 +88,10 @@ type MockOptions = {
   failFirstTunnelDelete?: boolean;
   tunnelDeleteDelayMs?: number;
   failFirstNetworkCreate?: boolean;
-  failFirstLinkCreate?: boolean;
   failFirstPublicDomainUpdate?: boolean;
   failFirstNetworksLoad?: boolean;
   publicDomains?: Array<typeof seedPublicDomain>;
+  meshRenamePending?: boolean;
 };
 
 const seedPublicDomain = {
@@ -131,17 +131,10 @@ const seedPublicDomain = {
   readiness_summary: { status: "ready", root_dns: "ready", wildcard_dns: "ready", https: "ready", management_entry: "ready", mesh_entry: "ready" },
 };
 
-const seedSites = [
-  { id: "site-home", tenant_id: "default", name: "家庭" },
-  { id: "site-office", tenant_id: "default", name: "办公室" },
-  { id: "site-warehouse", tenant_id: "default", name: "仓库" },
-];
-
 const seedDevices = [
   {
     id: "device-home",
     tenant_id: "default",
-    site_id: "site-home" as string | null,
     name: "家庭网关",
     os: "linux",
     architecture: "amd64",
@@ -150,12 +143,15 @@ const seedDevices = [
     connection_type: "nexo_agent",
     mesh_status: "connected",
     mesh_address: "100.64.0.2",
+    mesh_name: "home-gateway",
+    active_mesh_name: "home-gateway",
+    mesh_fqdn: "home-gateway.mesh.example.internal",
+    mesh_name_status: "ready",
     last_seen_at: 1893456000,
     gateway_report: {
       ipv4_forwarding: true,
       ipv6_forwarding: false,
       subnet_gateway: "ready",
-      site_gateway: "ready",
       local_networks: [
         { interface_id: "eth0", prefix: "192.168.1.0/24", gateway_address: "192.168.1.1" },
         { interface_id: "eth0", prefix: "10.0.0.0/24", gateway_address: "10.0.0.1" },
@@ -166,7 +162,6 @@ const seedDevices = [
   {
     id: "device-office",
     tenant_id: "default",
-    site_id: "site-office" as string | null,
     name: "办公室网关",
     os: "linux",
     architecture: "arm64",
@@ -175,12 +170,15 @@ const seedDevices = [
     connection_type: "nexo_agent",
     mesh_status: "connected",
     mesh_address: "100.64.0.3",
+    mesh_name: "office-gateway",
+    active_mesh_name: "office-gateway",
+    mesh_fqdn: "office-gateway.mesh.example.internal",
+    mesh_name_status: "ready",
     last_seen_at: 1893456000,
     gateway_report: {
       ipv4_forwarding: true,
       ipv6_forwarding: true,
       subnet_gateway: "ready",
-      site_gateway: "ready",
       local_networks: [
         { interface_id: "enp1s0", prefix: "10.20.0.0/24", gateway_address: "10.20.0.1" },
         { interface_id: "enp2s0", prefix: "2001:db8:20::/64", gateway_address: "2001:db8:20::1" },
@@ -190,7 +188,6 @@ const seedDevices = [
   {
     id: "device-v6",
     tenant_id: "default",
-    site_id: "site-home" as string | null,
     name: "IPv6 网关",
     os: "linux",
     architecture: "amd64",
@@ -199,12 +196,15 @@ const seedDevices = [
     connection_type: "nexo_agent",
     mesh_status: "connected",
     mesh_address: "fd7a:115c:a1e0::4",
+    mesh_name: "ipv6-gateway",
+    active_mesh_name: "ipv6-gateway",
+    mesh_fqdn: "ipv6-gateway.mesh.example.internal",
+    mesh_name_status: "ready",
     last_seen_at: 1893456000,
     gateway_report: {
       ipv4_forwarding: false,
       ipv6_forwarding: true,
       subnet_gateway: "ready",
-      site_gateway: "ready",
       local_networks: [
         { interface_id: "eth0", prefix: "192.168.2.0/24", gateway_address: "192.168.2.1" },
         { interface_id: "eth1", prefix: "2001:db8:2::/64", gateway_address: "2001:db8:2::1" },
@@ -215,50 +215,22 @@ const seedDevices = [
 
 const seedNetworks = [
   {
-    id: "network-home", tenant_id: "default", site_id: "site-home", site_name: "家庭", name: "家庭局域网",
+    id:"network-home",tenant_id:"default",name:"家庭局域网",
     publisher_device_name: "家庭网关", publisher_device_id: "device-home", interface_id: "eth0", source: "detected", gateway_address: "192.168.1.1",
     desired_prefix: "192.168.1.0/24", applied_prefix: "192.168.1.0/24", enabled: true, apply_status: "ready",
     apply_error: null, health_status: "ready", health_error: null, deletion_pending: false,
   },
   {
-    id: "network-office", tenant_id: "default", site_id: "site-office", site_name: "办公室", name: "办公室局域网",
+    id:"network-office",tenant_id:"default",name:"办公室局域网",
     publisher_device_name: "办公室网关", publisher_device_id: "device-office", interface_id: "enp1s0", source: "detected", gateway_address: "10.20.0.1",
     desired_prefix: "10.20.0.0/24", applied_prefix: "10.20.0.0/24", enabled: true, apply_status: "ready",
     apply_error: null, health_status: "ready", health_error: null, deletion_pending: false,
   },
   {
-    id: "network-office-v6", tenant_id: "default", site_id: "site-office", site_name: "办公室", name: "办公室 IPv6",
+    id:"network-office-v6",tenant_id:"default",name:"办公室 IPv6",
     publisher_device_name: "办公室网关", publisher_device_id: "device-office", interface_id: "enp2s0", source: "detected", gateway_address: "2001:db8:20::1",
     desired_prefix: "2001:db8:20::/64", applied_prefix: "2001:db8:20::/64", enabled: true, apply_status: "ready",
     apply_error: null, health_status: "ready", health_error: null, deletion_pending: false,
-  },
-];
-
-const seedLinks = [
-  {
-    id: "link-home-office",
-    tenant_id: "default",
-    left_site_id: "site-home",
-    right_site_id: "site-office",
-    left_site_name: "家庭",
-    right_site_name: "办公室",
-    left_networks: [{ id: "network-home", name: "家庭局域网", prefix: "192.168.1.0/24", source: "detected", address_family: "ipv4", publisher_device_id: "device-home", publisher_device_name: "家庭网关", gateway_address: "192.168.1.1", apply_status: "ready" }],
-    right_networks: [{ id: "network-office", name: "办公室局域网", prefix: "10.20.0.0/24", source: "detected", address_family: "ipv4", publisher_device_id: "device-office", publisher_device_name: "办公室网关", gateway_address: "10.20.0.1", apply_status: "ready" }],
-    static_routes: [
-      { router_site_id: "site-home", destination_site_id: "site-office", router_site_name: "家庭", destination_site_name: "办公室", destination_prefix: "10.20.0.0/24", next_hop: "192.168.1.2", router_confirmed: false },
-      { router_site_id: "site-office", destination_site_id: "site-home", router_site_name: "办公室", destination_site_name: "家庭", destination_prefix: "192.168.1.0/24", next_hop: "10.20.0.2", router_confirmed: false },
-    ],
-    route_statuses: [
-      { network_id: "network-office", router_site_id: "site-home", destination_site_id: "site-office", destination_prefix: "10.20.0.0/24", address_family: "ipv4", device_status: "applied", control_plane_status: "serving", remote_status: "accepted", error: null, checked_at: 1893456000 },
-      { network_id: "network-home", router_site_id: "site-office", destination_site_id: "site-home", destination_prefix: "192.168.1.0/24", address_family: "ipv4", device_status: "applied", control_plane_status: "serving", remote_status: "accepted", error: null, checked_at: 1893456000 },
-    ],
-    enabled: true,
-    apply_status: "ready",
-    apply_error: null,
-    health_status: "ready",
-    health_error: null,
-    deletion_pending: false,
-    route_confirmations: [] as { site_id: string; confirmed_at: number }[],
   },
 ];
 
@@ -280,14 +252,12 @@ async function installApiMocks(page: Page, options: MockOptions) {
   let failTunnelCreate = Boolean(options.failFirstTunnelCreate);
   let failTunnelDelete = Boolean(options.failFirstTunnelDelete);
   let failNetworkCreate = Boolean(options.failFirstNetworkCreate);
-  let failLinkCreate = Boolean(options.failFirstLinkCreate);
   let failPublicDomainUpdate = Boolean(options.failFirstPublicDomainUpdate);
   let failNetworksLoad = Boolean(options.failFirstNetworksLoad);
+  const meshRenamePending = Boolean(options.meshRenamePending);
   const state = {
-    sites: structuredClone(seedSites),
     devices: structuredClone(seedDevices),
-    networks: structuredClone(seedNetworks),
-    links: structuredClone(seedLinks),
+    networks: structuredClone(seedNetworks).map(n=>({...n,status_reason:"ready",updated_at:Math.floor(Date.now()/1000)})),
     tunnels: structuredClone(options.tunnels ?? [seedTunnel]),
     enrollments: [] as Record<string, unknown>[],
     sessions: [
@@ -344,7 +314,6 @@ async function installApiMocks(page: Page, options: MockOptions) {
       await fulfillJson(route, { devices: state.devices.length, running_tunnels: state.tunnels.filter((item) => item.enabled).length, mesh_devices: 2, current_connections: 2 }); return;
     }
     if (path === "/api/v1/devices" && method === "GET") { await fulfillJson(route, deviceSnapshot()); return; }
-    if (path === "/api/v1/sites" && method === "GET") { await fulfillJson(route, state.sites); return; }
     if (path === "/api/v1/enrollments" && method === "GET") { await fulfillJson(route, state.enrollments); return; }
     if (path === "/api/v1/mesh/status") { await fulfillJson(route, { status: "normal", message: "组网运行正常" }); return; }
     if (path === "/api/v1/mesh/client-config") { await fulfillJson(route, { login_server: "https://mesh.example.com", browser_authorization_url: null, supported_platforms: ["Linux", "Windows", "macOS", "iOS", "Android", "tvOS"], notes: [] }); return; }
@@ -359,7 +328,6 @@ async function installApiMocks(page: Page, options: MockOptions) {
       finishPendingDeletion("network", state.networks);
       await fulfillJson(route, state.networks); return;
     }
-    if (path === "/api/v1/site-links" && method === "GET") { finishPendingDeletion("link", state.links); await fulfillJson(route, state.links); return; }
     if (path === "/api/v1/tunnels" && method === "GET") { await fulfillJson(route, state.tunnels); return; }
     if (supportsPublicDomains && path === "/api/v1/public-domains" && method === "GET") {
       await fulfillJson(route, state.publicDomains);
@@ -480,78 +448,29 @@ async function installApiMocks(page: Page, options: MockOptions) {
       return;
     }
     if (path === "/api/v1/enrollments" && method === "POST") {
+      state.enrollments=[{enrollment_id:"enrollment-release",status:"awaiting_approval",device_name:request.postDataJSON().device_name,os:"linux",architecture:"amd64",agent_version:"0.1.17",expires_at:1893456000}];
       await fulfillJson(route, { enrollment_id: "enrollment-release", token: "release-one-time-token", expires_at: 1893456000 }); return;
     }
-    if (path === "/api/v1/sites" && method === "POST") {
-      const body = request.postDataJSON() as { name: string; tenant_id: string };
-      state.sites.push({ id: `site-${state.sites.length + 1}`, ...body });
-      await fulfillJson(route, state.sites.at(-1), 201); return;
+    if (path === "/api/v1/enrollments/enrollment-release/approve" && method === "POST") {
+      state.enrollments[0].status="consumed";
+      await fulfillJson(route,{device_id:"new-agent"});return;
     }
     if (path === "/api/v1/site-networks" && method === "POST") {
       if (failNetworkCreate) { failNetworkCreate = false; await fulfillJson(route, { error: "模拟共享网络创建失败" }, 422); return; }
       const body = request.postDataJSON() as Record<string, string>;
-      const site = state.sites.find((item) => item.id === body.site_id)!;
       const device = state.devices.find((item) => item.id === body.publisher_device_id)!;
-      const created = { id: `network-${state.networks.length + 1}`, ...body, site_name: site.name, publisher_device_name: device.name, desired_prefix: body.prefix, applied_prefix: null, gateway_address: null, enabled: true, apply_status: "checking", apply_error: null, health_status: "degraded", health_error: null, deletion_pending: false };
+      const created = { id: `network-${state.networks.length + 1}`, ...body, publisher_device_name: device.name, desired_prefix: body.prefix, applied_prefix: null, gateway_address: null, enabled: true, apply_status: "checking", apply_error: null, health_status: "degraded", health_error: null, deletion_pending: false };
       state.networks.push(created); await fulfillJson(route, created, 201); return;
     }
-    if (path === "/api/v1/site-networks/enable-detected" && method === "POST") {
-      const body = request.postDataJSON() as { device_id: string; networks: Array<{ interface_id: string; prefix: string; gateway_address: string }> };
-      const device = state.devices.find((item) => item.id === body.device_id);
-      const site = state.sites.find((item) => item.id === device?.site_id);
-      const created = body.networks.map((network, index) => ({
-        id: `network-detected-${index + 1}`, tenant_id: "default", site_id: site?.id ?? "", site_name: site?.name ?? "", name: network.prefix,
-        publisher_device_name: device?.name ?? "", publisher_device_id: body.device_id, interface_id: network.interface_id, source: "detected", gateway_address: network.gateway_address,
-        desired_prefix: network.prefix, applied_prefix: null, enabled: true, apply_status: "applying", apply_error: null, health_status: "pending", health_error: null, deletion_pending: false,
-      }));
-      state.networks.push(...created);
-      await fulfillJson(route, { created, affected_count: created.length, message: `已启用 ${created.length} 个共享网段` }, 201); return;
-    }
-    if (path === "/api/v1/site-links" && method === "POST") {
-      if (failLinkCreate) { failLinkCreate = false; await fulfillJson(route, { error: "模拟站点互联创建失败" }, 422); return; }
-      const body = request.postDataJSON() as { tenant_id: string; left_site_id: string; right_site_id: string; left_network_ids: string[]; right_network_ids: string[]; next_hops?: unknown };
-      const left = state.sites.find((item) => item.id === body.left_site_id)!;
-      const right = state.sites.find((item) => item.id === body.right_site_id)!;
-      const toSummary = (network: (typeof state.networks)[number]) => ({ id: network.id, name: network.name, prefix: network.desired_prefix, source: network.source, address_family: network.desired_prefix.includes(":") ? "ipv6" : "ipv4", publisher_device_id: network.publisher_device_id, publisher_device_name: network.publisher_device_name, gateway_address: network.gateway_address, apply_status: network.apply_status });
-      const leftNetworks = body.left_network_ids.map((id) => state.networks.find((item) => item.id === id)).filter((network): network is (typeof state.networks)[number] => Boolean(network)).map(toSummary);
-      const rightNetworks = body.right_network_ids.map((id) => state.networks.find((item) => item.id === id)).filter((network): network is (typeof state.networks)[number] => Boolean(network)).map(toSummary);
-      const leftNetwork = leftNetworks[0]!;
-      const rightNetwork = rightNetworks[0]!;
-      const created = {
-        id: "link-created", tenant_id: "default", ...body, left_site_name: left.name, right_site_name: right.name,
-        left_networks: leftNetworks,
-        right_networks: rightNetworks,
-        static_routes: [
-          { router_site_id: left.id, destination_site_id: right.id, router_site_name: left.name, destination_site_name: right.name, destination_prefix: rightNetwork.prefix, next_hop: "192.168.1.2", router_confirmed: false },
-          { router_site_id: right.id, destination_site_id: left.id, router_site_name: right.name, destination_site_name: left.name, destination_prefix: leftNetwork.prefix, next_hop: "10.20.0.2", router_confirmed: false },
-        ],
-        route_statuses: [
-          { network_id: rightNetwork.id, router_site_id: left.id, destination_site_id: right.id, destination_prefix: rightNetwork.prefix, address_family: rightNetwork.address_family, device_status: "pending", control_plane_status: "pending", remote_status: "pending", error: null, checked_at: null },
-          { network_id: leftNetwork.id, router_site_id: right.id, destination_site_id: left.id, destination_prefix: leftNetwork.prefix, address_family: leftNetwork.address_family, device_status: "pending", control_plane_status: "pending", remote_status: "pending", error: null, checked_at: null },
-        ],
-        enabled: true, apply_status: "checking", apply_error: null, health_status: "degraded", health_error: null, deletion_pending: false,
-        route_confirmations: [] as { site_id: string; confirmed_at: number }[],
-      };
-      state.links.push(created); await fulfillJson(route, created, 201); return;
-    }
-    if (/^\/api\/v1\/site-links\/[^/]+$/.test(path) && method === "PATCH") {
-      const id = decodeURIComponent(path.split("/").at(-1) ?? "");
-      const link = state.links.find((item) => item.id === id);
-      if (!link) { await fulfillJson(route, { error: "站点互联不存在" }, 404); return; }
-      const body = request.postDataJSON() as { left_network_ids?: string[]; right_network_ids?: string[]; next_hops?: unknown };
-      const leftIds = body.left_network_ids ?? link.left_networks.map((network) => network.id);
-      const rightIds = body.right_network_ids ?? link.right_networks.map((network) => network.id);
-      const toSummary = (network: (typeof state.networks)[number]) => ({ id: network.id, name: network.name, prefix: network.desired_prefix, source: network.source, address_family: network.desired_prefix.includes(":") ? "ipv6" : "ipv4", publisher_device_id: network.publisher_device_id, publisher_device_name: network.publisher_device_name, gateway_address: network.gateway_address, apply_status: network.apply_status });
-      const leftNetworks = leftIds.map((networkId) => state.networks.find((item) => item.id === networkId)).filter((network): network is (typeof state.networks)[number] => Boolean(network)).map(toSummary);
-      const rightNetworks = rightIds.map((networkId) => state.networks.find((item) => item.id === networkId)).filter((network): network is (typeof state.networks)[number] => Boolean(network)).map(toSummary);
-      Object.assign(link, body, {
-        left_networks: leftNetworks,
-        right_networks: rightNetworks,
-        apply_status: "checking",
-        health_status: "degraded",
-        route_confirmations: [],
-      });
-      await fulfillJson(route, link); return;
+    if (/^\/api\/v1\/devices\/[^/]+\/shared-networks$/.test(path) && method === "PUT") {
+      const deviceId=path.split('/')[4];
+      const body=request.postDataJSON();
+      for(const item of body.networks) {
+        const existing=state.networks.find(n=>n.id===item.id || n.publisher_device_id===deviceId && n.desired_prefix===item.prefix);
+        if(existing) { if(existing.enabled !== item.enabled) Object.assign(existing,{enabled:item.enabled,apply_status:"checking",status_reason:"applying"}); }
+        else if(item.enabled) state.networks.push({...seedNetworks[0],id:`new-${state.networks.length}`,publisher_device_id:deviceId,name:item.prefix,desired_prefix:item.prefix,interface_id:item.interface_id,apply_status:"checking"});
+      }
+      await fulfillJson(route,state.networks);return;
     }
     if (/^\/api\/v1\/site-networks\/[^/]+\/(enable|disable)$/.test(path) && method === "POST") {
       const parts = path.split("/");
@@ -559,28 +478,6 @@ async function installApiMocks(page: Page, options: MockOptions) {
       network.enabled = parts.at(-1) === "enable";
       network.apply_status = network.enabled ? "checking" : "disabled";
       await fulfillJson(route, network); return;
-    }
-    if (/^\/api\/v1\/site-links\/[^/]+\/(enable|disable)$/.test(path) && method === "POST") {
-      const parts = path.split("/");
-      const link = state.links.find((item) => item.id === decodeURIComponent(parts.at(-2) ?? ""))!;
-      link.enabled = parts.at(-1) === "enable";
-      link.apply_status = link.enabled ? "checking" : "disabled";
-      await fulfillJson(route, link); return;
-    }
-    if (/^\/api\/v1\/site-links\/[^/]+\/recheck$/.test(path) && method === "POST") {
-      const link = state.links.find((item) => item.id === decodeURIComponent(path.split("/").at(-2) ?? ""))!;
-      link.health_status = "ready";
-      link.health_error = null;
-      await fulfillJson(route, link); return;
-    }
-    if (/^\/api\/v1\/site-links\/[^/]+\/router-confirmations\/[^/]+$/.test(path) && method === "POST") {
-      const parts = path.split("/");
-      const siteId = decodeURIComponent(parts.at(-1) ?? "");
-      const link = state.links.find((item) => item.id === decodeURIComponent(parts.at(-3) ?? ""))!;
-      const guide = link.static_routes.find((item) => item.router_site_id === siteId)!;
-      guide.router_confirmed = true;
-      link.route_confirmations.push({ site_id: siteId, confirmed_at: 1893456000 });
-      await fulfillJson(route, link); return;
     }
     if (path === "/api/v1/tunnels" && method === "POST") {
       if (failTunnelCreate) { failTunnelCreate = false; await fulfillJson(route, { error: "模拟创建失败" }, 422); return; }
@@ -662,19 +559,10 @@ async function installApiMocks(page: Page, options: MockOptions) {
       tunnel.enabled = parts.at(-1) === "enable";
       await fulfillJson(route, tunnel); return;
     }
-    if (/^\/api\/v1\/site-links\/[^/]+$/.test(path) && method === "DELETE") {
-      const id = decodeURIComponent(path.split("/").at(-1) ?? "");
-      const link = state.links.find((item) => item.id === id);
-      if (!link) { await fulfillJson(route, { error: "站点互联不存在" }, 404); return; }
-      link.enabled = false; link.apply_status = "checking"; link.deletion_pending = true;
-      await fulfillJson(route, { deleted: false, pending: true, id, message: "已请求删除站点互联，等待两侧 Agent 与 Headscale 完成路由撤销" }); return;
-    }
     if (/^\/api\/v1\/site-networks\/[^/]+$/.test(path) && method === "DELETE") {
       const id = decodeURIComponent(path.split("/").at(-1) ?? "");
       const network = state.networks.find((item) => item.id === id);
       if (!network) { await fulfillJson(route, { error: "共享网络不存在" }, 404); return; }
-      const references = state.links.filter((item) => item.left_networks.some((network) => network.id === id) || item.right_networks.some((network) => network.id === id)).length;
-      if (references) { await fulfillJson(route, { error: `共享网络仍被 ${references} 个互联关系引用，请先删除互联关系` }, 409); return; }
       network.enabled = false; network.apply_status = "checking"; network.deletion_pending = true;
       await fulfillJson(route, { deleted: false, pending: true, id, message: "已请求删除共享网络，等待 Agent 与 Headscale 完成路由撤销" }); return;
     }
@@ -691,14 +579,16 @@ async function installApiMocks(page: Page, options: MockOptions) {
     }
     if (/^\/api\/v1\/devices\/[^/]+$/.test(path) && method === "PUT") {
       const id = decodeURIComponent(path.split("/").at(-1) ?? "");
-      const body = request.postDataJSON() as { name: string; site_id: string | null };
+      const body = request.postDataJSON() as { name: string; mesh_name: string };
       const device = state.devices.find((item) => item.id === id);
       if (!device) { await fulfillJson(route, { error: "设备不存在" }, 404); return; }
-      if (body.site_id && !state.sites.some((site) => site.id === body.site_id)) {
-        await fulfillJson(route, { error: "目标站点不存在" }, 404); return;
-      }
+      const previousActiveMeshName = device.active_mesh_name;
+      const previousMeshFqdn = device.mesh_fqdn;
       device.name = body.name;
-      device.site_id = body.site_id;
+      device.mesh_name = body.mesh_name;
+      device.active_mesh_name = meshRenamePending ? previousActiveMeshName : body.mesh_name;
+      device.mesh_fqdn = meshRenamePending ? previousMeshFqdn : `${body.mesh_name}.mesh.example.internal`;
+      device.mesh_name_status = meshRenamePending ? "applying" : "ready";
       for (const network of state.networks) {
         if (network.publisher_device_id === id) network.publisher_device_name = device.name;
       }
@@ -722,18 +612,12 @@ async function installApiMocks(page: Page, options: MockOptions) {
       state.devices = state.devices.filter((item) => item.id !== id);
       await fulfillJson(route, { deleted: true, pending: false, id, message: `设备已删除，${tunnelIds.length} 个公网服务已保留为未分配并关闭；原 Agent 需要重新入网才能连接` }); return;
     }
-    if (/^\/api\/v1\/sites\/[^/]+$/.test(path) && method === "DELETE") {
-      const id = decodeURIComponent(path.split("/").at(-1) ?? "");
-      const dependencies = state.devices.filter((item) => item.site_id === id).length + state.networks.filter((item) => item.site_id === id).length + state.links.filter((item) => item.left_site_id === id || item.right_site_id === id).length;
-      if (dependencies) { await fulfillJson(route, { error: "站点仍关联设备、共享网络或互联关系，请按顺序先完成删除" }, 409); return; }
-      state.sites = state.sites.filter((item) => item.id !== id);
-      await fulfillJson(route, { deleted: true, pending: false, id, message: "站点已删除" }); return;
-    }
     await fulfillJson(route, { error: `未模拟接口：${method} ${path}` }, 404);
   });
 }
 
 async function expectNoHorizontalOverflow(page: Page) {
+  await page.evaluate(async () => { await Promise.allSettled(document.getAnimations().filter(a=>a.effect?.getComputedTiming().iterations!==Infinity).map(a=>a.finished)); });
   const width = await page.evaluate(() => ({
     viewport: document.documentElement.clientWidth,
     document: document.documentElement.scrollWidth,
@@ -909,38 +793,26 @@ test("网络互联加载失败后可重试且不恢复通用刷新", async ({ pa
   await expect(page.getByRole("alert")).toContainText("模拟网络互联加载失败");
   await expectNoGenericRefresh(page);
   await page.getByRole("button", { name: "重试", exact: true }).click();
-  await openAdvancedSiteLink(page);
-  const sitesTab = page.getByRole("tab", { name: "站点与网段" });
-  if ((page.viewportSize()?.width ?? 1440) > 900) await sitesTab.click();
-  await expect(page.getByRole("button", { name: "展开家庭" })).toBeVisible();
+  await expect(page.getByRole("button", { name: "管理子网" }).first()).toBeVisible();
 });
 
-test("私网访问一次启用检测网段并展示 P2P 路径", async ({ page }) => {
-  await installApiMocks(page, { initialized: true, authenticated: true });
-  await page.goto("/#/network/private");
-  const detected = page.getByRole("checkbox", { name: /10\.0\.0\.0\/24/ });
-  await expect(detected).toBeEnabled();
-  await detected.check();
-  page.once("dialog", (dialog) => void dialog.accept());
-  const enableRequest = page.waitForRequest((request) => new URL(request.url()).pathname === "/api/v1/site-networks/enable-detected");
-  await page.getByRole("button", { name: "启用所选网段" }).click();
-  expect((await enableRequest).postDataJSON()).toMatchObject({
-    device_id: "device-home",
-    networks: [{ interface_id: "eth0", prefix: "10.0.0.0/24", gateway_address: "10.0.0.1" }],
-  });
-  await expect(page.locator(".private-network-row").filter({ hasText: "10.0.0.0/24" })).toBeVisible();
-
-  const home = page.locator(".private-network-row").filter({ hasText: "家庭局域网" });
-  await expect(home).toContainText("P2P 直连");
-  const trigger = home.getByRole("button", { name: "查看" });
+test("设备子网一次保存且路径只在详情按客户端显示", async ({page}) => {
+  await installApiMocks(page,{initialized:true,authenticated:true});
+  await page.goto('/#/network/devices');
+  const trigger=page.getByRole('button',{name:'家庭网关',exact:true});
   await trigger.click();
-  const sheet = page.getByRole("dialog", { name: "家庭局域网" });
-  await expect(sheet).toHaveClass(/form-sheet/);
-  await expect(sheet).toContainText("办公室网关");
-  await sheet.getByRole("button", { name: "检测" }).click();
-  await expect(sheet.getByRole("button", { name: "检测" })).toBeEnabled({ timeout: 3000 });
-  await page.keyboard.press("Escape");
-  await expect(trigger).toBeFocused();
+  await page.getByRole('button',{name:'编辑子网'}).click();
+  const sheet=page.getByRole('dialog');
+  await sheet.getByRole('checkbox',{name:/10\.0\.0\.0\/24/}).check();
+  const save=page.waitForRequest(r=>r.url().endsWith('/devices/device-home/shared-networks'));
+  await sheet.getByRole('button',{name:'保存',exact:true}).click();
+  expect((await save).postDataJSON().networks).toEqual(expect.arrayContaining([expect.objectContaining({prefix:'10.0.0.0/24',enabled:true})]));
+  await expect(page.getByRole('dialog',{name:'家庭网关',exact:true})).toBeVisible();
+  await expect(page.getByRole('button',{name:'编辑子网'})).toBeFocused();
+  await page.getByRole('button',{name:/192\.168\.1\.0\/24/}).click();
+  await expect(page.getByText('P2P 直连',{exact:true})).toBeVisible();
+  await expect(page.getByText('配置与必要批准已完成；此状态不代表已实测所有家庭服务。')).toBeVisible();
+  await expectNoHorizontalOverflow(page);
 });
 
 test("添加设备生成最小 Compose 配置", async ({ page, context }) => {
@@ -948,6 +820,7 @@ test("添加设备生成最小 Compose 配置", async ({ page, context }) => {
   await installApiMocks(page, { initialized: true, authenticated: true });
   await page.goto("/#/network/devices");
   await page.getByRole("button", { name: "添加设备" }).click();
+  await page.getByRole("tab",{name:"共享网络或发布服务"}).click();
   await page.getByLabel("设备名称").fill("家庭 NAS");
   await page.getByRole("button", { name: "生成设备配置" }).click();
   const compose = await page.getByLabel("Docker Compose 配置").inputValue();
@@ -956,11 +829,50 @@ test("添加设备生成最小 Compose 配置", async ({ page, context }) => {
   expect(compose.match(/NEXO_[A-Z_]+:/g)).toEqual(["NEXO_SERVER_URL:", "NEXO_ENROLLMENT_TOKEN:"]);
   await page.getByRole("button", { name: "复制 Compose 配置" }).click();
   await expect(page.getByRole("button", { name: "已复制" })).toBeVisible();
+  const sheet=page.getByRole("dialog",{name:"添加设备"});
+  await expect(sheet.getByText("待批准",{exact:true})).toBeVisible();
+  await expect(sheet.getByRole("button",{name:"完成",exact:true})).toHaveCount(0);
+  await sheet.getByRole("button",{name:"批准设备"}).click();
+  await expect(sheet.getByText("设备已加入",{exact:true})).toBeVisible();
+  await expect(sheet.getByRole("button",{name:"完成",exact:true})).toBeVisible();
   await expectNoHorizontalOverflow(page);
 });
 
+test("设备搜索筛选与详情 Sheet 在目标尺寸保持可操作", async ({page}, testInfo) => {
+  test.skip(testInfo.project.name !== "desktop-dark", "此测试自身覆盖尺寸与主题矩阵");
+  test.setTimeout(60000);
+  await installApiMocks(page,{initialized:true,authenticated:true,publicDomains:[seedPublicDomain]});
+  await page.emulateMedia({reducedMotion:"reduce"});
+  for (const colorScheme of ["light","dark"] as const) {
+    await page.emulateMedia({colorScheme});
+    for (const viewport of [{width:1440,height:900},{width:390,height:844},{width:320,height:568}]) {
+      await page.setViewportSize(viewport);
+      await page.goto('/#/network/devices');
+      await page.getByLabel('搜索设备',{exact:true}).fill('100.64.0.2');
+      await expect(page.locator('.unified-device-row')).toHaveCount(1);
+      await page.getByLabel('设备类型筛选').selectOption('tailscale_client');
+      await expect(page.locator('.unified-device-row')).toHaveCount(0);
+      await page.getByLabel('设备类型筛选').selectOption('nexo_agent');
+      await page.getByRole('button',{name:'家庭网关',exact:true}).click();
+      await expectNoHorizontalOverflow(page);
+      await page.screenshot({path:testInfo.outputPath(`device-${viewport.width}-${colorScheme}.png`)});
+      await page.getByRole('button',{name:'编辑子网'}).click();
+      const sheet=page.getByRole('dialog',{name:'编辑子网'});
+      await expect(sheet).toBeVisible();
+      for (const button of await sheet.getByRole('button').all()) expect((await button.boundingBox())!.height).toBeGreaterThanOrEqual(44);
+      await expectNoHorizontalOverflow(page);
+      await page.screenshot({path:testInfo.outputPath(`subnet-${viewport.width}-${colorScheme}.png`)});
+      await page.keyboard.press('Escape');
+      await expect(page.getByRole('button',{name:'编辑子网'})).toBeFocused();
+      await page.keyboard.press('Escape');
+      await expect(page.getByRole('button',{name:'家庭网关',exact:true})).toBeFocused();
+      await expect(page.getByLabel('搜索设备',{exact:true})).toHaveValue('100.64.0.2');
+    }
+  }
+});
+
 test("公网服务添加与编辑均使用表格式弹窗", async ({ page }) => {
-  await installApiMocks(page, { initialized: true, authenticated: true, failFirstTunnelCreate: true });
+  await installApiMocks(page, { initialized: true, authenticated: true, failFirstTunnelCreate: true, publicDomains: [seedPublicDomain] });
   await page.goto("/#/network/public");
   const createTrigger = page.getByRole("button", { name: "添加服务" });
   await createTrigger.click();
@@ -970,9 +882,10 @@ test("公网服务添加与编辑均使用表格式弹窗", async ({ page }) => 
   await expect(createTrigger).toBeFocused();
   await createTrigger.click();
   dialog = page.getByRole("dialog", { name: "添加服务" });
-  await expect(dialog.getByLabel("公网协议").locator("option")).toHaveText(["HTTP", "HTTPS", "TCP"]);
+  await expect(dialog.getByLabel("服务类型").locator("option")).toHaveText(["Web 服务", "TCP 服务"]);
   await dialog.getByLabel("显示名称（可选）", { exact: true }).fill("远程终端");
-  await dialog.getByLabel("公网协议").selectOption("tcp");
+  await dialog.getByLabel("服务类型").selectOption("tcp");
+  await dialog.getByText("指定公网端口（可选）",{exact:true}).click();
   await expect(dialog.getByLabel("公网端口（可选）")).toBeVisible();
   await expect(dialog.getByLabel("子域名前缀")).toHaveCount(0);
   await dialog.getByLabel("本地地址").fill("service.internal.example.local");
@@ -988,18 +901,18 @@ test("公网服务添加与编辑均使用表格式弹窗", async ({ page }) => 
   await expect(dialog).toBeHidden();
   await expect(page.getByText("远程终端", { exact: true })).toBeVisible();
   const tunnelRow = page.locator(".tunnel-row").filter({ hasText: "媒体中心" });
-  const editTrigger = tunnelRow.getByRole("button", { name: "编辑" });
+  const editTrigger = tunnelRow.getByRole("button", { name: "查看详情" });
   await editTrigger.click();
-  const editDialog = page.getByRole("dialog", { name: "编辑服务" });
-  await expect(editDialog.getByLabel("显示名称", { exact: true })).toHaveValue("媒体中心");
-  await expect(editDialog.getByLabel("公网协议").locator("option")).toHaveText(["HTTP", "HTTPS", "TCP"]);
-  await expect(editDialog.getByLabel("本地服务协议")).toBeVisible();
-  await expect(editDialog.getByLabel("本地地址")).toBeVisible();
-  await editDialog.getByLabel("显示名称", { exact: true }).fill("家庭媒体库");
+  await page.getByRole("button",{name:"编辑",exact:true}).click();
+  const editDialog = page.getByRole("dialog", { name: "编辑 媒体中心" });
+  await expect(editDialog.getByLabel("显示名称（可选）", { exact: true })).toHaveValue("媒体中心");
+  await expect(editDialog.getByLabel("服务类型").locator("option")).toHaveText(["Web 服务", "TCP 服务"]);
+  await expect(editDialog.getByLabel("本地服务地址")).toBeVisible();
+  await editDialog.getByLabel("显示名称（可选）", { exact: true }).fill("家庭媒体库");
   await editDialog.getByRole("button", { name: "保存修改" }).click();
   await expect(editDialog).toBeHidden();
-  await expect(page.getByText("家庭媒体库", { exact: true })).toBeVisible();
-  await expect(page.locator(".tunnel-row").filter({ hasText: "家庭媒体库" }).getByRole("button", { name: "编辑" })).toBeFocused();
+  await expect(page.getByRole("dialog",{name:"家庭媒体库",exact:true})).toBeVisible();
+  await page.keyboard.press("Escape");
   await expectNoHorizontalOverflow(page);
 });
 
@@ -1010,13 +923,13 @@ test("Web 服务配置域名后恢复创建草稿", async ({ page }) => {
   const sheet = page.getByRole("dialog", { name: "添加服务" });
   await sheet.getByLabel("显示名称（可选）").fill("家庭媒体库");
   await sheet.getByLabel("子域名前缀").fill("media-home");
-  await sheet.getByLabel("本地端口").fill("8096");
+  await sheet.getByLabel("本地服务地址").fill("http://127.0.0.1:8096");
   await sheet.getByRole("button", { name: "配置域名" }).click();
   await sheet.getByLabel("根域名").fill("home.example.com");
   await sheet.getByRole("button", { name: "添加域名" }).click();
   await expect(sheet.getByLabel("显示名称（可选）")).toHaveValue("家庭媒体库");
   await expect(sheet.getByLabel("子域名前缀")).toHaveValue("media-home");
-  await expect(sheet.getByLabel("本地端口")).toHaveValue("8096");
+  await expect(sheet.getByLabel("本地服务地址")).toHaveValue("http://127.0.0.1:8096");
   await expect(sheet.getByLabel("公网域名")).toHaveValue("domain-1");
 });
 
@@ -1124,21 +1037,46 @@ test("公网服务支持全选半选与四种批量操作", async ({ page }) => 
   await expectNoHorizontalOverflow(page);
 });
 
-test("已添加设备支持编辑名称与所属站点", async ({ page }) => {
-  await installApiMocks(page, { initialized: true, authenticated: true });
+test("设备详情同时编辑显示名称和短访问名且不再显示站点", async ({page}) => {
+  await installApiMocks(page,{initialized:true,authenticated:true});
+  await page.goto('/#/network/devices');
+  await page.getByRole('button',{name:'家庭网关',exact:true}).click();
+  await page.getByText('设备信息与更多操作',{exact:true}).click();
+  await page.getByRole('button',{name:'编辑设备'}).click();
+  await page.getByLabel('显示名称').fill('家庭 NAS');
+  await page.getByLabel('组网访问名').fill('nas');
+  await page.getByRole('button',{name:'保存修改'}).click();
+  await expect(page.getByRole('dialog',{name:'家庭 NAS',exact:true})).toBeVisible();
+  await expect(page.getByText('nas.mesh.example.internal',{exact:true})).toBeVisible();
+  await expect(page.getByLabel('所属站点')).toHaveCount(0);
+});
+
+test("设备搜索支持短名和完整域名，访问名更新期间保留旧地址并可复制", async ({ page, context }) => {
+  await context.grantPermissions(["clipboard-read", "clipboard-write"], { origin: "http://127.0.0.1:4173" });
+  await installApiMocks(page, { initialized: true, authenticated: true, meshRenamePending: true });
   await page.goto("/#/network/devices");
-  const row = page.locator(".device-row").filter({ hasText: "家庭网关" });
-  const editTrigger = row.getByRole("button", { name: "编辑设备家庭网关" });
-  await editTrigger.click();
-  const dialog = page.getByRole("dialog", { name: "编辑设备" });
-  await dialog.getByLabel("设备名称").fill("家庭 NAS");
-  await dialog.getByLabel("所属站点").selectOption("site-office");
-  await dialog.getByRole("button", { name: "保存修改" }).click();
-  await expect(dialog).toBeHidden();
-  const updatedRow = page.locator(".device-row").filter({ hasText: "家庭 NAS" });
-  await expect(updatedRow).toContainText("办公室");
-  await expect(updatedRow.getByRole("button", { name: "编辑设备家庭 NAS" })).toBeFocused();
-  await expectNoHorizontalOverflow(page);
+  const search = page.getByRole("textbox", { name: "搜索设备" });
+  await search.fill("home-gateway.mesh.example.internal");
+  const row = page.locator(".unified-device-row").filter({ hasText: "家庭网关" });
+  await expect(row).toBeVisible();
+  await row.getByRole("button", { name: "家庭网关", exact: true }).click();
+  const detail = page.getByRole("dialog", { name: "家庭网关", exact: true });
+  await expect(detail.getByText("home-gateway", { exact: true })).toBeVisible();
+  await expect(detail.getByText("home-gateway.mesh.example.internal", { exact: true })).toBeVisible();
+  await detail.getByRole("button", { name: "复制短访问名" }).click();
+  await expect(detail.getByRole("status")).toHaveText("短访问名已复制");
+  await expect.poll(() => page.evaluate(() => navigator.clipboard.readText())).toBe("home-gateway");
+  await detail.getByRole("button", { name: "复制完整域名" }).click();
+  await expect.poll(() => page.evaluate(() => navigator.clipboard.readText())).toBe("home-gateway.mesh.example.internal");
+  await detail.getByText("设备信息与更多操作", { exact: true }).click();
+  await detail.getByRole("button", { name: "编辑设备" }).click();
+  await page.getByLabel("显示名称").fill("家庭 NAS");
+  await page.getByLabel("组网访问名").fill("nas");
+  await page.getByRole("button", { name: "保存修改" }).click();
+  const updatedDetail = page.getByRole("dialog").filter({ hasText: "正在更新访问名" });
+  await expect(updatedDetail).toContainText("正在更新访问名");
+  await expect(updatedDetail).toContainText("home-gateway.mesh.example.internal");
+  await expect(updatedDetail).toContainText("nas");
 });
 
 test("域名编辑 Sheet 在失败后保留表单并安全提交 Cloudflare Token", async ({ page }) => {
@@ -1412,192 +1350,27 @@ test("删除唯一主域名明确关闭公网入口", async ({ page }) => {
   await expect(page.getByText("还没有公网域名", { exact: true })).toBeVisible();
 });
 
-test("网关能力按地址族展示并禁用不可转发网段", async ({ page }) => {
-  await installApiMocks(page, { initialized: true, authenticated: true });
-  await page.goto("/#/network/devices");
-  await expect(page.locator(".device-row").filter({ hasText: "家庭网关" })).toContainText("共享网络 IPv4 可用");
-  await expect(page.locator(".device-row").filter({ hasText: "办公室网关" })).toContainText("共享网络 IPv4/IPv6 可用");
-  await expect(page.locator(".device-row").filter({ hasText: "IPv6 网关" })).toContainText("共享网络 IPv6 可用");
-
-  await page.goto("/#/network/private");
-  await openAdvancedSiteLink(page);
-  const sitesTab = page.getByRole("tab", { name: "站点与网段" });
-  if ((page.viewportSize()?.width ?? 1440) > 900) await sitesTab.click();
-  await page.getByRole("button", { name: "展开家庭" }).click();
-  const home = page.locator(".network-site").filter({ has: page.locator(".network-site-identity").getByText("家庭", { exact: true }) });
-  await home.getByRole("button", { name: "添加共享网络" }).click();
-  let dialog = page.getByRole("dialog", { name: "添加共享网络" });
-  await dialog.getByLabel("网关设备").selectOption("device-home");
-  const networkSelect = dialog.getByLabel("本地网络");
-  await expect(networkSelect.locator("option")).toHaveText([
-    "选择已探测网段",
-    "192.168.1.0/24 · eth0",
-    "10.0.0.0/24 · eth0",
-    "2001:db8:1::/64 · eth1 · 需开启 IPv6 转发",
-  ]);
-  await expect(networkSelect.locator("option").nth(3)).toHaveAttribute("disabled", "");
-  await networkSelect.focus();
-  await page.keyboard.press("ArrowDown");
-  await expect(networkSelect).toHaveValue("eth0|192.168.1.0/24");
-  await dialog.getByRole("button", { name: "取消" }).click();
-
-  await home.getByRole("button", { name: "添加共享网络" }).click();
-  dialog = page.getByRole("dialog", { name: "添加共享网络" });
-  await dialog.getByRole("radio", { name: "手动填写" }).click();
-  await dialog.getByLabel("显示名称", { exact: true }).fill("访客手动网段");
-  await dialog.getByLabel("网关设备").selectOption("device-home");
-  const manualCidr = dialog.getByLabel("共享 CIDR");
-  await manualCidr.fill("192.168.50.1/33");
-  await manualCidr.blur();
-  await expect(dialog.locator(".field-error")).toHaveText("不能使用默认路由或无效前缀长度");
-  await expect(dialog.getByLabel("显示名称", { exact: true })).toHaveValue("访客手动网段");
-  await manualCidr.fill("192.168.50.9/24");
-  await manualCidr.blur();
-  await dialog.getByRole("button", { name: "创建共享网络" }).click();
-  await expect(dialog).toBeHidden();
-  await expect(home.getByText("访客手动网段", { exact: true })).toBeVisible();
-  await expectNoHorizontalOverflow(page);
+test("子网编辑分别校验 IPv4 与 IPv6 并保留未保存选择", async ({page}) => {
+  await installApiMocks(page,{initialized:true,authenticated:true});
+  await page.goto('/#/network/devices');
+  await page.getByRole('button',{name:'家庭网关',exact:true}).click();
+  await page.getByRole('button',{name:'编辑子网'}).click();
+  await expect(page.getByRole('checkbox',{name:/2001:db8:1::/})).toBeDisabled();
+  const selected=page.getByRole('checkbox',{name:/10\.0\.0\.0\/24/});
+  await selected.check();
+  await page.waitForResponse(r=>r.url().endsWith('/api/v1/devices'));
+  await expect(selected).toBeChecked();
+  page.once('dialog',d=>void d.dismiss());
+  await page.keyboard.press('Escape');
+  await expect(selected).toBeChecked();
+  page.once('dialog',d=>void d.accept());
+  await page.getByRole('button',{name:'取消',exact:true}).click();
+  await expect(page.getByRole('button',{name:'编辑子网'})).toBeVisible();
 });
 
-test("网络互联按站点展开、锁定来源并同步呈现双端关系", async ({ page }) => {
-  await installApiMocks(page, { initialized: true, authenticated: true, failFirstNetworkCreate: true, failFirstLinkCreate: true });
-  await page.goto("/#/network/private");
-  await openAdvancedSiteLink(page);
-  const sitesTab = page.getByRole("tab", { name: "站点与网段" });
-  if ((page.viewportSize()?.width ?? 1440) > 900) await sitesTab.click();
-  await expect(page.locator(".network-site-details")).toHaveCount(0);
-  await page.getByRole("button", { name: "展开家庭" }).click();
-  await page.getByRole("button", { name: "展开办公室" }).click();
-  const home = page.locator(".network-site").filter({ has: page.locator(".network-site-identity").getByText("家庭", { exact: true }) });
-  const office = page.locator(".network-site").filter({ has: page.locator(".network-site-identity").getByText("办公室", { exact: true }) });
-  await expect(page.locator(".network-site-details")).toHaveCount(2);
-  await expect(home.locator(".site-link-card")).toHaveCount(1);
-  await expect(office.locator(".site-link-card")).toHaveCount(1);
-  await expect(home.locator(".route-guide")).toContainText("10.20.0.0/24");
-  await expect(home.locator(".route-guide")).not.toContainText("192.168.1.0/24");
-
-  const homeNetwork = home.locator(".network-row").filter({ hasText: "家庭局域网" });
-  page.once("dialog", (confirmation) => confirmation.accept());
-  await homeNetwork.getByRole("button", { name: "停止共享本地网络" }).click();
-  await expect(homeNetwork.getByRole("button", { name: "重新共享本地网络" })).toBeVisible();
-  await homeNetwork.getByRole("button", { name: "重新共享本地网络" }).click();
-  await expect(homeNetwork.getByRole("button", { name: "停止共享本地网络" })).toBeVisible();
-
-  page.once("dialog", (confirmation) => confirmation.accept());
-  await home.locator(".site-link-card").first().getByRole("button", { name: "关闭站点互联" }).click();
-  await expect(home.getByRole("button", { name: "重新启用站点互联" })).toBeVisible();
-  await home.getByRole("button", { name: "重新启用站点互联" }).click();
-  await expect(office.getByRole("button", { name: "关闭站点互联" })).toBeVisible();
-
-  const networkTrigger = home.getByRole("button", { name: "添加共享网络" });
-  await networkTrigger.click();
-  let dialog = page.getByRole("dialog", { name: "添加共享网络" });
-  await expect(dialog.getByLabel("来源站点")).toBeDisabled();
-  await expect(dialog.getByLabel("来源站点")).toHaveValue("site-home");
-  await dialog.getByRole("button", { name: "取消" }).click();
-  await expect(networkTrigger).toBeFocused();
-  await networkTrigger.click();
-  dialog = page.getByRole("dialog", { name: "添加共享网络" });
-  await dialog.getByLabel("显示名称", { exact: true }).fill("访客网络");
-  await dialog.getByLabel("网关设备").selectOption("device-home");
-  await dialog.getByLabel("本地网络").selectOption("eth0|192.168.1.0/24");
-  await dialog.getByRole("button", { name: "创建共享网络" }).click();
-  await expect(dialog.getByRole("alert")).toHaveText("模拟共享网络创建失败");
-  await expect(dialog.getByLabel("显示名称", { exact: true })).toHaveValue("访客网络");
-  await dialog.getByRole("button", { name: "创建共享网络" }).click();
-  await expect(dialog).toBeHidden();
-  await expect(home.getByText("访客网络", { exact: true })).toBeVisible();
-  await expect(page.getByRole("button", { name: "收起家庭" })).toBeVisible();
-
-  const linkTrigger = home.getByRole("button", { name: "连接站点" });
-  await linkTrigger.click();
-  dialog = page.getByRole("dialog", { name: "连接站点" });
-  await expect(dialog.getByLabel("来源站点")).toBeDisabled();
-  await expect(dialog.getByLabel("来源站点")).toHaveValue("site-home");
-  await expect(dialog.getByLabel("目标站点").locator("option")).toHaveText(["选择站点", "办公室"]);
-  await dialog.getByRole("button", { name: "取消" }).click();
-  await expect(linkTrigger).toBeFocused();
-  await linkTrigger.click();
-  dialog = page.getByRole("dialog", { name: "连接站点" });
-  await dialog.getByLabel("目标站点").selectOption("site-office");
-  await dialog.getByLabel("左侧 Site Gateway").selectOption("device-home");
-  await dialog.getByLabel("右侧 Site Gateway").selectOption("device-office");
-  await dialog.getByRole("button", { name: "下一步" }).click();
-  await dialog.locator(".network-checklist").nth(0).getByRole("checkbox").first().check();
-  await dialog.locator(".network-checklist").nth(1).getByRole("checkbox").first().check();
-  await dialog.getByRole("button", { name: "下一步" }).click();
-  await dialog.getByRole("button", { name: "建立站点互联" }).click();
-  await expect(dialog.getByRole("alert")).toHaveText("模拟站点互联创建失败");
-  await expect(dialog.getByLabel("左侧 IPv4 下一跳")).toHaveValue("192.168.1.1");
-  await expect(dialog.getByLabel("右侧 IPv4 下一跳")).toHaveValue("10.20.0.1");
-  await dialog.getByRole("button", { name: "建立站点互联" }).click();
-  await expect(dialog).toBeHidden();
-  await expect(home.locator(".site-link-card")).toHaveCount(2);
-  await expect(office.locator(".site-link-card")).toHaveCount(2);
-
-  await home.getByRole("button", { name: "确认路由已配置" }).first().click();
-  await expect(home.getByRole("button", { name: "确认路由已配置" })).toHaveCount(1);
-  await expect(office.getByRole("button", { name: "确认路由已配置" })).toHaveCount(2);
-  await home.getByRole("button", { name: "重新检测", exact: true }).first().click();
-
-  await page.getByRole("button", { name: "展开仓库" }).click();
-  const warehouse = page.locator(".network-site").filter({ has: page.locator(".network-site-identity").getByText("仓库", { exact: true }) });
-  await expect(warehouse.getByRole("button", { name: "添加共享网络" })).toBeDisabled();
-  await expect(warehouse.getByRole("button", { name: "连接站点" })).toBeDisabled();
-  await expect(warehouse).toContainText("需要本站有一台共享网络能力就绪");
-  await expect(warehouse).toContainText("请先为本站添加并启用一个共享网络");
-  await expectNoHorizontalOverflow(page);
-});
-
-test("桌面拓扑支持键盘节点、连线和逐阶段详情", async ({ page }) => {
-  test.skip((page.viewportSize()?.width ?? 1440) <= 900, "拓扑只在桌面端呈现");
-  await installApiMocks(page, { initialized: true, authenticated: true });
-  await page.goto("/#/network/private");
-  await openAdvancedSiteLink(page);
-  const topology = page.locator(".network-topology");
-  await expect(topology).toBeVisible();
-  const node = page.getByRole("button", { name: "查看站点家庭" });
-  await node.focus();
-  await page.keyboard.press("Enter");
-  await expect(page.getByRole("tab", { name: "站点与网段" })).toHaveAttribute("aria-selected", "true");
-  await page.getByRole("tab", { name: "互联拓扑" }).click();
-  const link = page.getByRole("button", { name: "查看家庭与办公室的互联" });
-  await link.focus();
-  await page.keyboard.press("Enter");
-  await expect(topology.locator(".topology-detail")).toContainText("设备已发布");
-  await expect(topology.locator(".topology-detail")).toContainText("路由服务中");
-  await expectNoHorizontalOverflow(page);
-});
-
-test("移动端关系列表通过底部面板展示互联状态", async ({ page }) => {
-  test.skip((page.viewportSize()?.width ?? 1440) > 900, "仅验证移动端关系列表");
-  await installApiMocks(page, { initialized: true, authenticated: true });
-  await page.goto("/#/network/private");
-  await openAdvancedSiteLink(page);
-  await expect(page.locator(".network-topology")).toBeHidden();
-  const home = page.locator(".network-site").filter({ has: page.locator(".network-site-identity").getByText("家庭", { exact: true }) });
-  await home.getByRole("button", { name: "展开家庭" }).click();
-  await home.locator(".site-link-card").getByRole("button", { name: "查看详情" }).click();
-  const detail = page.locator(".mobile-site-link-detail");
-  await expect(detail).toBeVisible();
-  await expect(detail).toContainText("设备已发布");
-  await expect(detail).toContainText("对端已接受");
-  await detail.getByRole("button", { name: "关闭互联详情" }).click();
-  await expect(detail).toBeHidden();
-  await expectNoHorizontalOverflow(page);
-});
-
-test("站点保持页内创建，设置支持会话撤销与改密重登", async ({ page }) => {
-  await installApiMocks(page, { initialized: true, authenticated: true });
-  await page.goto("/#/network/private");
-  await openAdvancedSiteLink(page);
-  await page.getByRole("button", { name: "新建站点" }).click();
-  await page.getByLabel("站点名称").fill("门店");
-  await page.getByRole("button", { name: "创建站点" }).click();
-  const sitesTab = page.getByRole("tab", { name: "站点与网段" });
-  if ((page.viewportSize()?.width ?? 1440) > 900) await sitesTab.click();
-  await expect(page.locator(".network-site-identity strong").filter({ hasText: "门店" }).first()).toBeVisible();
-  await navigatePrimary(page, "设置");
+test("设置支持会话撤销与改密重登", async ({page}) => {
+  await installApiMocks(page,{initialized:true,authenticated:true});
+  await page.goto('/#/settings');
   await expect(page.getByRole("button", { name: "当前会话" })).toBeDisabled();
   await page.getByRole("button", { name: "撤销会话", exact: true }).click();
   await expect(page.getByText("公网 HTTPS 会话", { exact: false })).toHaveCount(0);
@@ -1612,123 +1385,19 @@ test("站点保持页内创建，设置支持会话撤销与改密重登", async
 test("取消删除确认时保留设备", async ({ page }) => {
   await installApiMocks(page, { initialized: true, authenticated: true });
   await page.goto("/#/network/devices");
-  const row = page.locator(".device-row").filter({ hasText: "家庭网关" });
-  await row.getByRole("button", { name: "删除设备家庭网关" }).click();
+  const row = page.locator(".unified-device-row").filter({hasText:"家庭网关"});
+  await row.getByRole('button',{name:'家庭网关'}).click();
+  await page.getByText('设备信息与更多操作',{exact:true}).click();
+  await page.getByRole('button',{name:'删除设备',exact:true}).click();
   const dialog = page.getByRole("alertdialog", { name: "删除设备" });
   await expect(dialog).toContainText("公网服务将保留为未分配并关闭");
   await dialog.getByRole("button", { name: "取消" }).click();
   await expect(row).toBeVisible();
 });
 
-test("按互联关系到站点的固定顺序完成安全删除", async ({ page }, testInfo) => {
-  test.skip(testInfo.project.name !== "desktop-dark", "等待删除轮询流程只需在一个浏览器项目中验证");
-  await installApiMocks(page, { initialized: true, authenticated: true });
-  page.on("dialog", (dialog) => void dialog.accept());
-  await page.goto("/#/network/private");
-  await openAdvancedSiteLink(page);
-  await page.getByRole("tab", { name: "站点与网段" }).click();
-  const home = page.locator(".network-site").filter({ has: page.locator(".network-site-identity").getByText("家庭", { exact: true }) });
-  await home.getByRole("button", { name: "展开家庭" }).click();
 
-  await home.getByRole("button", { name: "删除站点家庭" }).click();
-  await expect(page.getByRole("alert")).toContainText("站点仍关联设备、共享网络或互联关系");
-  await home.getByRole("button", { name: "删除共享网络家庭局域网" }).click();
-  await expect(page.getByRole("alert")).toContainText("共享网络仍被 1 个互联关系引用");
 
-  await home.getByRole("button", { name: "删除家庭到办公室的站点互联" }).click();
-  await expect(page.getByRole("status").filter({ hasText: "已请求删除站点互联" })).toBeVisible();
-  await expect(home.getByRole("button", { name: "删除家庭到办公室的站点互联" })).toBeDisabled();
-  await expect(home.locator(".site-link-card")).toHaveCount(0, { timeout: 7_000 });
 
-  await home.getByRole("button", { name: "删除共享网络家庭局域网" }).click();
-  await expect(home.getByText("处理中", { exact: true }).first()).toBeVisible();
-  await expect(home.locator(".network-row")).toHaveCount(0, { timeout: 7_000 });
-
-  await navigatePrimary(page, "公网服务");
-  const tunnelRow = page.locator(".tunnel-row").filter({ hasText: "媒体中心" });
-  await tunnelRow.getByRole("button", { name: "删除公网服务媒体中心" }).click();
-  await page.getByRole("alertdialog", { name: "删除公网服务" }).getByRole("button", { name: "永久删除" }).click();
-  await expect(tunnelRow).toHaveCount(0);
-
-  await navigatePrimary(page, "设备");
-  const deviceRow = page.locator(".device-row").filter({ hasText: "家庭网关" });
-  await deviceRow.getByRole("button", { name: "删除设备家庭网关" }).click();
-  await page.getByRole("alertdialog", { name: "删除设备" }).getByRole("button", { name: "永久删除" }).click();
-  await expect(deviceRow).toHaveCount(0);
-  await expect(page.getByRole("status").filter({ hasText: "设备已删除" })).toBeVisible();
-  const ipv6DeviceRow = page.locator(".device-row").filter({ hasText: "IPv6 网关" });
-  await ipv6DeviceRow.getByRole("button", { name: "删除设备IPv6 网关" }).click();
-  await page.getByRole("alertdialog", { name: "删除设备" }).getByRole("button", { name: "永久删除" }).click();
-  await expect(ipv6DeviceRow).toHaveCount(0);
-
-  await navigatePrimary(page, "私网访问");
-  await openAdvancedSiteLink(page);
-  await page.getByRole("tab", { name: "站点与网段" }).click();
-  const emptyHome = page.locator(".network-site").filter({ has: page.locator(".network-site-identity").getByText("家庭", { exact: true }) });
-  await emptyHome.getByRole("button", { name: "删除站点家庭" }).click();
-  await expect(emptyHome).toHaveCount(0);
-  await expect(page.getByRole("status").filter({ hasText: "站点已删除" })).toBeVisible();
-});
-
-test("站点图标居中且删除与展开按钮保持稳定点击区", async ({ browser }, testInfo) => {
-  test.skip(testInfo.project.name !== "desktop-dark", "视口与主题矩阵只需在一个浏览器项目中验证");
-  const cases = [
-    { viewport: { width: 1440, height: 900 }, isMobile: false },
-    { viewport: { width: 375, height: 812 }, isMobile: true },
-    { viewport: { width: 812, height: 375 }, isMobile: true },
-  ];
-
-  for (const colorScheme of ["light", "dark"] as const) {
-    for (const current of cases) {
-      const context = await browser.newContext({
-        viewport: current.viewport,
-        colorScheme,
-        isMobile: current.isMobile,
-        hasTouch: current.isMobile,
-      });
-      const page = await context.newPage();
-      try {
-        await installApiMocks(page, { initialized: true, authenticated: true });
-        await page.goto("http://127.0.0.1:4173/#/network/private");
-        await openAdvancedSiteLink(page);
-        if (!current.isMobile) await page.getByRole("tab", { name: "站点与网段" }).click();
-        const home = page.locator(".network-site").filter({ has: page.locator(".network-site-identity").getByText("家庭", { exact: true }) });
-        const icon = home.locator(".site-icon");
-        const alignment = await icon.evaluate((container) => {
-          const svg = container.querySelector("svg")!;
-          const outer = container.getBoundingClientRect();
-          const inner = svg.getBoundingClientRect();
-          return {
-            display: getComputedStyle(container).display,
-            x: Math.abs((outer.left + outer.width / 2) - (inner.left + inner.width / 2)),
-            y: Math.abs((outer.top + outer.height / 2) - (inner.top + inner.height / 2)),
-          };
-        });
-        expect(alignment.display).toBe("grid");
-        expect(alignment.x).toBeLessThanOrEqual(1);
-        expect(alignment.y).toBeLessThanOrEqual(1);
-
-        for (const button of [
-          home.getByRole("button", { name: "删除站点家庭" }),
-          home.getByRole("button", { name: "展开家庭" }),
-        ]) {
-          const box = await button.boundingBox();
-          expect(Math.abs((box?.width ?? 0) - 44)).toBeLessThanOrEqual(0.01);
-          expect(Math.abs((box?.height ?? 0) - 44)).toBeLessThanOrEqual(0.01);
-        }
-        const deleteButton = home.getByRole("button", { name: "删除站点家庭" });
-        await deleteButton.focus();
-        await expect(deleteButton).toBeFocused();
-        page.once("dialog", (dialog) => void dialog.dismiss());
-        await deleteButton.press("Enter");
-        await expect(home).toBeVisible();
-        await expectNoHorizontalOverflow(page);
-      } finally {
-        await context.close();
-      }
-    }
-  }
-});
 
 test("Manifest、PWA 图标与 Service Worker 缓存边界正确", async ({ browser }, testInfo) => {
   test.skip(testInfo.project.name !== "desktop-dark", "PWA 产物和缓存边界只需验证一次");
@@ -1941,14 +1610,7 @@ test("移动抽屉、横竖屏弹窗重排与长地址均无横向溢出", async
   await drawer.getByRole("link", { name: "公网服务" }).click();
   await page.getByRole("button", { name: "添加服务" }).click();
   const dialog = page.getByRole("dialog", { name: "添加服务" });
-  await dialog.getByLabel("本地地址").fill("very-long-internal-service-name.with-many-segments.example.local");
-  const labelBox = await dialog.getByText("本地服务", { exact: true }).boundingBox();
-  const protocolBox = await dialog.getByLabel("本地服务协议").boundingBox();
-  const inputBox = await dialog.getByLabel("本地地址").boundingBox();
-  expect(inputBox!.y).toBeGreaterThan(labelBox!.y);
-  expect(protocolBox!.x + protocolBox!.width).toBeLessThanOrEqual(inputBox!.x);
-  const footerBox = await dialog.locator(".form-footer").boundingBox();
-  expect(footerBox!.y + footerBox!.height).toBeLessThanOrEqual(page.viewportSize()!.height + 1);
+  await dialog.getByLabel("本地服务地址").fill("http://very-long-internal-service-name.with-many-segments.example.local:8800");
   await expectNoHorizontalOverflow(page);
 });
 

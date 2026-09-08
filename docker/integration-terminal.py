@@ -1,14 +1,12 @@
 #!/usr/bin/env python3
-"""Site-to-Site 验收用的普通 LAN 终端；不依赖 Nexo/Tailscale。"""
+"""普通子网验收用的 LAN 服务；不安装客户端、不配置静态回程路由。"""
 
 import argparse
 import base64
 import hashlib
 import http.server
-import ipaddress
 import socket
 import ssl
-import subprocess
 import threading
 
 
@@ -131,18 +129,7 @@ def serve(address: str, port: int, tls: bool):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--address", required=True)
-    parser.add_argument("--remote-prefix", required=True)
-    parser.add_argument("--next-hop", required=True)
     args = parser.parse_args()
-    ipaddress.ip_network(args.remote_prefix)
-    subprocess.run(
-        ["ip", "route", "replace", args.remote_prefix, "via", args.next_hop],
-        check=True,
-    )
-    print(
-        f"static route installed destination={args.remote_prefix} next_hop={args.next_hop}",
-        flush=True,
-    )
     threading.Thread(target=serve, args=(args.address, 8800, False), daemon=True).start()
     serve(args.address, 8843, True)
 

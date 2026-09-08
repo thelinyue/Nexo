@@ -49,7 +49,7 @@ jobs:
         run: npm run test:e2e
       - name: Shell 语法检查
         run: |
-          bash -n docker/site-to-site-smoke.sh
+          bash -n docker/network-smoke.sh
           bash -n docker/cloudflare-acme-smoke.sh
       - name: 工作区差异检查
         run: git diff --check
