@@ -182,6 +182,19 @@ fn tailscale_socket_arg(socket: &std::path::Path) -> String {
     format!("--socket={}", socket.display())
 }
 
+/// 生成 tailscaled 的持久化参数。`--state` 保持旧文件路径不变，`--statedir`
+/// 让 Tailscale 也能在 Agent 数据卷中保存 Tailnet Lock 等附属状态。
+fn tailscaled_command_args(state_dir: &std::path::Path, socket: &std::path::Path) -> Vec<String> {
+    vec![
+        "--state".to_owned(),
+        state_dir.join("tailscaled.state").display().to_string(),
+        "--statedir".to_owned(),
+        state_dir.display().to_string(),
+        "--socket".to_owned(),
+        socket.display().to_string(),
+    ]
+}
+
 /// Agent 内置的 tailscaled 子进程管理器。
 ///
 /// Tailscale Linux 二进制仍作为镜像中的独立文件提供，不编译进 Nexo Agent；
@@ -212,14 +225,8 @@ impl TailscaleDaemon {
             )
         })?;
         let socket = config.state_dir.join("tailscaled.sock");
-        let state = config.state_dir.join("tailscaled.state");
         let child = TokioCommand::new(&config.tailscaled_bin)
-            .args([
-                "--state",
-                state.to_string_lossy().as_ref(),
-                "--socket",
-                socket.to_string_lossy().as_ref(),
-            ])
+            .args(tailscaled_command_args(&config.state_dir, &socket))
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::inherit())
             .stderr(std::process::Stdio::inherit())
@@ -2745,6 +2752,24 @@ mod tests {
         assert_eq!(
             tailscale_socket_arg(std::path::Path::new("/data/nexo-agent/tailscaled.sock")),
             "--socket=/data/nexo-agent/tailscaled.sock"
+        );
+    }
+
+    #[test]
+    fn tailscaled_keeps_state_file_and_sets_persistent_state_directory() {
+        let state_dir = std::path::Path::new("/data/nexo-agent");
+        let socket = state_dir.join("tailscaled.sock");
+        let args = tailscaled_command_args(state_dir, &socket);
+        assert_eq!(
+            args,
+            vec![
+                "--state".to_owned(),
+                state_dir.join("tailscaled.state").display().to_string(),
+                "--statedir".to_owned(),
+                state_dir.display().to_string(),
+                "--socket".to_owned(),
+                socket.display().to_string(),
+            ]
         );
     }
 

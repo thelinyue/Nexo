@@ -196,6 +196,14 @@ headscale_node_ids() {
 
 headscale_node_count() { headscale_node_ids | jq 'length'; }
 
+assert_no_tailnet_lock_state_warning() {
+  if dc logs --no-color home-gateway office-gateway 2>&1 \
+    | grep -F 'no state directory for tailnet-lock' >/dev/null; then
+    echo "Agent 仍报告 Tailnet Lock 状态目录缺失" >&2
+    return 1
+  fi
+}
+
 headscale_pid() {
   dc exec -T nexo-server sh -c '
     for comm in /proc/[0-9]*/comm; do
@@ -592,6 +600,7 @@ wait_for "办公室 Agent 重启后在线" \
 wait_for "Agent 重启后无重复设备" \
   "api '$HTTP_URL/api/v1/devices' | jq -e '[.[] | select(.name == \"家庭网关\" or .name == \"办公网关\")] | length == 2'" 120
 wait_for "Agent 重启后无重复 Mesh Node" "test \"\$(headscale_node_count)\" -eq 2" 120
+wait_for "Agent 重启后无 Tailnet Lock 状态目录告警" "assert_no_tailnet_lock_state_warning" 30
 [[ "$nodes_before" == "$(headscale_node_ids)" ]]
 
 post_json "$HTTP_URL/api/v1/site-links/$link/enable" '{}' >/dev/null

@@ -120,6 +120,7 @@ struct JwksResponse {
 #[derive(Debug, Serialize)]
 struct JsonWebKey {
     kty: &'static str,
+    #[serde(rename = "use")]
     use_: &'static str,
     alg: &'static str,
     kid: String,
@@ -803,4 +804,24 @@ fn no_store(mut response: Response) -> Response {
         .headers_mut()
         .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
     response
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn jwks_serializes_standard_use_property() {
+        let value = serde_json::to_value(JsonWebKey {
+            kty: "RSA",
+            use_: "sig",
+            alg: "RS256",
+            kid: "test-key".to_owned(),
+            n: "modulus".to_owned(),
+            e: "AQAB".to_owned(),
+        })
+        .expect("JWKS 公钥应能序列化");
+        assert_eq!(value["use"], "sig");
+        assert!(value.get("use_").is_none());
+    }
 }

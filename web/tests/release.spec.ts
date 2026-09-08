@@ -1,4 +1,84 @@
 import { expect, test, type Page, type Route } from "@playwright/test";
+import { createServer, type AddressInfo } from "node:http";
+import { existsSync, readFileSync } from "node:fs";
+import { join, resolve } from "node:path";
+
+async function startPwaUpgradeServer() {
+  type Mode = "legacy" | "current";
+  let mode: Mode = "legacy";
+  const distDir = resolve(process.cwd(), "dist");
+  const currentServiceWorker = readFileSync(join(distDir, "sw.js"), "utf8");
+  const legacyServiceWorker = `
+const CACHE = "nexo-legacy-shell";
+self.addEventListener("install", (event) => {
+  event.waitUntil(caches.open(CACHE).then((cache) => cache.add("/")));
+});
+self.addEventListener("activate", (event) => event.waitUntil(self.clients.claim()));
+self.addEventListener("fetch", (event) => {
+  if (event.request.mode === "navigate") {
+    event.respondWith(caches.match("/").then((response) => response || fetch(event.request)));
+  }
+});
+`;
+  const legacyHtml = `<!doctype html><html><body><main id="legacy">legacy shell</main><script>
+navigator.serviceWorker.register("/sw.js").then((registration) => registration.update());
+</script></body></html>`;
+  const currentOidcHtml = "<!doctype html><html><body><main id=\"oidc-reached\">OIDC server reached</main></body></html>";
+  const server = createServer((request, response) => {
+    const requestUrl = new URL(request.url ?? "/", "http://127.0.0.1");
+    const pathname = requestUrl.pathname;
+    if (pathname === "/sw.js") {
+      response.writeHead(200, { "content-type": "application/javascript", "cache-control": "no-store" });
+      response.end(mode === "legacy" ? legacyServiceWorker : currentServiceWorker);
+      return;
+    }
+    if (mode === "legacy") {
+      response.writeHead(200, { "content-type": "text/html" });
+      response.end(legacyHtml);
+      return;
+    }
+    if (pathname === "/api/v1/auth/status") {
+      response.writeHead(200, { "content-type": "application/json", "cache-control": "no-store" });
+      response.end(JSON.stringify({
+        initialized: true,
+        authenticated: true,
+        user_id: "fixture-user",
+        username: "fixture",
+        role: "system_admin",
+        workspace_id: "default",
+        channel: "public_https",
+        csrf_token: "fixture-csrf",
+        local_http_warning: false,
+      }));
+      return;
+    }
+    if (pathname === "/oidc/authorize") {
+      response.writeHead(200, { "content-type": "text/html" });
+      response.end(currentOidcHtml);
+      return;
+    }
+    const filePath = pathname === "/" ? join(distDir, "index.html") : join(distDir, pathname.slice(1));
+    if (existsSync(filePath)) {
+      const contentType = pathname.endsWith(".js") ? "application/javascript"
+        : pathname.endsWith(".css") ? "text/css"
+          : pathname.endsWith(".json") ? "application/json"
+            : pathname.endsWith(".png") ? "image/png"
+              : "text/html";
+      response.writeHead(200, { "content-type": contentType });
+      response.end(readFileSync(filePath));
+      return;
+    }
+    response.writeHead(404);
+    response.end("not found");
+  });
+  await new Promise<void>((resolveServer) => server.listen(0, "127.0.0.1", resolveServer));
+  const address = server.address() as AddressInfo;
+  return {
+    url: `http://127.0.0.1:${address.port}`,
+    setMode: (nextMode: Mode) => { mode = nextMode; },
+    close: () => new Promise<void>((resolveServer, reject) => server.close((error) => error ? reject(error) : resolveServer())),
+  };
+}
 
 type MockOptions = {
   initialized: boolean;
@@ -822,7 +902,7 @@ test("添加设备生成最小 Compose 配置", async ({ page, context }) => {
   await page.getByLabel("设备名称").fill("家庭 NAS");
   await page.getByRole("button", { name: "生成设备配置" }).click();
   const compose = await page.getByLabel("Docker Compose 配置").inputValue();
-  expect(compose).toContain("ghcr.io/thelinyue/nexo-agent:0.1.12");
+  expect(compose).toContain("ghcr.io/thelinyue/nexo-agent:0.1.14");
   expect(compose).toContain("TZ: ${TZ:-Asia/Shanghai}");
   expect(compose.match(/NEXO_[A-Z_]+:/g)).toEqual(["NEXO_SERVER_URL:", "NEXO_ENROLLMENT_TOKEN:"]);
   await page.getByRole("button", { name: "复制 Compose 配置" }).click();
@@ -1622,7 +1702,7 @@ test("Manifest、PWA 图标与 Service Worker 缓存边界正确", async ({ brow
     return { active: registration.active?.state, script, cachedUrls };
   });
   expect(serviceWorker.active).toBe("activated");
-  expect(serviceWorker.script).toContain("NetworkOnly");
+  expect(serviceWorker.script).toContain("/api/");
   expect(serviceWorker.cachedUrls.some((url: string) => new URL(url).pathname.startsWith("/api/"))).toBeFalsy();
 
   try {
@@ -1632,6 +1712,60 @@ test("Manifest、PWA 图标与 Service Worker 缓存边界正确", async ({ brow
     await controlledPage.close();
   } finally {
     await context.close();
+  }
+});
+
+test("旧版 Worker 遇到 OIDC Ticket 会自动恢复登录路由", async ({ browser }, testInfo) => {
+  test.skip(testInfo.project.name !== "desktop-dark", "Worker 生命周期只需在一个浏览器项目中验证");
+  const server = await startPwaUpgradeServer();
+  const context = await browser.newContext({ serviceWorkers: "allow" });
+  const page = await context.newPage();
+  try {
+    await page.goto(`${server.url}/?oidc_ticket=upgrade-ticket`);
+    await expect(page.locator("#legacy")).toBeVisible();
+    await expect.poll(() => page.evaluate(() => navigator.serviceWorker.controller?.scriptURL ?? ""))
+      .toContain("/sw.js");
+
+    server.setMode("current");
+    await page.evaluate(async () => {
+      const registration = await navigator.serviceWorker.ready;
+      await registration.update();
+    });
+
+    await expect(page.locator("#oidc-reached")).toBeVisible({ timeout: 15_000 });
+    expect(new URL(page.url()).pathname).toBe("/oidc/authorize");
+    expect(new URL(page.url()).searchParams.get("nexo_login_ticket")).toBe("upgrade-ticket");
+  } finally {
+    await context.close();
+    await server.close();
+  }
+});
+
+test("普通控制台更新保持 waiting，不强制刷新", async ({ browser }, testInfo) => {
+  test.skip(testInfo.project.name !== "desktop-dark", "Worker 生命周期只需在一个浏览器项目中验证");
+  const server = await startPwaUpgradeServer();
+  const context = await browser.newContext({ serviceWorkers: "allow" });
+  const page = await context.newPage();
+  try {
+    await page.goto(`${server.url}/`);
+    await expect(page.locator("#legacy")).toBeVisible();
+    const before = await page.evaluate(() => navigator.serviceWorker.controller?.scriptURL ?? "");
+    expect(before).toContain("/sw.js");
+
+    server.setMode("current");
+    await page.evaluate(async () => {
+      const registration = await navigator.serviceWorker.ready;
+      await registration.update();
+    });
+    await expect.poll(() => page.evaluate(async () => {
+      const registration = await navigator.serviceWorker.ready;
+      return registration.waiting?.state ?? "none";
+    }), { timeout: 15_000 }).toBe("installed");
+    expect(await page.locator("#legacy").isVisible()).toBeTruthy();
+    expect(await page.evaluate(() => navigator.serviceWorker.controller?.scriptURL ?? "")).toBe(before);
+  } finally {
+    await context.close();
+    await server.close();
   }
 });
 

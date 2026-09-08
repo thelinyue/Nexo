@@ -672,20 +672,7 @@ function Dashboard({
           read<AccessWorkspace[]>("/api/v1/access-control/workspaces", "暂时无法读取可授权工作空间"),
         ]);
         setDevices(nextDevices); setSiteNetworks(nextNetworks); setAccessRules(nextRules); setAccessWorkspaces(nextWorkspaces);
-        const previewResponse = await request("/api/v1/access-control/policy/preview", {
-          method: "POST",
-          headers: { "content-type": "application/json" },
-          body: JSON.stringify({
-            name: "当前策略",
-            target_type: "file_share",
-            target_id: "preview",
-            protocols: ["tcp"],
-            ports: ["22"],
-            ssh_enabled: false,
-            enabled: true,
-            grantee_workspace_ids: [],
-          }),
-        });
+        const previewResponse = await request("/api/v1/access-control/policy/preview");
         const previewBody: unknown = await previewResponse.json().catch(() => null);
         if (previewResponse.ok) setAccessPolicyPreview(previewBody as AccessPolicyPreview);
       } else if (page === "domains") {
@@ -3251,7 +3238,11 @@ function DeviceRow({ device, sites, deleting, onEdit, onDelete }: { device: Devi
   const siteReady = device.gateway_report?.site_gateway === "ready";
   const familyAvailability = device.gateway_report ? gatewayFamilyAvailability(device.gateway_report) : null;
   const siteName = device.site_id ? sites.find((site) => site.id === device.site_id)?.name ?? "未知站点" : "未分配站点";
-  const tailscaleAddresses = [device.tailscale_ipv4, device.tailscale_ipv6].filter((address): address is string => Boolean(address));
+  const tailscaleAddresses = Array.from(new Set([
+    device.tailscale_ipv4,
+    device.tailscale_ipv6,
+    device.mesh_address,
+  ].filter((address): address is string => Boolean(address))));
   const connectionLabel = device.connection_type === "tailscale_client" ? "官方 Tailscale" : "Nexo Agent";
   const registrationLabel = device.registration_method === "auth_key" ? "Auth Key" : device.registration_method === "oidc" ? "OIDC" : device.registration_method === "browser" ? "浏览器授权" : null;
   return (
@@ -3267,7 +3258,6 @@ function DeviceRow({ device, sites, deleting, onEdit, onDelete }: { device: Devi
         {device.owner_username && <span className="capability">所有者：{device.owner_username}</span>}
         {registrationLabel && <span className="capability">注册：{registrationLabel}</span>}
         <span className={`capability ${device.mesh_status === "connected" ? "ready" : ""}`}>网络互联：{meshStatusLabel(device.mesh_status)}</span>
-        {device.mesh_address && <span className="capability">{device.mesh_address}</span>}
         {tailscaleAddresses.map((address) => <span className="capability" key={address}>{address}</span>)}
         {device.tags?.length ? <span className="capability">标签：{device.tags.join("、")}</span> : null}
         {device.expires_at && <span className="capability">有效期至 {formatSessionTime(device.expires_at)}</span>}
@@ -3816,7 +3806,7 @@ function CreateSiteLinkForm({
   );
 }
 
-const RELEASE_AGENT_IMAGE = "ghcr.io/thelinyue/nexo-agent:0.1.12";
+const RELEASE_AGENT_IMAGE = "ghcr.io/thelinyue/nexo-agent:0.1.14";
 
 function buildAgentCompose(serverUrl: string, token: string): string {
   return `name: nexo-agent

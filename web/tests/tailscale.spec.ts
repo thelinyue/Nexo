@@ -26,6 +26,8 @@ async function installTailscaleMocks(page: Page, role: Role) {
     }]
     : [];
   let externalRequests = 0;
+  let policyPreviewGetRequests = 0;
+  let policyPreviewPostRequests = 0;
 
   await page.route("**/api/v1/**", async (route) => {
     const request = route.request();
@@ -45,7 +47,7 @@ async function installTailscaleMocks(page: Page, role: Role) {
       });
       return;
     }
-    if (path === "/api/v1/devices") { await json(route, devices); return; }
+    if (path === "/api/v1/devices") { await json(route, [{ ...devices[0], status: "online", mesh_status: "connected", tailscale_ipv4: "100.64.0.8", tailscale_ipv6: "fd7a:115c:a1e0::8" }]); return; }
     if (path === "/api/v1/sites") { await json(route, []); return; }
     if (path === "/api/v1/site-networks") { await json(route, []); return; }
     if (path === "/api/v1/enrollments") { await json(route, []); return; }
@@ -81,7 +83,13 @@ async function installTailscaleMocks(page: Page, role: Role) {
       await json(route, rule, 201);
       return;
     }
+    if (path === "/api/v1/access-control/policy/preview" && method === "GET") {
+      policyPreviewGetRequests += 1;
+      await json(route, { valid: true, grant_count: 1, ssh_rule_count: 0, affected_targets: ["100.64.0.8"], summary: "Headscale Policy 校验通过", error: null });
+      return;
+    }
     if (path === "/api/v1/access-control/policy/preview" && method === "POST") {
+      policyPreviewPostRequests += 1;
       await json(route, { valid: true, grant_count: 2, ssh_rule_count: 0, affected_targets: ["100.64.0.8"], summary: "Headscale Policy 校验通过", error: null });
       return;
     }
@@ -136,6 +144,8 @@ async function installTailscaleMocks(page: Page, role: Role) {
 
   return {
     externalRequestCount: () => externalRequests,
+    policyPreviewGetRequestCount: () => policyPreviewGetRequests,
+    policyPreviewPostRequestCount: () => policyPreviewPostRequests,
   };
 }
 
@@ -172,16 +182,28 @@ test("普通用户不读取隔离节点且不能进入实例域名设置", async
 });
 
 test("管理员访问控制页支持结构化规则和移动窄屏布局", async ({ page }) => {
-  await installTailscaleMocks(page, "system_admin");
+  const mock = await installTailscaleMocks(page, "system_admin");
   await page.goto("/#/access-control");
   await expect(page.getByRole("heading", { name: "访问控制" }).first()).toBeVisible();
   await expect(page.getByText("当前结构化策略", { exact: true })).toBeVisible();
+  await expect.poll(() => mock.policyPreviewGetRequestCount()).toBe(1);
+  expect(mock.policyPreviewPostRequestCount()).toBe(0);
 
   await page.getByLabel("规则名称").fill("协作者访问设备");
   await page.locator(".access-rule-form select").nth(1).selectOption("access-device");
   await page.getByText("协作者空间", { exact: true }).last().click();
+  await page.getByRole("button", { name: "校验影响" }).click();
+  await expect.poll(() => mock.policyPreviewPostRequestCount()).toBe(1);
   await page.getByRole("button", { name: "保存规则" }).click();
   await expect(page.getByText("协作者访问设备", { exact: true })).toBeVisible();
   await expect(page.getByText("协作者空间", { exact: true }).last()).toBeVisible();
   expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBeLessThanOrEqual(await page.evaluate(() => window.innerWidth));
+});
+
+test("设备列表对重复组网地址去重并保留双栈地址", async ({ page }) => {
+  await installTailscaleMocks(page, "system_admin");
+  await page.goto("/#/devices/list");
+  const row = page.locator(".device-row").filter({ hasText: "共享设备" });
+  await expect(row.getByText("100.64.0.8", { exact: true })).toHaveCount(1);
+  await expect(row.getByText("fd7a:115c:a1e0::8", { exact: true })).toHaveCount(1);
 });

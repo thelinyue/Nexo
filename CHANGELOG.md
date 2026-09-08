@@ -2,6 +2,15 @@
 
 本项目使用 [Semantic Versioning](https://semver.org/) 记录公开版本。
 
+## [0.1.14] - 2026-09-08
+
+### Fixed
+
+- 修复移动端 OIDC 登录被旧版 PWA 应用壳和 Service Worker 导航 fallback 截断的问题。
+- 修复访问控制页面使用虚构 `preview` 目标校验当前 Headscale Policy 的问题。
+- 修复设备列表重复显示同一个组网地址，并让 Agent 为 tailscaled 设置持久化状态目录。
+- 修正 JWKS 标准 `use` 字段，并更新 Server/Agent 发布示例。
+
 ## [0.1.13] - 2026-09-07
 
 ### Added

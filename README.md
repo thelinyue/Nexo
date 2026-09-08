@@ -3,7 +3,7 @@
 Nexo 是面向个人自托管、NAS/HomeLab 和小型网络环境的设备、异地组网与公网访问管理服务。
 它把设备、共享网络、站点互联、Web 服务和 TCP 端口集中到一个 Web 界面中，正常使用不需要编辑配置文件。
 
-## v0.1.12 快速开始
+## v0.1.14 快速开始
 
 当前版本仅支持 `linux/amd64` Docker。Server 与 Agent 使用独立镜像，
 Agent 可以安装在其他家庭、办公室或 VPS 上并加入任意 Nexo Server。
@@ -18,7 +18,7 @@ name: nexo
 
 services:
   nexo-server:
-    image: ghcr.io/thelinyue/nexo-server:0.1.12
+    image: ghcr.io/thelinyue/nexo-server:0.1.14
     container_name: nexo-server
     network_mode: host
     environment:
@@ -58,7 +58,7 @@ name: nexo-agent
 
 services:
   nexo-agent:
-    image: ghcr.io/thelinyue/nexo-agent:0.1.12
+    image: ghcr.io/thelinyue/nexo-agent:0.1.14
     container_name: nexo-agent
     network_mode: host
     cap_add:
@@ -149,7 +149,7 @@ docker compose -f docker/compose.phase2.yml exec nexo-server nexo admin recover
 ## Docker 部署
 
 正式发布使用仓库根目录的 [`compose.yml`](compose.yml) 和
-[`compose.agent.yml`](compose.agent.yml)，镜像标签固定为 `0.1.12`，不会隐式
+[`compose.agent.yml`](compose.agent.yml)，镜像标签固定为 `0.1.14`，不会隐式
 升级。开发环境的源码构建示例仍保留在 [`docker/compose.phase2.yml`](docker/compose.phase2.yml)。
 它们使用 host network，保留真实 LAN 转发所需的最小权限：Agent 只授予
 `/dev/net/tun` 和 `NET_ADMIN`，不使用 `privileged` 或 Docker Socket。
@@ -214,7 +214,7 @@ v0.1.12 将历史 0001–0019 及在线结构补丁收敛为单一初始 Baselin
 
 Nexo Web 可从支持 PWA 的桌面或移动浏览器安装，启动地址为 `/#/overview`。Service Worker 只预缓存应用壳和带版本的静态资源；`/api/` 请求始终联网，账户、设备、穿透服务和网络数据不会写入离线缓存。断网时页面会显示“无法连接 Nexo”并提供重试，新版本也只在用户确认后刷新。
 
-浏览器设备模拟用于验证响应式布局与 Service Worker 行为，不能替代真实 iOS Safari 主屏幕模式或 Android 安装后的验收。
+普通控制台发现新版本时需要用户确认刷新；带 OIDC 登录票据的页面会自动接管旧版 Service Worker，避免组网登录停留在旧应用壳。浏览器设备模拟用于验证响应式布局与 Service Worker 行为，不能替代真实 iOS Safari 主屏幕模式或 Android 安装后的验收。
 
 ## 组网
 

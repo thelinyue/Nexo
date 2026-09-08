@@ -7,6 +7,9 @@ export default defineConfig({
     react(),
     VitePWA({
       registerType: "prompt",
+      strategies: "injectManifest",
+      srcDir: "src",
+      filename: "sw.ts",
       manifest: {
         name: "Nexo 联巢",
         short_name: "Nexo",
@@ -23,16 +26,8 @@ export default defineConfig({
           { src: "/pwa-maskable-512x512.png", sizes: "512x512", type: "image/png", purpose: "maskable" },
         ],
       },
-      workbox: {
+      injectManifest: {
         globPatterns: ["**/*.{js,css,html,png,svg,ico}"],
-        navigateFallback: "index.html",
-        runtimeCaching: [
-          {
-            urlPattern: /\/api\//,
-            handler: "NetworkOnly",
-            method: "GET",
-          },
-        ],
       },
     }),
   ],

@@ -1498,7 +1498,7 @@ async fn main() -> Result<()> {
         )
         .route(
             "/api/v1/access-control/policy/preview",
-            post(preview_access_policy),
+            get(current_access_policy_preview).post(preview_access_policy),
         )
         .route(
             "/api/v1/mesh/auth-keys",
@@ -11600,6 +11600,32 @@ fn generate_policy_document(
     Ok(policy::generate_policy_with_groups(&groups, grants))
 }
 
+/// 计算当前工作空间可以展示的策略摘要；完整 Policy 仍由 Server 统一校验，
+/// 但目标地址不能把其他工作空间的数据暴露到管理页面。
+fn visible_policy_preview_stats(
+    grants: &[policy::PolicyGrant],
+    tenant_id: &str,
+) -> (usize, usize, Vec<String>) {
+    let mut affected_targets = BTreeSet::new();
+    let mut grant_count = 0;
+    let mut ssh_rule_count = 0;
+    for grant in grants
+        .iter()
+        .filter(|grant| grant.source_tenant == tenant_id || grant.target_tenant == tenant_id)
+    {
+        grant_count += 1;
+        if grant.ssh {
+            ssh_rule_count += 1;
+        }
+        affected_targets.extend(grant.destinations.iter().cloned());
+    }
+    (
+        grant_count,
+        ssh_rule_count,
+        affected_targets.into_iter().collect(),
+    )
+}
+
 /// 将结构化访问规则解析成 Headscale Grant 目标。
 ///
 /// 设备目标优先使用当前已同步的 Tailscale 地址；共享网络使用 Agent
@@ -12532,6 +12558,50 @@ async fn delete_access_rule(
     }))
 }
 
+/// 校验当前已经保存的完整策略；编辑中的候选规则由下面的 POST 接口处理。
+async fn current_access_policy_preview(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<AccessPolicyPreviewResponse>, ApiError> {
+    let tenant_id = auth::admin_tenant_id(&state, &headers)?;
+    let (document, grant_count, ssh_rule_count, affected_targets) = {
+        let connection = state
+            .db
+            .lock()
+            .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "数据库锁不可用"))?;
+        let grants = build_policy_grants(&connection).map_err(|error| {
+            ApiError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("无法生成当前访问策略：{error:#}"),
+            )
+        })?;
+        let (grant_count, ssh_rule_count, affected_targets) =
+            visible_policy_preview_stats(&grants, &tenant_id);
+        let document = generate_policy_document(&connection, &grants).map_err(|error| {
+            ApiError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("无法生成带工作空间用户组的策略：{error:#}"),
+            )
+        })?;
+        (document, grant_count, ssh_rule_count, affected_targets)
+    };
+    let check = state.headscale.check_policy(&document).await;
+    let error = check.as_ref().err().map(|error| error.to_string());
+    Ok(Json(AccessPolicyPreviewResponse {
+        valid: error.is_none(),
+        grant_count,
+        ssh_rule_count,
+        affected_targets,
+        summary: if error.is_none() {
+            "Headscale Policy 校验通过".to_owned()
+        } else {
+            "Headscale Policy 校验未通过".to_owned()
+        },
+        error,
+    }))
+}
+
+/// 校验编辑中的候选访问规则；不会改变当前已生效策略。
 async fn preview_access_policy(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -17348,6 +17418,80 @@ mod tests {
         }));
         assert!(document.contains("autogroup:nonroot"));
         assert!(!document.contains("nexo-tenant-3@"));
+    }
+
+    #[tokio::test]
+    async fn current_policy_preview_checks_saved_policy_without_placeholder_target() {
+        let headscale = Arc::new(OfficialClientHeadscale::default());
+        let state = test_state_with_headscale(headscale.clone());
+        {
+            let connection = state.db.lock().expect("数据库锁应可用");
+            connection
+                .execute(
+                    "INSERT INTO devices (id, tenant_id, name, status)
+                     VALUES ('current-policy-device', 'tenant-1', '当前策略设备', 'online')",
+                    [],
+                )
+                .expect("应创建当前策略设备");
+            connection
+                .execute(
+                    "INSERT INTO tailscale_device_metadata
+                     (device_id, user_id, registration_method, tailscale_ipv4, control_plane_state)
+                     VALUES ('current-policy-device', 'user-1', 'browser', '100.64.0.11', 'ready')",
+                    [],
+                )
+                .expect("应创建当前策略设备地址");
+            connection
+                .execute(
+                    "INSERT INTO mesh_access_rules
+                     (id, owner_tenant_id, owner_user_id, name, target_type, target_id,
+                      protocols_json, ports_json, enabled, desired_revision, applied_revision,
+                      apply_status)
+                     VALUES ('current-policy-rule', 'tenant-1', 'user-1', '当前规则', 'device',
+                             'current-policy-device', '[\"tcp\"]', '[\"443\"]', 1, 1, 1, 'ready')",
+                    [],
+                )
+                .expect("应创建当前策略规则");
+            connection
+                .execute(
+                    "INSERT INTO mesh_access_grants
+                     (rule_id, grantee_tenant_id, status, accepted_at)
+                     VALUES ('current-policy-rule', 'tenant-1', 'accepted', unixepoch())",
+                    [],
+                )
+                .expect("应创建当前策略授权");
+        }
+
+        let preview = current_access_policy_preview(State(state.clone()), admin_headers())
+            .await
+            .expect("当前策略应能通过 Headscale 校验")
+            .0;
+        assert!(preview.valid);
+        assert_eq!(preview.grant_count, 1);
+        assert_eq!(preview.affected_targets, vec!["100.64.0.11"]);
+        let checked = headscale
+            .checked_policies
+            .lock()
+            .expect("应读取当前策略校验记录")
+            .clone();
+        assert!(checked
+            .iter()
+            .any(|document| { document.contains("100.64.0.11") && !document.contains("preview") }));
+
+        *headscale
+            .fail_policy_check
+            .lock()
+            .expect("应设置测试 Policy 拒绝开关") = true;
+        let rejected = current_access_policy_preview(State(state), admin_headers())
+            .await
+            .expect("Headscale 拒绝应作为预览结果返回")
+            .0;
+        assert!(!rejected.valid);
+        assert_eq!(rejected.summary, "Headscale Policy 校验未通过");
+        assert!(rejected
+            .error
+            .as_deref()
+            .is_some_and(|message| message.contains("测试模拟 Policy 校验失败")));
     }
 
     #[tokio::test]
