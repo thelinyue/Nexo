@@ -849,7 +849,7 @@ mod tests {
         let script = root.join("fake-headscale.sh");
         fs::write(
             &script,
-            "#!/bin/sh\ntrap 'exit 0' TERM INT\nwhile true; do sleep 0.05; done\n",
+            "#!/bin/sh\necho $$ > \"$(dirname \"$0\")/child.pid\"\ntrap 'exit 0' TERM INT\nwhile true; do sleep 0.05; done\n",
         )
         .expect("应写入测试 Headscale 脚本");
         fs::set_permissions(&script, fs::Permissions::from_mode(0o755))
@@ -870,7 +870,27 @@ mod tests {
             .start()
             .await
             .expect("测试 Supervisor 应能启动");
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        let pid_path = root.join("child.pid");
+        let read_running_pid = || {
+            let pid = fs::read_to_string(&pid_path)
+                .ok()?
+                .trim()
+                .parse::<libc::pid_t>()
+                .ok()?;
+            let running = unsafe { libc::kill(pid, 0) } == 0;
+            running.then_some(pid)
+        };
+        let initial_deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        let initial_pid = loop {
+            if let Some(pid) = read_running_pid() {
+                break pid;
+            }
+            assert!(
+                tokio::time::Instant::now() < initial_deadline,
+                "测试 Headscale 进程应先启动"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        };
         supervisor
             .update_server_url("https://mesh-one.example.com")
             .await
@@ -882,7 +902,7 @@ mod tests {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
         let mut child_seen = false;
         while tokio::time::Instant::now() < deadline {
-            if supervisor.child.lock().await.is_some() {
+            if read_running_pid().is_some_and(|pid| pid != initial_pid) {
                 child_seen = true;
                 break;
             }
@@ -893,11 +913,17 @@ mod tests {
             .update_server_url("https://mesh-three.example.com")
             .await
             .expect("后续配置更新应继续成功");
-        tokio::time::sleep(Duration::from_millis(200)).await;
-        assert!(
-            supervisor.child.lock().await.is_some(),
-            "后续重启后进程仍应存活"
-        );
+        let previous_pid = read_running_pid().unwrap_or(initial_pid);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        let mut restarted = false;
+        while tokio::time::Instant::now() < deadline {
+            if read_running_pid().is_some_and(|pid| pid != previous_pid) {
+                restarted = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(restarted, "后续配置更新后进程仍应完成重启并存活");
         supervisor
             .shutdown()
             .await
