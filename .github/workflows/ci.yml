@@ -43,7 +43,7 @@ jobs:
         run: npm run build
       - name: 安装 Chromium
         working-directory: web
-        run: npx playwright install --with-deps chromium
+        run: npx playwright install --with-deps chromium webkit
       - name: 浏览器发布验收
         working-directory: web
         run: npm run test:e2e
