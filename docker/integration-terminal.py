@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""普通子网验收用的 LAN 服务；不安装客户端、不配置静态回程路由。"""
+"""本地服务验收用的 LAN 服务。"""
 
 import argparse
 import base64

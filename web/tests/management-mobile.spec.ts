@@ -1,0 +1,78 @@
+import { expect, test } from "@playwright/test";
+import { installApiMocks } from "./api-mocks";
+
+test("管理首页直达密码与会话，密码键盘不误提交且可切换可见性", async ({ page }, testInfo) => {
+  const state = await installApiMocks(page);
+  await page.goto("/#/manage");
+  await page.screenshot({ path: testInfo.outputPath("manage-home.png") });
+  await page.getByRole("button", { name: /修改密码/ }).click();
+  const dialog = page.getByRole("dialog", { name: "修改密码" });
+  expect(await page.evaluate(() => document.activeElement instanceof HTMLInputElement)).toBeFalsy();
+  await dialog.getByLabel("当前密码").fill("current-password");
+  await dialog.getByLabel("当前密码").press("Enter");
+  await expect(dialog.getByLabel("新密码")).toBeFocused();
+  await dialog.getByLabel("新密码").fill("new-password-123");
+  await dialog.getByRole("button", { name: "显示密码" }).click();
+  await expect(dialog.getByLabel("新密码")).toHaveAttribute("type", "text");
+  await dialog.getByRole("button", { name: "隐藏密码" }).click();
+  await expect(dialog.getByLabel("当前密码")).toHaveAttribute("type", "password");
+  await dialog.getByLabel("新密码").press("Enter");
+  expect(state.calls.filter(call => call.method === "POST")).toHaveLength(0);
+  await page.screenshot({ path: testInfo.outputPath("manage-password.png") });
+  await dialog.getByRole("button", { name: "关闭", exact: true }).click();
+  await page.getByRole("button", { name: "放弃修改", exact: true }).click();
+  await expect(dialog).toBeHidden();
+  await page.getByRole("link", { name: /登录会话/ }).click();
+  await expect(page.locator(".session-row")).toHaveCount(2);
+  const current = page.locator(".session-row").filter({ hasText: "当前会话" });
+  await expect(current.getByText(/过期时间/)).toBeHidden();
+  await current.locator("summary").click();
+  await expect(current.getByText(/过期时间/)).toBeVisible();
+  await page.screenshot({ path: testInfo.outputPath("manage-sessions.png") });
+  await page.locator(".session-row").filter({ hasText: "会话 s-other" }).getByRole("button", { name: "结束会话", exact: true }).click();
+  await page.getByRole("dialog").getByRole("button", { name: "取消", exact: true }).click();
+  expect(state.calls.filter(call => call.method === "POST")).toHaveLength(0);
+});
+
+test("管理合并旧账号入口，Agent 摘要随状态刷新且可直接进入", async ({ page }) => {
+  const state = await installApiMocks(page);
+  await page.goto("/#/settings");
+  await expect(page).toHaveURL(/#\/manage$/);
+  await expect(page.getByRole("heading", { name: "管理", exact: true })).toBeVisible();
+  const agents = page.locator(".manage-page").getByRole("link", { name: /^Agent/ });
+  await expect(agents).toContainText("1 台在线 · 1 待批准 · 1 台离线");
+  state.devices[1].status = "online";
+  state.enrollments = [];
+  await page.evaluate(() => window.dispatchEvent(new Event("focus")));
+  await expect(agents).toContainText("2 台在线");
+  await expect(agents).not.toContainText("待批准");
+  await agents.click();
+  await expect(page.getByRole("heading", { name: "Agent", exact: true })).toBeVisible();
+  await page.getByRole("link", { name: "返回", exact: true }).click();
+  await expect(page).toHaveURL(/#\/manage$/);
+});
+
+test("服务直达 Agent 可返回原服务，正常证书折叠且关联服务优先", async ({ page }, info) => {
+  const state = await installApiMocks(page);
+  state.devices[0].certificate = { status: "valid", expires_at: 1893456000, renew_after: 1890864000, error: null, next_retry_at: null };
+  await page.goto("/#/services");
+  await page.getByLabel("搜索穿透服务").fill("媒体");
+  await page.getByRole("link", { name: "媒体中心", exact: true }).click();
+  await page.getByRole("link", { name: "家庭 Agent", exact: true }).click();
+  await expect(page).toHaveURL(/#\/agents\/a-1$/);
+  const certificates = page.getByRole("region", { name: "设备内部证书" });
+  await expect(certificates.getByRole("button", { name: "恢复设备身份" })).toBeHidden();
+  const related = page.locator(".agent-services").getByRole("link");
+  await expect(related).toContainText("媒体中心");
+  if ((page.viewportSize()?.height ?? 0) >= 568) await expect(related).toBeInViewport();
+  await page.screenshot({ path: info.outputPath("agent-services-first.png") });
+  state.devices[0].certificate.status = "retry_wait";
+  state.devices[0].certificate.error = "续签失败：磁盘空间不足";
+  await page.evaluate(() => window.dispatchEvent(new Event("focus")));
+  await expect(certificates.getByText("续签失败：磁盘空间不足", { exact: true })).toBeVisible();
+  await page.getByRole("link", { name: "返回", exact: true }).click();
+  await expect(page).toHaveURL(/#\/services\/t-1$/);
+  await expect(page.getByRole("heading", { name: "服务详情", exact: true })).toBeVisible();
+  await page.getByRole("link", { name: "返回", exact: true }).click();
+  await expect(page.getByLabel("搜索穿透服务")).toHaveValue("媒体");
+});

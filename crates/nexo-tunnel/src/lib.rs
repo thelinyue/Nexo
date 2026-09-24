@@ -3,7 +3,7 @@
 //! 数据通道固定为 TLS（由 Server/Agent 负责 mTLS）之上的 Yamux。Yamux
 //! 负责多路复用，第一帧使用长度前缀 JSON 携带受限的 Tunnel/连接标识，
 //! 后续字节原样转发到 Agent 本地 TCP 服务。这里不实现 UDP、TLS passthrough
-//! 或应用层认证，避免把公网访问入口和网络组网边界混在一起。
+//! 或应用层认证，保持公网访问入口与应用数据面的边界清晰。
 
 use std::{io, task::Poll, time::Duration};
 
@@ -14,7 +14,9 @@ use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio_util::compat::{Compat, FuturesAsyncReadCompatExt, TokioAsyncReadCompatExt};
 
-pub const PROTOCOL_VERSION: u8 = 1;
+pub mod identity;
+
+pub const PROTOCOL_VERSION: u8 = 2;
 pub const MAX_HEADER_BYTES: usize = 8 * 1024;
 pub const DEFAULT_MAX_STREAMS: usize = 128;
 pub const DEFAULT_MAX_CONNECTION_WINDOW: usize = 64 * 1024 * 1024;
@@ -59,17 +61,20 @@ pub struct LogicalStreamHeader {
     pub version: u8,
     pub tunnel_id: String,
     pub connection_id: String,
+    pub revision: i64,
 }
 
 impl LogicalStreamHeader {
     pub fn new(
         tunnel_id: impl Into<String>,
         connection_id: impl Into<String>,
+        revision: i64,
     ) -> Result<Self, HeaderError> {
         let header = Self {
             version: PROTOCOL_VERSION,
             tunnel_id: tunnel_id.into(),
             connection_id: connection_id.into(),
+            revision,
         };
         header.validate()?;
         Ok(header)
@@ -81,12 +86,17 @@ impl LogicalStreamHeader {
         }
         validate_identifier("Tunnel ID", &self.tunnel_id)?;
         validate_identifier("连接 ID", &self.connection_id)?;
+        if self.revision < 1 {
+            return Err(HeaderError::InvalidRevision);
+        }
         Ok(())
     }
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum HeaderError {
+    #[error("Tunnel 配置版本无效")]
+    InvalidRevision,
     #[error("Tunnel 协议版本不受支持：{0}")]
     UnsupportedVersion(u8),
     #[error("{0} 不能为空")]
@@ -218,7 +228,7 @@ mod tests {
     #[tokio::test]
     async fn logical_header_round_trip_is_length_bounded() {
         let (mut left, mut right) = duplex(4096);
-        let header = LogicalStreamHeader::new("tunnel-1", "conn-1").unwrap();
+        let header = LogicalStreamHeader::new("tunnel-1", "conn-1", 1).unwrap();
         let expected = header.clone();
         let writer = tokio::spawn(async move {
             write_logical_header(&mut left, &header).await.unwrap();
@@ -231,11 +241,11 @@ mod tests {
     #[test]
     fn invalid_identifiers_are_rejected() {
         assert_eq!(
-            LogicalStreamHeader::new("", "connection").unwrap_err(),
+            LogicalStreamHeader::new("", "connection", 1).unwrap_err(),
             HeaderError::EmptyIdentifier("Tunnel ID")
         );
         assert_eq!(
-            LogicalStreamHeader::new("tunnel/1", "connection").unwrap_err(),
+            LogicalStreamHeader::new("tunnel/1", "connection", 1).unwrap_err(),
             HeaderError::InvalidIdentifier("Tunnel ID")
         );
     }

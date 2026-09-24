@@ -6,18 +6,16 @@ members = [
     "crates/nexo-tunnel",
     "crates/nexo-server",
     "crates/nexo-agent",
-    "crates/nexo-headscale-adapter",
 ]
 
 [workspace.package]
-version = "0.1.18"
+version = "0.2.0"
 edition = "2021"
 license = "AGPL-3.0-only"
 
 [workspace.dependencies]
 anyhow = "1"
 argon2 = "0.5"
-async-trait = "0.1"
 axum = "0.8"
 base64 = "0.22"
 bytes = "1"
@@ -26,13 +24,11 @@ futures-io = "0.3"
 hex = "0.4"
 get_if_addrs = "0.5"
 ipnet = { version = "2", features = ["serde"] }
-jsonwebtoken = { version = "10.4", features = ["rust_crypto"] }
 libc = "0.2"
 clap = { version = "4", features = ["derive"] }
 rand = "0.8"
-rcgen = { version = "0.14", features = ["x509-parser"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
-rsa = { version = "0.9", features = ["pem"] }
+rcgen = { version = "0.14", features = ["x509-parser"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 rustls-pemfile = "2"
@@ -44,12 +40,9 @@ thiserror = "2"
 time = "0.3"
 tokio = { version = "1", features = ["io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "logging", "tls12"] }
-tokio-util = { version = "0.7", features = ["compat"] }
+tokio-util = { version = "0.7", features = ["compat", "codec", "rt"] }
 yamux = "0.14"
 tower-http = { version = "0.6", features = ["fs"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["chrono", "env-filter", "fmt"] }
 uuid = { version = "1", features = ["v4"] }
-oxide-auth = "0.6.1"
-oxide-auth-axum = "0.6.0"
-x509-parser = "0.18"

@@ -47,9 +47,9 @@ jobs:
       - name: 浏览器发布验收
         working-directory: web
         run: npm run test:e2e
-      - name: Shell 语法检查
+      - name: 验收脚本语法检查
         run: |
-          bash -n docker/network-smoke.sh
-          bash -n docker/cloudflare-acme-smoke.sh
+          python -c "import ast, pathlib; [ast.parse(pathlib.Path(path).read_text(encoding='utf-8'), filename=path) for path in ['docker/integration-terminal.py', 'docker/identity-renewal-smoke.py', 'docker/multiuser-smoke.py', 'docker/tunnel-smoke.py']]"
+          node --check docker/recovery-smoke.mjs
       - name: 工作区差异检查
         run: git diff --check
