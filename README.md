@@ -6,11 +6,12 @@ Nexo v0.2.0 是一个自托管内网穿透平台。它通过轻量 Agent 将本�
 
 这是一次全新安装版本。v0.1.x 数据目录不会转换、删除或尝试兼容；启动新版时检测到旧结构会用中文错误拒绝加载。请保留旧镜像和备份，并为新版使用空目录。
 
-## 快速开始
+## Docker Compose 一键部署（Linux/amd64）
+
+需预先安装 Docker Engine、Docker Compose v2 和 `curl`。Server 命令会从项目的 `v0.2.0` 标签下载 Compose 配置并创建全新的数据目录；不要复用 v0.1.x 数据目录：
 
 ```bash
-mkdir -p data/nexo
-docker compose -f compose.yml up -d
+mkdir -p "$HOME/nexo-v0.2.0/data/nexo" && cd "$HOME/nexo-v0.2.0" && curl -fL https://raw.githubusercontent.com/thelinyue/Nexo/v0.2.0/compose.yml -o compose.yml && docker compose -f compose.yml pull && docker compose -f compose.yml up -d
 ```
 
 打开 `http://服务器地址:8280`，首次启动按页面提示创建本地管理员。穿透服务页可创建 TCP、HTTP 或 HTTPS 服务，并绑定已入网的 Agent 与公网域名。
@@ -27,12 +28,30 @@ Server 暴露以下端口：
 
 ## Agent
 
-在需要访问本地服务的主机上创建入网 Token，再运行：
+在每台需要访问本地服务的 Linux 主机复制执行以下命令。运行时输入 Server 的 Web/API 地址和管理页面生成的一次性入网 Token；Token 会写入权限受限的 `.env` 文件：
 
 ```bash
-NEXO_SERVER_URL=https://nexo.example.com \
-NEXO_ENROLLMENT_TOKEN=入网Token \
+bash <<'NEXO_DEPLOY'
+set -euo pipefail
+install_dir="$HOME/nexo-agent-v0.2.0"
+mkdir -p "$install_dir/data/nexo-agent"
+cd "$install_dir"
+curl -fL https://raw.githubusercontent.com/thelinyue/Nexo/v0.2.0/compose.agent.yml -o compose.agent.yml
+if [ ! -f .env ]; then
+  read -r -p 'NEXO_SERVER_URL: ' server_url </dev/tty
+  read -r -s -p 'NEXO_ENROLLMENT_TOKEN: ' enrollment_token </dev/tty
+  printf '\n'
+  if [ -z "$server_url" ] || [ -z "$enrollment_token" ]; then
+    echo 'Server 地址和入网 Token 不能为空' >&2
+    exit 1
+  fi
+  umask 077
+  printf 'TZ=Asia/Shanghai\nNEXO_SERVER_URL=%s\nNEXO_ENROLLMENT_TOKEN=%s\n' "$server_url" "$enrollment_token" > .env
+  unset enrollment_token
+fi
+docker compose -f compose.agent.yml pull
 docker compose -f compose.agent.yml up -d
+NEXO_DEPLOY
 ```
 
 Agent 只访问本地目标并维护控制/Tunnel 通道，不需要特权能力、虚拟网卡、转发 sysctl 或额外网络工具。首次启动提交设备 CSR，所属账号在管理页批准后领取证书；私钥始终保留在 Agent。之后重启复用持久身份，不再需要入网 Token。请保留 Compose 挂载的 Server 和 Agent 数据目录。
