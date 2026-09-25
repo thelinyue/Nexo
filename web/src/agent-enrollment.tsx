@@ -24,7 +24,7 @@ export function AgentEnrollment({ csrf, onClose, onCreated }: { csrf?: string | 
   const expired = Boolean(invite && (!Number.isFinite(invite.expires_at) || invite.expires_at * 1000 <= now));
   const deployment = useMemo(() => {
     if (!invite?.token || !normalizedUrl || expired) return { content: "", error: null };
-    try { return { content: agentDeploymentContent(__AGENT_COMPOSE_TEMPLATE__, normalizedUrl, invite.token, method), error: null }; }
+    try { return { content: agentDeploymentContent(__AGENT_COMPOSE_TEMPLATE__, normalizedUrl, invite.token, invite.id, method), error: null }; }
     catch (e) { return { content: "", error: errorText(e) }; }
   }, [invite, normalizedUrl, expired, method]);
 

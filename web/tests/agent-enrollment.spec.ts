@@ -35,6 +35,7 @@ test("Compose 配置与 docker run 命令自动填入地址和凭证，复制不
   expect(compose).toMatch(/^name: nexo-agent/m);
   expect(compose).toContain('NEXO_SERVER_URL: "https://nexo.example.com/prefix"');
   expect(compose).toContain('NEXO_ENROLLMENT_TOKEN: "one-time-secret-enrollment-token"');
+  expect(compose).toContain("./data/nexo-agent-e-new:/data/nexo-agent");
   expect(compose).not.toContain("bash <<");
   await dialog.getByRole("button", { name: "docker run", exact: true }).click();
   await dialog.getByRole("button", { name: "复制部署命令", exact: true }).click();
@@ -43,6 +44,7 @@ test("Compose 配置与 docker run 命令自动填入地址和凭证，复制不
   expect(docker).not.toContain("bash <<");
   expect(docker).toContain("NEXO_SERVER_URL=https://nexo.example.com/prefix");
   expect(docker).toContain("NEXO_ENROLLMENT_TOKEN=one-time-secret-enrollment-token");
+  expect(docker).toContain("nexo-agent-e-new:/data/nexo-agent");
   expect(await page.evaluate(() => JSON.stringify({ ...localStorage, ...sessionStorage }))).not.toContain("one-time-secret");
   await dialog.getByRole("button", { name: "关闭", exact: true }).click();
   await page.getByRole("button", { name: "放弃修改", exact: true }).click();

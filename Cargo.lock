@@ -1097,7 +1097,7 @@ dependencies = [
 
 [[package]]
 name = "nexo-agent"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "anyhow",
  "clap",
@@ -1121,7 +1121,7 @@ dependencies = [
 
 [[package]]
 name = "nexo-core"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "base64 0.22.1",
  "hex",
@@ -1134,7 +1134,7 @@ dependencies = [
 
 [[package]]
 name = "nexo-protocol"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "bytes",
  "nexo-core",
@@ -1144,7 +1144,7 @@ dependencies = [
 
 [[package]]
 name = "nexo-server"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "anyhow",
  "argon2",
@@ -1177,7 +1177,7 @@ dependencies = [
 
 [[package]]
 name = "nexo-tunnel"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "anyhow",
  "bytes",
