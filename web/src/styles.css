@@ -222,7 +222,7 @@ dd>code { display:block; margin-bottom:10px; user-select:text; font-size:.9375re
 .steps p { color:var(--secondary); font-size:.875rem; margin:6px 0 12px; }
 .steps small { display:block; margin-top:8px; }
 .token { display:block; padding:12px; border:1px solid var(--border); border-radius:10px; margin:12px 0; user-select:text; }
-/* 入网弹窗保留固定标题与操作栏；长脚本仅在自身区域横向滚动。 */
+/* 入网弹窗保留固定标题与操作栏；长配置仅在自身区域横向滚动。 */
 .modal:has(>.agent-enrollment) { max-height:min(720px,calc(var(--visible-height,100dvh) - max(12px,env(safe-area-inset-top)))); }
 .agent-enrollment { min-width:0; }
 .agent-enrollment .modal-body { padding:16px; scroll-padding-block:16px; }

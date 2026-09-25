@@ -14,7 +14,7 @@ async function mockClipboard(page: Page, fail = false) {
   }, fail);
 }
 
-test("两种部署命令自动填入地址与凭证，复制不写入浏览器存储", async ({ page }) => {
+test("Compose 配置与 docker run 命令自动填入地址和凭证，复制不写入浏览器存储", async ({ page }) => {
   await installApiMocks(page); await mockClipboard(page);
   const dialog = await openEnrollment(page);
   expect(await page.evaluate(() => document.activeElement instanceof HTMLInputElement)).toBeFalsy();
@@ -22,21 +22,25 @@ test("两种部署命令自动填入地址与凭证，复制不写入浏览器�
   await dialog.getByRole("button", { name: "生成凭证", exact: true }).click();
   await expect(dialog.getByRole("button", { name: "复制入网凭证" })).toBeVisible();
   await expect(dialog.getByRole("button", { name: "Docker Compose", exact: true })).toHaveAttribute("aria-pressed", "true");
-  await expect(dialog.getByLabel("部署命令", { exact: true })).toBeHidden();
+  await expect(dialog.getByLabel("Compose 配置文件", { exact: true })).toBeVisible();
   await dialog.getByLabel("Server 地址").fill("https://nexo.example.com/prefix///");
   await dialog.getByLabel("Server 地址").press("Enter");
   expect(await page.evaluate(() => (window as any).copiedCommand)).toBeUndefined();
-  await dialog.getByRole("button", { name: "复制部署命令", exact: true }).click();
-  await expect(dialog.getByRole("status")).toHaveText("部署命令已复制");
+  await dialog.getByRole("button", { name: "复制 Compose 配置文件", exact: true }).click();
+  await expect(dialog.getByRole("status")).toHaveText("Compose 配置文件已复制");
   const compose = await page.evaluate(() => (window as any).copiedCommand as string);
   expect(compose).toContain("https://nexo.example.com/prefix");
   expect(compose).not.toContain("prefix///");
   expect(compose).toContain("one-time-secret-enrollment-token");
-  expect(compose).toContain("docker compose -f compose.agent.yml up -d");
+  expect(compose).toMatch(/^name: nexo-agent/m);
+  expect(compose).toContain('NEXO_SERVER_URL: "https://nexo.example.com/prefix"');
+  expect(compose).toContain('NEXO_ENROLLMENT_TOKEN: "one-time-secret-enrollment-token"');
+  expect(compose).not.toContain("bash <<");
   await dialog.getByRole("button", { name: "docker run", exact: true }).click();
   await dialog.getByRole("button", { name: "复制部署命令", exact: true }).click();
   const docker = await page.evaluate(() => (window as any).copiedCommand as string);
   expect(docker).toContain("docker run -d --name nexo-agent --network host");
+  expect(docker).not.toContain("bash <<");
   expect(docker).toContain("NEXO_SERVER_URL=https://nexo.example.com/prefix");
   expect(docker).toContain("NEXO_ENROLLMENT_TOKEN=one-time-secret-enrollment-token");
   expect(await page.evaluate(() => JSON.stringify({ ...localStorage, ...sessionStorage }))).not.toContain("one-time-secret");
@@ -55,7 +59,7 @@ test("失败可重试，无效地址阻止复制，剪贴板失败展开完整�
   await expect(dialog.getByRole("alert")).toHaveText("生成失败，请重试");
   state.failures.clear();
   await dialog.getByRole("button", { name: "生成凭证", exact: true }).click();
-  const copy = dialog.getByRole("button", { name: "复制部署命令", exact: true });
+  const copy = dialog.getByRole("button", { name: "复制 Compose 配置文件", exact: true });
   await expect(copy).toBeEnabled();
   await dialog.getByLabel("Server 地址").fill("https://user:pass@example.com/?secret=yes");
   await expect(copy).toBeDisabled();
@@ -63,7 +67,7 @@ test("失败可重试，无效地址阻止复制，剪贴板失败展开完整�
   await dialog.getByLabel("Server 地址").fill("https://nexo.example.com");
   await copy.click();
   await expect(dialog.getByRole("alert")).toContainText("长按选择");
-  await expect(dialog.getByLabel("部署命令", { exact: true })).toBeVisible();
+  await expect(dialog.getByLabel("Compose 配置文件", { exact: true })).toBeVisible();
   await expect(dialog).toBeVisible();
 });
 
@@ -74,16 +78,16 @@ test("缺失凭证禁用复制，过期凭证移除命令并提示重新生成",
   const dialog = await openEnrollment(page);
   await dialog.getByRole("button", { name: "生成凭证", exact: true }).click();
   await expect(dialog.getByRole("alert")).toContainText("未返回凭证");
-  await expect(dialog.getByRole("button", { name: "复制部署命令", exact: true })).toBeDisabled();
+  await expect(dialog.getByRole("button", { name: "复制 Compose 配置文件", exact: true })).toBeDisabled();
   await dialog.getByRole("button", { name: "关闭", exact: true }).click();
   token = "short-lived-token";
   await page.clock.install();
   await page.getByRole("button", { name: "添加 Agent", exact: true }).click();
   await dialog.getByRole("button", { name: "生成凭证", exact: true }).click();
-  await expect(dialog.getByRole("button", { name: "复制部署命令", exact: true })).toBeEnabled();
+  await expect(dialog.getByRole("button", { name: "复制 Compose 配置文件", exact: true })).toBeEnabled();
   await page.clock.fastForward(3601_000);
   await expect(dialog.getByRole("alert")).toContainText("凭证已过期");
-  await expect(dialog.getByRole("button", { name: "复制部署命令", exact: true })).toBeDisabled();
+  await expect(dialog.getByRole("button", { name: "复制 Compose 配置文件", exact: true })).toBeDisabled();
   await expect(dialog.locator(".agent-command")).toHaveCount(0);
 });
 
@@ -91,7 +95,7 @@ test("移动端触控、长命令、横屏与键盘压缩视口", async ({ page 
   await installApiMocks(page);
   const dialog = await openEnrollment(page);
   await dialog.getByRole("button", { name: "生成凭证", exact: true }).click();
-  const copy = dialog.getByRole("button", { name: "复制部署命令", exact: true });
+  const copy = dialog.getByRole("button", { name: "复制 Compose 配置文件", exact: true });
   await expect(copy).toBeEnabled();
   for (const [width, height, name] of [[320, 640, "narrow"], [375, 812, "portrait"], [390, 844, "portrait-large"], [812, 375, "landscape"], [320, 360, "keyboard"]] as const) {
     await page.setViewportSize({ width, height });
@@ -119,8 +123,7 @@ test("移动端触控、长命令、横屏与键盘压缩视口", async ({ page 
     }
   }
   await page.setViewportSize({ width: 375, height: 812 });
-  await dialog.locator("summary").click();
-  await expect(dialog.getByLabel("部署命令", { exact: true })).toBeVisible();
+  await expect(dialog.getByLabel("Compose 配置文件", { exact: true })).toBeVisible();
   expect(await dialog.evaluate(e => e.scrollWidth <= e.clientWidth)).toBeTruthy();
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBeTruthy();
   await page.screenshot({ path: info.outputPath("agent-command-expanded.png") });
@@ -131,7 +134,7 @@ test("普通用户使用本人入网接口", async ({ page }) => {
   await page.route("**/api/v1/auth/status", route => route.fulfill({ json: { initialized: true, authenticated: true, user_id: "alice", workspace_id: "alice-space", role: "tenant", username: "alice", csrf_token: "tenant-csrf" } }));
   const dialog = await openEnrollment(page);
   await dialog.getByRole("button", { name: "生成凭证", exact: true }).click();
-  await expect(dialog.getByRole("button", { name: "复制部署命令", exact: true })).toBeEnabled();
+  await expect(dialog.getByRole("button", { name: "复制 Compose 配置文件", exact: true })).toBeEnabled();
   expect(state.calls.find(c => c.method === "POST" && c.path.endsWith("/enrollments"))?.path).toBe("/api/v1/enrollments");
 });
 
