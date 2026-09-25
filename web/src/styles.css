@@ -222,6 +222,28 @@ dd>code { display:block; margin-bottom:10px; user-select:text; font-size:.9375re
 .steps p { color:var(--secondary); font-size:.875rem; margin:6px 0 12px; }
 .steps small { display:block; margin-top:8px; }
 .token { display:block; padding:12px; border:1px solid var(--border); border-radius:10px; margin:12px 0; user-select:text; }
+/* 入网弹窗保留固定标题与操作栏；长脚本仅在自身区域横向滚动。 */
+.modal:has(>.agent-enrollment) { max-height:min(720px,calc(var(--visible-height,100dvh) - max(12px,env(safe-area-inset-top)))); }
+.agent-enrollment { min-width:0; }
+.agent-enrollment .modal-body { padding:16px; scroll-padding-block:16px; }
+.agent-enrollment .steps { gap:20px; padding-left:22px; }
+.agent-enrollment .steps li { min-width:0; }
+.agent-enrollment .token { white-space:pre-wrap; overflow-wrap:anywhere; }
+.agent-enrollment .agent-server-label { margin-top:12px; }
+.agent-enrollment input { font-size:max(16px,1rem); }
+.agent-enrollment .steps .form-error { color:var(--danger); }
+.agent-deployment-method { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:4px; padding:4px; border:1px solid var(--border); border-radius:16px; background:var(--surface-soft); }
+.agent-deployment-method button { min-width:44px; min-height:44px; padding:8px 4px; border:1px solid transparent; border-radius:12px; color:var(--secondary); background:transparent; font-size:.8125rem; font-weight:600; }
+.agent-deployment-method button[aria-pressed=true] { color:var(--text); background:var(--surface); border-color:var(--border); }
+.agent-command { min-width:0; }
+.agent-command summary { min-height:44px; padding:12px 0; cursor:pointer; font-size:.875rem; }
+.agent-command pre { max-width:100%; margin:0; padding:12px; border:1px solid var(--border); border-radius:12px; background:var(--surface-soft); overflow-x:auto; white-space:pre; user-select:text; }
+.agent-command code { overflow-wrap:normal; }
+.agent-enrollment .modal-actions { flex-direction:column; gap:8px; }
+.agent-enrollment .modal-actions>.primary-button { width:100%; min-height:48px; }
+.agent-enrollment .modal-actions .notice { margin:0; }
+.agent-enrollment .modal-actions [role=alert] { max-height:4.5em; overflow-y:auto; }
+.agent-enrollment .copy-feedback { text-align:center; }
 .brand { display:flex; align-items:center; gap:10px; }
 .brand-icon { width:38px; height:38px; display:grid; place-items:center; border-radius:12px; background:var(--success); color:#082016; font-size:1.125rem; font-weight:750; }
 .brand strong,.brand small { display:block; }

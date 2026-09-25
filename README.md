@@ -1,110 +1,212 @@
 # Nexo 联巢
 
-Nexo v0.2.0 是一个自托管内网穿透平台。它通过轻量 Agent 将本地 TCP、HTTP、HTTPS 服务安全发布到公网，并提供本地账号、工作空间隔离、域名接入检查、证书和 Cloudflare DNS 验证。
+**将内网服务发布到公网，集中管理访问入口。**
 
-## v0.2.0 重要说明
+Nexo 是一个自托管内网穿透平台，通过轻量 Agent 将内网 TCP、HTTP、HTTPS 服务发布到公网，提供可视化管理、独立工作空间、域名接入检查和自动 HTTPS 证书管理。适合访问家中或办公室的 Web 应用、开发服务和其他 TCP 服务。
 
-这是一次全新安装版本。v0.1.x 数据目录不会转换、删除或尝试兼容；启动新版时检测到旧结构会用中文错误拒绝加载。请保留旧镜像和备份，并为新版使用空目录。
+[快速部署](#快速部署) · [发布第一个服务](#发布第一个服务) · [使用指南](https://github.com/thelinyue/Nexo/blob/master/docs/usage.md) · [容器与维护](https://github.com/thelinyue/Nexo/blob/master/docker/README.md) · [版本说明](https://github.com/thelinyue/Nexo/releases)
 
-## Docker Compose 一键部署（Linux/amd64）
+## 核心能力
 
-需预先安装 Docker Engine、Docker Compose v2 和 `curl`。Server 命令会从项目的 `v0.2.0` 标签下载 Compose 配置并创建全新的数据目录；不要复用 v0.1.x 数据目录：
+| 能力 | 说明 |
+| --- | --- |
+| TCP / HTTP / HTTPS | 配置本地目标、公网端口或域名，支持 WebSocket |
+| 可视化管理 | 创建、编辑、启停服务，查看状态并复制访问地址 |
+| Agent 身份管理 | 入网审批、mTLS 加密通道、证书自动续签与身份恢复 |
+| 多用户工作空间 | 邀请加入，分别管理 Agent、服务、域名和证书 |
+| 域名与证书 | 检查域名归属及解析，通过 Caddy 自动申请与续期证书，支持 Cloudflare DNS-01 |
 
-```bash
-mkdir -p "$HOME/nexo-v0.2.0/data/nexo" && cd "$HOME/nexo-v0.2.0" && curl -fL https://raw.githubusercontent.com/thelinyue/Nexo/v0.2.0/compose.yml -o compose.yml && docker compose -f compose.yml pull && docker compose -f compose.yml up -d
+## 工作方式
+
+```mermaid
+flowchart LR
+    Visitor[公网访问者] -->|TCP / HTTP / HTTPS| Server[公网 Server]
+    Server <-->|mTLS 加密通道| Agent[内网 Agent]
+    Agent --> App[内网应用]
+    Admin[管理员 / 用户] -->|Web 管理入口| Server
 ```
 
-打开 `http://服务器地址:8280`，首次启动按页面提示创建本地管理员。穿透服务页可创建 TCP、HTTP 或 HTTPS 服务，并绑定已入网的 Agent 与公网域名。
+Server 部署在公网可达的 Linux 主机上，提供管理页面和公网入口；Agent 部署在能够访问内网应用的 Linux 主机上，主动连接 Server。访问者使用浏览器或应用自己的客户端，无需安装 Nexo。Agent 不需要虚拟网卡或特权网络能力。
 
-公网管理入口请配置 HTTPS 反向代理和可信代理地址。忘记密码可在 Server 本机生成一次性恢复码；设备证书过期或私钥丢失可从原 Agent 详情页重新授权，保留设备 ID 与服务绑定。具体配置、恢复步骤和验证命令见[容器说明](docker/README.md)。
+## 部署前准备
 
-Server 暴露以下端口：
+- Server 和 Agent 的官方镜像支持 **Linux/amd64**；主机需安装 Docker Engine 和 Docker Compose v2。
+- Server 需要公网可达的地址。Agent 需能访问 Server 的管理 API、控制端口、数据端口及本地目标应用。
+- TCP 服务不需要域名；HTTP/HTTPS 服务需要自己拥有并能配置 DNS 的域名。
+- 默认使用 host 网络，先确认 Server 的相关端口没有被其他程序占用。同机反向代理与 Caddy 不能同时监听同一地址的 `80/443`，具体安排见 [容器说明](https://github.com/thelinyue/Nexo/blob/master/docker/README.md#管理入口与账号恢复)。
 
-- `8280`：Web 管理入口和 API
-- `9890`：Agent mTLS 控制通道
-- `9891`：mTLS + Yamux Tunnel 数据通道
-- `80/443`：Web Tunnel 与证书终止（使用反向代理时可自行映射）
-- `20000-29999`：TCP Tunnel 公网端口范围
+| Server 端口 | 用途 | 访问要求 |
+| --- | --- | --- |
+| TCP `8280` | Web 管理与入网 API | 初始化阶段限制为可信来源；公网使用时配置 HTTPS 反向代理 |
+| TCP `9890` / `9891` | Agent 控制 / Tunnel 数据 | 允许 Agent 访问；必须直连或 TCP 透传，不可中间终止 TLS |
+| TCP `80` / `443` | Web 服务与 HTTPS 证书验证 | 使用 Web Tunnel 时开放；HTTP-01 验证依赖标准端口 |
+| TCP `20000–29999` | TCP 服务公网端口池 | 开放实际分配端口；需要任意自动分配端口均可访问时再放行整个范围 |
+| UDP `443` | HTTP/3 | 可选；普通 HTTPS 不要求此项 |
 
-## Agent
+**从 v0.1.x 切换：** 当前产品自 v0.2.0 起仅支持全新安装，不迁移旧版组网数据。请备份并保留旧目录、镜像和配置，给新 Server 与 Agent 使用空数据目录。检测到旧结构时 Server 会拒绝启动，不会转换或删除旧数据。
 
-在每台需要访问本地服务的 Linux 主机复制执行以下命令。运行时输入 Server 的 Web/API 地址和管理页面生成的一次性入网 Token；Token 会写入权限受限的 `.env` 文件：
+## 快速部署
 
-```bash
-bash <<'NEXO_DEPLOY'
-set -euo pipefail
-install_dir="$HOME/nexo-agent-v0.2.0"
-mkdir -p "$install_dir/data/nexo-agent"
-cd "$install_dir"
-curl -fL https://raw.githubusercontent.com/thelinyue/Nexo/v0.2.0/compose.agent.yml -o compose.agent.yml
-if [ ! -f .env ]; then
-  read -r -p 'NEXO_SERVER_URL: ' server_url </dev/tty
-  read -r -s -p 'NEXO_ENROLLMENT_TOKEN: ' enrollment_token </dev/tty
-  printf '\n'
-  if [ -z "$server_url" ] || [ -z "$enrollment_token" ]; then
-    echo 'Server 地址和入网 Token 不能为空' >&2
-    exit 1
-  fi
-  umask 077
-  printf 'TZ=Asia/Shanghai\nNEXO_SERVER_URL=%s\nNEXO_ENROLLMENT_TOKEN=%s\n' "$server_url" "$enrollment_token" > .env
-  unset enrollment_token
-fi
-docker compose -f compose.agent.yml pull
-docker compose -f compose.agent.yml up -d
-NEXO_DEPLOY
-```
+默认镜像使用 `latest`，分别指向 Server 和 Agent 的最新稳定版。数字版本继续保留用于定位问题和回退。`latest` 不会让正在运行的容器自动升级；已有安装请阅读下方“维护与更新”，不要重跑新安装步骤。
 
-Agent 只访问本地目标并维护控制/Tunnel 通道，不需要特权能力、虚拟网卡、转发 sysctl 或额外网络工具。首次启动提交设备 CSR，所属账号在管理页批准后领取证书；私钥始终保留在 Agent。之后重启复用持久身份，不再需要入网 Token。请保留 Compose 挂载的 Server 和 Agent 数据目录。
+### 1. 启动 Server
 
-设备与服务端内部证书会在到期前 30 天自动续签，失败后重试。续签保留设备 ID、服务绑定和现有连接；Agent 页面显示到期提醒、失败原因与下次重试时间。内部 CA 维护与长期离线设备的处理边界见 [容器说明](docker/README.md#tunnel-连接与持久身份)。
-
-Server 与 Agent 可以位于不同主机。控制端口 `9890` 和数据端口 `9891` 原生使用双向 TLS；前置代理应使用 TCP 透传，不能在中间终止 TLS。管理入口 `8280` 可由 HTTPS 反向代理保护。自定义端口与连接地址见 [容器说明](docker/README.md)。本次恢复调整了 Tunnel 逻辑流协议，Server 与 Agent 需使用配套构建。
-
-## 页面与 API
-
-登录后默认进入 `#/services`。主要页面为：
-
-- `#/services`：穿透服务的创建、编辑、启停、批量操作与地址复制
-- `#/agents`：Agent 入网、审批、在线状态、版本和关联服务
-- `#/domains`：公网域名、Caddy 配置加载结果、证书签发与到期时间、失败原因和最近记录
-- `#/settings`：本人账号和登录会话
-- `#/users`：管理员邀请用户、启停账号、生成恢复链接和进入任意用户工作空间
-
-保留 `/api/v1/devices` 作为稳定 Agent 资源路径；Tunnel、域名、证书和会话 API 继续使用 `/api/v1`。
-
-## 多用户分享
-
-管理员进入“管理 → 用户管理”生成邀请链接，受邀人自行设置用户名和密码。邀请仅可使用一次，7 天到期，可随时撤销；没有公开注册入口。每位用户拥有独立工作空间，自行管理 Agent、服务、域名和证书。已验证域名的父子范围不能跨空间重叠，完整服务主机名全局唯一。
-
-系统只有一位管理员，由首次初始化创建；邀请只能创建普通用户，不支持修改角色。管理员可修改所有账号的用户名，改名会撤销该账号的全部登录会话和密码恢复码，用户与资源 ID 保持不变。管理员自己的用户名修改成功后需用新名字重新登录；自身密码和登录会话可直接从管理员卡片管理。管理员不能被停用或删除。
-
-管理员可从用户卡片进入任意空间进行维护；账号与安全始终操作管理员本人，资源审计同时记录实际操作者和目标空间。停用用户立即吊销登录会话、密码恢复码和待入网凭证，断开转发与 Agent 连接并拒绝重连。服务开关和地址保留，重新启用后恢复此前开启的服务。
-
-普通用户忘记密码时由管理员生成 15 分钟有效的单次恢复链接。管理员仍可用 Server 本机命令恢复账号。邀请与恢复链接仅展示一次，请通过可信渠道发给本人；页面读取后会清除地址栏中的凭据。
-
-删除普通用户时需输入当前用户名确认，会永久删除账号、工作空间、Agent 身份、服务、域名和入网凭证，并立即关闭转发及 Agent 连接；无需事先停用。审计记录保留，已使用的邀请不会再次生效。此操作不删除远端 Agent 主机上的应用文件。域名专属 Cloudflare 凭据在 Caddy 的运行配置与已保存配置均不再引用后清理；失败时页面提示清理待完成，后台与重启后会继续重试，共享证书缓存仍由 Caddy 管理。
-
-## Caddy 与自动证书
-
-Server 默认启动并管理 Caddy。添加域名后，Server 每 5 秒核对 Caddy Admin API 的实际配置，仅在配置或引用凭据变化时加载；加载失败保留上一份可用配置。页面读取 Caddy 日志和证书文件中的真实有效期，分别展示配置加载与证书申请结果。已有证书仍有效时，续期失败原因和 Caddy 提供的下次重试时间会同时显示。申请、续期、退避重试均由 Caddy 执行，刷新页面不会发起额外申请。
-
-新域名默认使用 HTTP-01，为各服务主机名单独签发证书。先在 DNS 服务商添加页面给出的 `_nexo-verification.<域名>` TXT 记录并完成归属验证，再配置服务。选择 Cloudflare DNS 验证时，可提交域名专属 Token 自动验证归属，并复用根域名与泛域名证书；支持传统 Token、`cfut_` 和 `cfat_`。每个域名可独立设置 DNS 解析器、传播等待与超时。TXT 归属检查使用 Server DNS，不采信用户指定的签发解析器。
-
-Token 保存在受限文件中，Caddy 配置只引用 `{file.绝对路径}`，通过强制配置重载热更新。新凭据使用独立候选文件；加载失败保留上一份 Applied 配置及其旧凭据。DNS-01 不自动创建访问服务所需的 A/AAAA 记录。HTTP-01 需开放公网 TCP 80、443；HTTP/3 还需开放 UDP 443。WebSocket 重载关闭延迟为 5 分钟，显式停用用户、停用/删除服务或撤销设备身份仍立即终止转发。凭据与端口设置见 [容器说明](docker/README.md)。
-
-TCP 入口通过 mTLS + Yamux 转发到 Agent 本地目标；HTTP/HTTPS 由 Caddy 经本机入口接入同一通道，支持 WebSocket。公网 HTTPS 在 Caddy 终止，页面配置的本地目标默认使用 HTTP，无需本地应用再安装公网证书。Linux 使用受限 Unix socket，Windows 使用回环地址随机端口。
-
-服务只有在 Agent 控制/数据连接、本地目标探测、公网监听和相应 Caddy 路由就绪后才显示正常，HTTPS 还需有效证书。缺少数据通道时 Caddy 返回 `503`；未知主机返回 `404`。修改、停用或删除服务会关闭旧连接；删除 Agent 会撤销其证书访问权限。Agent 自动重连通道，Caddy 继续独立负责证书续期与重试。
-
-## 开发与验证
+在 Server 主机新建安装目录。若目录已存在，停止新安装步骤并检查原部署：
 
 ```bash
-cargo fmt --all --check
-cargo test --workspace
-cargo clippy --workspace --all-targets -- -D warnings
-cd web && npm ci && npm run build
+mkdir "$HOME/nexo-server-latest" && cd "$HOME/nexo-server-latest"
 ```
+
+在此目录创建 `compose.yml`，填写以下完整内容：
+
+```yaml
+name: nexo
+
+# Nexo 最新稳定版 Server。首次安装使用空数据目录，更新时保留原目录。
+services:
+  nexo-server:
+    image: ghcr.io/thelinyue/nexo-server:latest
+    container_name: nexo-server
+    network_mode: host
+    environment:
+      TZ: ${TZ:-Asia/Shanghai}
+      NEXO_PUBLIC_URL: ${NEXO_PUBLIC_URL:-}
+      NEXO_TRUSTED_PROXIES: ${NEXO_TRUSTED_PROXIES:-}
+      NEXO_PUBLIC_IPS: ${NEXO_PUBLIC_IPS:-}
+    volumes:
+      - ./data/nexo:/data/nexo
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "curl --fail --silent http://127.0.0.1:8280/health >/dev/null"]
+      interval: 10s
+      timeout: 3s
+      retries: 6
+```
+
+启动并查看状态：
+
+```bash
+docker compose -f compose.yml pull nexo-server
+docker compose -f compose.yml up -d nexo-server
+docker compose -f compose.yml ps
+```
+
+从可信网络打开 `http://服务器地址:8280`，按提示创建唯一管理员。首次初始化没有默认账号或密码。持久数据位于当前目录的 `data/nexo`。
+
+面向公网使用前，为管理入口配置 HTTPS，并设置 `NEXO_PUBLIC_URL`、`NEXO_TRUSTED_PROXIES`；完整说明见 [管理入口](https://github.com/thelinyue/Nexo/blob/master/docker/README.md#管理入口与账号恢复)。Agent 的 Server URL 也应使用此 HTTPS 地址。
+
+### 2. 接入 Agent
+
+在管理页面进入“Agent → 添加 Agent”，生成并复制一次性入网凭证，有效期 1 小时。然后在能够访问内网应用的主机新建目录；已有 Agent 请使用原目录管理，避免丢失身份：
+
+```bash
+mkdir "$HOME/nexo-agent-latest" && cd "$HOME/nexo-agent-latest"
+```
+
+创建 `compose.agent.yml`：
+
+```yaml
+name: nexo-agent
+
+# 每个需要公网 Tunnel 的站点运行一个 Agent。Agent 可连接任意 Nexo Server。
+services:
+  nexo-agent:
+    image: ghcr.io/thelinyue/nexo-agent:latest
+    container_name: nexo-agent
+    network_mode: host
+    environment:
+      TZ: ${TZ:-Asia/Shanghai}
+      NEXO_SERVER_URL: ${NEXO_SERVER_URL:?请在 .env 中填写 NEXO_SERVER_URL}
+      NEXO_ENROLLMENT_TOKEN: ${NEXO_ENROLLMENT_TOKEN:-}
+    volumes:
+      - ./data/nexo-agent:/data/nexo-agent
+    restart: unless-stopped
+```
+
+在同一目录创建 `.env`。先限制文件权限，再用文本编辑器填入 Agent 可访问的 Server Web/API 地址和刚生成的凭证；将下方示例值替换为实际值：
+
+```bash
+umask 077
+touch .env
+chmod 600 .env
+```
+
+```dotenv
+TZ=Asia/Shanghai
+NEXO_SERVER_URL='https://nexo.example.com'
+NEXO_ENROLLMENT_TOKEN='替换为刚生成的入网凭证'
+```
+
+启动 Agent 后，回到管理页面核对入网申请，批准并设置名称，等待状态变为在线：
+
+```bash
+# 避免当前 Shell 中的同名变量覆盖 .env。
+unset NEXO_SERVER_URL NEXO_ENROLLMENT_TOKEN TZ
+docker compose -f compose.agent.yml pull nexo-agent
+docker compose -f compose.agent.yml up -d nexo-agent
+docker compose -f compose.agent.yml logs --tail=50 nexo-agent
+```
+
+Agent 身份保存在 `data/nexo-agent`。入网成功后可清空 `.env` 中的凭证值，后续重启复用原身份；不要把同一身份目录复制到多台主机。
+
+## 发布第一个服务
+
+### TCP：先验证基本链路
+
+假设 Agent 所在主机已有一个监听 `127.0.0.1:8080` 的 HTTP 应用：
+
+1. 在“穿透服务”新建服务，协议选 TCP，选择刚批准的 Agent。
+2. 本地地址填 `127.0.0.1`，本地端口填 `8080`，公网端口留空以自动分配。
+3. 保存后放行分配的公网 TCP 端口，并等待服务正常。
+4. 从外部网络访问 `http://Server公网IP:分配端口`，确认打开的是该应用。
+
+这里使用 TCP 转发 HTTP 应用便于浏览器验收；其他 TCP 应用使用各自客户端访问。若应用在局域网另一台主机上，本地地址应填写那台主机的内网 IP。
+
+### HTTPS：使用自己的域名
+
+1. 在“域名与证书”添加 `example.com`，按提示添加 TXT 记录完成归属验证，或提交该域名的 Cloudflare Token 验证。
+2. 在 DNS 服务商添加 `app.example.com` 的 A 记录，指向 Server 的公网 IPv4；没有可达 IPv6 时不要添加 AAAA。
+3. 新建 HTTPS 服务，选择 Agent，绑定该域名，服务子域名填 `app`，本地目标填实际应用地址和端口。
+4. 默认 HTTP-01 需要公网 TCP `80/443` 可达。等待配置加载、解析与证书状态正常，再从外部网络打开 `https://app.example.com`。
+
+公网 HTTPS 由 Caddy 终止，本地目标默认使用 HTTP，无需给内网应用安装公网证书。Cloudflare DNS-01 支持泛域名签发，但**不会自动创建访问所需的 A/AAAA 记录**。DNS 检查成功也不能代替真实外网访问。
+
+## 维护与更新
+
+Server 与 Agent 独立发布，二者的数字版本可能不同。更新前阅读发布说明并备份完整数据目录；只对本次实际更新的组件执行拉取和重建，保留另一端的容器与节点身份。
+
+以只更新 Server 为例，在原 Server 安装目录执行：
+
+```bash
+docker compose -f compose.yml pull nexo-server
+docker compose -f compose.yml up -d --no-deps nexo-server
+docker compose -f compose.yml ps
+```
+
+如果原配置固定了数字版本，需要先将对应组件的 `image` 改为 `latest`。不要通过删除数据目录更新或回退；版本回退前确认数据兼容性，必要时使用与旧镜像匹配的完整备份。详细步骤见 [更新、备份与恢复](https://github.com/thelinyue/Nexo/blob/master/docker/README.md#更新备份与恢复)。
+
+| 需要帮助 | 文档 |
+| --- | --- |
+| 服务操作、用户分享、工作空间、域名和证书 | [使用指南](https://github.com/thelinyue/Nexo/blob/master/docs/usage.md) |
+| 环境变量、HTTPS 管理入口、备份恢复、排障 | [容器说明](https://github.com/thelinyue/Nexo/blob/master/docker/README.md) |
+| 本机验证、真实流量验收与测试边界 | [穿透验收](https://github.com/thelinyue/Nexo/blob/master/docs/network-experience.md) |
+| 版本变化与兼容说明 | [GitHub Releases](https://github.com/thelinyue/Nexo/releases) · [更新记录](https://github.com/thelinyue/Nexo/blob/master/CHANGELOG.md) |
+
+## 开发与安全
+
+项目使用 Rust 与 React。以下命令在仓库根目录运行；浏览器和真实流量验收见上述穿透验收文档：
+
+```bash
+cargo fmt --all -- --check
+cargo test --workspace --locked
+cargo clippy --workspace --all-targets --locked -- -D warnings
+cd web
+npm ci --ignore-scripts
+npm run build
+```
+
+漏洞请按 [安全策略](https://github.com/thelinyue/Nexo/blob/master/SECURITY.md) 私密报告，不要在公开 Issue 中提交 Token、私钥或包含凭据的日志。
 
 ## 许可证
 
-Nexo 以 AGPL-3.0-only 发布，第三方声明见 [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md)。
+Nexo 以 [AGPL-3.0-only](LICENSE) 发布，第三方声明见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。

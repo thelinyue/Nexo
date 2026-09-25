@@ -40,7 +40,7 @@ export async function installApiMocks(page: Page, options: { empty?: boolean; an
     if (path === "/api/v1/transport-identity") return respond(state.transportIdentity);
     if (path.startsWith("/api/v1/devices/") && method === "DELETE") { state.devices = state.devices.filter(item => item.id !== path.split("/").pop()); return respond({}); }
     if (path === "/api/v1/enrollments" && method === "GET") return respond(state.enrollments);
-    if (path === "/api/v1/enrollments" && method === "POST") return respond({ id: "e-new", status: "awaiting_agent", token: "one-time-secret-enrollment-token", expires_at: 1791000000 });
+    if (path === "/api/v1/enrollments" && method === "POST") return respond({ id: "e-new", status: "awaiting_agent", token: "one-time-secret-enrollment-token", expires_at: Math.floor(Date.now()/1000) + 3600 });
     if (path.startsWith("/api/v1/enrollments/") && method === "DELETE") { state.enrollments = state.enrollments.filter(item => item.id !== path.split("/").pop()); return respond({ revoked: true }); }
     if (path.endsWith("/approve")) { state.enrollments = []; return respond({}); }
     if (path.endsWith("/access")) { if (method === "POST") state.dnsChecked = true; return respond(access(state.domains.find(domain => domain.id === path.split("/")[4])?.domain ?? "example.com")); }

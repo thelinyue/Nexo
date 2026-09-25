@@ -3,7 +3,7 @@ name: nexo-agent
 # 每个需要公网 Tunnel 的站点运行一个 Agent。Agent 可连接任意 Nexo Server。
 services:
   nexo-agent:
-    image: ghcr.io/thelinyue/nexo-agent:0.2.0
+    image: ghcr.io/thelinyue/nexo-agent:latest
     container_name: nexo-agent
     network_mode: host
     environment:

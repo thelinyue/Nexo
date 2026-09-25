@@ -1,10 +1,62 @@
 # Nexo 容器说明
 
-`Dockerfile.server` 构建管理入口、控制服务与 Tunnel 公网入口；`Dockerfile.agent` 构建只负责本地目标代理和 Tunnel 通道的 Agent。两者均为 v0.2.0，使用空数据目录部署。
+`Dockerfile.server` 构建管理入口、控制服务与 Tunnel 公网入口；`Dockerfile.agent` 构建只负责本地目标代理和 Tunnel 通道的 Agent。默认 Compose 使用各组件最新稳定版 `latest`，数字标签保留用于回退。首次安装使用空数据目录，已有 v0.2.x 安装更新时保留原目录；v0.1.x 需要全新安装。
+
+新安装从 [README 快速部署](../README.md#快速部署) 开始，日常服务与账号操作见 [使用指南](../docs/usage.md)。以下维护命令均在对应组件的原安装目录运行。
 
 Agent 不需要 `NET_ADMIN`、`/dev/net/tun`、转发 sysctl、iptables 或 iproute2。宿主机需允许 Agent 访问 Server 入网 API、控制端口、数据端口和本地应用端口。
 
 默认监听：Server Web/API `8280`、Agent 控制 `9890`、Tunnel 数据 `9891`，TCP 自动分配公网端口范围 `20000-29999`。管理 API 可由前置 HTTPS 代理保护；`9890/9891` 使用设备证书双向 TLS，必须直连或 TCP 透传。Web Tunnel 的 `80/443` 交给 Caddy。
+
+## 更新、备份与恢复
+
+`latest` 是可移动的稳定版别名，不代表容器会自动更新。Server 和 Agent 独立发布，仅对发布说明列出的更新组件操作；需要配套更新时，先安排维护窗口，再按该版本说明处理两端。更新前记录正在运行的数字版本（管理页版本信息或容器镜像的 `org.opencontainers.image.version` 标签），保存原 Compose 和环境变量。
+
+Server 更新命令：
+
+```sh
+docker compose -f compose.yml pull nexo-server
+docker compose -f compose.yml up -d --no-deps nexo-server
+docker compose -f compose.yml ps
+docker compose -f compose.yml logs --tail=100 nexo-server
+```
+
+仅在 Agent 有更新时，在其主机的原目录执行：
+
+```sh
+docker compose -f compose.agent.yml pull nexo-agent
+docker compose -f compose.agent.yml up -d --no-deps nexo-agent
+docker compose -f compose.agent.yml logs --tail=100 nexo-agent
+```
+
+旧 Compose 若固定了数字版本，需手动将对应服务的 `image` 改为 `latest`。不要为更新重建身份目录，也不要运行新安装脚本覆盖旧配置。
+
+### 备份与版本回退
+
+备份前停止需要备份的组件，以获得一致的数据库和身份文件；这会中断该组件负责的转发。备份完成后用 `docker compose -f 对应配置文件 start 对应服务名` 恢复原容器。
+
+| 组件 | 停止命令 | 需要一起备份 |
+| --- | --- | --- |
+| Server | `docker compose -f compose.yml stop nexo-server` | `compose.yml`、存在时的 `.env`、整个 `data/nexo` |
+| Agent | `docker compose -f compose.agent.yml stop nexo-agent` | `compose.agent.yml`、`.env`、整个 `data/nexo-agent` |
+
+Server 数据包含数据库、内部 CA、身份、Caddy 证书及域名凭据；Agent 数据包含私钥与证书。备份应存放在受限位置，保留文件权限，不能只备份数据库，也不要用清空证书缓存的方式排障。
+
+回退时先核对目标版本的数据兼容说明，再把对应组件镜像改为更新前记录的数字版本。若数据结构不兼容，应在停止组件后恢复该版本的完整备份，再启动；先保留当前数据副本，不要直接覆盖或删除。v0.1.x 回退必须恢复原 v0.1.x 镜像、配置和数据，不能挂载新版目录。
+
+## 常见问题
+
+| 现象 | 优先检查 |
+| --- | --- |
+| 管理页无法访问 | 容器状态、8280 监听、可信来源防火墙规则；配置公网 HTTPS 后检查代理及请求协议 |
+| Agent 一直等待或离线 | 入网凭证是否过期、是否已批准、Server URL 是否可达、9890/9891 是否直连或 TCP 透传 |
+| TCP 服务无法访问 | Agent 能否访问本地目标、公网分配端口是否放行、访问地址是否误用了 HTTP 代理域名 |
+| 域名解析正确但 HTTPS 不通 | Caddy 加载结果、证书错误、80/443 冲突、公网 DNS 与防火墙；解析正确不代表转发已通 |
+| Caddy 监听失败 | 主机上其他反向代理是否已占用同一 IP 的 80/443；host 网络下不能靠 Compose ports 解决冲突 |
+| 设备证书过期或私钥丢失 | 使用下方“设备身份恢复”，保留原 Agent 和服务绑定 |
+| Server 报旧数据结构 | 使用新的空目录部署，不复制 v0.1.x 数据进入新版目录 |
+
+日志仅在本地排查，分享前删除凭据、私钥和用户数据。Caddy Admin API `8290` 仅供本机使用，不要开放到公网。
 
 ## Tunnel 连接与持久身份
 
@@ -61,6 +113,8 @@ Compose 使用 host 网络，新增环境变量应填入 `nexo-server.environmen
 
 ### 管理入口与账号恢复
 
+默认 Caddy 的 `80/443` 用于穿透服务；管理 API 位于 `8280`。前置 HTTPS 代理若与 Server 同机，应使用独立监听 IP，或将内置 Caddy 改为其他本机监听端口并配置服务域名回源。HTTP-01 的公网验证入口仍为 TCP 80。host 网络下不存在 Docker 端口映射层，不能仅添加 `ports` 来解决监听冲突。
+
 公网部署时在 Server 的 `.env` 中配置 `NEXO_PUBLIC_URL=https://你的管理域名`，并将 `NEXO_TRUSTED_PROXIES` 设置为直连 Server 的反向代理 IP（多个地址用逗号分隔，不支持 CIDR）。代理必须覆盖写入 `X-Forwarded-Proto`，HTTPS 请求使用单值 `https`，同时保留原始 Host。例如同机代理可使用 `127.0.0.1`；请按实际连接地址填写，不要信任来源不受控的代理。
 
 配置 HTTPS 管理地址后，不经可信代理的 API 请求会被拒绝；`/health` 仍供本机健康检查使用。HTTPS 登录 Cookie 带 `Secure`，写入检查 Origin 和 CSRF。未配置公网地址时保留局域网 HTTP 访问，管理页会提示当前连接未使用 HTTPS。Agent 的 `NEXO_SERVER_URL` 也应改为此 HTTPS 入口；控制和数据端口继续由 mTLS 保护。
@@ -108,58 +162,8 @@ Server 在新增域名或服务域名变化后自动检查一次，解析成功�
 
 ## 本机集成验证
 
-### 恢复流程验收
-
-Node 22+ 可直接运行真实 Server/Agent 验收，测试只使用独立目录和本机随机端口：
-
-```sh
-node docker/recovery-smoke.mjs --server-bin target/debug/nexo-server --agent-bin target/debug/nexo-agent --report .edge-screenshot/recovery-runtime/report.json
-```
-
-Windows 将二进制路径加上 `.exe`。验证账号恢复与旧会话撤销、恢复命令中断重试、设备身份替换和旧连接关闭、私钥丢失后恢复、服务绑定与真实 TCP 转发保留、HTTPS 代理识别、CSRF 和登录限流。测试日志与身份保留在 `.edge-screenshot/recovery-runtime/run-*` 中，只用于本地诊断，不可用作生产身份或公开发布。
-
-### Caddy 与 Tunnel 验收
-
-设置 `NEXO_TEST_CADDY_BIN` 指向 Caddy 二进制后运行：
-
-```bash
-cargo test -p nexo-server real_caddy_reuses_wildcards_and_keeps_last_good_config -- --ignored --nocapture
-```
-
-该测试使用随机回环端口和 `.localhost` 域名，验证真实配置加载、Caddy 内部 CA 签发、有效期读取、HTTPS 握手与失败配置保留；同时验证旧单域名证书切换到泛域名、同级及多级服务共用证书、新增同级服务不增加证书。测试不会安装系统根证书，也不会向公网 CA 申请证书；公网 ACME 与 Cloudflare DNS-01 还需使用自己的真实域名和受限凭据验证。
-
-完整转发验收使用 Python 3.10+ 标准库，在独立临时目录运行真实 Server、Agent 和 Caddy：
-
-```bash
-cargo build -p nexo-server -p nexo-agent
-python3 docker/tunnel-smoke.py \
-  --server-bin target/debug/nexo-server \
-  --agent-bin target/debug/nexo-agent \
-  --caddy-bin /usr/local/bin/caddy
-```
-
-Windows 将二进制路径改为 `.exe`。脚本验证 TCP 大文件、并发与半关闭、HTTP/HTTPS、WebSocket、mTLS 拒绝无效身份、目标修改、启停删除、独立数据重连及进程重启恢复。Linux 同时覆盖实际 Unix socket 路径。临时目录保留日志与测试身份用于诊断，不可用于生产；可用 `--report 路径.json` 保存验收结果。
-
-内部证书验收额外需要 Python `cryptography`，使用同样的三个二进制参数运行 `docker/identity-renewal-smoke.py`。它只修改独立临时目录中的测试证书，模拟进入续签时间、磁盘写入失败与恢复，并验证自动重试、证书热更新、身份和长连接保留；不修改系统时间，也不连接公网 CA。
+开发构建、账号恢复、Caddy、Tunnel 和身份续签验收统一见 [穿透验收](../docs/network-experience.md#本机集成验证)。本机测试结果不能代替公网 DNS、ACME 或防火墙验收。
 
 ## 多用户与热重载验收
 
-管理页通过“用户管理”分享单次注册链接；账号隔离与启停说明见项目 README。服务端在原有 v0.2.0 数据库上增量添加用户邀请和域名配置，不替换已有数据。
-
-用户管理采用单管理员模式。管理员可修改自己和普通用户的用户名；改名后目标账号的旧会话与恢复码失效，资源身份不变。管理员不可停用、删除或修改角色，邀请只创建普通用户。删除普通用户需输入当前用户名，将删除其整个工作空间并关闭转发；不会卸载远端 Agent 或删除实际应用文件。若提示公网配置和凭据清理正在重试，账号及转发已经撤销，Server 会在 Caddy 恢复后自动回收不再被运行配置及 Applied 文件引用的域名凭据，重启后仍会继续处理。
-
-```sh
-python docker/multiuser-smoke.py \
-  --server-bin target/debug/nexo-server \
-  --agent-bin target/debug/nexo-agent \
-  --caddy-bin /usr/local/bin/caddy \
-  --report /tmp/nexo-multiuser-report.json
-```
-
-该测试启动独立 Server、两个 Agent 和多个浏览器会话，覆盖跨空间拒绝、单次邀请、用户停用后的 TCP/WebSocket 断流与恢复、密码恢复隔离，以及 Caddy 重载时保留既有 WebSocket。测试仅在独立临时数据库中设置 `.localhost` 归属，不提供生产绕过验证的开关。安装 `aioquic` 后还会用内部 CA 校验证书，通过 UDP 实际请求 HTTP/3；未安装时明确跳过该项。此结果不能证明公网 UDP 443 可达。
-
-```sh
-NEXO_TEST_CADDY_BIN=/usr/local/bin/caddy cargo test -p nexo-server real_caddy -- --ignored --nocapture
-```
-
-包含相同 JSON 强制重载文件凭据、两种新版 Token 装配、无效候选配置保留旧 Applied 文件测试，不使用真实 Token、不访问 Cloudflare 或公网 CA。公网 DNS-01/HTTP-01 仍需在受控真实域名和 ACME staging 环境中单独验收。
+具体命令、覆盖场景和验证边界见 [多用户与热重载验收](../docs/network-experience.md#多用户与热重载验收)。

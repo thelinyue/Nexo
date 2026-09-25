@@ -1,8 +1,11 @@
 import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react";
 import { VitePWA } from "vite-plugin-pwa";
+import { readFileSync } from "node:fs";
 
 export default defineConfig({
+  // 独立发布时沿用 Compose 中真实存在的 Agent 镜像，不借用 Server/Web 版本号。
+  define: { __AGENT_COMPOSE_TEMPLATE__: JSON.stringify(readFileSync(new URL("../compose.agent.yml", import.meta.url), "utf8")) },
   plugins: [
     react(),
     VitePWA({

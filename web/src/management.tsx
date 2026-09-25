@@ -1,10 +1,11 @@
 import { useEffect, useRef, useState } from "react";
 import type { FormEvent, ReactNode } from "react";
 import { DeviceRecovery } from "./recovery";
+import { AgentEnrollment } from "./agent-enrollment";
 import { DomainSettings } from "./domain-settings";
 import { DomainAccess } from "./domain-access";
 import { ChevronRight, Eye, EyeOff, Globe2, KeyRound, Plus, Server, ShieldCheck, Users, X } from "lucide-react";
-import { Confirm, CopyButton, CreateButton, DetailField, Empty, Loading, Modal, Notice, PageHeader, Refresh, RowLink, Status, dateText, errorText, navigate, request, useApi, useResource } from "./ui";
+import { Confirm, CreateButton, DetailField, Empty, Loading, Modal, Notice, PageHeader, Refresh, RowLink, Status, dateText, errorText, navigate, request, useApi, useResource } from "./ui";
 import type { Auth, Device, Domain, DomainCertificate, DomainEvent, Enrollment, IdentityCertificate, Session, TransportIdentity, Tunnel } from "./ui";
 
 function identityCertificateLabel(certificate?: IdentityCertificate) {
@@ -31,14 +32,13 @@ function NameForm({ title, label, initial = "", onClose, onSave, children }: { t
 export function AgentsPage({ route, active, csrf, back }: { route: string; active: boolean; csrf?: string | null; back: string }) {
   const request = useApi();
   const resource = useResource(async () => { const [devices, enrollments, tunnels] = await Promise.all([request<Device[]>("/api/v1/devices"), request<Enrollment[]>("/api/v1/enrollments"), request<Tunnel[]>("/api/v1/tunnels")]); return { devices, enrollments, tunnels }; }, active);
-  const [enrolling, setEnrolling] = useState(false); const [token, setToken] = useState<Enrollment | null>(null); const [busy, setBusy] = useState(false); const [error, setError] = useState<string | null>(null); const [approveId, setApproveId] = useState<string | null>(null); const [deleting, setDeleting] = useState<Device | null>(null);
+  const [enrolling, setEnrolling] = useState(false); const [approveId, setApproveId] = useState<string | null>(null); const [deleting, setDeleting] = useState<Device | null>(null);
   const [recovering, setRecovering] = useState<Device | null>(null); const [cancelInvite, setCancelInvite] = useState<Enrollment | null>(null);
   const detailId = route.startsWith("#/agents/") ? route.slice("#/agents/".length) : null;
   const data = resource.data; const detail = data?.devices.find(item => encodeURIComponent(item.id) === detailId);
   const pending = data?.enrollments.filter(item => ["awaiting_agent", "awaiting_approval"].includes(item.status)) ?? [];
   const approval = data?.enrollments.find(item => item.id === approveId);
   const recoveryTarget = data?.devices.find(item => item.id === approval?.device_id);
-  async function create() { setBusy(true); setError(null); try { setToken(await request<Enrollment>("/api/v1/enrollments", { method: "POST", body: JSON.stringify({ ttl_seconds: 3600 }) }, csrf)); await resource.reload(); } catch (e) { setError(errorText(e)); } finally { setBusy(false); } }
   return <>
     <PageHeader title={detailId ? "Agent 详情" : "Agent"} subtitle={detailId ? undefined : "连接本地服务的运行节点"} back={detailId ? back : "#/manage"} action={!detailId && <Refresh label="Agent" busy={resource.busy} onClick={() => void resource.reload()} />} />
     <Notice error={resource.error} onRetry={() => void resource.reload()} />{!data && resource.busy && <Loading />}
@@ -53,9 +53,9 @@ export function AgentsPage({ route, active, csrf, back }: { route: string; activ
       {pending.length > 0 && <section className="panel pending-panel"><h2 className="section-title">等待批准 · {pending.length}</h2>{pending.map(item => <div className="pending-row" key={item.id}><div><strong>{item.kind === "recovery" ? `恢复 ${data.devices.find(device => device.id === item.device_id)?.name ?? "原设备"} 的身份` : "新的 Agent 入网请求"}</strong><small>有效期至 {dateText(item.expires_at)}</small></div><div className="pending-actions">{item.status === "awaiting_approval" ? <button className="primary-button" onClick={() => setApproveId(item.id)}>批准</button> : <span className="helper">等待 Agent 提交</span>}<button className="text-button" aria-label={`撤销请求 ${item.id}`} onClick={() => setCancelInvite(item)}>撤销</button></div></div>)}</section>}
       <div className="list-caption"><span>{data.devices.length} 台 Agent</span><span>{data.devices.filter(item => item.status === "online").length} 台在线</span></div>
       {!data.devices.length ? <Empty title="还没有 Agent" detail="添加一台 Agent，让它连接你的本地服务。" /> : <section className="panel agent-list">{data.devices.map(item => <a className="agent-row" key={item.id} href={`#/agents/${encodeURIComponent(item.id)}`}><span className="agent-avatar"><Server size={21} /></span><div className="agent-identity"><strong>{item.name}</strong><small>{item.tunnel_count} 个服务</small>{item.certificate && ["expiring", "retry_wait", "expired"].includes(item.certificate.status) && <small className="form-error">{identityCertificateLabel(item.certificate)}</small>}</div><Status kind="agent" value={item.status} /><ChevronRight size={18} /></a>)}</section>}
-      <CreateButton label="Agent" onClick={() => { setError(null); setEnrolling(true); }} />
+      <CreateButton label="Agent" onClick={() => setEnrolling(true)} />
     </>)}
-    {enrolling && active && <Modal title="添加 Agent" onClose={() => { setEnrolling(false); setToken(null); }} busy={busy} dirty={Boolean(token?.token)}><div className="modal-body"><ol className="steps"><li><strong>生成入网凭证</strong><p>凭证有效期为 1 小时，仅在此处显示，请先复制。</p>{!token ? <button className="primary-button" onClick={() => void create()} disabled={busy}>{busy ? "生成中…" : "生成凭证"}</button> : <><code className="token">{token.token ?? "服务器未返回凭证，请关闭后重试"}</code>{token.token && <CopyButton value={token.token} label="复制入网凭证" />}<small>有效期至 {dateText(token.expires_at)}</small></>}</li><li><strong>部署并启动 Agent</strong><p>将凭证填入部署配置的 <code>NEXO_ENROLLMENT_TOKEN</code>，启动 Agent。</p></li><li><strong>批准入网</strong><p>返回 Agent 列表，申请会自动出现，核对后批准并设置名称。</p></li></ol><Notice error={error} /></div></Modal>}
+    {enrolling && active && <AgentEnrollment csrf={csrf} onClose={() => setEnrolling(false)} onCreated={() => resource.reload()} />}
     {approveId && active && approval?.kind !== "recovery" && <NameForm title="批准 Agent 入网" label="Agent 名称" initial="我的 Agent" onClose={() => setApproveId(null)} onSave={async name => { await request(`/api/v1/enrollments/${encodeURIComponent(approveId)}/approve`, { method: "POST", body: JSON.stringify({ device_name: name }) }, csrf); await resource.reload(); }} />}
     {recovering && active && <DeviceRecovery device={recovering} csrf={csrf} onClose={() => setRecovering(null)} onCreated={() => void resource.reload()} />}
     {approveId && active && approval?.kind === "recovery" && <Confirm title={`批准恢复 ${recoveryTarget?.name ?? "原设备"} 的身份？`} description="原设备 ID、名称和服务绑定保留。批准后旧证书及旧连接立即失效，请确认申请来自你的 Agent。" label="批准恢复" onClose={() => setApproveId(null)} onConfirm={async () => { await request(`/api/v1/enrollments/${encodeURIComponent(approveId)}/approve`, { method: "POST", body: "{}" }, csrf); await resource.reload(); }} />}

@@ -2,6 +2,19 @@
 
 本项目使用 [Semantic Versioning](https://semver.org/) 记录公开版本。
 
+## [0.2.1]
+
+- Agent 添加流程可生成 Docker Compose 或 `docker run` 部署命令，自动填入 Server 地址与一次性入网凭证。
+- 官方 Compose 改用各组件的 latest 稳定标签；发布流程只更新本次实际发布组件的 latest，且不会回退到旧版本。
+- 本次仅发布 Server，Agent 保持 `0.2.0`；无需数据库迁移。升级方法见 [v0.2.1 发布说明](docs/releases/v0.2.1.md)。
+
+## [0.2.0]
+
+- 产品收敛为 TCP、HTTP、HTTPS 内网穿透，移除 Headscale、Tailscale 与虚拟组网管理。
+- 提供工作空间隔离、账号邀请与恢复、Agent 入网审批、mTLS 通道和身份自动续签。
+- 统一管理公网域名、解析检查、Cloudflare DNS 验证及 Caddy 自动证书。
+- 本版本发布 Server 与 Agent，仅支持全新安装，不从 v0.1.x 迁移数据。部署与兼容说明见 [v0.2.0 发布说明](docs/releases/v0.2.0.md)。
+
 ## [0.1.17] - 2026-09-08
 
 ### Added

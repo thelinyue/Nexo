@@ -1,9 +1,9 @@
 name: nexo
 
-# Nexo v0.2.0 Server 部署。使用空数据目录进行全新安装。
+# Nexo 最新稳定版 Server。首次安装使用空数据目录，更新时保留原目录。
 services:
   nexo-server:
-    image: ghcr.io/thelinyue/nexo-server:0.2.0
+    image: ghcr.io/thelinyue/nexo-server:latest
     container_name: nexo-server
     network_mode: host
     environment:
