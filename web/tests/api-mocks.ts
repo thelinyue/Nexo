@@ -5,6 +5,7 @@ import type { Device, Domain, DomainEvent, Enrollment, TransportIdentity } from 
 export async function installApiMocks(page: Page, options: { empty?: boolean; anonymous?: boolean; initialize?: boolean } = {}) {
   const state = {
     authenticated: !options.anonymous,
+    users: [{ id: "admin", username: "admin", role: "system_admin", workspace_id: "default", workspace_name: "admin的工作空间", enabled: true, devices: 2, services: 1, domains: 1 }, { id: "alice", username: "alice", role: "tenant", workspace_id: "alice-space", workspace_name: "alice 的工作空间", enabled: true, devices: 1, services: 1, domains: 0 }],
     accessKey: "nexo_join_shared-test-key",
     tunnels: options.empty ? [] : [{ id: "t-1", name: "媒体中心", protocol: "https", local_address: "127.0.0.1", local_port: 8096, public_port: null, public_address: "https://media.example.com/a-very-long-public-address", hostname: "media", public_domain: "example.com", device_id: "a-1", device_name: "家庭 Agent", enabled: true, apply_status: "ready", apply_error: null, lan_redirect_enabled: false }] as any[],
     devices: [{ id: "a-1", name: "家庭 Agent", status: "online", os: "Linux", architecture: "amd64", last_seen_at: 1790000000, agent_version: "0.2.0", tunnel_count: 1 }, { id: "a-2", name: "备用 Agent", status: "offline", os: "Linux", agent_version: "0.2.0", tunnel_count: 0 }] as Device[],
@@ -13,6 +14,8 @@ export async function installApiMocks(page: Page, options: { empty?: boolean; an
     domainEvents: [{ id: 1, domain_id: "d-1", summary: "配置已加载", occurred_at: Math.floor(Date.now() / 1000) }] as DomainEvent[],
     enrollments: [{ id: "e-1", kind: "enroll", status: "awaiting_approval", expires_at: 1791000000 }] as Enrollment[],
     failureStatuses: new Map<string, number>(),
+    trafficResets: new Map<string, number>(),
+    quotas: new Map<string, { monthly_limit_bytes: number | null; used_bytes: number }>(),
     dnsMatches: true,
     dnsChecked: true,
     dnsResolved: true,
@@ -29,6 +32,38 @@ export async function installApiMocks(page: Page, options: { empty?: boolean; an
     const failure = state.failures.get(`${method} ${path}`);
     if (failure) { const status = state.failureStatuses.get(`${method} ${path}`) ?? 503; return respond({ error: failure, ...(status === 401 && !path.endsWith("/login") && !path.endsWith("/recover") ? { code: "session_expired" } : {}) }, status); }
     if (state.delay && method === "GET") await new Promise(resolve => setTimeout(resolve, state.delay));
+    if (path === "/api/v1/admin/users") return respond(state.users);
+    if (path === "/api/v1/admin/invitations") return respond([]);
+    if (path.endsWith("/traffic/quota")) {
+      const user = new URL(req.url()).searchParams.get("user_id") ?? "alice";
+      const quota = state.quotas.get(user) ?? { monthly_limit_bytes: null, used_bytes: 80 * 1024 ** 3 };
+      if (method === "PUT") { quota.monthly_limit_bytes = body.monthly_limit_bytes; state.quotas.set(user, quota); }
+      const now = Math.floor(Date.now() / 1000);
+      return respond({ ...quota, remaining_bytes: quota.monthly_limit_bytes === null ? null : Math.max(0, quota.monthly_limit_bytes - quota.used_bytes), exhausted: quota.monthly_limit_bytes !== null && quota.used_bytes >= quota.monthly_limit_bytes, period_start: now - 20 * 86400, period_end: now + 10 * 86400, started_at: now - 30 * 86400 });
+    }
+    if (path === "/api/v1/admin/traffic/reset" && method === "POST") {
+      const reset_at = Math.floor(Date.now() / 1000);
+      state.trafficResets.set(body.user_id, reset_at);
+      return respond({ reset_at });
+    }
+    if (path.endsWith("/traffic/usage")) {
+      const now = Math.floor(Date.now() / 1000);
+      const user = new URL(req.url()).searchParams.get("user_id");
+      const reset_at = state.trafficResets.get(user ?? "") ?? null;
+      const period = (days: number, value: number) => ({ start: now - days * 86400, total: { to_origin: reset_at ? 0 : value, to_public: reset_at ? 0 : value }, partial: false });
+      return respond({ timezone: "Asia/Shanghai", sampled_at: now, started_at: now - 40 * 86400, reset_at, reset_users: reset_at ? 1 : user ? 0 : state.trafficResets.size, today: period(0, 1024), week: period(3, 10240), month: period(15, 102400) });
+    }
+    if (path.endsWith("/traffic/realtime")) return respond({ sampled_at: Math.floor(Date.now() / 1000), status: "ready", rates: { to_origin: 2048, to_public: 8192 } });
+    if (path.endsWith("/traffic/history")) {
+      const range = new URL(req.url()).searchParams.get("range");
+      const step = range === "1h" ? 60 : range === "7d" ? 3600 : 300;
+      const count = range === "1h" ? 60 : range === "7d" ? 168 : 288;
+      const end = Math.floor(Date.now() / 60000) * 60 + 60;
+      const points = Array.from({ length: count }, (_, i) => ({ at: end - (count - i) * step, seconds: step, covered_seconds: step, bytes: { to_origin: 2048 * step, to_public: (4096 + Math.sin(i / 5) * 2048) * step }, rates: { to_origin: 2048, to_public: 4096 + Math.sin(i / 5) * 2048 } }));
+      return respond({ start: end - count * step, end, step, sampled_at: end - 60, total: { to_origin: 2048 * count * step, to_public: 4096 * count * step }, points });
+    }
+    const scopedResource = path.match(/^\/api\/v1\/admin\/workspaces\/[^/]+\/(tunnels|devices|public-domains)$/);
+    if (scopedResource && method === "GET") return respond(scopedResource[1] === "tunnels" ? state.tunnels : scopedResource[1] === "devices" ? state.devices : state.domains);
     if (path === "/api/v1/auth/status") return respond({ initialized: !options.initialize, authenticated: state.authenticated, user_id: "admin", workspace_id: "default", role: "system_admin", username: "admin", csrf_token: "test-csrf" });
     if (path === "/api/v1/auth/login" || path === "/api/v1/auth/initialize") { state.authenticated = true; return respond({ user_id: "admin", workspace_id: "default", role: "system_admin", username: "admin", csrf_token: "test-csrf" }); }
     if (path === "/api/v1/auth/recover") return respond({ username: "admin", message: "密码已更新，请重新登录" });

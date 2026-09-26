@@ -1,7 +1,8 @@
-import { useEffect, useId, useMemo, useRef, useState } from "react";
-import type { FormEvent } from "react";
-import { Check, ChevronDown, ChevronRight, Search, Trash2 } from "lucide-react";
-import { Confirm, CopyButton, CreateButton, DetailField, Empty, Loading, Modal, Notice, PageHeader, Status, errorText, localTarget, navigate, useApi, useResource } from "./ui";
+import { PageNavigationContext, useResourceDeletions } from "./navigation";
+import { useContext, useEffect, useId, useMemo, useRef, useState } from "react";
+import type { FormEvent, PointerEvent as ReactPointerEvent } from "react";
+import { Check, ChevronDown, ChevronRight, Power, PowerOff, Search, Server, Trash2 } from "lucide-react";
+import { Confirm, CopyButton, CreateButton, DetailField, Empty, Loading, Modal, Notice, PageHeader, Status, errorText, localTarget, useApi, useResource } from "./ui";
 import type { Device, Domain, Tunnel } from "./ui";
 import { isLanRedirectAddress } from "./lan-redirect";
 
@@ -157,10 +158,10 @@ function ServiceEditor({ tunnel, data, active, csrf, onClose, onSaved }: { tunne
     }}>
       <div className="modal-body"><fieldset disabled={busy}>
         <fieldset className="protocol-picker"><legend className="sr-only">服务类型</legend>{[["web", "网页服务"], ["tcp", "TCP 服务"]].map(([type, label]) => <label className="protocol-option" key={type}><input type="radio" name="service_type" value={type} checked={(draft.protocol === "tcp" ? "tcp" : "web") === type} disabled={Boolean(tunnel && !tunnel.public_domain && type === "web")} onChange={() => update("protocol", type === "tcp" ? "tcp" : webProtocol.current)} /><span>{label}</span></label>)}</fieldset>
-        <section className="service-form-section"><div className="service-field-group">
+        <section className="service-form-section"><h3 className="desktop-form-label">基本信息</h3><div className="service-field-group">
           <label className="service-field"><span>服务名称</span><input {...fieldProps("name")} value={draft.name} onChange={e => update("name", e.target.value)} placeholder="例如：家庭 NAS" enterKeyHint="next" autoComplete="off" required /></label>
           <ServiceSelect {...fieldProps("device_id")} label="Agent" value={draft.device_id} placeholder="选择 Agent" options={devices.map(item => ({ value: item.id, label: item.name, status: item.status === "online" ? "online" : "offline" }))} disabled={busy} onChange={value => update("device_id", value)} />
-        </div>{!devices.length && <div className="notice"><span>请先接入一台 Agent。</span><button type="button" className="text-button" onClick={() => navigate("#/agents", true)}>配置 Agent</button></div>}{devices.find(item => item.id === draft.device_id)?.status === "offline" && <p className="helper" role="status">Agent 当前离线，可保存配置，连接恢复后下发。</p>}</section>
+        </div>{!devices.length && <div className="notice"><span>请先接入一台 Agent。</span><span className="helper">请先取消表单，再到设备页添加。</span></div>}{devices.find(item => item.id === draft.device_id)?.status === "offline" && <p className="helper" role="status">Agent 当前离线，可保存配置，连接恢复后下发。</p>}</section>
         <section className="service-form-section"><h3>内网地址</h3><div className="service-field-group service-address-input" role="group" aria-label="内网连接">
           {draft.protocol === "tcp" ? <span className="service-fixed-protocol">TCP</span> : <select aria-label="内网协议" {...fieldProps("origin_protocol")} value={draft.origin_protocol} onChange={e => update("origin_protocol", e.target.value)}><option value="http">HTTP</option><option value="https">HTTPS</option></select>}
           <input aria-label="内网地址" {...fieldProps("local_address")} value={draft.local_address} onChange={e => update("local_address", e.target.value)} placeholder="IP 或主机名" inputMode="url" enterKeyHint="next" autoComplete="off" autoCorrect="off" autoCapitalize="none" spellCheck={false} required />
@@ -172,7 +173,7 @@ function ServiceEditor({ tunnel, data, active, csrf, onClose, onSaved }: { tunne
           <input aria-label="主机名" {...fieldProps("hostname")} value={draft.hostname} onChange={e => update("hostname", e.target.value)} placeholder="主机名" enterKeyHint="done" autoComplete="off" autoCorrect="off" autoCapitalize="none" spellCheck={false} required />
           <span className="service-address-separator" aria-hidden="true">.</span>
           <ServiceSelect compact {...fieldProps("public_domain_id")} label="根域名" value={draft.public_domain_id} placeholder="选择域名" options={data.domains.map(item => ({ value: item.id, label: item.domain }))} disabled={busy || Boolean(tunnel)} onChange={value => update("public_domain_id", value)} />
-        </div>{!data.domains.length && <div className="notice"><span>网页服务需要根域名。</span><button type="button" className="text-button" onClick={() => navigate("#/domains", true)}>添加域名</button></div>}{tunnel && <p className="helper">现有服务保留原根域名；更换根域名请创建新服务。</p>}</section>}
+        </div>{!data.domains.length && <div className="notice"><span>网页服务需要根域名。</span><span className="helper">请先取消表单，再到域名页添加。</span></div>}{tunnel && <p className="helper">现有服务保留原根域名；更换根域名请创建新服务。</p>}</section>}
         {draft.protocol !== "tcp" && <section className="service-form-section"><div className="service-field-group">
           <label className="service-field service-toggle-field"><span>内网重定向</span><span className="service-switch"><input {...fieldProps("lan_redirect_enabled")} type="checkbox" role="switch" checked={draft.lan_redirect_enabled} onChange={e => update("lan_redirect_enabled", e.target.checked)} /><span className="service-switch-track" aria-hidden="true" /></span></label>
         </div>{draft.protocol === "http" && draft.lan_redirect_enabled && <p className="helper" role="status">部分浏览器访问 HTTP 域名时无法触发重定向，建议使用 HTTPS。</p>}</section>}
@@ -183,13 +184,74 @@ function ServiceEditor({ tunnel, data, active, csrf, onClose, onSaved }: { tunne
   </Modal>;
 }
 
-/** 列表在二级详情和其他页之间保持挂载，保存筛选、选择和表单草稿。 */
-export function ServicesPage({ route, active, csrf }: { route: string; active: boolean; csrf?: string | null }) {
+/** 批量换设备复用单项更新接口。提交前读取最新配置，逐项保留协议、域名、端口和启停状态；
+ * 成功项立即更新并移出待办，失败项留在表单中重试，避免部分成功被误报为整体成功。
+ */
+function BatchAgentEditor({ items, devices, csrf, onSaved, onClose, onComplete }: { items: Tunnel[]; devices: Device[]; csrf?: string | null; onSaved: (item: Tunnel) => void; onClose: () => void; onComplete: () => void }) {
   const request = useApi();
+  const [target, setTarget] = useState(""); const [pending, setPending] = useState(items);
+  const [busy, setBusy] = useState(false); const [errors, setErrors] = useState<string[]>([]);
+  const [completed, setCompleted] = useState(0);
+  const mounted = useRef(true);
+  useEffect(() => { mounted.current = true; return () => { mounted.current = false; }; }, []);
+  async function save(event: FormEvent) {
+    event.preventDefault(); if (busy || !target) return;
+    setBusy(true); setErrors([]);
+    try {
+      const latest = await loadServices(request);
+      if (!latest.devices.some(item => item.id === target)) throw new Error("目标 Agent 已不存在，请关闭表单并刷新设备列表");
+      const failed: Tunnel[] = []; const failures: string[] = [];
+      for (const original of pending) {
+        if (!mounted.current) return;
+        try {
+          const item = latest.tunnels.find(item => item.id === original.id);
+          if (!item) throw new Error("服务已不存在，请关闭表单并刷新列表");
+          const domain = latest.domains.find(domain => domain.domain === item.public_domain);
+          if (item.protocol !== "tcp" && !domain) throw new Error("原域名不可用，请先检查该服务的域名配置");
+          const updated = item.device_id === target ? item : await request<Tunnel>(`/api/v1/tunnels/${encodeURIComponent(item.id)}`, { method: "PUT", body: JSON.stringify({
+            device_id: target, name: item.name, protocol: item.protocol, origin_protocol: item.protocol === "tcp" ? null : item.origin_protocol ?? "http",
+            local_address: item.local_address, local_port: item.local_port, public_port: item.protocol === "tcp" ? item.public_port : null,
+            hostname: item.protocol === "tcp" ? null : item.hostname, public_domain_id: item.protocol === "tcp" ? null : domain!.id,
+            enabled: item.enabled, lan_redirect_enabled: item.protocol !== "tcp" && item.lan_redirect_enabled,
+          }) }, csrf);
+          if (!mounted.current) return;
+          onSaved(updated); setCompleted(value => value + 1);
+        } catch (error) { failed.push(original); failures.push(`${original.name}：${errorText(error)}`); }
+      }
+      if (!mounted.current) return;
+      setPending(failed); setErrors(failures);
+      if (!failed.length) { onComplete(); onClose(); }
+    } catch (error) { if (mounted.current) setErrors([errorText(error)]); }
+    finally { if (mounted.current) setBusy(false); }
+  }
+  return <Modal title="批量修改 Agent" full dirty={Boolean(target) && pending.length > 0} busy={busy} onClose={onClose}>
+    <form className="modal-form batch-agent-form" onSubmit={save}><div className="modal-body">
+      <details className="batch-agent-items"><summary><span>已选 {pending.length} 个服务</span><ChevronDown size={16} aria-hidden="true" /></summary><ul>{pending.map(item => <li key={item.id}>{item.name}</li>)}</ul></details>
+      <fieldset className="batch-agent-options" disabled={busy}><legend>选择目标 Agent</legend>{devices.map(item => <label className="batch-agent-option" key={item.id}>
+        <Server size={20} aria-hidden="true" /><span className="batch-agent-name" title={item.name}>{item.name}</span><Status kind="agent" value={item.status} />
+        <input type="radio" name="batch-agent-target" aria-label={`${item.name} · ${item.status === "online" ? "在线" : "离线"}`} value={item.id} checked={target === item.id} required onChange={() => setTarget(item.id)} />
+      </label>)}</fieldset>
+      <p className="helper batch-agent-hint">目标 Agent 需能访问现有内网地址。</p>
+      {devices.find(item => item.id === target)?.status === "offline" && <p className="helper batch-agent-hint">Agent 当前离线，恢复连接后下发配置。</p>}
+      {(busy || completed > 0) && <p role="status">已完成 {completed} / {items.length} 项</p>}
+      {errors.length > 0 && <div className="notice error batch-agent-errors" role="alert"><p>以下服务未完成，可重试：</p><ul>{errors.map(error => <li key={error}>{error}</li>)}</ul></div>}
+    </div><footer className="modal-actions"><button className="primary-button" disabled={busy || !target || !pending.length}>{busy ? "修改中…" : errors.length ? "重试未完成项" : "保存修改"}</button></footer></form>
+  </Modal>;
+}
+
+/** 列表在二级详情和其他页之间保持挂载，保存筛选、选择和表单草稿。 */
+export function ServicesPage({ route, active, csrf, back }: { route: string; active: boolean; csrf?: string | null; back?: string }) {
+  const request = useApi();
+  const navigation = useContext(PageNavigationContext);
   const resource = useResource(() => loadServices(request), active);
+  useResourceDeletions(routes => { if (routes.some(route => route.startsWith("#/services/"))) resource.setData(previous => previous && ({ ...previous, tunnels: previous.tunnels.filter(item => !routes.includes(`#/services/${encodeURIComponent(item.id)}`)) })); });
   const [protocol, setProtocol] = useState("all"); const [agent, setAgent] = useState("all");
   const [query, setQuery] = useState(""); const [filter, setFilter] = useState("all"); const [selecting, setSelecting] = useState(false); const [selected, setSelected] = useState<string[]>([]);
+  const [pressing, setPressing] = useState<string | null>(null);
+  const press = useRef<{ timer: number; pointer: number; x: number; y: number } | null>(null);
+  const longPressed = useRef(false);
   const [editor, setEditor] = useState<Tunnel | "new" | null>(null); const [busy, setBusy] = useState(false); const [actionError, setActionError] = useState<string | null>(null); const [message, setMessage] = useState<string | null>(null); const [deleting, setDeleting] = useState<Tunnel[] | null>(null);
+  const [changingAgent, setChangingAgent] = useState<Tunnel[] | null>(null);
   const data = resource.data;
   const tunnels = data?.tunnels ?? [];
   const detailId = route.startsWith("#/services/") ? route.slice("#/services/".length) : null;
@@ -198,8 +260,32 @@ export function ServicesPage({ route, active, csrf }: { route: string; active: b
   const matching = tunnels.filter(item => !query || `${item.name} ${item.device_name ?? ""} ${item.public_address ?? ""}`.toLowerCase().includes(query.toLowerCase()));
   const matchesFilter = (item: Tunnel, value: string) => value === "all" || (value === "web" ? item.protocol !== "tcp" : value === "attention" ? ["failed", "error"].includes(item.apply_status) : value === "disabled" ? !item.enabled : item.enabled);
   const visible = matching.filter(item => matchesFilter(item, filter) && (protocol === "all" || (protocol === "web" ? item.protocol !== "tcp" : item.protocol === "tcp")) && (agent === "all" || item.device_id === agent));
-  useEffect(() => { if (data) { setSelected(current => current.filter(id => data.tunnels.some(item => item.id === id))); if (!data.tunnels.length) setSelecting(false); } }, [data]);
-  useEffect(() => { document.body.classList.toggle("selection-mode", active && selecting && !detailId); return () => document.body.classList.remove("selection-mode"); }, [active, selecting, detailId]);
+  // 全选只作用于当前筛选结果，切换筛选后不把隐藏的服务带入批量操作。
+  useEffect(() => { if (data) { setSelected(current => current.filter(id => visible.some(item => item.id === id))); if (!data.tunnels.length) setSelecting(false); } }, [data, query, filter, protocol, agent]);
+  useEffect(() => { if (!active) return; document.body.classList.toggle("selection-mode", selecting && !detailId); return () => document.body.classList.remove("selection-mode"); }, [active, selecting, detailId]);
+  function cancelPress() { if (press.current) window.clearTimeout(press.current.timer); press.current = null; setPressing(null); }
+  function selectionTarget(target: EventTarget) { return target instanceof Element && !target.closest('button,input,label,select,code,a:not(.service-name)'); }
+  function toggleSelected(id: string) { if (!busy) setSelected(current => current.includes(id) ? current.filter(value => value !== id) : [...current, id]); }
+  /** 长按只在手机布局启用；滑动、滚动和多指立即取消计时，不阻止浏览器原生滚动。
+   * 成功后吞掉抬手产生的点击，避免进入详情或把刚选中的项再次取消。
+   */
+  function startPress(event: ReactPointerEvent, id: string) {
+    cancelPress(); longPressed.current = false;
+    if (!active || navigation?.desktop || selecting || event.button !== 0 || !event.isPrimary || !selectionTarget(event.target)) return;
+    setPressing(id);
+    press.current = { pointer: event.pointerId, x: event.clientX, y: event.clientY, timer: window.setTimeout(() => {
+      longPressed.current = true; setPressing(null); setSelecting(true); setSelected([id]);
+    }, 450) };
+  }
+  useEffect(() => {
+    if (!active || navigation?.desktop || detailId) return;
+    const scroll = () => cancelPress();
+    const anotherPointer = (event: PointerEvent) => { if (press.current && event.pointerId !== press.current.pointer) cancelPress(); };
+    window.addEventListener("scroll", scroll, true);
+    window.addEventListener("pointerdown", anotherPointer);
+    window.addEventListener("blur", scroll);
+    return () => { cancelPress(); window.removeEventListener("scroll", scroll, true); window.removeEventListener("pointerdown", anotherPointer); window.removeEventListener("blur", scroll); };
+  }, [active, navigation?.desktop, detailId, data, query, filter, protocol, agent]);
   const merge = (updated: Tunnel) => resource.setData(current => current && ({ ...current, tunnels: current.tunnels.some(item => item.id === updated.id) ? current.tunnels.map(item => item.id === updated.id ? updated : item) : [updated, ...current.tunnels] }));
   async function toggle(items: Tunnel[], enabled: boolean) {
     setBusy(true); setActionError(null); setMessage(null);
@@ -209,11 +295,13 @@ export function ServicesPage({ route, active, csrf }: { route: string; active: b
   }
   async function remove(items: Tunnel[]) {
     const failures: string[] = [];
-    await Promise.all(items.map(async item => { try { await request(`/api/v1/tunnels/${encodeURIComponent(item.id)}`, { method: "DELETE" }, csrf); resource.setData(current => current && ({ ...current, tunnels: current.tunnels.filter(value => value.id !== item.id) })); setSelected(current => current.filter(id => id !== item.id)); } catch (e) { failures.push(`${item.name}：${errorText(e)}`); } }));
-    if (failures.length) { setActionError(failures.join("；")); } else { setMessage(`已删除 ${items.length} 个服务`); if (detailId) navigate("#/services", true); }
+    const removed: string[] = [];
+    await Promise.all(items.map(async item => { try { await request(`/api/v1/tunnels/${encodeURIComponent(item.id)}`, { method: "DELETE" }, csrf); removed.push(`#/services/${encodeURIComponent(item.id)}`); resource.setData(current => current && ({ ...current, tunnels: current.tunnels.filter(value => value.id !== item.id) })); setSelected(current => current.filter(id => id !== item.id)); } catch (e) { failures.push(`${item.name}：${errorText(e)}`); } }));
+    if (removed.length) navigation?.removePages(removed, "#/services");
+    if (failures.length) { setActionError(failures.join("；")); } else { setMessage(`已删除 ${items.length} 个服务`); }
   }
   return <>
-    <PageHeader title={detailId ? "服务详情" : "穿透服务"} subtitle={detailId ? undefined : "管理公网入口与内网服务"} back={detailId ? "#/services" : undefined} action={!detailId && !selecting && Boolean(tunnels.length) && <CreateButton label="服务" onClick={() => { setEditor("new"); setMessage(null); }} />} />
+    <PageHeader title={detailId ? detail?.name ?? "隧道详情" : "隧道"} back={detailId ? back ?? "#/services" : undefined} action={!detailId && !selecting && Boolean(tunnels.length) && <CreateButton label="服务" onClick={() => { setEditor("new"); setMessage(null); }} />} />
     <Notice updatedAt={resource.updatedAt} error={resource.error} onRetry={() => void resource.reload()} /><Notice error={actionError} />{message && <p className="action-status" role="status">{message}</p>}
     {!data && resource.busy && <Loading />}
     {data && (detailId ? detail ? <>
@@ -231,11 +319,20 @@ export function ServicesPage({ route, active, csrf }: { route: string; active: b
         <div className="service-detail-actions"><button className="primary-button" onClick={() => setEditor(detail)}>编辑服务</button><button className="secondary-button" disabled={busy} onClick={() => void toggle([detail], !detail.enabled)}>{busy ? "提交中…" : detail.enabled ? "关闭服务" : "启用服务"}</button><div className="service-detail-danger"><button className="danger-button" onClick={() => setDeleting([detail])}><Trash2 size={18} aria-hidden="true" />删除服务</button></div></div>
       </section>
     </> : <Empty title="服务不存在" detail="该服务可能已被删除。"><a href="#/services" className="secondary-button">返回服务列表</a></Empty> : <>
-      {tunnels.length > 0 && <div className="toolbar"><label className="search"><Search size={19} /><input aria-label="搜索穿透服务" placeholder="搜索服务" value={query} onChange={e => setQuery(e.target.value)} /></label><div className="toolbar-row"><select aria-label="服务筛选" value={filter} onChange={e => setFilter(e.target.value)}>{[["all", "全部状态"], ["attention", "需处理"], ["enabled", "已启用"], ["disabled", "已关闭"]].map(([value, label]) => <option key={value} value={value}>{label} {matching.filter(item => matchesFilter(item, value)).length}</option>)}</select><select aria-label="类型筛选" value={protocol} onChange={e => setProtocol(e.target.value)}><option value="all">全部类型</option><option value="web">网页服务</option><option value="tcp">TCP 服务</option></select><select aria-label="Agent 筛选" value={agent} onChange={e => setAgent(e.target.value)}><option value="all">全部 Agent</option>{data.devices.map(item => <option key={item.id} value={item.id}>{item.name}</option>)}</select>{visible.length > 0 && (query || filter !== "all" || protocol !== "all" || agent !== "all") && <button className="text-button" onClick={() => { setQuery(""); setFilter("all"); setProtocol("all"); setAgent("all"); }}>清除筛选</button>}<button className="text-button" onClick={() => { setSelecting(value => !value); setSelected([]); }}>{selecting ? "完成" : "选择"}</button></div></div>}
-      {!visible.length ? <Empty kind={tunnels.length ? "search" : "services"} title={tunnels.length ? "没有匹配的服务" : "还没有穿透服务"} detail={tunnels.length ? "试试其他关键词，或清除筛选条件。" : !data.devices.length ? "先接入一台 Agent，让内网应用随时可访问。" : !data.domains.length ? "TCP 服务可直接创建，网页服务需先配置域名。" : "连接 NAS、相册或其他内网应用，从公网轻松访问。"}>{tunnels.length ? <button className="secondary-button" onClick={() => { setQuery(""); setFilter("all"); setProtocol("all"); setAgent("all"); }}>清除筛选</button> : !data.devices.length ? <a href="#/agents" className="primary-button">接入 Agent</a> : <><button className="primary-button" onClick={() => setEditor("new")}>创建第一个服务</button>{!data.domains.length && <a href="#/domains" className="text-button">配置网页域名</a>}</>}</Empty> : <section className={`service-list ${selecting ? "selectable" : ""}`} aria-label="穿透服务列表">{visible.map(item => <article className="service-row" key={item.id}>{selecting && <label className="check"><input type="checkbox" aria-label={`选择${item.name}`} checked={selected.includes(item.id)} onChange={e => setSelected(current => e.target.checked ? [...current, item.id] : current.filter(id => id !== item.id))} /></label>}<div className="service-card-content"><div className="service-title"><a className="service-name" href={`#/services/${encodeURIComponent(item.id)}`}><strong title={item.name}>{item.name}</strong></a><Status value={item.enabled ? item.apply_status : "disabled"} /></div><p className="service-meta" title={`${item.protocol === "tcp" ? "TCP 服务" : "网页服务"} · ${item.device_name ?? "未分配 Agent"}`}>{item.protocol === "tcp" ? "TCP 服务" : "网页服务"} · {item.device_name ?? "未分配 Agent"}</p><div className="service-address"><span>公网</span>{item.public_address ? item.protocol === "tcp" ? <CopyButton value={item.public_address} compact label={`复制${item.name}公网地址`} /> : <><a className="public-address" href={item.public_address} target="_blank" rel="noopener noreferrer" title={item.public_address}>{item.public_address}</a><CopyButton value={item.public_address} iconOnly label={`复制${item.name}公网地址`} /></> : <span className="muted">等待配置</span>}</div><div className="service-origin"><span>内网</span><code title={localTarget(item)}>{localTarget(item)}</code><a className="icon-button" aria-label={`查看${item.name}详情`} href={`#/services/${encodeURIComponent(item.id)}`}><ChevronRight size={18} /></a></div>{item.apply_error && <a className="row-error" href={`#/services/${encodeURIComponent(item.id)}`}><span>{item.apply_error}</span>查看 <ChevronRight size={15} /></a>}</div></article>)}</section>}
-      {selecting && <div className="batch-actions"><span aria-live="polite">已选择 {selected.length} 项</span><div><button className="secondary-button" disabled={!selected.length || busy} onClick={() => void toggle(tunnels.filter(item => selected.includes(item.id)), true)}>启用</button><button className="secondary-button" disabled={!selected.length || busy} onClick={() => void toggle(tunnels.filter(item => selected.includes(item.id)), false)}>关闭</button><button className="danger-button" disabled={!selected.length || busy} onClick={() => setDeleting(tunnels.filter(item => selected.includes(item.id)))}>删除</button></div></div>}
+      {tunnels.length > 0 && <div className="toolbar service-toolbar">
+        <div className="service-search-row"><label className="search"><Search size={19} /><input aria-label="搜索穿透服务" placeholder="搜索服务" value={query} onChange={e => setQuery(e.target.value)} /></label><button className="text-button service-selection-toggle" data-selecting={selecting} disabled={busy} onClick={() => { setSelecting(value => !value); setSelected([]); }}>{selecting ? "完成" : "选择"}</button></div>
+        <div className="toolbar-row">
+          <div className="service-filter-control" data-active={filter !== "all"}><select aria-label="服务筛选" value={filter} onChange={e => setFilter(e.target.value)}>{[["all", "全部状态"], ["attention", "需处理"], ["enabled", "已启用"], ["disabled", "已关闭"]].map(([value, label]) => <option key={value} value={value}>{label}{navigation?.desktop ? ` ${matching.filter(item => matchesFilter(item, value)).length}` : ""}</option>)}</select><ChevronDown size={14} aria-hidden="true" /></div>
+          <div className="service-filter-control" data-active={protocol !== "all"}><select aria-label="类型筛选" value={protocol} onChange={e => setProtocol(e.target.value)}><option value="all">全部类型</option><option value="web">网页服务</option><option value="tcp">TCP 服务</option></select><ChevronDown size={14} aria-hidden="true" /></div>
+          <div className="service-filter-control" data-active={agent !== "all"}><select aria-label="Agent 筛选" title={agent === "all" ? "全部设备" : data.devices.find(item => item.id === agent)?.name} value={agent} onChange={e => setAgent(e.target.value)}><option value="all">{navigation?.desktop ? "全部 Agent" : "全部设备"}</option>{data.devices.map(item => <option key={item.id} value={item.id}>{item.name}</option>)}</select><ChevronDown size={14} aria-hidden="true" /></div>
+          {visible.length > 0 && (query || filter !== "all" || protocol !== "all" || agent !== "all") && <div className="service-filter-result"><span role="status">找到 {visible.length} 个服务</span><button className="text-button" onClick={() => { setQuery(""); setFilter("all"); setProtocol("all"); setAgent("all"); }}>清除筛选</button></div>}
+        </div>
+      </div>}
+      {!visible.length ? <Empty kind={tunnels.length ? "search" : "services"} title={tunnels.length ? "没有匹配的服务" : "还没有穿透服务"} detail={tunnels.length ? "试试其他关键词，或清除筛选条件。" : !data.devices.length ? "先接入一台 Agent，让内网应用随时可访问。" : !data.domains.length ? "TCP 服务可直接创建，网页服务需先配置域名。" : "连接 NAS、相册或其他内网应用，从公网轻松访问。"}>{tunnels.length ? <button className="secondary-button" onClick={() => { setQuery(""); setFilter("all"); setProtocol("all"); setAgent("all"); }}>清除筛选</button> : !data.devices.length ? <a href="#/agents" className="primary-button">接入 Agent</a> : <><button className="primary-button" onClick={() => setEditor("new")}>创建第一个服务</button>{!data.domains.length && <a href="#/domains" className="text-button">配置网页域名</a>}</>}</Empty> : <section className={`service-list ${selecting ? "selectable" : ""}`} aria-label="穿透服务列表">{visible.map(item => <article className="service-row" key={item.id} data-pressing={pressing === item.id} data-selected={selecting && selected.includes(item.id)} onPointerDown={event => startPress(event, item.id)} onPointerMove={event => { const current = press.current; if (current && (current.pointer !== event.pointerId || Math.hypot(event.clientX - current.x, event.clientY - current.y) > 10)) cancelPress(); }} onPointerUp={cancelPress} onPointerCancel={cancelPress} onPointerLeave={cancelPress} onContextMenu={event => { if (longPressed.current || press.current) event.preventDefault(); }} onClickCapture={event => { if (longPressed.current) { longPressed.current = false; event.preventDefault(); event.stopPropagation(); } else if (selecting && selectionTarget(event.target)) { event.preventDefault(); toggleSelected(item.id); } }}>{selecting && <label className="check"><input type="checkbox" aria-label={`选择${item.name}`} checked={selected.includes(item.id)} disabled={busy} onChange={() => toggleSelected(item.id)} /></label>}<div className="service-card-content"><div className="service-title"><a className="service-name" href={`#/services/${encodeURIComponent(item.id)}`}><strong title={item.name}>{item.name}</strong></a><span className="service-device" title={item.device_name ?? "未分配 Agent"}>{item.device_name ?? "未分配 Agent"}</span><Status value={item.enabled ? item.apply_status : "disabled"} /></div><div className="service-address"><span>公网</span>{item.public_address ? item.protocol === "tcp" ? <CopyButton value={item.public_address} compact label={`复制${item.name}公网地址`} /> : <><a className="public-address" href={item.public_address} target="_blank" rel="noopener noreferrer" title={item.public_address}>{item.public_address}</a><CopyButton value={item.public_address} iconOnly label={`复制${item.name}公网地址`} /></> : <span className="muted">等待配置</span>}</div><div className="service-origin"><span>内网</span><code title={localTarget(item)}>{localTarget(item)}</code><a className="icon-button" aria-label={`查看${item.name}详情`} href={`#/services/${encodeURIComponent(item.id)}`}><ChevronRight size={18} /></a></div>{item.apply_error && <a className="row-error" href={`#/services/${encodeURIComponent(item.id)}`}><span>{item.apply_error}</span>查看 <ChevronRight size={15} /></a>}</div></article>)}</section>}
+      {selecting && <div className="batch-actions"><div className="batch-selection"><span aria-live="polite">已选择 {selected.length} 项</span><button className="text-button" disabled={busy || !visible.length} onClick={() => setSelected(selected.length === visible.length ? [] : visible.map(item => item.id))}>{visible.length > 0 && selected.length === visible.length ? "取消全选" : "全选"}</button>{!navigation?.desktop && <button className="text-button" disabled={busy} onClick={() => { setSelecting(false); setSelected([]); }}>完成</button>}</div><div className="batch-commands"><button className="secondary-button" disabled={!selected.length || busy || !data.devices.length} onClick={() => { setActionError(null); setMessage(null); setChangingAgent(tunnels.filter(item => selected.includes(item.id))); }}><Server size={20} aria-hidden="true" /><span>修改 Agent</span></button><button className="secondary-button" disabled={!selected.length || busy} onClick={() => void toggle(tunnels.filter(item => selected.includes(item.id)), true)}><Power size={20} aria-hidden="true" /><span>启用</span></button><button className="secondary-button" disabled={!selected.length || busy} onClick={() => void toggle(tunnels.filter(item => selected.includes(item.id)), false)}><PowerOff size={20} aria-hidden="true" /><span>关闭</span></button><button className="danger-button" disabled={!selected.length || busy} onClick={() => setDeleting(tunnels.filter(item => selected.includes(item.id)))}><Trash2 size={20} aria-hidden="true" /><span>删除</span></button></div></div>}
     </>)}
     {editor && data && <ServiceEditor active={active} tunnel={editor === "new" ? undefined : editor} data={data} csrf={csrf} onClose={() => setEditor(null)} onSaved={item => { merge(item); setMessage("配置已保存"); }} />}
+    {changingAgent && active && data && <BatchAgentEditor items={changingAgent} devices={data.devices} csrf={csrf} onSaved={item => { merge(item); setSelected(current => current.filter(id => id !== item.id)); }} onComplete={() => setMessage(`已完成 ${changingAgent.length} 个服务的 Agent 配置`)} onClose={() => setChangingAgent(null)} />}
     {deleting && active && <Confirm title={deleting.length === 1 ? `删除 ${deleting[0].name}？` : `删除 ${deleting.length} 个服务？`} description="删除后将立即停止新的连接，此操作无法撤销。" label="删除服务" onClose={() => setDeleting(null)} onConfirm={() => remove(deleting.filter(item => tunnels.some(current => current.id === item.id)))} />}
   </>;
 }

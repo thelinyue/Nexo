@@ -1,11 +1,12 @@
-import { useEffect, useRef, useState } from "react";
+import { PageNavigationContext, useResourceDeletions } from "./navigation";
+import { useContext, useEffect, useRef, useState } from "react";
 import type { FormEvent, ReactNode } from "react";
 import { DeviceRecovery } from "./recovery";
 import { AgentEnrollment } from "./agent-enrollment";
 import { DomainSettings } from "./domain-settings";
 import { DomainAccess } from "./domain-access";
-import { ChevronRight, Eye, EyeOff, Globe2, KeyRound, Server, ShieldCheck, Users, X } from "lucide-react";
-import { Confirm, CopyButton, EnrollmentDevice, CreateButton, DetailField, Empty, Loading, Modal, Notice, PageHeader, RowLink, Status, dateText, errorText, navigate, request, useApi, useResource } from "./ui";
+import { ChevronRight, Eye, EyeOff, KeyRound, Server, ShieldCheck, Users, X } from "lucide-react";
+import { Confirm, CopyButton, EnrollmentDevice, CreateButton, DetailField, Empty, Loading, Modal, Notice, PageHeader, RowLink, Status, dateText, errorText, request, useApi, useResource } from "./ui";
 import type { Auth, Device, Domain, DomainCertificate, DomainEvent, Enrollment, IdentityCertificate, Session, TransportIdentity, Tunnel } from "./ui";
 
 function identityCertificateLabel(certificate?: IdentityCertificate) {
@@ -26,12 +27,14 @@ function ServerIdentityCard({ active }: { active: boolean }) {
 /** 短表单集中处理请求状态，失败时保留输入；令牌只保存在当前组件内存。 */
 function NameForm({ title, label, initial = "", onClose, onSave, children }: { title: string; label: string; initial?: string; onClose: () => void; onSave: (value: string) => Promise<void>; children?: ReactNode }) {
   const [value, setValue] = useState(initial); const [busy, setBusy] = useState(false); const [error, setError] = useState<string | null>(null);
-  return <Modal title={title} dirty={value !== initial} busy={busy} onClose={onClose}><form className="modal-form" onSubmit={async e => { e.preventDefault(); if (!value.trim()) { setError(`${label}不能为空`); return; } setBusy(true); setError(null); try { await onSave(value.trim()); onClose(); } catch (e) { setError(errorText(e)); } finally { setBusy(false); } }}><div className="modal-body">{children}<label>{label}<input value={value} onChange={e => setValue(e.target.value)} required autoFocus enterKeyHint="done" autoCapitalize="none" spellCheck={false} disabled={busy} /></label><Notice error={error} /></div><footer className="modal-actions"><button className="primary-button" disabled={busy}>{busy ? "提交中…" : "批准入网"}</button></footer></form></Modal>;
+  return <Modal title={title} full dirty={value !== initial} busy={busy} onClose={onClose}><form className="modal-form" onSubmit={async e => { e.preventDefault(); if (!value.trim()) { setError(`${label}不能为空`); return; } setBusy(true); setError(null); try { await onSave(value.trim()); onClose(); } catch (e) { setError(errorText(e)); } finally { setBusy(false); } }}><div className="modal-body">{children}<label>{label}<input value={value} onChange={e => setValue(e.target.value)} required autoFocus enterKeyHint="done" autoCapitalize="none" spellCheck={false} disabled={busy} /></label><Notice error={error} /></div><footer className="modal-actions"><button className="primary-button" disabled={busy}>{busy ? "提交中…" : "批准入网"}</button></footer></form></Modal>;
 }
 
 export function AgentsPage({ route, active, csrf, back }: { route: string; active: boolean; csrf?: string | null; back: string }) {
+  const navigation = useContext(PageNavigationContext);
   const request = useApi();
   const resource = useResource(async () => { const [devices, enrollments, tunnels] = await Promise.all([request<Device[]>("/api/v1/devices"), request<Enrollment[]>("/api/v1/enrollments"), request<Tunnel[]>("/api/v1/tunnels")]); return { devices, enrollments, tunnels }; }, active);
+  useResourceDeletions(routes => { if (routes.some(route => route.startsWith("#/agents/"))) resource.setData(previous => previous && ({ ...previous, devices: previous.devices.filter(item => !routes.includes(`#/agents/${encodeURIComponent(item.id)}`)) })); });
   const [enrolling, setEnrolling] = useState(false); const [approveId, setApproveId] = useState<string | null>(null); const [deleting, setDeleting] = useState<Device | null>(null);
   const [recovering, setRecovering] = useState<Device | null>(null); const [cancelInvite, setCancelInvite] = useState<Enrollment | null>(null);
   const detailId = route.startsWith("#/agents/") ? route.slice("#/agents/".length) : null;
@@ -40,7 +43,7 @@ export function AgentsPage({ route, active, csrf, back }: { route: string; activ
   const approval = data?.enrollments.find(item => item.id === approveId);
   const recoveryTarget = data?.devices.find(item => item.id === approval?.device_id);
   return <>
-    <PageHeader title={detailId ? "Agent 详情" : "Agent"} subtitle={detailId ? undefined : "连接本地服务的运行节点"} back={detailId ? back : "#/manage"} action={!detailId && Boolean(data && (data.devices.length || pending.length)) && <CreateButton label="Agent" onClick={() => setEnrolling(true)} />} />
+    <PageHeader title={detailId ? detail?.name ?? "设备详情" : "设备"} back={detailId ? back : undefined} action={!detailId && Boolean(data && (data.devices.length || pending.length)) && <CreateButton label="Agent" onClick={() => setEnrolling(true)} />} />
     <Notice updatedAt={resource.updatedAt} error={resource.error} onRetry={() => void resource.reload()} />{!data && resource.busy && <Loading />}
     {data && (detailId ? detail ? <>
       <section className="panel detail-panel"><div className="detail-heading"><h2>{detail.name}</h2><Status kind="agent" value={detail.status} /></div>{detail.status !== "online" && <div className="notice"><p>Agent 离线，关联服务暂时无法转发。</p><p>最近连接：{dateText(detail.last_seen_at)} · {identityCertificateLabel(detail.certificate)}</p><p className="helper">请先检查主机上的 Agent 是否运行及能否连接 Server；身份过期或损坏时再恢复身份。</p></div>}</section>
@@ -59,28 +62,20 @@ export function AgentsPage({ route, active, csrf, back }: { route: string; activ
     {recovering && active && <DeviceRecovery device={recovering} csrf={csrf} onClose={() => setRecovering(null)} onCreated={() => resource.reload()} />}
     {approveId && active && approval?.kind === "recovery" && <Confirm title={`批准恢复 ${recoveryTarget?.name ?? "原设备"} 的身份？`} description="原设备 ID、名称和服务绑定保留。批准后旧证书及旧连接立即失效，请确认申请来自你的 Agent。" label="批准恢复" onClose={() => setApproveId(null)} onConfirm={async () => { await request(`/api/v1/enrollments/${encodeURIComponent(approveId)}/approve`, { method: "POST", body: "{}" }, csrf); await resource.reload(); }} />}
     {cancelInvite && active && <Confirm title="撤销入网请求？" description="凭证将立即失效。现有设备身份与服务不受影响。" label="撤销请求" onClose={() => setCancelInvite(null)} onConfirm={async () => { await request(`/api/v1/enrollments/${encodeURIComponent(cancelInvite.id)}`, { method: "DELETE" }, csrf); await resource.reload(); }} />}
-    {deleting && active && <Confirm title={`删除 ${deleting.name}？`} description={`关联的 ${deleting.tunnel_count} 个服务将被停用，并解除 Agent 绑定。此操作无法撤销。`} label="删除 Agent" onClose={() => setDeleting(null)} onConfirm={async () => { await request(`/api/v1/devices/${encodeURIComponent(deleting.id)}`, { method: "DELETE" }, csrf); await resource.reload(); navigate("#/agents", true); }} />}
+    {deleting && active && <Confirm title={`删除 ${deleting.name}？`} description={`关联的 ${deleting.tunnel_count} 个服务将被停用，并解除 Agent 绑定。此操作无法撤销。`} label="删除 Agent" onClose={() => setDeleting(null)} onConfirm={async () => { await request(`/api/v1/devices/${encodeURIComponent(deleting.id)}`, { method: "DELETE" }, csrf); await resource.reload(); navigation?.removePages([`#/agents/${encodeURIComponent(deleting.id)}`], "#/agents"); }} />}
   </>;
 }
 
-/** 管理页统一承载资源与本人账号操作；资源摘要绑定当前空间，账号与服务端身份始终使用本人权限。 */
+/** 账号页只承载本人设置；管理员诊断仍使用本人的平台权限，不跟随代管空间。 */
 export function ManagePage({ auth, active, onLogout, onExpired }: { auth: Auth; active: boolean; onLogout: () => Promise<void>; onExpired: () => void }) {
-  const scopedRequest = useApi();
-  const resource = useResource(async () => { const [devices, enrollments] = await Promise.all([scopedRequest<Device[]>("/api/v1/devices"), scopedRequest<Enrollment[]>("/api/v1/enrollments")]); return { devices, enrollments }; }, active);
+  const navigation = useContext(PageNavigationContext);
   const [password, setPassword] = useState(false); const [busy, setBusy] = useState(false); const [error, setError] = useState<string | null>(null);
-  const devices = resource.data?.devices ?? [];
-  const approvals = resource.data?.enrollments.filter(item => item.status === "awaiting_approval").length ?? 0;
-  const offline = devices.filter(item => item.status !== "online").length;
-  const certificates = devices.filter(item => item.certificate?.error || ["expiring", "retry_wait", "expired"].includes(item.certificate?.status ?? "")).length;
-  const agentSummary = resource.data ? [`${devices.filter(item => item.status === "online").length} 台在线`, approvals ? `${approvals} 待批准` : "", offline ? `${offline} 台离线` : "", certificates ? `${certificates} 台证书需处理` : ""].filter(Boolean).join(" · ") : resource.error ? "摘要读取失败" : "读取中…";
   return <div className="manage-page">
-    <PageHeader title="管理" />
+    <PageHeader title={navigation?.desktop ? "账号设置" : "我的"} />
     {auth.local_http_warning && <p className="notice" role="status">当前管理连接未使用 HTTPS，公网部署请通过 HTTPS 反向代理访问。</p>}
-    <section className="panel account-summary"><span className="account-avatar">{(auth.username ?? "N").slice(0, 1).toUpperCase()}</span><div><strong>{auth.username}</strong><small>{auth.role === "system_admin" ? "管理员" : "普通用户"}</small></div></section>
-    <div className="management-sections"><section><h2 className="section-title">当前空间资源</h2><Notice updatedAt={resource.updatedAt} error={resource.error} onRetry={() => void resource.reload()} />
-    <section className="panel management-group"><RowLink href="#/agents" title="Agent" detail={agentSummary} icon={<Server size={23} />} /><RowLink href="#/domains" title="域名与证书" icon={<Globe2 size={23} />} /></section>
-    </section><section><h2 className="section-title">我的账号</h2><section className="panel management-group"><button className="row-link" onClick={() => setPassword(true)}><KeyRound size={23} /><span><strong>修改密码</strong></span><ChevronRight size={19} /></button><RowLink href="#/settings/sessions" title="登录会话" icon={<ShieldCheck size={23} />} /></section>
-    </section>{auth.role === "system_admin" && <section><h2 className="section-title">平台管理</h2><section className="panel management-group"><RowLink href="#/users" title="用户管理" icon={<Users size={23} />} /></section><ServerIdentityCard active={active} /></section>}</div>
+    <section className="panel account-summary"><div><strong>{auth.username}</strong><small>{auth.role === "system_admin" ? "管理员" : "普通用户"}</small></div></section>
+    <div className="management-sections"><section><h2 className="section-title">账号与安全</h2><section className="panel management-group"><button className="row-link" onClick={() => setPassword(true)}><KeyRound size={23} /><span><strong>修改密码</strong></span><ChevronRight size={19} /></button><RowLink href="#/settings/sessions" title="登录会话" icon={<ShieldCheck size={23} />} /></section>
+    </section>{auth.role === "system_admin" && <section><h2 className="section-title">管理员功能</h2><section className="panel management-group"><RowLink href="#/users" title="用户管理" icon={<Users size={23} />} /></section><ServerIdentityCard active={active} /></section>}</div>
     <Notice error={error} /><button className="danger-button danger-zone" disabled={busy} onClick={async () => { setBusy(true); setError(null); try { await onLogout(); } catch (e) { setError(errorText(e)); } finally { setBusy(false); } }}>{busy ? "退出中…" : "退出登录"}</button>
     {password && active && <PasswordForm csrf={auth.csrf_token} onClose={() => setPassword(false)} onExpired={onExpired} />}
   </div>;
@@ -121,7 +116,7 @@ function DomainForm({ onClose, onSave }: { onClose: () => void; onSave: (domain:
     setBusy(true); setError(null); setInvalid(false);
     try { await onSave(domain); onClose(); } catch (e) { setError(errorText(e)); } finally { setBusy(false); }
   }
-  return <Modal title="添加域名" dirty={Boolean(value.trim())} busy={busy} onClose={onClose}>
+  return <Modal title="添加域名" full dirty={Boolean(value.trim())} busy={busy} onClose={onClose}>
     <form className="modal-form domain-form" onSubmit={submit} noValidate>
       <div className="modal-body">
         <label className="domain-input-label" htmlFor="domain-input">域名</label>
@@ -188,25 +183,31 @@ function DomainEvents({ active, domains, domainId }: { active: boolean; domains:
   </details>;
 }
 
-export function DomainsPage({ active, csrf, route, back }: { active: boolean; csrf?: string | null; route: string; back: string }) {
+export function DomainsPage({ active, csrf, route, back, initialConfiguration }: { active: boolean; csrf?: string | null; route: string; back: string; initialConfiguration?: Domain }) {
+  const navigation = useContext(PageNavigationContext);
   const request = useApi();
-  const resource = useResource(() => request<Domain[]>("/api/v1/public-domains"), active);
-  const [configuring, setConfiguring] = useState<Domain | null>(null);
-  const [adding, setAdding] = useState(false); const [deleting, setDeleting] = useState<Domain | null>(null); const [saved, setSaved] = useState<string | null>(null);
+  const resource = useResource(() => request<Domain[]>("/api/v1/public-domains"), active, true, false, initialConfiguration ? [initialConfiguration] : undefined);
+  const [configuring, setConfiguring] = useState<Domain | null>(initialConfiguration ?? null);
+  const [adding, setAdding] = useState(false); const [deleting, setDeleting] = useState<Domain | null>(null); const [saved, setSaved] = useState<string | null>(initialConfiguration ? `已添加 ${initialConfiguration.domain}` : null);
+  useResourceDeletions(routes => {
+    if (!routes.some(route => route.startsWith("#/domains/"))) return;
+    resource.setData(previous => previous?.filter(item => !routes.includes(`#/domains/${encodeURIComponent(item.id)}`)) ?? null);
+    setSaved("域名已删除");
+  });
   useEffect(() => { if (!active) setSaved(null); }, [active]);
   const detailId = route.startsWith("#/domains/") ? route.slice("#/domains/".length) : null;
   const detail = resource.data?.find(item => encodeURIComponent(item.id) === detailId);
   return <div className="domains-page">
-    <PageHeader title={detailId ? "域名详情" : "域名与证书"} back={detailId ? back : "#/manage"} action={!detailId && Boolean(resource.data?.length) && <CreateButton label="域名" onClick={() => setAdding(true)} />} />
+    <PageHeader title={detailId ? detail?.domain ?? "域名详情" : "域名"} back={detailId ? back : undefined} action={!detailId && Boolean(resource.data?.length) && <CreateButton label="域名" onClick={() => setAdding(true)} />} />
     <Notice updatedAt={resource.updatedAt} error={resource.error ? `${saved ? "域名变更已保存，但列表刷新失败。可重试刷新，无需重复操作。" : ""}${resource.error}` : null} onRetry={() => void resource.reload()} />{saved && !resource.error && <p className="helper domain-feedback" role="status">{saved}</p>}{!resource.data && resource.busy && <Loading />}
     {resource.data && (detailId ? detail ? <><DomainCard key={detail.id} item={detail} detail onConfigure={() => setConfiguring(detail)} active={active} csrf={csrf} />{detail.verification_status === "pending" && <p className="notice">下一步：验证域名归属，再为服务配置访问地址。</p>}<DomainEvents active={active} domains={resource.data} domainId={detail.id} /></> : <Empty title="域名不存在" detail="域名可能已被删除，或不属于当前空间。"><a href="#/domains" className="secondary-button">返回域名列表</a></Empty> : !resource.data.length ? <Empty kind="domains" title="还没有域名" detail="为 Web 服务设置访问地址，并自动管理 HTTPS 证书。"><button className="primary-button" aria-label="添加 域名" onClick={() => setAdding(true)}>添加域名</button></Empty> : <>
       <div className="list-caption"><span>{resource.data.length} 个域名</span></div>
       <section className="domain-list" aria-label="域名列表">{resource.data.map(item => <DomainCard key={item.id} item={item} onConfigure={() => setConfiguring(item)} active={active} csrf={csrf} />)}</section>
       <DomainEvents active={active} domains={resource.data} />
     </>)}
-    {adding && active && <DomainForm onClose={() => setAdding(false)} onSave={async domain => { const created = await request<Domain>("/api/v1/public-domains", { method: "POST", body: JSON.stringify({ domain, https_enabled: true }) }, csrf); resource.setData(previous => [...(previous ?? []).filter(item => item.id !== created.id), created].sort((a, b) => a.domain.localeCompare(b.domain))); setSaved(`已添加 ${created.domain}`); setAdding(false); navigate(`#/domains/${encodeURIComponent(created.id)}`, true); setConfiguring(created); void resource.reload(); }} />}
+    {adding && active && <DomainForm onClose={() => setAdding(false)} onSave={async domain => { const created = await request<Domain>("/api/v1/public-domains", { method: "POST", body: JSON.stringify({ domain, https_enabled: true }) }, csrf); resource.setData(previous => [...(previous ?? []).filter(item => item.id !== created.id), created].sort((a, b) => a.domain.localeCompare(b.domain))); setSaved(`已添加 ${created.domain}`); setAdding(false); navigation?.openDomainConfiguration(created); }} />}
     {configuring && active && <DomainSettings domain={configuring} csrf={csrf} onDelete={() => setDeleting(configuring)} onClose={() => setConfiguring(null)} onSaved={value => { resource.setData(previous => (previous ?? []).map(item => item.id === configuring.id ? { ...item, ...value } : item)); }} />}
-    {deleting && active && <Confirm title={`删除 ${deleting.domain}？`} description="删除后无法再使用此域名配置服务。仍有关联服务时会阻止删除，请先修改或删除关联服务。" label="删除域名" onClose={() => setDeleting(null)} onConfirm={async () => { await request(`/api/v1/public-domains/${encodeURIComponent(deleting.id)}`, { method: "DELETE" }, csrf); resource.setData(previous => (previous ?? []).filter(item => item.id !== deleting.id)); setSaved(`已删除 ${deleting.domain}`); setConfiguring(null); navigate("#/domains", true); void resource.reload(); }} />}
+    {deleting && active && <Confirm title={`删除 ${deleting.domain}？`} description="删除后无法再使用此域名配置服务。仍有关联服务时会阻止删除，请先修改或删除关联服务。" label="删除域名" onClose={() => setDeleting(null)} onConfirm={async () => { await request(`/api/v1/public-domains/${encodeURIComponent(deleting.id)}`, { method: "DELETE" }, csrf); resource.setData(previous => (previous ?? []).filter(item => item.id !== deleting.id)); setSaved(`已删除 ${deleting.domain}`); setConfiguring(null); navigation?.removePages([`#/domains/${encodeURIComponent(deleting.id)}`], "#/domains"); void resource.reload(); }} />}
   </div>;
 }
 
@@ -222,7 +223,7 @@ export function PasswordForm({ csrf, onClose, onExpired }: { csrf?: string | nul
 export function SessionsPage({ active, auth, onExpired }: { active: boolean; auth: Auth; onExpired: () => void }) {
   const resource = useResource(async () => { const [sessions, current] = await Promise.all([request<Session[]>("/api/v1/auth/sessions"), request<Session>("/api/v1/auth/session")]); return { sessions, current }; }, active);
   const [revoke, setRevoke] = useState<Session | null>(null);
-  return <><PageHeader title="登录会话" subtitle="我的账号 · 仅管理本人的登录设备" back="#/manage" />
+  return <><PageHeader title="登录会话" back="#/manage" />
     <Notice updatedAt={resource.updatedAt} error={resource.error} onRetry={() => void resource.reload()} />{!resource.data && resource.busy && <Loading />}
     {resource.data && (resource.data.sessions.length ? <section className="panel session-list">{resource.data.sessions.map(session => <div className="session-row" data-current={session.id === resource.data?.current.id} key={session.id}><div><strong>{[session.browser, session.os].filter(Boolean).join(" · ") || "未知设备"}{session.id === resource.data?.current.id && <span> · <span>当前会话</span></span>}</strong><small>创建时间：{dateText(session.created_at)}</small><small>最近使用：{dateText(session.last_seen_at)}</small><details className="session-details"><summary>详情</summary><small>会话 {session.id.slice(0, 8)}</small><small>过期时间：{dateText(session.expires_at)}</small></details></div><button className="secondary-button" onClick={() => setRevoke(session)}>结束会话</button></div>)}</section> : <Empty kind="sessions" title="暂无登录会话" detail="登录设备的活动记录会显示在这里。" />)}
     {revoke && active && <Confirm title="结束登录会话？" description={revoke.id === resource.data?.current.id ? "这是当前会话，结束后需要重新登录。" : "该会话将立即失效，需要重新登录。"} label="结束会话" onClose={() => setRevoke(null)} onConfirm={async () => { await request(`/api/v1/auth/sessions/${encodeURIComponent(revoke.id)}`, { method: "POST" }, auth.csrf_token); if (revoke.id === resource.data?.current.id) onExpired(); else await resource.reload(); }} />}

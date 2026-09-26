@@ -42,7 +42,7 @@ export function AgentEnrollment({ csrf, onClose, onCreated }: { csrf?: string | 
     catch { setCopyState("failed"); setExpanded(true); requestAnimationFrame(() => preview.current?.scrollIntoView({ block: "nearest" })); }
   }
   const close = () => { onClose(); void onCreated(); };
-  return <Modal title="添加 Agent" onClose={close}>
+  return <Modal title="添加 Agent" full onClose={close}>
     <div className="modal-form agent-enrollment">
       <div className="modal-body">
         <div ref={addressField}><label className="agent-server-label">Server 地址<input ref={input} type="url" inputMode="url" enterKeyHint="done" autoCapitalize="none" autoCorrect="off" spellCheck={false} value={serverUrl} aria-invalid={!normalizedUrl || undefined} aria-describedby={!normalizedUrl ? "agent-server-error" : undefined} onChange={e => setServerUrl(e.target.value)} onFocus={() => requestAnimationFrame(() => addressField.current?.scrollIntoView({ block: "nearest" }))} onKeyDown={e => { if (e.key === "Enter") { e.preventDefault(); e.currentTarget.blur(); } }} /></label>

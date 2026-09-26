@@ -41,6 +41,7 @@ mod enrollment;
 mod identity_runtime;
 mod lan_redirect;
 mod security;
+mod traffic;
 mod transport;
 use enrollment::{agent_enroll, agent_poll, approve_enrollment};
 
@@ -290,6 +291,11 @@ async fn main() -> Result<()> {
                 server_name: nexo_tunnel::identity::SERVER_NAME.into(),
             }),
     };
+    state
+        .tunnel_runtime
+        .quotas
+        .restore(&state)
+        .context("无法恢复用户流量额度，停止启动以避免绕过限制")?;
     let control_listener = TcpListener::bind(&state.control_addr)
         .await
         .context("无法监听 Agent mTLS 控制端口")?;
@@ -308,6 +314,8 @@ async fn main() -> Result<()> {
         .context("NEXO_HTTP_ADDR 不是有效地址")?;
     let caddy_task = tokio::spawn(domain_runtime::DomainRuntimeManager::run(state.clone()));
     let dns_task = tokio::spawn(domain_access::Runtime::run(state.clone()));
+    let traffic_task = tokio::spawn(traffic::Collector::run(state.clone()));
+    let traffic_state = state.clone();
     let runtime = state.domain_runtime.clone();
     let app = router(state);
     tracing::info!("Nexo 内网穿透服务监听 http://{http_addr}");
@@ -325,6 +333,12 @@ async fn main() -> Result<()> {
     identity_task.abort();
     let _ = control_task.await;
     let _ = data_task.await;
+    tunnel_runtime.finish_transfers().await;
+    traffic_task.abort();
+    let _ = traffic_task.await;
+    if let Err(error) = tunnel_runtime.traffic.sample(&traffic_state, true) {
+        tracing::error!("退出时保存流量统计失败：{error:#}");
+    }
     runtime.supervisor.shutdown().await?;
     serving?;
     Ok(())
@@ -349,6 +363,21 @@ async fn shutdown_signal() {
 fn router(state: AppState) -> Router {
     let routes = Router::new()
         .route("/health", get(health))
+        .route("/api/v1/traffic/realtime", get(traffic::own_realtime))
+        .route("/api/v1/traffic/history", get(traffic::own_history))
+        .route("/api/v1/traffic/usage", get(traffic::own_usage))
+        .route("/api/v1/traffic/quota", get(traffic::quota::own_quota))
+        .route(
+            "/api/v1/admin/traffic/quota",
+            get(traffic::quota::admin_quota).put(traffic::quota::update_quota),
+        )
+        .route("/api/v1/admin/traffic/usage", get(traffic::admin_usage))
+        .route("/api/v1/admin/traffic/reset", post(traffic::admin_reset))
+        .route(
+            "/api/v1/admin/traffic/realtime",
+            get(traffic::admin_realtime),
+        )
+        .route("/api/v1/admin/traffic/history", get(traffic::admin_history))
         .route("/api/v1/admin/users", get(accounts::list_users))
         .route(
             "/api/v1/admin/users/{id}",
@@ -478,6 +507,7 @@ fn initialize_database(connection: &Connection, is_new: bool) -> Result<()> {
         access_keys::initialize_schema(connection)?;
         accounts::initialize_schema(connection)?;
         lan_redirect::initialize_schema(connection)?;
+        traffic::initialize_schema(connection)?;
         return domains::initialize_schema(connection);
     }
     connection.execute_batch(include_str!("../../../migrations/v0.2.0_baseline.sql"))?;
@@ -485,6 +515,7 @@ fn initialize_database(connection: &Connection, is_new: bool) -> Result<()> {
     access_keys::initialize_schema(connection)?;
     accounts::initialize_schema(connection)?;
     lan_redirect::initialize_schema(connection)?;
+    traffic::initialize_schema(connection)?;
     domains::initialize_schema(connection)
 }
 

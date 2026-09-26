@@ -82,7 +82,7 @@ test("设备恢复凭证绑定原设备，批准前说明撤销旧身份", async
   await expect(recovery).toContainText("--recover-identity");
   await page.screenshot({ path: testInfo.outputPath("device-recovery.png") });
   state.enrollments = state.enrollments.filter(item => item.kind === "recovery"); state.enrollments[0].status = "awaiting_approval";
-  await recovery.getByRole("button", { name: "关闭", exact: true }).click();
+  await recovery.getByRole("button", { name: "取消", exact: true }).click();
   await page.getByRole("link", { name: "返回", exact: true }).click();
   await page.clock.fastForward(5000);
   await page.getByRole("button", { name: "批准", exact: true }).click();

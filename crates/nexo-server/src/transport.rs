@@ -27,6 +27,7 @@ use tokio_rustls::{server::TlsStream, TlsAcceptor};
 use tokio_util::{
     codec::{FramedRead, LinesCodec},
     sync::CancellationToken,
+    task::TaskTracker,
 };
 
 trait TunnelIo: AsyncRead + AsyncWrite + Unpin + Send {}
@@ -36,6 +37,7 @@ type BoxIo = Box<dyn TunnelIo>;
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Service {
     id: String,
+    tenant: String,
     device: String,
     revision: i64,
     protocol: String,
@@ -75,6 +77,9 @@ struct Connections {
 
 /// 监听器与连接的拥有者：协调串行化，连接任务使用取消令牌，不靠数据库标记假装关闭。
 pub struct Runtime {
+    pub traffic: crate::traffic::Collector,
+    pub quotas: crate::traffic::quota::Manager,
+    transfers: TaskTracker,
     bind: IpAddr,
     connections: Mutex<Connections>,
     reconcile_lock: Mutex<()>,
@@ -83,6 +88,9 @@ pub struct Runtime {
 impl Runtime {
     pub fn new(bind: IpAddr) -> Self {
         Self {
+            traffic: crate::traffic::Collector::default(),
+            quotas: crate::traffic::quota::Manager::default(),
+            transfers: TaskTracker::new(),
             bind,
             connections: Mutex::new(Connections::default()),
             reconcile_lock: Mutex::new(()),
@@ -130,6 +138,13 @@ impl Runtime {
         for (_, session) in connections.data.drain() {
             session.cancel.cancel();
         }
+    }
+
+    /// 数据会话已退出后，等待其被取消的子转发任务真正释放，再保存最后一批流量。
+    /// JoinSet 的 Drop 只请求取消，不等待完成，不能直接作为最终计数已经稳定的依据。
+    pub async fn finish_transfers(&self) {
+        self.transfers.close();
+        self.transfers.wait().await;
     }
 
     /// 身份恢复是显式撤销：与连接注册串行化，提交新身份后取消旧控制和数据通道。
@@ -221,11 +236,12 @@ impl Runtime {
                 .db
                 .lock()
                 .map_err(|_| anyhow::anyhow!("数据库锁不可用"))?;
-            let mut query = db.prepare("SELECT t.id,t.device_id,t.apply_revision,t.protocol,t.public_port FROM tunnels t JOIN devices d ON d.id=t.device_id AND d.tenant_id=t.tenant_id JOIN tenants w ON w.id=t.tenant_id AND w.enabled=1 WHERE t.enabled=1 AND t.deleted_at IS NULL")?;
+            let mut query = db.prepare("SELECT t.id,t.device_id,t.apply_revision,t.protocol,t.public_port,t.tenant_id FROM tunnels t JOIN devices d ON d.id=t.device_id AND d.tenant_id=t.tenant_id JOIN tenants w ON w.id=t.tenant_id AND w.enabled=1 WHERE t.enabled=1 AND t.deleted_at IS NULL")?;
             let services = query
                 .query_map([], |r| {
                     Ok(Service {
                         id: r.get(0)?,
+                        tenant: r.get(5)?,
                         device: r.get(1)?,
                         revision: r.get(2)?,
                         protocol: r.get(3)?,
@@ -392,6 +408,14 @@ fn tcp_listener(
     })
 }
 async fn handoff(state: &AppState, service: &Service, socket: BoxIo, cancel: &CancellationToken) {
+    match state.tunnel_runtime.quotas.get(state, &service.tenant) {
+        Ok(quota) if quota.connection().is_some() => {}
+        Ok(_) => return,
+        Err(error) => {
+            tracing::error!("无法读取流量额度，拒绝转发：{error:#}");
+            return;
+        }
+    }
     let connections = state.tunnel_runtime.connections.lock().await;
     let Some(session) = connections.data.get(&service.device) else {
         return;
@@ -668,17 +692,22 @@ async fn data_session(
         command = receiver.recv() => {
             let Some(mut command) = command else { break; };
             if command.cancel.is_cancelled() || !allowed(&state, &command.service, &device)? { continue; }
+            let quota = state.tunnel_runtime.quotas.get(&state, &command.service.tenant)?;
+            let Some(quota_cancel) = quota.connection() else { continue; };
             let stream = tokio::time::timeout(Duration::from_secs(10), nexo_tunnel::new_outbound(&mut connection)).await.context("Tunnel 开流超时")??;
-            copies.spawn(async move {
+            let meter = state.tunnel_runtime.traffic.meter(&command.service.tenant, &command.service.id);
+            copies.spawn(state.tunnel_runtime.transfers.track_future(async move {
                 let mut stream = nexo_tunnel::into_tokio_io(stream);
                 let transfer = async {
                     let header = LogicalStreamHeader::new(&command.service.id, uuid::Uuid::new_v4().to_string(), command.service.revision)?;
                     tokio::time::timeout(Duration::from_secs(10), nexo_tunnel::write_logical_header(&mut stream, &header)).await??;
-                    tokio::io::copy_bidirectional(&mut command.socket, &mut stream).await?;
+                    let mut stream = crate::traffic::Counted::new(stream, meter.clone(), true).with_quota(quota.clone(), quota_cancel.clone());
+                    let mut socket = crate::traffic::Counted::new(&mut command.socket, meter, false).with_quota(quota, quota_cancel.clone());
+                    tokio::io::copy_bidirectional(&mut socket, &mut stream).await?;
                     anyhow::Ok(())
                 };
-                tokio::select! { _ = command.cancel.cancelled() => {}, result = transfer => if let Err(error) = result { tracing::debug!("Tunnel 转发结束：{error:#}"); } }
-            });
+                tokio::select! { _ = command.cancel.cancelled() => {}, _ = quota_cancel.cancelled() => {}, result = transfer => if let Err(error) = result { tracing::debug!("Tunnel 转发结束：{error:#}"); } }
+            }));
         }
         inbound = nexo_tunnel::next_inbound(&mut connection) => match inbound? {
             Some(_) => anyhow::bail!("Agent 不允许主动打开服务端逻辑流"),
@@ -711,7 +740,7 @@ fn refresh_status(
             .db
             .lock()
             .map_err(|_| anyhow::anyhow!("数据库锁不可用"))?;
-        let mut query = db.prepare("SELECT t.id,t.device_id,(t.enabled AND EXISTS(SELECT 1 FROM tenants w WHERE w.id=t.tenant_id AND w.enabled=1)),t.protocol,t.apply_revision,a.revision,a.status,a.error_message,t.public_domain_id,t.hostname,p.domain FROM tunnels t LEFT JOIN tunnel_applied_states a ON a.tunnel_id=t.id LEFT JOIN public_domains p ON p.id=t.public_domain_id AND p.tenant_id=t.tenant_id WHERE t.deleted_at IS NULL")?;
+        let mut query = db.prepare("SELECT t.id,t.device_id,(t.enabled AND EXISTS(SELECT 1 FROM tenants w WHERE w.id=t.tenant_id AND w.enabled=1)),t.protocol,t.apply_revision,a.revision,a.status,a.error_message,t.public_domain_id,t.hostname,p.domain,t.tenant_id FROM tunnels t LEFT JOIN tunnel_applied_states a ON a.tunnel_id=t.id LEFT JOIN public_domains p ON p.id=t.public_domain_id AND p.tenant_id=t.tenant_id WHERE t.deleted_at IS NULL")?;
         let rows = query
             .query_map([], |r| {
                 Ok((
@@ -726,6 +755,7 @@ fn refresh_status(
                     r.get::<_, Option<String>>(8)?,
                     r.get::<_, Option<String>>(9)?,
                     r.get::<_, Option<String>>(10)?,
+                    r.get::<_, String>(11)?,
                 ))
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -743,10 +773,19 @@ fn refresh_status(
         domain_id,
         hostname,
         domain_name,
+        tenant,
     ) in rows
     {
         let (status, error) = if !enabled {
             ("disabled", None)
+        } else if state
+            .tunnel_runtime
+            .quotas
+            .get(state, &tenant)?
+            .connection()
+            .is_none()
+        {
+            ("checking", Some(crate::traffic::quota::EXHAUSTED.into()))
         } else if let Some(error) = failures.get(&id) {
             ("failed", Some(error.clone()))
         } else if device

@@ -13,7 +13,7 @@ test("网页类型包含 HTTP 和 HTTPS，内网 IPv6 地址单行展示并完�
   await expect(filter.locator("option")).toHaveText(["全部类型", "网页服务", "TCP 服务"]);
   await filter.selectOption("web");
   await expect(page.locator(".service-row")).toHaveCount(2);
-  await expect(page.locator(".service-meta")).toHaveText(["网页服务 · 家庭 Agent", "网页服务 · 家庭 Agent"]);
+  await expect(page.locator(".service-title .service-device")).toHaveText(["家庭 Agent", "家庭 Agent"]);
   await page.getByRole("link", { name: "媒体中心", exact: true }).click();
   const field = page.locator(".detail-field", { has: page.getByText("内网地址", { exact: true }) });
   const code = field.locator("code");
@@ -30,24 +30,22 @@ test("网页类型包含 HTTP 和 HTTPS，内网 IPv6 地址单行展示并完�
   await expect(editor.getByLabel("内网地址", { exact: true })).toHaveValue(ip);
 });
 
-test("两入口导航、旧链接和不存在的详情均可返回", async ({ page }) => {
+test("五入口导航、旧链接和不存在的详情均可返回", async ({ page }) => {
   await installApiMocks(page);
   await page.goto("/#/services");
   const nav = page.locator((page.viewportSize()?.width ?? 0) <= 900 ? ".bottom-nav" : ".sidebar nav");
-  await expect(nav.getByRole("link")).toHaveCount(2);
-  await nav.getByRole("link", { name: "管理", exact: true }).click();
-  await page.getByRole("link", { name: /域名与证书/ }).click();
-  await expect(visiblePage(page).getByRole("heading", { name: "域名与证书" })).toBeVisible();
-  if ((page.viewportSize()?.width ?? 0) <= 900) await expect(nav).toBeHidden();
-  else await expect(nav.getByRole("link", { name: "管理", exact: true })).toHaveAttribute("aria-current", "page");
+  await expect(nav.getByRole("link")).toHaveCount(5);
+  await nav.getByRole("link", { name: "域名", exact: true }).click();
+  await expect(visiblePage(page).locator("h1")).toHaveText("域名");
+  await expect(nav.getByRole("link", { name: "域名", exact: true })).toHaveAttribute("aria-current", "page");
   await page.goto("/#/settings");
-  await expect(visiblePage(page).getByRole("heading", { name: "管理", exact: true })).toBeVisible();
+  await expect(visiblePage(page).locator("h1")).toHaveText((page.viewportSize()?.width ?? 0) <= 900 ? "我的" : "账号设置");
   await page.goto("/#/services/missing");
   await expect(page.getByText("服务不存在", { exact: true })).toBeVisible();
   await page.getByRole("link", { name: "返回服务列表" }).click();
   await expect(page.getByRole("link", { name: "媒体中心", exact: true })).toBeVisible();
   await page.goto("/#/overview");
-  await expect(visiblePage(page).getByRole("heading", { name: "穿透服务" })).toBeVisible();
+  await expect(visiblePage(page).locator("h1")).toHaveText("首页");
 });
 
 test("详情显示完整地址，返回保留搜索与滚动位置", async ({ page }) => {
@@ -59,7 +57,7 @@ test("详情显示完整地址，返回保留搜索与滚动位置", async ({ pa
   await target.scrollIntoViewIfNeeded();
   const scroll = await page.evaluate(() => window.scrollY);
   await target.click();
-  await expect(page.getByRole("heading", { name: "服务详情" })).toBeVisible();
+  await expect(visiblePage(page).locator("h1")).toHaveText("媒体中心 12");
   await expect(page.locator(".detail-field code").first()).toHaveText(state.tunnels[0].public_address);
   await page.goBack();
   await expect(page.getByRole("textbox", { name: "搜索穿透服务" })).toHaveValue("媒体");
@@ -144,7 +142,7 @@ test("编辑预填域名，保存不丢失原配置", async ({ page }) => {
   await expect(dialog.getByRole("combobox", { name: "根域名", exact: true })).toBeDisabled();
   await dialog.getByLabel("服务名称").fill("改名的服务");
   await dialog.getByRole("button", { name: "保存服务" }).click();
-  await expect(page.getByRole("heading", { name: "改名的服务" })).toBeVisible();
+  await expect(visiblePage(page).locator(".service-detail h2")).toHaveText("改名的服务");
   expect(state.calls.find(item => item.method === "PUT")?.body.public_domain_id).toBe("d-1");
 });
 
@@ -169,30 +167,26 @@ test("未保存保护、弹层焦点约束与关闭后恢复", async ({ page }) 
   await expect(create).toBeFocused();
 });
 
-test("无域名时跳转配置并恢复服务草稿", async ({ page }) => {
+test("无域名时先关闭表单再配置，不允许跨页保留编辑窗口", async ({ page }) => {
   const state = await installApiMocks(page); state.domains = [];
   await page.goto("/#/services");
   await page.getByRole("button", { name: "创建服务", exact: true }).click();
   const editor = page.getByRole("dialog", { name: "创建服务" });
   await editor.getByLabel("服务名称").fill("草稿服务");
   await editor.getByRole("radio", { name: "网页服务", exact: true }).check();
-  await editor.getByRole("button", { name: "添加域名", exact: true }).click();
+  await expect(editor.getByText("请先取消表单，再到域名页添加。", { exact: true })).toBeVisible();
+  await page.evaluate(() => { window.location.hash = "#/domains"; });
+  await expect(page).toHaveURL(/#\/services$/);
+  await expect(editor.getByLabel("服务名称")).toHaveValue("草稿服务");
+  await editor.getByRole("button", { name: "取消", exact: true }).click();
+  await page.getByRole("button", { name: "放弃修改", exact: true }).click();
+  await page.evaluate(() => { window.location.hash = "#/domains"; });
   await page.getByRole("button", { name: "添加 域名", exact: true }).click();
   const add = page.getByRole("dialog", { name: "添加域名" });
   await add.getByLabel("域名", { exact: true }).fill("new.example.com");
   await add.getByRole("button", { name: "添加域名", exact: true }).click();
-  await expect(add).not.toBeVisible();
   await expect(page).toHaveURL(/#\/domains\/d-2$/);
-  await page.getByRole("dialog", { name: /^配置 / }).getByRole("button", { name: "关闭", exact: true }).click();
-  await page.goBack();
-  await expect(page).toHaveURL(/#\/domains$/);
-  await expect(visiblePage(page).getByRole("heading", { name: "域名与证书", exact: true })).toBeVisible();
-  await page.goBack();
-  await expect(editor.getByLabel("服务名称")).toHaveValue("草稿服务");
-  await expect(editor.getByRole("radio", { name: "网页服务", exact: true })).toBeChecked();
-  await expect(editor.getByRole("combobox", { name: "根域名", exact: true })).toContainText("new.example.com");
-  await editor.getByRole("combobox", { name: "根域名", exact: true }).click();
-  await expect(editor.getByRole("option", { name: "new.example.com", exact: true })).toHaveAttribute("aria-selected", "true");
+  await expect(page.getByRole("dialog", { name: /^配置 / })).toBeVisible();
 });
 
 test("批量操作一次确认并逐项呈现失败", async ({ page }) => {
@@ -200,7 +194,8 @@ test("批量操作一次确认并逐项呈现失败", async ({ page }) => {
   state.tunnels.push({ ...state.tunnels[0], id: "t-2", name: "备用服务" });
   await page.goto("/#/services");
   await expect(page.getByRole("checkbox")).toHaveCount(0);
-  await page.getByRole("button", { name: "选择", exact: true }).click();
+  await page.getByRole("button", { name: "选择", exact: true }).focus();
+  await page.getByRole("button", { name: "选择", exact: true }).press("Space");
   await page.getByRole("checkbox", { name: "选择媒体中心" }).check();
   await page.getByRole("checkbox", { name: "选择备用服务" }).check();
   state.failures.set("POST /api/v1/tunnels/t-2/disable", "节点暂不可达");
@@ -278,7 +273,7 @@ test("Agent 离线可见，批准表单和删除错误可重试", async ({ page 
   await expect(confirm.getByRole("alert")).toContainText("删除节点失败");
   state.failures.clear();
   await confirm.getByRole("button", { name: "删除 Agent", exact: true }).click();
-  await expect(visiblePage(page).getByRole("heading", { name: "Agent", exact: true })).toBeVisible();
+  await expect(visiblePage(page).locator("h1")).toHaveText("设备");
 });
 
 test("共享接入密钥可复制且不写入浏览器存储", async ({ page }) => {
@@ -348,40 +343,37 @@ test("登录和初始化使用可自动填充的单栏表单", async ({ page }) 
   await page.getByLabel("密码", { exact: true }).fill("a-secure-password");
   if ((page.viewportSize()?.width ?? 0) <= 900) await expect(page.locator(".auth-visual")).toBeHidden();
   await page.getByRole("button", { name: "开始使用" }).click();
-  await expect(visiblePage(page).getByRole("heading", { name: "穿透服务" })).toBeVisible();
+  await expect(visiblePage(page).locator("h1")).toHaveText("首页");
 });
 
-test("浏览器返回同样保护未保存的表单", async ({ page }) => {
+test("浏览器返回不能切走正在编辑的表单", async ({ page }) => {
   await installApiMocks(page);
   await page.goto("/#/manage");
   const nav = page.locator((page.viewportSize()?.width ?? 0) <= 900 ? ".bottom-nav" : ".sidebar nav");
-  await nav.getByRole("link", { name: "服务", exact: true }).click();
+  await nav.getByRole("link", { name: "隧道", exact: true }).click();
   await page.getByRole("button", { name: "创建服务", exact: true }).click();
   const editor = page.getByRole("dialog", { name: "创建服务" });
   await editor.getByLabel("服务名称").fill("未保存内容");
   await page.goBack();
-  const confirm = page.getByRole("dialog", { name: "放弃未保存的修改？" });
-  await expect(confirm).toBeVisible();
-  await confirm.getByRole("button", { name: "放弃修改", exact: true }).click();
-  await expect(visiblePage(page).getByRole("heading", { name: "管理", exact: true })).toBeVisible();
-  await expect(editor).not.toBeVisible();
+  await expect(page).toHaveURL(/#\/services$/);
+  await expect(editor.getByLabel("服务名称")).toHaveValue("未保存内容");
+  await expect(page.getByRole("dialog", { name: "放弃未保存的修改？" })).toHaveCount(0);
+  await editor.getByRole("button", { name: "取消", exact: true }).click();
+  await page.getByRole("button", { name: "放弃修改", exact: true }).click();
+  await expect(editor).toBeHidden();
 });
 
-test("尚无 Agent 时禁止保存，并保留跳转前的草稿", async ({ page }) => {
-  const state = await installApiMocks(page); const devices = state.devices; state.devices = [];
+test("尚无 Agent 时禁止保存并说明如何接入设备", async ({ page }) => {
+  const state = await installApiMocks(page); state.devices = [];
   await page.goto("/#/services");
   await page.getByRole("button", { name: "创建服务", exact: true }).click();
   const editor = page.getByRole("dialog", { name: "创建服务" });
   await editor.getByLabel("服务名称").fill("等待 Agent 的服务");
   await expect(editor.getByRole("button", { name: "保存服务" })).toBeDisabled();
-  await editor.getByRole("button", { name: "配置 Agent" }).click();
-  await expect(visiblePage(page).getByRole("heading", { name: "Agent", exact: true })).toBeVisible();
-  state.devices = devices;
-  await page.goBack();
+  await expect(editor.getByText("请先取消表单，再到设备页添加。", { exact: true })).toBeVisible();
+  await page.evaluate(() => { window.location.hash = "#/agents"; });
+  await expect(page).toHaveURL(/#\/services$/);
   await expect(editor.getByLabel("服务名称")).toHaveValue("等待 Agent 的服务");
-  await editor.getByRole("combobox", { name: "Agent", exact: true }).click();
-  await editor.getByRole("option", { name: "家庭 Agent 在线", exact: true }).click();
-  await expect(editor.getByRole("button", { name: "保存服务" })).toBeEnabled();
 });
 
 test("域名操作失败保留表单，删除失败可重试", async ({ page }) => {
@@ -396,7 +388,7 @@ test("域名操作失败保留表单，删除失败可重试", async ({ page }) 
   await expect(add.getByLabel("域名", { exact: true })).toHaveValue("new.example.com");
   state.failures.clear();
   await add.getByRole("button", { name: "添加域名", exact: true }).click();
-  const row = page.locator(".domain-row").filter({ has: page.getByText("new.example.com", { exact: true }) });
+  const row = page.locator(".page-slot:not([hidden]) .domain-row").filter({ has: page.getByText("new.example.com", { exact: true }) });
   await expect(page.getByRole("dialog", { name: /^配置 / })).toBeVisible();
   await page.getByRole("dialog", { name: /^配置 / }).getByRole("button", { name: "删除域名", exact: true }).click();
   const confirm = page.getByRole("dialog", { name: /^删除 / });
@@ -419,6 +411,8 @@ test("登录失败可重试，已有列表刷新时保持可读", async ({ page 
   await expect(page.getByRole("alert")).toContainText("用户名或密码错误");
   state.failures.clear();
   await page.getByRole("button", { name: "登录", exact: true }).click();
+  await expect(visiblePage(page).locator("h1")).toHaveText("首页");
+  await page.evaluate(() => { location.hash = "#/services"; });
   await expect(page.getByRole("link", { name: "媒体中心", exact: true })).toBeVisible();
   state.delay = 600;
   const refreshing = page.waitForRequest("**/api/v1/tunnels");
@@ -438,5 +432,5 @@ test("连接中断显示重试，不误判为未登录", async ({ page }) => {
   await expect(page.getByRole("button", { name: "登录", exact: true })).toHaveCount(0);
   await page.unroute("**/api/v1/auth/status");
   await page.getByRole("button", { name: "重试", exact: true }).click();
-  await expect(page.getByRole("link", { name: "媒体中心", exact: true })).toBeVisible();
+  await expect(visiblePage(page).locator("h1")).toHaveText("首页");
 });

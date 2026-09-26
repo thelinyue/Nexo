@@ -15,7 +15,7 @@ test("管理员代管空间时请求绑定该空间，账号安全仍访问本�
   const state = await installApiMocks(page);
   const scoped: string[] = [];
   await page.route("**/api/v1/admin/**", async route => {
-    const path = new URL(route.request().url()).pathname; scoped.push(path);
+    const path = new URL(route.request().url()).pathname; if (path.includes("/traffic/")) return route.fallback(); scoped.push(path);
     if (path === "/api/v1/admin/users") return route.fulfill({ json: [{ id: "alice", username: "alice", role: "tenant", workspace_id: "alice-space", workspace_name: "alice 的工作空间", enabled: true, devices: 1, services: 1, domains: 1 }] });
     if (path === "/api/v1/admin/invitations") return route.fulfill({ json: [] });
     const resource = path.split("/").at(-1);
@@ -23,16 +23,18 @@ test("管理员代管空间时请求绑定该空间，账号安全仍访问本�
   });
   await page.goto("/#/users");
   await page.getByRole("button", { name: "管理 alice 的空间" }).click();
+  await expect(page).toHaveURL(/#\/home$/);
+  await page.evaluate(() => { location.hash = "#/services"; });
   await expect(page.locator(".workspace-banner")).toContainText("alice 的工作空间");
-  await expect(page.getByText("alice 的服务", { exact: true }).first()).toBeVisible();
+  await expect(page.getByRole("link", { name: "alice 的服务", exact: true })).toBeVisible();
   expect(scoped).toContain("/api/v1/admin/workspaces/alice-space/tunnels");
   await page.screenshot({ path: info.outputPath("managed-workspace.png"), fullPage: true });
   await page.getByRole("button", { name: "创建服务", exact: true }).click();
   await expect(page.getByRole("dialog").locator(".modal-workspace")).toHaveText("操作空间：alice 的工作空间");
   await page.screenshot({ path: info.outputPath("managed-service-form.png") });
-  await page.getByRole("dialog").getByRole("button", { name: "关闭", exact: true }).click();
-  await page.evaluate(() => { window.location.hash = "#/manage"; });
-  await expect(page.locator(".manage-page").getByRole("link", { name: /^Agent/ })).toContainText("1 台在线");
+  await page.getByRole("dialog").getByRole("button", { name: "取消", exact: true }).click();
+  await page.evaluate(() => { window.location.hash = "#/agents"; });
+  await expect(page.locator(".page-slot:not([hidden]) .agent-row")).toHaveCount(2);
   expect(scoped).toContain("/api/v1/admin/workspaces/alice-space/devices");
   expect(scoped).toContain("/api/v1/admin/workspaces/alice-space/enrollments");
   await page.evaluate(() => { window.location.hash = "#/settings/sessions"; });
@@ -40,8 +42,10 @@ test("管理员代管空间时请求绑定该空间，账号安全仍访问本�
   expect(state.calls.some(call => call.path === "/api/v1/auth/sessions")).toBeTruthy();
   expect(scoped.some(path => path.includes("/auth/"))).toBeFalsy();
   await page.getByRole("button", { name: "返回我的空间" }).click();
+  await expect(page).toHaveURL(/#\/home$/);
+  await page.evaluate(() => { location.hash = "#/services"; });
   await expect(page.locator(".workspace-banner")).toHaveCount(0);
-  await expect(page.getByText("媒体中心", { exact: true }).first()).toBeVisible();
+  await expect(page.getByRole("link", { name: "媒体中心", exact: true })).toBeVisible();
 });
 
 test("邀请链接清除地址栏凭据，注册失败保留输入且成功进入空间", async ({ page }, info) => {
@@ -65,7 +69,8 @@ test("邀请链接清除地址栏凭据，注册失败保留输入且成功进�
   await page.screenshot({ path: info.outputPath("invitation-form.png"), fullPage: true });
   expect(await page.evaluate(() => JSON.stringify(localStorage)+JSON.stringify(sessionStorage))).not.toContain(token);
   fail = false; await page.getByRole("button", { name: "创建账号" }).click();
-  await expect(page.getByRole("button", { name: "创建服务" })).toBeVisible();
+  await expect(page).toHaveURL(/#\/home$/);
+  await expect(page.locator(".home-page")).toBeVisible();
 });
 
 test("域名自助配置保留失败输入，兼容长 Token 并按域名保存 DNS 选项", async ({ page }, info) => {
@@ -102,14 +107,14 @@ test("域名自助配置保留失败输入，兼容长 Token 并按域名保存 
   expect(writes.at(-1)).not.toHaveProperty("token");
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBeTruthy();
   await page.screenshot({path:info.outputPath("domain-settings.png"),fullPage:true});
-  await dialog.getByRole("button",{name:"关闭",exact:true}).click();
+  await dialog.getByRole("button",{name:"取消",exact:true}).click();
   await expect(dialog).toBeHidden();
 });
 
 test("管理员邀请和停用有明确反馈，失败不伪报成功", async ({ page }, info) => {
   await installApiMocks(page);let enabled=true;let fail=true;
   await page.route("**/api/v1/admin/**", async route => {
-    const path=new URL(route.request().url()).pathname;const method=route.request().method();
+    const path=new URL(route.request().url()).pathname; if (path.includes("/traffic/")) return route.fallback();const method=route.request().method();
     if(path==="/api/v1/admin/users")return route.fulfill({json:[{id:"alice",username:"alice",role:"tenant",workspace_id:"alice",workspace_name:"alice 的空间",enabled,devices:2,services:3,domains:1}]});
     if(path.endsWith("/users/alice")){if(fail)return route.fulfill({status:503,json:{error:"暂时无法停用，请重试"}});enabled=route.request().postDataJSON().enabled;return route.fulfill({json:{enabled}});}
     if(method==="POST")return route.fulfill({json:{token:"secret-invitation",expires_at:Date.now()/1000+86400}});
@@ -143,7 +148,7 @@ test("恢复链接在已打开的登录页也可进入，凭据不留在 URL", a
 test("代管空间中重新认证保留原空间及服务草稿", async ({ page }) => {
   const state=await installApiMocks(page);let expired=true;
   await page.route("**/api/v1/admin/**",async route=>{
-    const path=new URL(route.request().url()).pathname;
+    const path=new URL(route.request().url()).pathname; if (path.includes("/traffic/")) return route.fallback();
     if(path==="/api/v1/admin/users")return route.fulfill({json:[{id:"alice",username:"alice",role:"tenant",workspace_id:"alice",workspace_name:"alice 空间",enabled:true,devices:1,services:1,domains:1}]});
     if(path==="/api/v1/admin/invitations")return route.fulfill({json:[]});
     if(route.request().method()==="POST" && path.endsWith("/tunnels")) {
@@ -154,6 +159,8 @@ test("代管空间中重新认证保留原空间及服务草稿", async ({ page 
     return route.fulfill({json:path.endsWith("/devices")?state.devices:path.endsWith("/public-domains")?state.domains:path.endsWith("/tunnels")?state.tunnels:[]});
   });
   await page.goto("/#/users");await page.getByRole("button",{name:"管理 alice 的空间"}).click();
+  await expect(page).toHaveURL(/#\/home$/);
+  await page.evaluate(() => { location.hash = "#/services"; });
   await page.getByRole("button",{name:"创建服务"}).click();const editor=page.getByRole("dialog",{name:"创建服务"});
   await editor.getByLabel("服务名称").fill("保留代管草稿");await editor.getByLabel("内网端口").fill("8080");
   await editor.getByLabel("主机名").fill("reauth");
@@ -169,7 +176,7 @@ test("唯一管理员可改名及管理自身安全，改名失败保留输入�
   const state = await installApiMocks(page); let username = "admin"; let fail = true;
   await page.route("**/api/v1/auth/status", route => route.fulfill({ json: { initialized: true, authenticated: state.authenticated, user_id: "admin", username, role: "system_admin", workspace_id: "default", csrf_token: "test-csrf" } }));
   await page.route("**/api/v1/admin/**", async route => {
-    const path = new URL(route.request().url()).pathname;
+    const path = new URL(route.request().url()).pathname; if (path.includes("/traffic/")) return route.fallback();
     if (path === "/api/v1/admin/users") return route.fulfill({ json: [{ id: "admin", username, role: "system_admin", enabled: true, workspace_id: "default", workspace_name: "默认工作空间", created_at: 1790000000, devices: 1, services: 2, domains: 1 }] });
     if (path === "/api/v1/admin/users/admin") {
       if (fail) return route.fulfill({ status: 409, json: { error: "用户名已被使用" } });
@@ -187,7 +194,7 @@ test("唯一管理员可改名及管理自身安全，改名失败保留输入�
   await expect(page.getByRole("button", { name: "停用用户", exact: true })).toHaveCount(0);
   await page.locator(".user-card").getByRole("button", { name: "修改密码", exact: true }).click();
   await expect(page.getByRole("dialog", { name: "修改密码" }).getByLabel("当前密码", { exact: true })).toBeVisible();
-  await page.getByRole("dialog").getByRole("button", { name: "关闭", exact: true }).click();
+  await page.getByRole("dialog").getByRole("button", { name: "取消", exact: true }).click();
   await expect(page.locator(".user-card").getByRole("link", { name: "登录会话" })).toHaveAttribute("href", "#/settings/sessions");
   await page.getByRole("button", { name: "修改用户名", exact: true }).click();
   const dialog = page.getByRole("dialog", { name: "修改用户名" });
@@ -209,7 +216,7 @@ test("唯一管理员可改名及管理自身安全，改名失败保留输入�
 test("普通用户改名和整空间删除提供确认、失败重试与清理状态", async ({ page }, info) => {
   await installApiMocks(page); let fail = true; let removed = false; let username = "alice"; const writes: any[] = [];
   await page.route("**/api/v1/admin/**", async route => {
-    const path = new URL(route.request().url()).pathname;
+    const path = new URL(route.request().url()).pathname; if (path.includes("/traffic/")) return route.fallback();
     if (path === "/api/v1/admin/users") return route.fulfill({ json: removed ? [] : [{ id: "alice", username, role: "tenant", enabled: true, workspace_id: "alice-space", workspace_name: `${username}的工作空间`, created_at: 1790000000, devices: 2, services: 3, domains: 1 }] });
     if (path.endsWith("/users/alice")) {
       const body = route.request().postDataJSON(); writes.push({ method: route.request().method(), ...body });
@@ -252,12 +259,14 @@ test("普通用户改名和整空间删除提供确认、失败重试与清理�
 test("删除正在代管的用户后回到本人空间", async ({ page }) => {
   const state = await installApiMocks(page); let removed = false;
   await page.route("**/api/v1/admin/**", async route => {
-    const path = new URL(route.request().url()).pathname;
+    const path = new URL(route.request().url()).pathname; if (path.includes("/traffic/")) return route.fallback();
     if (path === "/api/v1/admin/users") return route.fulfill({ json: removed ? [] : [{ id: "alice", username: "alice", role: "tenant", enabled: true, workspace_id: "alice-space", workspace_name: "alice的工作空间", devices: 1, services: 1, domains: 1 }] });
     if (path === "/api/v1/admin/users/alice") { removed = true; return route.fulfill({ json: { deleted: true, cleanup_pending: false, message: "用户及其资源已删除" } }); }
     return route.fulfill({ json: path.endsWith("/tunnels") ? [{ ...state.tunnels[0], name: "alice服务" }] : [] });
   });
   await page.goto("/#/users"); await page.getByRole("button", { name: "管理 alice 的空间" }).click();
+  await expect(page).toHaveURL(/#\/home$/);
+  await page.evaluate(() => { location.hash = "#/services"; });
   await expect(page.locator(".workspace-banner")).toBeVisible();
   await page.evaluate(() => { location.hash = "#/users"; });
   await page.getByRole("button", { name: "账号设置", exact: true }).click();
@@ -267,7 +276,7 @@ test("删除正在代管的用户后回到本人空间", async ({ page }) => {
   await expect(page.locator(".workspace-banner")).toHaveCount(0);
   await expect(page.getByText("用户及其资源已删除", { exact: true })).toBeVisible();
   await page.evaluate(() => { location.hash = "#/services"; });
-  await expect(page.getByText("媒体中心", { exact: true }).first()).toBeVisible();
+  await expect(page.getByRole("link", { name: "媒体中心", exact: true })).toBeVisible();
 });
 
 test("重新认证可输入新用户名，切换账号清除代管和旧草稿", async ({ page }) => {
@@ -275,12 +284,14 @@ test("重新认证可输入新用户名，切换账号清除代管和旧草稿",
   await page.route("**/api/v1/auth/status", route => route.fulfill({ json: { initialized: true, authenticated: true, user_id: switched ? "bob" : "admin", username: switched ? "bob-new" : "admin", role: switched ? "tenant" : "system_admin", workspace_id: switched ? "bob-space" : "default", csrf_token: "csrf" } }));
   await page.route("**/api/v1/auth/login", route => { expect(route.request().postDataJSON().username).toBe("bob-new"); switched = true; return route.fulfill({ json: {} }); });
   await page.route("**/api/v1/admin/**", route => {
-    const path = new URL(route.request().url()).pathname;
+    const path = new URL(route.request().url()).pathname; if (path.includes("/traffic/")) return route.fallback();
     if (path === "/api/v1/admin/users") return route.fulfill({ json: [{ id: "alice", username: "alice", role: "tenant", enabled: true, workspace_id: "alice-space", workspace_name: "alice的工作空间", devices: 1, services: 1, domains: 1 }] });
     if (path.endsWith("/tunnels") && route.request().method() === "POST") return route.fulfill({ status: 401, json: { code: "session_expired", error: "登录已过期" } });
     return route.fulfill({ json: path.endsWith("/devices") ? state.devices : path.endsWith("/public-domains") ? state.domains : [] });
   });
   await page.goto("/#/users"); await page.getByRole("button", { name: "管理 alice 的空间" }).click();
+  await expect(page).toHaveURL(/#\/home$/);
+  await page.evaluate(() => { location.hash = "#/services"; });
   await page.getByRole("button", { name: "创建第一个服务", exact: true }).click();
   const editor = page.getByRole("dialog", { name: "创建服务" });
   await editor.getByLabel("服务名称").fill("旧账号未保存草稿"); await editor.getByLabel("内网端口").fill("8080");

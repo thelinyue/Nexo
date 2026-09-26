@@ -285,16 +285,16 @@ test("长名称和长域名浮层在窄屏、横屏及低高度视口内可滚�
   }
 });
 
-test("无 Agent 或域名时保留配置入口，选择框和保存禁用", async ({ page }) => {
+test("无 Agent 或域名时指引先取消表单，选择框和保存禁用", async ({ page }) => {
   const state = await installApiMocks(page); state.devices = []; state.domains = [];
   await page.goto("/#/services");
   await page.getByRole("button", { name: "创建服务", exact: true }).click();
   const dialog = page.getByRole("dialog", { name: "创建服务" });
   await expect(dialog.getByRole("combobox", { name: "Agent", exact: true })).toBeDisabled();
-  await expect(dialog.getByRole("button", { name: "配置 Agent", exact: true })).toBeVisible();
+  await expect(dialog.getByText("请先取消表单，再到设备页添加。", { exact: true })).toBeVisible();
   await dialog.getByRole("radio", { name: "网页服务", exact: true }).check();
   await expect(dialog.getByRole("combobox", { name: "根域名", exact: true })).toBeDisabled();
-  await expect(dialog.getByRole("button", { name: "添加域名", exact: true })).toBeVisible();
+  await expect(dialog.getByText("请先取消表单，再到域名页添加。", { exact: true })).toBeVisible();
   await expect(dialog.getByRole("button", { name: "保存服务" })).toBeDisabled();
 });
 

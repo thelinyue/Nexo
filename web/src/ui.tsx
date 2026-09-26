@@ -1,6 +1,7 @@
 import { createContext, useCallback, useContext, useEffect, useRef, useState } from "react";
 import type { InputHTMLAttributes, ReactNode } from "react";
 import { ArrowLeft, Check, ChevronRight, Copy, FileQuestion, Globe2, Network, Plus, Search, Server, ShieldCheck, Users, X } from "lucide-react";
+import { PageNavigationContext } from "./navigation";
 
 export type Auth = { initialized: boolean; authenticated: boolean; user_id?: string; username?: string; role?: "system_admin" | "tenant"; workspace_id?: string; csrf_token?: string | null; local_http_warning?: boolean };
 export type Tunnel = { id: string; name: string; protocol: string; origin_protocol?: "http" | "https" | null; local_address: string; local_port: number; public_port?: number | null; public_address?: string | null; device_id?: string | null; device_name?: string | null; hostname?: string | null; enabled: boolean; apply_status: string; apply_error?: string | null; public_domain?: string | null; lan_redirect_enabled: boolean };
@@ -40,10 +41,6 @@ export function useApi() {
   return useCallback(<T,>(path: string, options: RequestInit = {}, csrf?: string | null) => request<T>(path, options, csrf, workspace), [workspace]);
 }
 export const errorText = (error: unknown) => error instanceof Error ? error.message : "操作失败，请重试";
-// 前置配置跳转和成功提交后的返回由调用方明确放行，其余离开操作遵守弹层保护。
-let allowedModalRoute: string | null = null;
-export const navigate = (route: string, allowModalNavigation = false) => { allowedModalRoute = allowModalNavigation ? route : null; window.location.hash = route; };
-export function consumeModalNavigation(route: string) { const retained = allowedModalRoute === route; allowedModalRoute = null; return retained; }
 // Safari 的触摸点击不一定聚焦按钮，显式记住触发控件用于弹层关闭后的焦点恢复。
 let interactionTarget: HTMLElement | null = null;
 export function rememberInteraction(target: EventTarget | null) { interactionTarget = target instanceof Element ? target.closest<HTMLElement>("button,a,input,textarea,select") : null; }
@@ -74,11 +71,14 @@ export function Status({ value, kind = "service" }: { value: string; kind?: "ser
   return <span className={`status ${tone}`}><i />{labels[value] ?? `未知状态：${value || "未返回"}`}</span>;
 }
 
-export function PageHeader({ title, subtitle, back, action }: { title: string; subtitle?: string; back?: string; action?: ReactNode }) {
-  return <header className="page-header">{back && <a className="icon-button page-back" href={back} aria-label="返回"><ArrowLeft size={21} /></a>}<div><h1 className="mobile-page-title" tabIndex={-1}>{title}</h1>{subtitle && <p className="subtitle">{subtitle}</p>}</div>{action && <div className="page-actions">{action}</div>}</header>;
+export function PageHeader({ title, back, action }: { title: string; back?: string; action?: ReactNode }) {
+  const navigation = useContext(PageNavigationContext);
+  const route = navigation?.route; const report = navigation?.reportTitle;
+  useEffect(() => { if (route) report?.(route, title); }, [route, report, title]);
+  return <header className="page-header" data-has-action={Boolean(action)} data-has-back={Boolean(back)}>{back && <a className="icon-button page-back" href={back} aria-label="返回"><ArrowLeft size={21} /></a>}<div><h1 className="mobile-page-title" title={title} tabIndex={-1}>{title}</h1></div>{action && <div className="page-actions">{action}</div>}</header>;
 }
 export function CreateButton({ label, onClick, disabled }: { label: string; onClick: () => void; disabled?: boolean }) {
-  return <button className="primary-button page-create" aria-label={label === "服务" ? "创建服务" : `添加 ${label}`} onClick={onClick} disabled={disabled}><Plus size={20} strokeWidth={1.8} /><span>{label === "服务" ? "添加服务" : `添加${label}`}</span></button>;
+  return <button className="primary-button page-create" data-resource={label} aria-label={label === "服务" ? "创建服务" : `添加 ${label}`} title={label === "服务" ? "添加服务" : `添加${label}`} onClick={onClick} disabled={disabled}><Plus size={20} strokeWidth={1.8} /><span>{label === "服务" ? "添加服务" : `添加${label}`}</span></button>;
 }
 export function Notice({ error, onRetry, updatedAt }: { error?: string | null; onRetry?: () => void; updatedAt?: number | null }) { return error ? <><div className="notice error" role="alert"><span>{error}</span>{onRetry && <button className="text-button" onClick={onRetry}>重试</button>}</div>{updatedAt && <p className="helper">保留上次数据 · 更新于 {dateText(updatedAt)}</p>}</> : null; }
 /** 空状态用场景图标和单一下一步引导，搜索无结果与资源不存在不冒充首次使用。 */
@@ -143,25 +143,26 @@ export function Modal({ title, children, onClose, full = false, dirty = false, b
   // 使用独立监听读取最新 dirty，避免首次打开时的状态被闭包固定。
   useEffect(() => { if (!dirty) return; const handler = (e: BeforeUnloadEvent) => { e.preventDefault(); }; window.addEventListener("beforeunload", handler); return () => window.removeEventListener("beforeunload", handler); }, [dirty]);
   useEffect(() => {
-    // 浏览器返回与界面关闭遵守同样的草稿保护；配置前置资源的跳转由调用方明确保留草稿。
+    // 完整表单在编辑期间阻止历史导航；主动关闭仍遵守草稿确认与提交保护。
     const handler = (event: Event) => {
       if (Array.from(document.querySelectorAll("dialog[open]")).at(-1) !== ref.current) return;
       event.preventDefault();
+      if (full) return;
       if (busy || !dismissible) return;
       if (dirty) { pendingNavigation.current = (event as CustomEvent<{ resume: () => void }>).detail.resume; setDiscard(true); }
       else onClose();
     };
     window.addEventListener("nexo:route-change", handler);
     return () => window.removeEventListener("nexo:route-change", handler);
-  }, [dirty, busy, dismissible, onClose]);
-  return <><dialog ref={ref} className={`modal ${full ? "full-form" : "short-modal"}`} aria-label={title} tabIndex={-1} onKeyDown={event => {
+  }, [dirty, busy, dismissible, full, onClose]);
+  return <><dialog ref={ref} data-navigation-lock={full} className={`modal ${full ? "full-form" : "short-modal"}`} aria-label={title} tabIndex={-1} onKeyDown={event => {
     if (event.key !== "Tab") return;
     const items = Array.from(ref.current!.querySelectorAll<HTMLElement>('button:not(:disabled),a[href],input:not(:disabled),textarea:not(:disabled),select:not(:disabled),summary,[tabindex="0"]')).filter(item => item.getClientRects().length > 0);
     const first = items[0]; const last = items[items.length - 1];
     if (!first) { event.preventDefault(); ref.current?.focus(); }
     else if (event.shiftKey && (document.activeElement === first || document.activeElement === ref.current)) { event.preventDefault(); last.focus(); }
     else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first.focus(); }
-  }} onCancel={e => { e.preventDefault(); close(); }} onClick={e => { if (e.target === ref.current) { const box = ref.current.getBoundingClientRect(); if (e.clientX < box.left || e.clientX > box.right || e.clientY < box.top || e.clientY > box.bottom) close(); } }}><header className="modal-heading"><h2>{title}</h2>{dismissible && <button className="icon-button" aria-label="关闭" onClick={close} disabled={busy}><X size={21} /></button>}</header>{workspaceLabel && <p className="modal-workspace">操作空间：{workspaceLabel}</p>}{children}</dialog>{discard && <Confirm title="放弃未保存的修改？" description="离开后，本次填写的内容将丢失。" label="放弃修改" onClose={() => { pendingNavigation.current = null; setDiscard(false); }} onConfirm={async () => { const resume = pendingNavigation.current; pendingNavigation.current = null; setDiscard(false); onClose(); if (resume) window.setTimeout(resume, 0); }} />}</>;
+  }} onCancel={e => { e.preventDefault(); close(); }} onClick={e => { if (e.target === ref.current) { const box = ref.current.getBoundingClientRect(); if (e.clientX < box.left || e.clientX > box.right || e.clientY < box.top || e.clientY > box.bottom) close(); } }}><header className="modal-heading"><h2>{title}</h2>{dismissible && <button className={`icon-button${full ? " form-cancel" : ""}`} aria-label={full ? "取消" : "关闭"} onClick={close} disabled={busy}>{full ? "取消" : <X size={21} />}</button>}</header>{workspaceLabel && <p className="modal-workspace">操作空间：{workspaceLabel}</p>}{children}</dialog>{discard && <Confirm title="放弃未保存的修改？" description="离开后，本次填写的内容将丢失。" label="放弃修改" onClose={() => { pendingNavigation.current = null; setDiscard(false); }} onConfirm={async () => { const resume = pendingNavigation.current; pendingNavigation.current = null; setDiscard(false); onClose(); if (resume) window.setTimeout(resume, 0); }} />}</>;
 }
 export function Confirm({ title, description, label, onClose, onConfirm, tone = "danger" }: { title: string; description: string; label: string; tone?: "danger" | "primary"; onClose: () => void; onConfirm: () => Promise<void> }) {
   const [busy, setBusy] = useState(false); const [error, setError] = useState<string | null>(null);
@@ -169,11 +170,11 @@ export function Confirm({ title, description, label, onClose, onConfirm, tone = 
 }
 
 /** 前台每 5 秒更新，编辑/后台/登录过期时暂停；只读详情可显式允许弹层内更新，回到页面或网络恢复立即检查。 */
-export function useResource<T>(load: () => Promise<T>, active: boolean, poll = true, pollInDialog = false) {
+export function useResource<T>(load: () => Promise<T>, active: boolean, poll: boolean | number = true, pollInDialog = false, initialData?: T) {
   const loader = useRef(load); loader.current = load;
   const sequence = useRef(0); const inFlight = useRef(0);
   const [updatedAt, setUpdatedAt] = useState<number | null>(null);
-  const [data, updateData] = useState<T | null>(null); const [busy, setBusy] = useState(false); const [error, setError] = useState<string | null>(null);
+  const [data, updateData] = useState<T | null>(initialData ?? null); const [busy, setBusy] = useState(false); const [error, setError] = useState<string | null>(null);
   async function reload(silent = false) {
     if (sessionExpired || inFlight.current) return;
     const seq = ++sequence.current; inFlight.current = seq;
@@ -190,7 +191,7 @@ export function useResource<T>(load: () => Promise<T>, active: boolean, poll = t
     void reload();
     const refresh = () => { if (document.visibilityState === "visible" && (pollInDialog || !document.querySelector("dialog[open]"))) void reload(true); };
     const restored = () => { void reload(); };
-    const timer = poll ? window.setInterval(refresh, 5000) : undefined;
+    const timer = poll ? window.setInterval(refresh, poll === true ? 5000 : poll) : undefined;
     window.addEventListener("focus", refresh); window.addEventListener("online", refresh);
     document.addEventListener("visibilitychange", refresh); window.addEventListener("nexo:authenticated", restored);
     return () => {

@@ -4,6 +4,7 @@ import type { FormEvent } from "react";
 import { Brand, PasswordInput, Empty, Confirm, CopyButton, Loading, Modal, Notice, PageHeader, errorText, request, useResource } from "./ui";
 import type { Auth } from "./ui";
 import { PasswordForm } from "./management";
+import { QuotaForm } from "./traffic-quota";
 
 export type ManagedWorkspace = { id: string; name: string; enabled: boolean };
 type User = { id: string; username: string; role: string; workspace_id: string; workspace_name: string; enabled: boolean; created_at: number; devices: number; services: number; domains: number };
@@ -28,6 +29,7 @@ export function UsersPage({ active, auth, onManage, onRenamed, onDeleted, onExpi
   useEffect(() => { if (!active) setLink(null); }, [active]);
   const [changing, setChanging] = useState<User | null>(null); const [revoking, setRevoking] = useState<Invitation | null>(null);
   const [editing, setEditing] = useState<User | null>(null); const [deleting, setDeleting] = useState<User | null>(null);
+  const [quotaUser, setQuotaUser] = useState<User | null>(null);
   const [expanded, setExpanded] = useState<string | null>(null);
   const [password, setPassword] = useState(false); const [notice, setNotice] = useState<string | null>(null);
   async function createLink(user?: User) {
@@ -51,7 +53,7 @@ export function UsersPage({ active, auth, onManage, onRenamed, onDeleted, onExpi
       <div className="user-card-actions"><button className="text-button user-manage" disabled={busy} aria-label={`管理 ${user.username} 的空间`} onClick={() => onManage({ id: user.workspace_id, name: user.workspace_name, enabled: user.enabled })}>管理资源<ChevronRight size={16} aria-hidden="true" /></button><button className="text-button user-expand" disabled={busy} aria-expanded={expanded === user.id} aria-controls={`user-settings-${user.id}`} onClick={() => setExpanded(expanded === user.id ? null : user.id)}>账号设置<ChevronDown size={16} aria-hidden="true" /></button></div>
       {expanded === user.id && <section className="user-settings" id={`user-settings-${user.id}`} aria-label={`${user.username} 的账号设置`}>
         <dl className="user-profile"><div><dt>创建时间</dt><dd>{accountDate(user.created_at)}</dd></div></dl>
-        <div className="user-account-actions"><button className="secondary-button" disabled={busy} onClick={() => setEditing(user)}>修改用户名</button>{user.id === auth.user_id && <><button className="secondary-button" disabled={busy} onClick={() => setPassword(true)}>修改密码</button><a className="secondary-button" href="#/settings/sessions">登录会话</a></>}{user.role !== "system_admin" && <><button className="secondary-button" disabled={busy || !user.enabled} onClick={() => void createLink(user)}>重设密码</button><button className="secondary-button" disabled={busy} onClick={() => setChanging(user)}>{user.enabled ? "停用用户" : "启用用户"}</button><button className="secondary-button user-delete" disabled={busy} onClick={() => setDeleting(user)}>删除用户</button></>}</div>
+        <div className="user-account-actions"><button className="secondary-button" disabled={busy} onClick={() => setQuotaUser(user)}>流量限制</button><button className="secondary-button" disabled={busy} onClick={() => setEditing(user)}>修改用户名</button>{user.id === auth.user_id && <><button className="secondary-button" disabled={busy} onClick={() => setPassword(true)}>修改密码</button><a className="secondary-button" href="#/settings/sessions">登录会话</a></>}{user.role !== "system_admin" && <><button className="secondary-button" disabled={busy || !user.enabled} onClick={() => void createLink(user)}>重设密码</button><button className="secondary-button" disabled={busy} onClick={() => setChanging(user)}>{user.enabled ? "停用用户" : "启用用户"}</button><button className="secondary-button user-delete" disabled={busy} onClick={() => setDeleting(user)}>删除用户</button></>}</div>
       </section>}
     </article>)}</section>}{resource.data.invitations.length ? <details className="panel invitation-history"><summary>邀请记录 · {resource.data.invitations.filter(item => item.status === "pending").length} 待接受</summary><div>{resource.data.invitations.map(invitation => <div className="pending-row invitation-row" key={invitation.id}><div><strong>{{ pending: "等待接受", used: "已接受", revoked: "已撤销", expired: "已过期" }[invitation.status] ?? invitation.status}{invitation.username ? ` · ${invitation.username}` : ""}</strong><small>到期时间：{accountDate(invitation.expires_at)}</small></div>{invitation.status === "pending" && <button className="text-button" onClick={() => setRevoking(invitation)}>撤销邀请</button>}</div>)}</div></details> : null}</>}
     {link && active && <Modal title={link.kind === "invite" ? "邀请链接" : `重设 ${link.username} 的密码`} onClose={() => setLink(null)}><div className="modal-body"><p>{link.kind === "invite" ? "链接仅本次显示，关闭后无法再次查看。单次使用，请在到期前发给受邀人。" : "链接仅本次显示，单次使用，请发给本人。重设后需重新登录。"}</p><code className="token">{url}</code><p className="helper">到期时间：{accountDate(link.expires_at)}</p></div><footer className="modal-actions link-actions"><CopyButton value={url} label="复制链接" /></footer></Modal>}
@@ -59,6 +61,7 @@ export function UsersPage({ active, auth, onManage, onRenamed, onDeleted, onExpi
     {revoking && active && <Confirm title="撤销邀请？" description="链接将立即失效，无法再用于创建账号。" label="撤销邀请" onClose={() => setRevoking(null)} onConfirm={async () => { await request(`/api/v1/admin/invitations/${encodeURIComponent(revoking.id)}`, { method: "DELETE" }, auth.csrf_token); await resource.reload(); }} />}
     {editing && active && <UsernameForm user={editing} csrf={auth.csrf_token} onClose={() => setEditing(null)} onSaved={async result => { setEditing(null); if (result.reauthenticate) { onRenamed(result.username); return; } setNotice("用户名已更新，该用户需重新登录。"); await resource.reload(); }} />}
     {deleting && active && <DeleteUserForm user={deleting} csrf={auth.csrf_token} onClose={() => setDeleting(null)} onDeleted={async result => { const workspace = deleting.workspace_id; setDeleting(null); onDeleted(workspace, result.message); await resource.reload(); }} />}
+    {quotaUser && active && <QuotaForm key={quotaUser.id} user={quotaUser} csrf={auth.csrf_token} onClose={() => setQuotaUser(null)} onSaved={() => { setQuotaUser(null); setNotice("流量限制已更新，统计数据保留。"); void resource.reload(); }} />}
     {password && active && <PasswordForm csrf={auth.csrf_token} onClose={() => setPassword(false)} onExpired={onExpired} />}
   </>;
 }
@@ -72,7 +75,7 @@ function UsernameForm({ user, csrf, onClose, onSaved }: { user: User; csrf?: str
     try { const result = await request<{ username: string; reauthenticate: boolean }>(`/api/v1/admin/users/${encodeURIComponent(user.id)}`, { method: "PATCH", body: JSON.stringify({ username: username.trim() }) }, csrf); await onSaved(result); }
     catch (e) { setError(errorText(e)); } finally { setBusy(false); }
   }
-  return <Modal title="修改用户名" dirty={dirty} busy={busy} onClose={onClose}><form className="modal-form management-form" onSubmit={submit}><div className="modal-body"><p className="user-target">{user.username}</p><p className="helper">所有会话及恢复码将失效，需重新登录。</p><fieldset disabled={busy}><label>新用户名<input value={username} onChange={e => setUsername(e.target.value)} autoComplete="off" autoCapitalize="none" spellCheck={false} required /></label></fieldset><Notice error={error} /></div><footer className="modal-actions"><button className="primary-button" disabled={busy || !dirty}>{busy ? "保存中…" : "保存用户名"}</button></footer></form></Modal>;
+  return <Modal title="修改用户名" full dirty={dirty} busy={busy} onClose={onClose}><form className="modal-form management-form" onSubmit={submit}><div className="modal-body"><p className="user-target">{user.username}</p><p className="helper">所有会话及恢复码将失效，需重新登录。</p><fieldset disabled={busy}><label>新用户名<input value={username} onChange={e => setUsername(e.target.value)} autoComplete="off" autoCapitalize="none" spellCheck={false} required /></label></fieldset><Notice error={error} /></div><footer className="modal-actions"><button className="primary-button" disabled={busy || !dirty}>{busy ? "保存中…" : "保存用户名"}</button></footer></form></Modal>;
 }
 
 /** 删除会清除整个独立空间；确认文本随请求送到后端，防止账号已改名时误删。 */

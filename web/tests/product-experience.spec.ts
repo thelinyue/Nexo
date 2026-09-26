@@ -17,6 +17,10 @@ test("桌面添加服务属于标题区，设备识别码可完整复制", async
       expect(box!.height).toBeGreaterThanOrEqual(44);
       expect(box!.y).toBeGreaterThanOrEqual(header!.y);
       expect(box!.y + box!.height).toBeLessThanOrEqual(header!.y + header!.height);
+      const workspace = await page.locator(".page-slot:not([hidden])").boundingBox();
+      expect(workspace!.y + workspace!.height).toBeCloseTo(page.viewportSize()!.height - 24, 0);
+      const search = await page.getByLabel("搜索穿透服务").boundingBox();
+      expect(Math.abs(search!.y - box!.y)).toBeLessThanOrEqual(2);
       expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBeTruthy();
       if (width === 1440) await page.screenshot({ path: info.outputPath(`service-header-${colorScheme}.png`) });
     }
@@ -90,7 +94,7 @@ test("服务进入关联域名后返回原服务，手机子页隐藏底栏", as
   await expect(page.locator(".service-public-link")).toHaveAttribute("target", "_blank");
   await page.getByRole("link", { name: "域名与 DNS" }).click();
   await expect(page).toHaveURL(/#\/domains\/d-1$/);
-  await expect(page.getByRole("heading", { name: "域名详情" })).toBeVisible();
+  await expect(page.locator(".page-slot:not([hidden]) h1")).toHaveText("example.com");
   if ((page.viewportSize()?.width ?? 0) <= 900) await expect(page.locator(".bottom-nav")).toBeHidden();
   await page.screenshot({ path: info.outputPath("domain-detail.png") });
   await page.getByRole("link", { name: "返回", exact: true }).click();
@@ -100,7 +104,8 @@ test("服务进入关联域名后返回原服务，手机子页隐藏底栏", as
 test("空服务页只有一个创建入口，删除最后一项后退出批量选择", async ({ page }, info) => {
   await installApiMocks(page);
   await page.goto("/#/services");
-  await page.getByRole("button", { name: "选择", exact: true }).click();
+  await page.getByRole("button", { name: "选择", exact: true }).focus();
+  await page.getByRole("button", { name: "选择", exact: true }).press("Space");
   await page.getByRole("checkbox", { name: "选择媒体中心" }).check();
   await page.locator(".batch-actions").getByRole("button", { name: "删除", exact: true }).click();
   await expect(page.getByRole("dialog", { name: "删除 媒体中心？" })).toBeVisible();
@@ -161,7 +166,7 @@ test("首次接入的空状态只有一个添加入口，手机可直接操作",
   await page.screenshot({ path: info.outputPath("empty-agents.png") });
   await addAgent.click();
   await expect(page.getByRole("dialog", { name: "添加 Agent", exact: true })).toBeVisible();
-  await page.getByRole("dialog").getByRole("button", { name: "关闭", exact: true }).click();
+  await page.getByRole("dialog").getByRole("button", { name: "取消", exact: true }).click();
   await page.goto("/#/domains");
   const addDomain = page.getByRole("button", { name: "添加 域名", exact: true });
   await expect(addDomain).toHaveCount(1);

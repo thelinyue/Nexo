@@ -16,7 +16,7 @@ export function DeviceRecovery({ device, csrf, onClose, onCreated }: { device: D
   }
   const command = invite?.token && composeFile.trim() ? `docker compose -f ${shellLiteral(composeFile.trim())} run --rm -e ${shellLiteral(`NEXO_ENROLLMENT_TOKEN=${invite.token}`)} nexo-agent --recover-identity` : "";
   const binaryCommand = invite?.token ? `NEXO_ENROLLMENT_TOKEN=${shellLiteral(invite.token)} nexo-agent --recover-identity` : "";
-  return <Modal title={`恢复 ${device.name} 的身份`} onClose={onClose} busy={busy}><div className="modal-body">
+  return <Modal title={`恢复 ${device.name} 的身份`} full onClose={onClose} busy={busy}><div className="modal-body">
     <p>用于设备证书已过期、私钥丢失或身份文件损坏。原设备 ID 和 {device.tunnel_count} 个服务绑定会保留。</p>
     <ol className="steps">
       <li><strong>生成恢复凭证</strong><p>有效期 1 小时，仅本次显示，请在关闭前保存。重新生成会撤销此前的恢复凭证。</p>{!invite ? <button className="primary-button" onClick={() => void create()} disabled={busy}>{busy ? "生成中…" : "生成恢复凭证"}</button> : <><code className="token">{invite.token}</code>{invite.token && <CopyButton value={invite.token} label="复制恢复凭证" />}<small>有效期至 {dateText(invite.expires_at)}</small></>}</li>

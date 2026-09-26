@@ -27,7 +27,7 @@ test("完整网址可明确提取域名，清空后继续输入且操作不误�
   await clear.click();
   await expect(input).toHaveValue(""); await expect(input).toBeFocused();
   await expect(clear).toBeHidden();
-  await dialog.getByRole("button", { name: "关闭", exact: true }).click();
+  await dialog.getByRole("button", { name: "取消", exact: true }).click();
   await expect(page.getByRole("dialog")).toHaveCount(0);
 });
 
@@ -87,10 +87,10 @@ test("域名表单阻止完整网址和键盘误提交，失败保留输入", as
   await save.click();
   await expect(dialog).toBeHidden();
   await expect(page).toHaveURL(/#\/domains\/d-2$/);
-  await page.getByRole("dialog", { name: /^配置 / }).getByRole("button", { name: "关闭", exact: true }).click();
+  await page.getByRole("dialog", { name: /^配置 / }).getByRole("button", { name: "取消", exact: true }).click();
   await page.getByRole("link", { name: "返回", exact: true }).click();
   expect(state.calls.find(c => c.method === "POST")?.body).toEqual({ domain: "new.example.com", https_enabled: true });
-  await expect(page.locator(".domain-row")).toHaveCount(2);
+  await expect(page.locator(".page-slot:not([hidden]) .domain-row")).toHaveCount(2);
 });
 
 test("小屏长域名可选择且无复制按钮，删除取消不发请求", async ({ page }, testInfo) => {
@@ -98,7 +98,7 @@ test("小屏长域名可选择且无复制按钮，删除取消不发请求", as
   state.domains[0].domain = "a-very-long-domain-name-for-mobile-layout.example.com";
   await page.setViewportSize({ width: 320, height: 568 });
   await page.goto("/#/domains");
-  const row = page.locator(".domain-row");
+  const row = page.locator(".page-slot:not([hidden]) .domain-row");
   await expect(row.getByRole("heading")).toHaveText(state.domains[0].domain);
   await expect(row.getByRole("heading")).toHaveCSS("user-select", "text");
   await expect(row.getByRole("button", { name: /复制/ })).toHaveCount(0);
@@ -116,7 +116,7 @@ test("小屏长域名可选择且无复制按钮，删除取消不发请求", as
   await page.getByRole("dialog", { name: /^配置 / }).getByRole("button", { name: "删除域名", exact: true }).click();
   await page.getByRole("dialog", { name: /^删除 / }).getByRole("button", { name: "取消", exact: true }).click();
   expect(state.calls.filter(c => c.method === "DELETE")).toHaveLength(0);
-  await page.getByRole("dialog", { name: /^配置 / }).getByRole("button", { name: "关闭", exact: true }).click();
+  await page.getByRole("dialog", { name: /^配置 / }).getByRole("button", { name: "取消", exact: true }).click();
   await page.getByRole("link", { name: "返回", exact: true }).click();
   await page.getByRole("button", { name: "添加 域名", exact: true }).click();
   await page.setViewportSize({ width: 320, height: 360 });
@@ -130,7 +130,7 @@ test("小屏长域名可选择且无复制按钮，删除取消不发请求", as
 test("域名格式校验和规范化，保存成功后刷新失败不会丢失结果", async ({ page }, testInfo) => {
   const state = await installApiMocks(page);
   await page.goto("/#/domains");
-  await expect(page.locator(".domain-row")).toHaveCount(1);
+  await expect(page.locator(".page-slot:not([hidden]) .domain-row")).toHaveCount(1);
   await page.getByRole("button", { name: "添加 域名", exact: true }).click();
   const dialog = page.getByRole("dialog", { name: "添加域名" });
   const input = dialog.getByLabel("域名", { exact: true });
@@ -147,11 +147,11 @@ test("域名格式校验和规范化，保存成功后刷新失败不会丢失�
   state.failures.set("GET /api/v1/public-domains", "网络连接中断");
   await save.click();
   await expect(dialog).toBeHidden();
-  await page.getByRole("dialog", { name: /^配置 / }).getByRole("button", { name: "关闭", exact: true }).click();
-  await expect(page.locator(".domain-row")).toHaveCount(1);
+  await page.getByRole("dialog", { name: /^配置 / }).getByRole("button", { name: "取消", exact: true }).click();
+  await expect(page.locator(".page-slot:not([hidden]) .domain-row")).toHaveCount(1);
   await expect(page.getByRole("alert")).toContainText("域名变更已保存，但列表刷新失败");
   expect(state.calls.find(c => c.method === "POST")?.body.domain).toBe("new.example.com");
-  const row = page.locator(".domain-row").filter({ hasText: "new.example.com" });
+  const row = page.locator(".page-slot:not([hidden]) .domain-row").filter({ hasText: "new.example.com" });
   await expect(row).toContainText("等待加载");
   await row.getByRole("button", { name: "证书配置", exact: true }).click();
   await page.getByRole("dialog", { name: /^配置 / }).getByRole("button", { name: "删除域名", exact: true }).click();
@@ -171,7 +171,7 @@ test("多域名卡片保持紧凑，应用和证书状态不混淆", async ({ pa
   state.domains.push({ ...state.domains[0], id: "d-3", domain: "office.example.com", is_primary: false, https_enabled: false });
   await page.setViewportSize({ width: 375, height: 812 });
   await page.goto("/#/domains");
-  const rows = page.locator(".domain-row");
+  const rows = page.locator(".page-slot:not([hidden]) .domain-row");
   await expect(rows).toHaveCount(3);
   expect((await rows.first().boundingBox())!.height).toBeLessThan(170);
   await expect(page.getByText("主域名", { exact: true })).toHaveCount(0);
@@ -190,18 +190,19 @@ test("空白输入无需放弃确认，离开页面后清除旧操作提示", as
   await dialog.getByLabel("域名", { exact: true }).fill("   ");
   await dialog.getByRole("button", { name: "添加域名", exact: true }).click();
   await expect(dialog.getByRole("alert")).toContainText("请输入域名");
-  await dialog.getByRole("button", { name: "关闭", exact: true }).click();
+  await dialog.getByRole("button", { name: "取消", exact: true }).click();
   await expect(page.getByRole("dialog")).toHaveCount(0);
   await page.getByRole("button", { name: "添加 域名", exact: true }).click();
   await dialog.getByLabel("域名", { exact: true }).fill("new.example.com");
   await dialog.getByRole("button", { name: "添加域名", exact: true }).click();
   await expect(dialog).toBeHidden();
   await expect(page.getByRole("status")).toContainText("已添加 new.example.com");
-  await page.getByRole("dialog", { name: /^配置 / }).getByRole("button", { name: "关闭", exact: true }).click();
+  await page.getByRole("dialog", { name: /^配置 / }).getByRole("button", { name: "取消", exact: true }).click();
   await page.getByRole("link", { name: "返回", exact: true }).click();
-  await page.getByRole("link", { name: "返回", exact: true }).click();
-  await page.getByRole("link", { name: /域名与证书/ }).click();
-  await expect(page.locator(".domain-row")).toHaveCount(2);
+  await page.evaluate(() => { window.location.hash = "#/manage"; });
+  await expect(page).toHaveURL(/#\/manage$/);
+  await page.evaluate(() => { window.location.hash = "#/domains"; });
+  await expect(page.locator(".page-slot:not([hidden]) .domain-row")).toHaveCount(2);
   await expect(page.getByText("已添加 new.example.com", { exact: true })).toBeHidden();
 });
 
@@ -214,7 +215,7 @@ test("自动刷新真实状态，续期失败保留旧证书日期且不触发�
   runtime.config_status = "pending";
   runtime.certificates = [];
   await page.goto("/#/domains/d-1");
-  const row = page.locator(".domain-row");
+  const row = page.locator(".page-slot:not([hidden]) .domain-row");
   await expect(row).toContainText("等待加载");
   runtime.config_status = "applied";
   runtime.certificates = [certificate];
@@ -254,7 +255,7 @@ test("配置失败、证书过期和运行记录各自展示，旧响应不冒�
   state.domainEvents[0].summary = runtime.config_error;
   await page.setViewportSize({ width: 320, height: 700 });
   await page.goto("/#/domains/d-1");
-  const row = page.locator(".domain-row");
+  const row = page.locator(".page-slot:not([hidden]) .domain-row");
   await expect(row).toContainText("配置加载失败");
   await expect(row.locator("summary")).toHaveText("证书已过期");
   await expect(row.getByText(runtime.service_warning, { exact: true })).toBeVisible();

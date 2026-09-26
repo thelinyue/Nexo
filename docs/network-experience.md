@@ -53,7 +53,7 @@ python3 docker/tunnel-smoke.py \
   --caddy-bin /usr/local/bin/caddy
 ```
 
-Windows 将二进制路径改为 `.exe`。脚本验证 TCP 大文件、并发与半关闭、HTTP/HTTPS、WebSocket、mTLS 拒绝无效身份、目标修改、启停删除、独立数据重连及进程重启恢复。Linux 同时覆盖实际 Unix socket 路径。临时目录保留日志与测试身份用于诊断，不可用于生产；可用 `--report 路径.json` 保存验收结果。
+Windows 将二进制路径改为 `.exe`。脚本验证 TCP 大文件、并发与半关闭、HTTP/HTTPS、WebSocket、mTLS 拒绝无效身份、目标修改、启停删除、独立数据重连及进程重启恢复。同时验证 TCP 双向字节精确计数、HTTP/HTTPS 分隧道统计、长连接实时更新、内网直连不计入以及重启保留已落库历史。为验证每分钟落库，脚本可能等待一个保存周期。Linux 同时覆盖实际 Unix socket 路径。临时目录保留日志与测试身份用于诊断，不可用于生产；可用 `--report 路径.json` 保存验收结果。
 
 内部证书验收额外需要 Python `cryptography`，使用同样的三个二进制参数运行 `docker/identity-renewal-smoke.py`。它只修改独立临时目录中的测试证书，模拟进入续签时间、磁盘写入失败与恢复，并验证自动重试、证书热更新、身份和长连接保留；不修改系统时间，也不连接公网 CA。
 

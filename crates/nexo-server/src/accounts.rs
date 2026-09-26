@@ -406,6 +406,8 @@ pub async fn delete_user(
             tx.execute("DELETE FROM tenants WHERE id=?1", [&tenant])
                 .map_err(db_error)?;
             tx.commit().map_err(db_error)?;
+            drop(db);
+            state.tunnel_runtime.quotas.remove(&tenant);
             Ok((devices, services))
         })
         .await?;

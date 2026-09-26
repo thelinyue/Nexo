@@ -198,6 +198,7 @@ class Harness:
             return response.status, response.read()
 
     def run(self):
+        started_at = int(time.time())
         echo = EchoServer(("127.0.0.1", 0), Echo)
         origin = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Origin)
         for service in [echo, origin]:
@@ -239,6 +240,93 @@ class Harness:
             assert status == 200 and body == bytes(range(256)) * 32768
             assert self.web("unknown.nexo-smoke.localhost")[0] == 404
             self.check("Caddy HTTP / HTTPS → Tunnel → 本地 HTTP；TLS 校验与大响应")
+            # 真实转发产生统计；每个协议独立归属，内网直连不会进入 Server 计数。
+            def traffic(tunnel=None):
+                suffix = f"&tunnel_id={tunnel['id']}" if tunnel else ""
+                return self.api(f"traffic/history?range=1h{suffix}")
+            wait_for(lambda: all(traffic(item)["total"]["to_origin"] > 0 and traffic(item)["total"]["to_public"] > 0 for item in [tcp, web, secure]), "三个协议均产生流量统计")
+            assert traffic(tcp)["total"]["to_origin"] == 9 * 1024 * 1024
+            assert traffic(tcp)["total"]["to_public"] == 9 * 1024 * 1024 + len(TAIL) * 9
+            baseline = traffic()
+            direct = http.client.HTTPConnection("127.0.0.1", origin.server_address[1], timeout=10)
+            direct.request("GET", "/")
+            assert direct.getresponse().read() == b"nexo-real-origin\n"
+            direct.close()
+            wait_for(lambda: traffic()["sampled_at"] != baseline["sampled_at"], "直连后的采样")
+            assert traffic()["total"] == baseline["total"], "直连流量被错误计入隧道"
+            with socket.create_connection(("127.0.0.1", self.ports["public"]), timeout=10) as active:
+                active.sendall(b"live-traffic")
+                assert active.recv(100) == b"live-traffic"
+                wait_for(lambda: traffic(tcp)["total"]["to_origin"] == 9 * 1024 * 1024 + len(b"live-traffic"), "长连接未结束时流量可见")
+                assert self.api(f"traffic/realtime?tunnel_id={tcp['id']}")["rates"]["to_origin"] > 0
+                used = self.api("traffic/usage")
+                for period in ["today", "week", "month"]:
+                    if used[period]["start"] <= started_at:
+                        assert used[period]["total"] == traffic()["total"]
+                admin_id = self.api("auth/status")["user_id"]
+                before_reset = traffic()["total"]
+                self.api("admin/traffic/reset", "POST", {"user_id": admin_id})
+                assert self.api("traffic/usage")["today"]["total"] == {"to_origin": 0, "to_public": 0}
+                assert traffic()["total"] == before_reset, "重置不应清空趋势"
+                after_at = int(time.time())
+                active.sendall(b"after-reset")
+                assert active.recv(100) == b"after-reset", "重置不应中断已有连接"
+                def counted_after_reset():
+                    used = self.api("traffic/usage")
+                    if not used["sampled_at"] or used["sampled_at"] <= after_at:
+                        return False
+                    # 用量按自然日切换；跨午夜时上一日的传输仍保留在所在周/月。
+                    return all(used[period]["total"] == {"to_origin": len(b"after-reset") if used[period]["start"] <= after_at else 0, "to_public": len(b"after-reset") if used[period]["start"] <= after_at else 0} for period in ["today", "week", "month"])
+                wait_for(counted_after_reset, "重置后重新累计")
+            self.check("日周月用量与真实传输一致，管理员重置保留趋势与长连接并重新累计")
+            self.check("TCP 精确双向计数、HTTP/HTTPS 独立统计、长连接实时更新与直连排除")
+            # 额度独立计量：三个协议共用预算，达到上限须取消空闲连接，管理 API 仍可用。
+            quota_path = f"admin/traffic/quota?user_id={admin_id}"
+            def limit_to(value):
+                return self.api(quota_path, "PUT", {"monthly_limit_bytes": value})
+            def closed(stream):
+                try:
+                    while stream.recv(4096):
+                        pass
+                except (ConnectionResetError, ConnectionAbortedError):
+                    pass
+            for protocol in ["tcp", "http", "https"]:
+                with socket.create_connection(("127.0.0.1", self.ports["public"]), timeout=5) as idle:
+                    idle.sendall(b"quota-idle")
+                    assert idle.recv(100) == b"quota-idle"
+                    used_before = self.api("traffic/quota")["used_bytes"]
+                    cap = used_before + 512
+                    limit_to(cap)
+                    if protocol == "tcp":
+                        with socket.create_connection(("127.0.0.1", self.ports["public"]), timeout=5) as active:
+                            active.sendall(b"x" * 2048)
+                            closed(active)
+                    else:
+                        try:
+                            status, body = self.web(f"{'secure' if protocol == 'https' else 'web'}.nexo-smoke.localhost", protocol == "https", "/large")
+                            assert status != 200 or len(body) < 8 * 1024 * 1024, "额度耗尽仍完整传输大响应"
+                        except (http.client.HTTPException, ConnectionError):
+                            pass
+                    wait_for(lambda: self.api("traffic/quota")["exhausted"], f"{protocol} 耗尽月额度")
+                    closed(idle)
+                    assert self.api("traffic/quota")["used_bytes"] == cap, "并发双向传输超出月额度"
+                    with socket.create_connection(("127.0.0.1", self.ports["public"]), timeout=5) as rejected_stream:
+                        try:
+                            rejected_stream.sendall(b"rejected")
+                        except (ConnectionResetError, ConnectionAbortedError):
+                            pass
+                        closed(rejected_stream)
+                    self.api("admin/traffic/reset", "POST", {"user_id": admin_id})
+                    assert self.api("traffic/quota")["exhausted"], "重置统计意外恢复了额度"
+                    assert self.api("traffic/quota")["used_bytes"] == cap
+                    assert self.api("auth/status")["authenticated"]
+                    assert next(item for item in self.api("devices") if item["id"] == device)["status"] == "online"
+                    wait_for(lambda: all("额度已用尽" in (item.get("apply_error") or "") for item in self.api("tunnels") if item["enabled"]), "隧道显示额度耗尽原因")
+                    limit_to(cap + 1024 * 1024)
+                    exchange(self.ports["public"], b"quota-restored")
+                    limit_to(None)
+                    wait_for(lambda: self.ready(tcp["id"]), "取消额度限制恢复服务")
+                self.check(f"{protocol.upper()} 月额度精确拦截、空闲连接关闭、重置统计不恢复额度、提高额度后重连")
             with socket.create_connection(("127.0.0.1", self.ports["http"]), timeout=10) as stream:
                 stream.sendall(b"GET /ws HTTP/1.1\r\nHost: web.nexo-smoke.localhost\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n")
                 response = b""
@@ -345,6 +433,16 @@ class Harness:
             assert (self.root / "agent/identity.json").read_bytes() == before
             exchange(self.ports["public"], b"agent-restarted")
             self.check("Agent 无入网 Token 重启，复用原身份并恢复数据连接")
+            def persisted_traffic():
+                with sqlite3.connect(self.root / "server/nexo.db") as db:
+                    return db.execute("SELECT COALESCE(SUM(to_origin),0),COALESCE(SUM(to_public),0) FROM traffic_minutes").fetchone()
+            # Windows 的 terminate 是强制结束；先等定时落库，验证重启保留已保存历史。
+            wait_for(lambda: persisted_traffic()[0] >= 9 * 1024 * 1024, "流量分钟批次落库", timeout=75)
+            saved_traffic = persisted_traffic()
+            with sqlite3.connect(self.root / "server/nexo.db") as db:
+                saved_quota = db.execute("SELECT COALESCE(SUM(used_bytes),0) FROM traffic_quota_months").fetchone()[0]
+            assert saved_quota > 0
+            limit_to(saved_quota + 1024 * 1024 * 1024)
             self.stop_server()
             self.start_server()
             wait_for(lambda: self.ready(secure["id"]), "Server 重启后恢复 HTTPS")
@@ -352,6 +450,13 @@ class Harness:
             assert self.web("secure.nexo-smoke.localhost", True)[0] == 200
             assert len(self.api("devices")) == 1
             self.check("Server 重启恢复监听、CA、证书与 Agent 自动重连")
+            restored = self.api("traffic/history?range=1h")["total"]
+            assert restored["to_origin"] >= saved_traffic[0] and restored["to_public"] >= saved_traffic[1]
+            self.check("Server 重启保留已落库流量历史")
+            quota = self.api("traffic/quota")
+            assert quota["used_bytes"] >= saved_quota
+            assert quota["monthly_limit_bytes"] == saved_quota + 1024 * 1024 * 1024
+            self.check("Server 重启恢复独立月额度消耗与配置")
             self.api(f"tunnels/{web['id']}", "DELETE")
             wait_for(lambda: self.web("web.nexo-smoke.localhost")[0] != 200, "删除 HTTP 撤销路由")
             self.api(f"devices/{device}", "DELETE")

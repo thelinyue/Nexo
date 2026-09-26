@@ -48,7 +48,7 @@ test("Compose 配置与 docker run 命令自动填入地址和凭证，复制不
   expect(docker).toContain("NEXO_ENROLLMENT_TOKEN=nexo_join_shared-test-key");
   expect(docker).toContain("nexo-agent:/data/nexo-agent");
   expect(await page.evaluate(() => JSON.stringify({ ...localStorage, ...sessionStorage }))).not.toContain("nexo_join_");
-  await dialog.getByRole("button", { name: "关闭", exact: true }).click();
+  await dialog.getByRole("button", { name: "取消", exact: true }).click();
   await page.getByRole("button", { name: "添加 Agent", exact: true }).click();
   await expect(dialog.getByLabel("Compose 配置文件", { exact: true })).toContainText("nexo_join_shared-test-key");
 });
@@ -96,7 +96,7 @@ test("移动端触控、长命令、横屏与键盘压缩视口", async ({ page 
   for (const [width, height, name] of [[320, 640, "narrow"], [375, 812, "portrait"], [390, 844, "portrait-large"], [430, 932, "portrait-wide"], [812, 375, "landscape"], [320, 360, "keyboard"]] as const) {
     await page.setViewportSize({ width, height });
     await expect(copy).toBeInViewport();
-    await expect(dialog.getByRole("button", { name: "关闭", exact: true })).toBeInViewport();
+    await expect(dialog.getByRole("button", { name: "取消", exact: true })).toBeInViewport();
     expect((await copy.boundingBox())!.height).toBeGreaterThanOrEqual(48);
     if (!await dialog.getByRole("button", { name: "复制接入密钥" }).isVisible()) await dialog.getByText("高级：接入密钥", { exact: true }).click();
     for (const button of [dialog.getByRole("button", { name: "Docker Compose", exact: true }), dialog.getByRole("button", { name: "docker run", exact: true }), dialog.getByRole("button", { name: "复制接入密钥" })]) {

@@ -174,7 +174,7 @@ test("地址修改受未保存保护，保存中禁用控件且请求失败保�
   const toggle = dialog.getByRole("switch", { name: "内网重定向" });
   await toggle.check();
   await dialog.getByLabel("内网地址").fill("10.0.0.4");
-  await dialog.getByRole("button", { name: "关闭", exact: true }).click();
+  await dialog.getByRole("button", { name: "取消", exact: true }).click();
   const discard = page.getByRole("dialog", { name: "放弃未保存的修改？" });
   await expect(discard).toBeVisible();
   await discard.getByRole("button", { name: "取消" }).click();
@@ -182,7 +182,7 @@ test("地址修改受未保存保护，保存中禁用控件且请求失败保�
   try {
     await expect(toggle).toBeDisabled();
     await expect(dialog.getByLabel("内网地址")).toBeDisabled();
-    await expect(dialog.getByRole("button", { name: "关闭", exact: true })).toBeDisabled();
+    await expect(dialog.getByRole("button", { name: "取消", exact: true })).toBeDisabled();
   } finally { releaseRequest(); }
   await expect(dialog.getByRole("alert")).toHaveText("暂时无法保存");
   await expect(toggle).toBeEnabled();
