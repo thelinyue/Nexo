@@ -16,15 +16,16 @@ test("所有页面在移动尺寸和明暗主题中无溢出，输出实际截�
     await page.emulateMedia({ colorScheme: theme, reducedMotion: "reduce" });
     for (const [name, width, height] of cases) {
       await page.setViewportSize({ width, height });
-      for (const route of ["services", "agents", "manage", "domains", "settings", "settings/sessions", "services/t-2", "agents/a-2"]) {
+      for (const route of ["services", "agents", "manage", "domains", "settings", "settings/sessions", "services/t-2", "agents/a-2", "domains/d-1"]) {
         await page.goto(`/#/${route}`);
         await expect(page.locator(".page-slot:not([hidden]) h1")).toBeVisible();
         await expect(page.locator(".page-slot:not([hidden]) .skeleton-list")).toHaveCount(0);
         await expect.poll(() => page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBeTruthy();
         if (width <= 900) {
-          await expect(page.locator(".bottom-nav")).toBeVisible();
+          if (!["services", "manage", "settings"].includes(route)) await expect(page.locator(".bottom-nav")).toBeHidden();
+          else await expect(page.locator(".bottom-nav")).toBeVisible();
           if (route === "services") {
-            await expect(page.locator(".service-address code").first()).toHaveCSS("white-space", "nowrap");
+            await expect(page.locator(".service-address .public-address").first()).toHaveCSS("white-space", "nowrap");
             await expect(page.locator(".service-origin code").first()).toHaveCSS("white-space", "nowrap");
             const fab = await page.getByRole("button", { name: "创建服务", exact: true }).boundingBox();
             const nav = await page.locator(".bottom-nav").boundingBox();
@@ -32,6 +33,10 @@ test("所有页面在移动尺寸和明暗主题中无溢出，输出实际截�
             expect(nav!.x).toBeGreaterThanOrEqual(16);
             expect(nav!.x + nav!.width).toBeLessThanOrEqual(width - 16);
             expect(nav!.y + nav!.height).toBeLessThanOrEqual(height - 12);
+            await page.evaluate(() => window.scrollTo(0, document.documentElement.scrollHeight));
+            const lastRow = await page.locator(".service-row").last().boundingBox();
+            expect(lastRow!.y + lastRow!.height).toBeLessThanOrEqual(nav!.y);
+            await page.evaluate(() => window.scrollTo(0, 0));
           }
           if (route === "agents") await expect(page.getByText("离线", { exact: true })).toBeVisible();
         }
@@ -47,7 +52,7 @@ test("所有页面在移动尺寸和明暗主题中无溢出，输出实际截�
       await page.keyboard.press("Escape");
       await page.goto("/#/agents");
       await page.getByRole("button", { name: "批准", exact: true }).click();
-      await expect(page.getByRole("dialog").getByRole("button", { name: "确定" })).toBeInViewport();
+      await expect(page.getByRole("dialog").getByRole("button", { name: "批准入网" })).toBeInViewport();
       await page.screenshot({ path: testInfo.outputPath(`${name}-${theme}-approve.png`) });
       await page.keyboard.press("Escape");
     }

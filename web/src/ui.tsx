@@ -1,24 +1,24 @@
 import { createContext, useCallback, useContext, useEffect, useRef, useState } from "react";
-import type { ReactNode } from "react";
-import { ArrowLeft, Check, ChevronRight, Copy, Plus, RefreshCw, X } from "lucide-react";
+import type { InputHTMLAttributes, ReactNode } from "react";
+import { ArrowLeft, Check, ChevronRight, Copy, FileQuestion, Globe2, Network, Plus, Search, Server, ShieldCheck, Users, X } from "lucide-react";
 
 export type Auth = { initialized: boolean; authenticated: boolean; user_id?: string; username?: string; role?: "system_admin" | "tenant"; workspace_id?: string; csrf_token?: string | null; local_http_warning?: boolean };
 export type Tunnel = { id: string; name: string; protocol: string; local_address: string; local_port: number; public_port?: number | null; public_address?: string | null; device_id?: string | null; device_name?: string | null; hostname?: string | null; enabled: boolean; apply_status: string; apply_error?: string | null; public_domain?: string | null };
 export type IdentityCertificate = { status: string; expires_at: number | null; renew_after: number | null; error: string | null; next_retry_at: number | null };
 export type TransportIdentity = { server: IdentityCertificate; ca_expires_at: number | null; ca_needs_attention: boolean };
-export type Device = { id: string; name: string; status: string; os?: string | null; architecture?: string | null; agent_version?: string | null; tunnel_count: number; last_seen_at?: number | null; certificate?: IdentityCertificate };
-export type Enrollment = { id: string; kind?: string; device_id?: string | null; status: string; expires_at: number; token?: string | null };
+export type Device = { id: string; name: string; status: string; os?: string | null; architecture?: string | null; agent_version?: string | null; tunnel_count: number; enrolled_at?: number | null; last_seen_at?: number | null; certificate?: IdentityCertificate };
+export type Enrollment = { id: string; kind?: string; device_id?: string | null; status: string; expires_at: number; token?: string | null; device_name?: string | null; os?: string | null; architecture?: string | null; agent_version?: string | null };
 export type DomainCertificate = { hostname: string; status: string; not_before: number | null; expires_at: number | null; error: string | null; next_retry_at: number | null };
 export type DomainRuntime = { config_status: string; config_error: string | null; service_warning: string | null; checked_at: number | null; certificates: DomainCertificate[] };
 export type DomainAccessStatus = { expected_addresses: string[]; checked_at: number | null; next_retry_at?: number | null; retries_remaining?: number; public_access: string; records: { hostname: string; addresses: string[]; status: string; matches_server: boolean | null; error: string | null }[] };
 export type Domain = { id: string; domain: string; is_primary: boolean; https_enabled: boolean; apply_status: string; runtime?: DomainRuntime; access?: DomainAccessStatus | null; certificate_mode?: "http01" | "cloudflare_dns"; verification_status?: "pending" | "verified"; verification_record?: { name: string; value: string } | null; credential_configured?: boolean; dns_resolvers?: string[]; dns_propagation_delay_seconds?: number | null; dns_propagation_timeout_seconds?: number | null };
 export type DomainEvent = { id: number; domain_id: string; summary: string; occurred_at: number };
-export type Session = { id: string; last_seen_at: number; expires_at: number };
+export type Session = { created_at?: number; browser?: string | null; os?: string | null; id: string; last_seen_at: number; expires_at: number };
 
 let sessionExpired = false;
 export function resumeSession() { sessionExpired = false; window.dispatchEvent(new Event("nexo:authenticated")); }
 export async function request<T>(path: string, options: RequestInit = {}, csrf?: string | null, workspace?: string): Promise<T> {
-  if (workspace && /^\/api\/v1\/(devices|enrollments|tunnels|public-domains|public-domain-runtime-events)(\/|$)/.test(path)) path = `/api/v1/admin/workspaces/${encodeURIComponent(workspace)}/${path.slice("/api/v1/".length)}`;
+  if (workspace && /^\/api\/v1\/(devices|enrollments|agent-access-key|tunnels|public-domains|public-domain-runtime-events)(\/|$)/.test(path)) path = `/api/v1/admin/workspaces/${encodeURIComponent(workspace)}/${path.slice("/api/v1/".length)}`;
   const headers = new Headers(options.headers);
   headers.set("content-type", "application/json");
   if (csrf && options.method && options.method !== "GET") headers.set("x-nexo-csrf", csrf);
@@ -34,6 +34,7 @@ export async function request<T>(path: string, options: RequestInit = {}, csrf?:
 }
 /** 请求闭包绑定空间，旧请求和迟到回调不会随界面切换而访问另一个用户。 */
 export const WorkspaceContext = createContext<string | undefined>(undefined);
+export const WorkspaceLabelContext = createContext<string | undefined>(undefined);
 export function useApi() {
   const workspace = useContext(WorkspaceContext);
   return useCallback(<T,>(path: string, options: RequestInit = {}, csrf?: string | null) => request<T>(path, options, csrf, workspace), [workspace]);
@@ -45,9 +46,19 @@ export const navigate = (route: string, allowModalNavigation = false) => { allow
 export function consumeModalNavigation(route: string) { const retained = allowedModalRoute === route; allowedModalRoute = null; return retained; }
 // Safari 的触摸点击不一定聚焦按钮，显式记住触发控件用于弹层关闭后的焦点恢复。
 let interactionTarget: HTMLElement | null = null;
-export function rememberInteraction(target: EventTarget | null) { interactionTarget = target instanceof Element ? target.closest<HTMLElement>("button,a,input,select") : null; }
+export function rememberInteraction(target: EventTarget | null) { interactionTarget = target instanceof Element ? target.closest<HTMLElement>("button,a,input,textarea,select") : null; }
 export const localTarget = (item: Tunnel) => `${item.local_address.includes(":") ? `[${item.local_address.replace(/^\[|\]$/g, "")}]` : item.local_address}:${item.local_port}`;
 export const dateText = (value?: number | null) => value ? new Date(value * 1000).toLocaleString("zh-CN", { year: "numeric", month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit", hour12: false }) : "暂无记录";
+
+/** 密码显隐只改变当前输入的呈现，不改变自动填充语义或保存密码。 */
+export function PasswordInput(props: InputHTMLAttributes<HTMLInputElement>) {
+  const [visible, setVisible] = useState(false);
+  return <span className="password-input"><input {...props} type={visible ? "text" : "password"} /><button type="button" className="text-button" aria-label={visible ? "隐藏密码" : "显示密码"} aria-pressed={visible} onClick={() => setVisible(!visible)}>{visible ? "隐藏" : "显示"}</button></span>;
+}
+
+export function EnrollmentDevice({ item }: { item: Enrollment }) {
+  return <div className="enrollment-device"><strong>{item.device_name || "尚未收到主机名"}</strong><p>{[item.os, item.architecture, item.agent_version && `Agent ${item.agent_version}`].filter(Boolean).join(" · ") || "等待设备信息"}</p><small>设备自报信息，请在批准前与目标主机核对。</small></div>;
+}
 
 export function Brand() { return <div className="brand"><span className="brand-icon">N</span><span><strong>Nexo</strong><small>联巢 · 内网穿透</small></span></div>; }
 
@@ -57,7 +68,7 @@ export function Status({ value, kind = "service" }: { value: string; kind?: "ser
     ? { online: "在线", offline: "离线" }
     : kind === "domain" ? { applied: "配置已加载", pending: "等待加载", failed: "配置加载失败", disabled: "Caddy 已停用", unverified: "尚无运行状态" }
     : kind === "certificate" ? { pending: "等待签发", waiting_configuration: "申请中", presenting_dns: "提交 DNS 验证", waiting_dns: "等待 DNS 生效", validating: "验证中", issued: "已签发", active: "已签发", renewing: "续期中", retry_wait: "等待重试", failed: "申请失败", expired: "已过期", not_yet_valid: "尚未生效" }
-    : { ready: "转发就绪", failed: "需处理", error: "需处理", disabled: "已关闭", checking: "检查中", pending: "待应用", applying: "应用中" };
+    : { ready: "运行中", failed: "需处理", error: "需处理", disabled: "已关闭", checking: "检查中", pending: "待应用", applying: "应用中" };
   const tone = ["ready", "online", "applied", "issued", "active"].includes(value) ? "ready" : ["failed", "error", "expired"].includes(value) ? "failed" : ["pending", "checking", "applying", "waiting_configuration", "presenting_dns", "waiting_dns", "validating", "renewing", "retry_wait"].includes(value) ? "working" : "neutral";
   return <span className={`status ${tone}`}><i />{labels[value] ?? `未知状态：${value || "未返回"}`}</span>;
 }
@@ -66,23 +77,55 @@ export function PageHeader({ title, subtitle, back, action }: { title: string; s
   return <header className="page-header">{back && <a className="icon-button page-back" href={back} aria-label="返回"><ArrowLeft size={21} /></a>}<div><h1 className="mobile-page-title" tabIndex={-1}>{title}</h1>{subtitle && <p className="subtitle">{subtitle}</p>}</div>{action && <div className="page-actions">{action}</div>}</header>;
 }
 export function CreateButton({ label, onClick, disabled }: { label: string; onClick: () => void; disabled?: boolean }) {
-  return <button className={`primary-button fab-create${label === "服务" ? " fab-service" : ""}`} aria-label={label === "服务" ? "创建服务" : `添加 ${label}`} onClick={onClick} disabled={disabled}><Plus size={label === "服务" ? 26 : 20} strokeWidth={1.8} /><span>{label === "服务" ? "添加服务" : label}</span></button>;
+  return <button className="primary-button page-create" aria-label={label === "服务" ? "创建服务" : `添加 ${label}`} onClick={onClick} disabled={disabled}><Plus size={20} strokeWidth={1.8} /><span>{label === "服务" ? "添加服务" : `添加${label}`}</span></button>;
 }
-export function Refresh({ onClick, busy, label }: { onClick: () => void; busy: boolean; label: string }) { return <button className="icon-button" aria-label={`刷新${label}`} onClick={onClick} disabled={busy}><RefreshCw size={18} className={busy ? "spin" : ""} /></button>; }
-export function Notice({ error, onRetry }: { error?: string | null; onRetry?: () => void }) { return error ? <div className="notice error" role="alert"><span>{error}</span>{onRetry && <button className="text-button" onClick={onRetry}>重试</button>}</div> : null; }
-export function Empty({ title, detail, children }: { title: string; detail?: string; children?: ReactNode }) { return <div className="empty"><span className="empty-symbol">N</span><h2>{title}</h2>{detail && <p>{detail}</p>}{children}</div>; }
+export function Notice({ error, onRetry, updatedAt }: { error?: string | null; onRetry?: () => void; updatedAt?: number | null }) { return error ? <><div className="notice error" role="alert"><span>{error}</span>{onRetry && <button className="text-button" onClick={onRetry}>重试</button>}</div>{updatedAt && <p className="helper">保留上次数据 · 更新于 {dateText(updatedAt)}</p>}</> : null; }
+/** 空状态用场景图标和单一下一步引导，搜索无结果与资源不存在不冒充首次使用。 */
+export function Empty({ title, detail, children, kind = "missing" }: { title: string; detail?: string; children?: ReactNode; kind?: "services" | "agents" | "domains" | "users" | "sessions" | "search" | "missing" }) {
+  const Icon = { services: Network, agents: Server, domains: Globe2, users: Users, sessions: ShieldCheck, search: Search, missing: FileQuestion }[kind];
+  return <section className="empty" data-kind={kind}><div className="empty-symbol" aria-hidden="true"><Icon size={34} strokeWidth={1.5} /></div><h2>{title}</h2>{detail && <p>{detail}</p>}{children && <div className="empty-actions">{children}</div>}</section>;
+}
 export function Loading() { return <div className="skeleton-list" role="status" aria-label="正在加载"><div /><div /><div /><span className="sr-only">正在加载</span></div>; }
 export function RowLink({ href, title, detail, icon }: { href: string; title: string; detail?: string; icon?: ReactNode }) { return <a className="row-link" href={href}>{icon}<span><strong>{title}</strong>{detail && <small>{detail}</small>}</span><ChevronRight size={19} /></a>; }
-export function DetailField({ label, children }: { label: string; children: ReactNode }) { return <div className="detail-field"><dt>{label}</dt><dd>{children}</dd></div>; }
+export function DetailField({ label, children, className = "" }: { label: string; children: ReactNode; className?: string }) { return <div className={`detail-field ${className}`}><dt>{label}</dt><dd>{children}</dd></div>; }
 
-export function CopyButton({ value, label = "复制地址", compact = false }: { value: string; label?: string; compact?: boolean }) {
+/** HTTP 页面可能没有 Clipboard API；在点击回调内用同步选择复制，并恢复原焦点和选区。 */
+export async function copyText(value: string): Promise<void> {
+  if (navigator.clipboard?.writeText) {
+    try { await navigator.clipboard.writeText(value); return; } catch { /* 尝试浏览器的同步复制能力。 */ }
+  }
+  const focused = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+  const selection = window.getSelection();
+  const ranges = Array.from({ length: selection?.rangeCount ?? 0 }, (_, index) => selection!.getRangeAt(index).cloneRange());
+  const input = document.createElement("textarea");
+  input.value = value;
+  input.readOnly = true;
+  input.tabIndex = -1;
+  input.setAttribute("aria-hidden", "true");
+  input.style.cssText = "position:fixed;top:0;left:0;width:1px;height:1px;opacity:0";
+  (Array.from(document.querySelectorAll("dialog[open]")).at(-1) ?? document.body).append(input);
+  try {
+    input.focus({ preventScroll: true });
+    input.select();
+    if (!document.execCommand("copy")) throw new Error("浏览器不允许复制");
+  } finally {
+    input.remove();
+    selection?.removeAllRanges();
+    ranges.forEach(range => selection?.addRange(range));
+    focused?.focus({ preventScroll: true });
+  }
+}
+
+export function CopyButton({ value, label = "复制地址", compact = false, iconOnly = false }: { value: string; label?: string; compact?: boolean; iconOnly?: boolean }) {
   const [state, setState] = useState<"idle" | "copied" | "failed">("idle");
-  useEffect(() => { if (state === "idle") return; const timer = window.setTimeout(() => setState("idle"), 2500); return () => clearTimeout(timer); }, [state]);
-  return <div className={`copy-control ${compact ? "compact-copy" : ""}`}><button className={compact ? "address-button" : "secondary-button"} aria-label={label} onClick={async () => { try { await navigator.clipboard.writeText(value); setState("copied"); } catch { setState("failed"); } }}>{compact && <code>{value}</code>}{state === "copied" ? <Check size={17} /> : <Copy size={17} />}{!compact && (state === "copied" ? "已复制" : "复制")}</button>{state !== "idle" && <span className={state === "failed" ? "form-error" : "copy-feedback"} role={state === "failed" ? "alert" : "status"}>{state === "copied" ? "已复制" : "无法复制，请在详情中长按文本手动复制"}</span>}</div>;
+  useEffect(() => { setState("idle"); }, [value]);
+  useEffect(() => { if (state !== "copied") return; const timer = window.setTimeout(() => setState("idle"), 2500); return () => clearTimeout(timer); }, [state]);
+  return <div className={`copy-control ${compact ? "compact-copy" : ""}${iconOnly ? " icon-copy" : ""}`}><button className={iconOnly ? "icon-button" : compact ? "address-button" : "secondary-button"} aria-label={label} title={iconOnly ? label : undefined} onClick={async () => { try { await copyText(value); setState("copied"); } catch { setState("failed"); } }}>{compact && <code>{value}</code>}{state === "copied" ? <Check size={17} /> : <Copy size={17} />}{!compact && !iconOnly && (state === "copied" ? "已复制" : "复制")}</button>{state !== "idle" && <span className={state === "failed" ? "form-error" : "sr-only"} role={state === "failed" ? "alert" : "status"}>{state === "copied" ? "已复制" : "无法复制，请选择下方文本手动复制"}</span>}{state === "failed" && <textarea className="copy-fallback" aria-label="手动复制内容" readOnly value={value} onFocus={e => e.currentTarget.select()} />}</div>;
 }
 
 /** 原生 dialog 提供焦点约束和背景隔离；长表单与短操作共享关闭和未保存保护。 */
 export function Modal({ title, children, onClose, full = false, dirty = false, busy = false, dismissible = true }: { title: string; children: ReactNode; onClose: () => void; full?: boolean; dirty?: boolean; busy?: boolean; dismissible?: boolean }) {
+  const workspaceLabel = useContext(WorkspaceLabelContext);
   const ref = useRef<HTMLDialogElement>(null);
   const pendingNavigation = useRef<(() => void) | null>(null);
   const [discard, setDiscard] = useState(false);
@@ -112,28 +155,29 @@ export function Modal({ title, children, onClose, full = false, dirty = false, b
   }, [dirty, busy, dismissible, onClose]);
   return <><dialog ref={ref} className={`modal ${full ? "full-form" : "short-modal"}`} aria-label={title} tabIndex={-1} onKeyDown={event => {
     if (event.key !== "Tab") return;
-    const items = Array.from(ref.current!.querySelectorAll<HTMLElement>('button:not(:disabled),a[href],input:not(:disabled),select:not(:disabled),summary,[tabindex="0"]')).filter(item => item.getClientRects().length > 0);
+    const items = Array.from(ref.current!.querySelectorAll<HTMLElement>('button:not(:disabled),a[href],input:not(:disabled),textarea:not(:disabled),select:not(:disabled),summary,[tabindex="0"]')).filter(item => item.getClientRects().length > 0);
     const first = items[0]; const last = items[items.length - 1];
     if (!first) { event.preventDefault(); ref.current?.focus(); }
     else if (event.shiftKey && (document.activeElement === first || document.activeElement === ref.current)) { event.preventDefault(); last.focus(); }
     else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first.focus(); }
-  }} onCancel={e => { e.preventDefault(); close(); }} onClick={e => { if (e.target === ref.current) { const box = ref.current.getBoundingClientRect(); if (e.clientX < box.left || e.clientX > box.right || e.clientY < box.top || e.clientY > box.bottom) close(); } }}><header className="modal-heading"><h2>{title}</h2>{dismissible && <button className="icon-button" aria-label="关闭" onClick={close} disabled={busy}><X size={21} /></button>}</header>{children}</dialog>{discard && <Confirm title="放弃未保存的修改？" description="离开后，本次填写的内容将丢失。" label="放弃修改" onClose={() => { pendingNavigation.current = null; setDiscard(false); }} onConfirm={async () => { const resume = pendingNavigation.current; pendingNavigation.current = null; setDiscard(false); onClose(); if (resume) window.setTimeout(resume, 0); }} />}</>;
+  }} onCancel={e => { e.preventDefault(); close(); }} onClick={e => { if (e.target === ref.current) { const box = ref.current.getBoundingClientRect(); if (e.clientX < box.left || e.clientX > box.right || e.clientY < box.top || e.clientY > box.bottom) close(); } }}><header className="modal-heading"><h2>{title}</h2>{dismissible && <button className="icon-button" aria-label="关闭" onClick={close} disabled={busy}><X size={21} /></button>}</header>{workspaceLabel && <p className="modal-workspace">操作空间：{workspaceLabel}</p>}{children}</dialog>{discard && <Confirm title="放弃未保存的修改？" description="离开后，本次填写的内容将丢失。" label="放弃修改" onClose={() => { pendingNavigation.current = null; setDiscard(false); }} onConfirm={async () => { const resume = pendingNavigation.current; pendingNavigation.current = null; setDiscard(false); onClose(); if (resume) window.setTimeout(resume, 0); }} />}</>;
 }
-export function Confirm({ title, description, label, onClose, onConfirm }: { title: string; description: string; label: string; onClose: () => void; onConfirm: () => Promise<void> }) {
+export function Confirm({ title, description, label, onClose, onConfirm, tone = "danger" }: { title: string; description: string; label: string; tone?: "danger" | "primary"; onClose: () => void; onConfirm: () => Promise<void> }) {
   const [busy, setBusy] = useState(false); const [error, setError] = useState<string | null>(null);
-  return <Modal title={title} onClose={onClose} busy={busy}><div className="modal-body"><p>{description}</p><Notice error={error} /></div><footer className="modal-actions"><button className="secondary-button" onClick={onClose} disabled={busy}>取消</button><button className="danger-button" disabled={busy} onClick={async () => { setBusy(true); try { await onConfirm(); onClose(); } catch (e) { setError(errorText(e)); } finally { setBusy(false); } }}>{busy ? "处理中…" : label}</button></footer></Modal>;
+  return <Modal title={title} onClose={onClose} busy={busy}><div className="modal-body"><p>{description}</p><Notice error={error} /></div><footer className="modal-actions"><button className="secondary-button" onClick={onClose} disabled={busy}>取消</button><button className={`${tone}-button`} disabled={busy} onClick={async () => { setBusy(true); try { await onConfirm(); onClose(); } catch (e) { setError(`${label}失败：${errorText(e)}`); } finally { setBusy(false); } }}>{busy ? "处理中…" : label}</button></footer></Modal>;
 }
 
 /** 前台每 5 秒更新，编辑/后台/登录过期时暂停；只读详情可显式允许弹层内更新，回到页面或网络恢复立即检查。 */
 export function useResource<T>(load: () => Promise<T>, active: boolean, poll = true, pollInDialog = false) {
   const loader = useRef(load); loader.current = load;
   const sequence = useRef(0); const inFlight = useRef(0);
+  const [updatedAt, setUpdatedAt] = useState<number | null>(null);
   const [data, updateData] = useState<T | null>(null); const [busy, setBusy] = useState(false); const [error, setError] = useState<string | null>(null);
   async function reload(silent = false) {
     if (sessionExpired || inFlight.current) return;
     const seq = ++sequence.current; inFlight.current = seq;
     if (!silent) setBusy(true);
-    try { const value = await loader.current(); if (seq === sequence.current) { updateData(value); setError(null); } }
+    try { const value = await loader.current(); if (seq === sequence.current) { updateData(value); setUpdatedAt(Date.now() / 1000); setError(null); } }
     catch (e) { if (seq === sequence.current) setError(errorText(e)); }
     finally { if (seq === sequence.current) { inFlight.current = 0; setBusy(false); } }
   }
@@ -154,5 +198,5 @@ export function useResource<T>(load: () => Promise<T>, active: boolean, poll = t
       document.removeEventListener("visibilitychange", refresh); window.removeEventListener("nexo:authenticated", restored);
     };
   }, [active, poll, pollInDialog]);
-  return { data, setData, busy, error, reload };
+  return { updatedAt, data, setData, busy, error, reload };
 }

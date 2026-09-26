@@ -17,6 +17,7 @@ test("离线设备显示到期提醒，详情显示失败原因与重试时间",
 });
 
 test("服务端失败和 CA 到期提醒可见，刷新后清除成功续签的旧错误", async ({ page }) => {
+  await page.clock.install();
   const state = await installApiMocks(page);
   state.transportIdentity.server.status = "retry_wait";
   state.transportIdentity.server.error = "内部服务端证书续签失败：无法保存身份文件";
@@ -31,7 +32,7 @@ test("服务端失败和 CA 到期提醒可见，刷新后清除成功续签的�
   state.transportIdentity.server.error = null;
   state.transportIdentity.server.next_retry_at = null;
   state.transportIdentity.ca_needs_attention = false;
-  await card.getByRole("button", { name: "刷新内部证书" }).click();
+  await page.clock.fastForward(5000);
   await expect(card.locator("summary")).toContainText("证书有效");
   await expect(card.getByText(/内部 CA 需维护/)).toHaveCount(0);
   await expect(card.getByText(/无法保存身份文件/)).toHaveCount(0);

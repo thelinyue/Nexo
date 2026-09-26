@@ -1,6 +1,6 @@
 import { useState } from "react";
 import type { FormEvent } from "react";
-import { Brand, Confirm, Modal, Notice, errorText, request } from "./ui";
+import { Brand, PasswordInput, Confirm, Modal, Notice, errorText, request } from "./ui";
 import type { Auth } from "./ui";
 
 /** 登录与恢复共用短表单。会话过期时叠加在当前页面上，原表单只保留在内存中。 */
@@ -26,15 +26,16 @@ function AuthForm({ initial, message, onAuth, reauth = false, recoveryCode }: { 
   }
   return <>
     {!reauth && <><Brand /><h1>{mode === "recover" ? "找回账号" : mode === "initialize" ? "创建管理员" : "欢迎回来"}</h1></>}
-    {(mode !== "login" || reauth) && <p className="auth-copy">{mode === "recover" ? "使用管理员提供的恢复链接或本机生成的一次性恢复码重设密码。" : reauth ? "重新登录后继续操作，当前填写的内容会保留。" : mode === "initialize" ? "设置管理员账号，开始使用 Nexo。" : ""}</p>}
+    {(mode !== "login" || reauth) && <p className="auth-copy">{mode === "recover" ? recoveryCode ? "设置新密码，恢复账号访问。" : "请联系管理员获取恢复链接。" : reauth ? "重新登录后继续操作，当前填写的内容会保留。" : mode === "initialize" ? "设置管理员账号，开始使用 Nexo。" : ""}</p>}
     {(notice || message) && <p className="action-status" role="status">{notice || message}</p>}
-    {mode === "recover" && <details className="recovery-help"><summary>如何获取恢复码</summary><p>普通用户请联系管理员生成恢复链接。管理员可在 Server 所在主机运行：</p><code>docker compose exec nexo-server nexo admin recover</code><p>直接运行二进制时使用 <code>nexo-server admin recover</code>，并设置原来的 NEXO_DATA_DIR。恢复码有效期 15 分钟，重新生成后旧码失效。</p></details>}
+    {mode === "recover" && <details className="recovery-help"><summary>管理员如何恢复账号</summary><p>在 Server 所在主机运行：</p><code>docker compose exec nexo-server nexo admin recover</code><p>直接运行二进制时使用 <code>nexo-server admin recover</code>，并设置原来的 NEXO_DATA_DIR。恢复码有效期 15 分钟，重新生成后旧码失效。</p></details>}
     <form className="auth-form" onSubmit={submit}>
       <fieldset disabled={busy}>
         {mode !== "login" && <label>{mode === "recover" ? "一次性恢复码" : "初始化口令"}<input value={code} onChange={e => setCode(e.target.value)} type="password" autoComplete="one-time-code" autoCapitalize="none" spellCheck={false} required /></label>}
+        {mode === "initialize" && <p className="helper">在 Server 所在主机执行 <code>nexo bootstrap-code</code> 获取初始化口令；Docker 部署执行 <code>docker compose exec nexo-server nexo bootstrap-code</code>。</p>}
         {mode !== "recover" && <label>用户名<input value={username} onChange={e => setUsername(e.target.value)} autoComplete="username" autoCapitalize="none" spellCheck={false} required /></label>}
-        <label>{mode === "recover" ? "新密码" : "密码"}<input value={password} onChange={e => setPassword(e.target.value)} type="password" autoComplete={mode === "login" ? "current-password" : "new-password"} minLength={mode === "login" ? undefined : 12} required /></label>
-        {mode === "recover" && <label>确认新密码<input value={confirm} onChange={e => setConfirm(e.target.value)} type="password" autoComplete="new-password" minLength={12} required /></label>}
+        <label>{mode === "recover" ? "新密码" : "密码"}<PasswordInput aria-label={mode === "recover" ? "新密码" : "密码"} value={password} onChange={e => setPassword(e.target.value)} type="password" autoComplete={mode === "login" ? "current-password" : "new-password"} minLength={mode === "login" ? undefined : 12} required /></label>
+        {mode === "recover" && <label>确认新密码<PasswordInput aria-label="确认新密码" value={confirm} onChange={e => setConfirm(e.target.value)} type="password" autoComplete="new-password" minLength={12} required /></label>}
         {mode !== "login" && <p className="helper">密码至少 12 个字符。{mode === "recover" && "重设后，此账号的所有登录会话都会失效。"}</p>}
       </fieldset>
       <Notice error={error} /><button className="primary-button" disabled={busy}>{busy ? "处理中…" : mode === "recover" ? "重设密码" : mode === "initialize" ? "开始使用" : "登录"}</button>

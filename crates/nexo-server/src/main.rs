@@ -1,6 +1,6 @@
 //! Nexo v0.2.0 Server：只负责账号、Agent、域名和内网穿透服务。
 //!
-//! Agent 通过一次性入网凭证加入，之后使用独立的控制连接接收 Tunnel Desired State。
+//! Agent 通过空间共享密钥或兼容的一次性入网凭证加入，之后使用独立的控制连接接收 Tunnel Desired State。
 
 use std::{
     env, fs,
@@ -30,6 +30,7 @@ use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
 use uuid::Uuid;
 
+mod access_keys;
 mod accounts;
 mod auth;
 mod caddy;
@@ -139,7 +140,7 @@ struct Device {
     tunnel_count: i64,
     certificate: identity_runtime::CertificateStatus,
 }
-#[derive(Debug, Serialize)]
+#[derive(Debug, Default, Serialize)]
 struct Enrollment {
     id: String,
     kind: String,
@@ -148,6 +149,10 @@ struct Enrollment {
     expires_at: i64,
     device_id: Option<String>,
     token: Option<String>,
+    device_name: Option<String>,
+    os: Option<String>,
+    architecture: Option<String>,
+    agent_version: Option<String>,
 }
 #[derive(Debug, Deserialize)]
 struct CreateEnrollment {
@@ -387,6 +392,12 @@ fn router(state: AppState) -> Router {
             get(get_enrollment).delete(enrollment::cancel_enrollment),
         )
         .route("/api/v1/enrollments/{id}/approve", post(approve_enrollment))
+        .route(
+            "/api/v1/agent-access-key",
+            get(access_keys::get).post(access_keys::ensure),
+        )
+        .route("/api/v1/agent-access-key/reset", post(access_keys::reset))
+        .route("/api/v1/agent/register", post(access_keys::register))
         .route("/api/v1/agent/enroll", post(agent_enroll))
         .route("/api/v1/agent/enroll/{id}/poll", post(agent_poll))
         .route("/api/v1/tunnels", get(list_tunnels).post(create_tunnel))
@@ -457,11 +468,13 @@ fn initialize_database(connection: &Connection, is_new: bool) -> Result<()> {
             );
         }
         enrollment::initialize_schema(connection)?;
+        access_keys::initialize_schema(connection)?;
         accounts::initialize_schema(connection)?;
         return domains::initialize_schema(connection);
     }
     connection.execute_batch(include_str!("../../../migrations/v0.2.0_baseline.sql"))?;
     enrollment::initialize_schema(connection)?;
+    access_keys::initialize_schema(connection)?;
     accounts::initialize_schema(connection)?;
     domains::initialize_schema(connection)
 }
@@ -524,10 +537,12 @@ async fn delete_device(
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let session = require_write(&state, &headers)?;
-    {
+    // 删除与连接注册互斥，事务提交后立即撤销该设备的控制、数据通道和监听。
+    state.tunnel_runtime.remove_workspace(|| {
         let connection = state.db.lock().map_err(|_| db_error("数据库锁不可用"))?;
         let tx = connection.unchecked_transaction().map_err(db_error)?;
         tx.execute("UPDATE tunnels SET enabled=0,device_id=NULL,apply_status='disabled',apply_revision=apply_revision+1 WHERE device_id=?1 AND tenant_id=?2",params![id,session.tenant_id]).map_err(db_error)?;
+        tx.execute("UPDATE agent_registrations SET certificate_pem='' WHERE device_id=?1 AND tenant_id=?2",params![id,session.tenant_id]).map_err(db_error)?;
         let removed = tx
             .execute(
                 "DELETE FROM devices WHERE id=?1 AND tenant_id=?2",
@@ -539,7 +554,8 @@ async fn delete_device(
         }
         accounts::audit(&tx, &session, "device_deleted", "device", &id)?;
         tx.commit().map_err(db_error)?;
-    }
+        Ok((vec![id.clone()], Vec::new()))
+    }).await?;
     state
         .tunnel_runtime
         .changed(&state)
@@ -554,7 +570,7 @@ async fn list_enrollments(
 ) -> Result<Json<Vec<Enrollment>>, ApiError> {
     let session = require_session(&state, &headers)?;
     let connection = state.db.lock().map_err(|_| db_error("数据库锁不可用"))?;
-    let mut q=connection.prepare("SELECT id,tenant_id,status,expires_at,device_id,kind FROM pending_enrollments WHERE tenant_id=?1 AND status IN ('awaiting_agent','awaiting_approval','approved') AND expires_at>unixepoch() ORDER BY created_at DESC").map_err(db_error)?;
+    let mut q=connection.prepare("SELECT p.id,p.tenant_id,p.status,p.expires_at,p.device_id,p.kind,r.device_name,r.os,r.architecture,r.agent_version FROM pending_enrollments p LEFT JOIN enrollment_requests r ON r.enrollment_id=p.id WHERE p.tenant_id=?1 AND p.status IN ('awaiting_agent','awaiting_approval','approved') AND p.expires_at>unixepoch() ORDER BY p.created_at DESC").map_err(db_error)?;
     let rows = q
         .query_map(params![session.tenant_id], |row| {
             Ok(Enrollment {
@@ -565,6 +581,10 @@ async fn list_enrollments(
                 expires_at: row.get(3)?,
                 device_id: row.get(4)?,
                 token: None,
+                device_name: row.get(6)?,
+                os: row.get(7)?,
+                architecture: row.get(8)?,
+                agent_version: row.get(9)?,
             })
         })
         .map_err(db_error)?
@@ -601,6 +621,7 @@ async fn create_enrollment(
         expires_at: token.expires_at,
         device_id: None,
         token: Some(token.secret),
+        ..Enrollment::default()
     }))
 }
 async fn get_enrollment(
@@ -610,7 +631,7 @@ async fn get_enrollment(
 ) -> Result<Json<Enrollment>, ApiError> {
     let session = require_session(&state, &headers)?;
     let connection = state.db.lock().map_err(|_| db_error("数据库锁不可用"))?;
-    let row=connection.query_row("SELECT id,tenant_id,CASE WHEN expires_at<=unixepoch() AND status IN ('awaiting_agent','awaiting_approval') THEN 'expired' ELSE status END,expires_at,device_id,kind FROM pending_enrollments WHERE id=?1 AND tenant_id=?2",params![id,session.tenant_id],|row|Ok(Enrollment{id:row.get(0)?,kind:row.get(5)?,tenant_id:row.get(1)?,status:row.get(2)?,expires_at:row.get(3)?,device_id:row.get(4)?,token:None})).optional().map_err(db_error)?.ok_or_else(||ApiError::new(StatusCode::NOT_FOUND,"入网请求不存在"))?;
+    let row=connection.query_row("SELECT p.id,p.tenant_id,CASE WHEN p.expires_at<=unixepoch() AND p.status IN ('awaiting_agent','awaiting_approval') THEN 'expired' ELSE p.status END,p.expires_at,p.device_id,p.kind,r.device_name,r.os,r.architecture,r.agent_version FROM pending_enrollments p LEFT JOIN enrollment_requests r ON r.enrollment_id=p.id WHERE p.id=?1 AND p.tenant_id=?2",params![id,session.tenant_id],|row|Ok(Enrollment{id:row.get(0)?,kind:row.get(5)?,tenant_id:row.get(1)?,status:row.get(2)?,expires_at:row.get(3)?,device_id:row.get(4)?,token:None,device_name:row.get(6)?,os:row.get(7)?,architecture:row.get(8)?,agent_version:row.get(9)?})).optional().map_err(db_error)?.ok_or_else(||ApiError::new(StatusCode::NOT_FOUND,"入网请求不存在"))?;
     Ok(Json(row))
 }
 async fn list_tunnels(

@@ -5,6 +5,7 @@ use axum::{body::Body, http::Request, middleware::Next};
 const WORKSPACE_HEADER: &str = "x-nexo-internal-workspace";
 
 pub fn initialize_schema(db: &Connection) -> Result<()> {
+    auth::initialize_session_labels(db)?;
     let has_enabled: bool = db.query_row(
         "SELECT EXISTS(SELECT 1 FROM pragma_table_info('tenants') WHERE name='enabled')",
         [],
@@ -57,6 +58,7 @@ pub async fn workspace_context(
             kind,
             "devices"
                 | "enrollments"
+                | "agent-access-key"
                 | "tunnels"
                 | "public-domains"
                 | "public-domain-runtime-events"
@@ -587,7 +589,8 @@ pub async fn accept_invitation(
         params![user, invitation],
     )
     .map_err(db_error)?;
-    let (session, csrf) = auth::create_session(&tx, &user, &tenant, now).map_err(db_error)?;
+    let (session, csrf) =
+        auth::create_session(&tx, &user, &tenant, now, &headers).map_err(db_error)?;
     audit(
         &tx,
         &auth::Session {
@@ -622,7 +625,8 @@ pub(crate) mod tests {
         )
         .unwrap();
         db.execute("INSERT INTO users(id,tenant_id,username,role,password_hash,created_at) VALUES (?1,?1,?1,'tenant','unused',0)", [id]).unwrap();
-        let (cookie, csrf) = auth::create_session(&db, id, id, unix_now()).unwrap();
+        let (cookie, csrf) =
+            auth::create_session(&db, id, id, unix_now(), &HeaderMap::new()).unwrap();
         let mut headers = HeaderMap::new();
         headers.insert("cookie", format!("nexo_session={cookie}").parse().unwrap());
         headers.insert("x-nexo-csrf", csrf.parse().unwrap());

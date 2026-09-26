@@ -49,7 +49,7 @@ Server 数据包含数据库、内部 CA、身份、Caddy 证书及域名凭据�
 | 现象 | 优先检查 |
 | --- | --- |
 | 管理页无法访问 | 容器状态、8280 监听、可信来源防火墙规则；配置公网 HTTPS 后检查代理及请求协议 |
-| Agent 一直等待或离线 | 入网凭证是否过期、是否已批准、Server URL 是否可达、9890/9891 是否直连或 TCP 透传 |
+| Agent 一直等待或离线 | 空间密钥是否已重置（旧临时凭证检查过期与审批）、Server URL 是否可达、9890/9891 是否直连或 TCP 透传 |
 | TCP 服务无法访问 | Agent 能否访问本地目标、公网分配端口是否放行、访问地址是否误用了 HTTP 代理域名 |
 | 域名解析正确但 HTTPS 不通 | Caddy 加载结果、证书错误、80/443 冲突、公网 DNS 与防火墙；解析正确不代表转发已通 |
 | Caddy 监听失败 | 主机上其他反向代理是否已占用同一 IP 的 80/443；host 网络下不能靠 Compose ports 解决冲突 |
@@ -74,7 +74,7 @@ IPv6 地址使用 `[地址]:端口`。Compose 自定义变量需写入对应服�
 
 页面中的 TCP 访问地址使用请求管理页时的主机名，管理页反向代理应保留原始 `Host`。若管理域名经过仅支持 HTTP 的代理，TCP 客户端需改用直达 Server 的 IP 或 DNS 名称。HTTP/HTTPS 地址使用服务绑定的域名，公网端口默认为 `80/443`。
 
-Server 的 `transport/identity.json` 保存私有 CA 与服务端身份；Agent 的 `identity.json` 保存设备私钥和证书。首次入网使用 Token 提交 CSR，需在管理页批准；已保存身份后可清空 Token，重启自动恢复。更换 Server 时使用独立 Agent 目录。备份整个数据目录，避免仅恢复数据库而丢失 CA；不要复制同一 Agent 身份到多台主机。内部设备身份与 Caddy 公网证书相互独立。
+Server 的 `transport/identity.json` 保存私有 CA 与服务端身份；Agent 的 `identity.json` 保存设备私钥和证书。首次接入使用空间共享密钥提交 CSR，自动获得独立设备身份；旧临时凭证仍需审批。已保存身份后可清空 Token，重启复用原身份。更换 Server 时使用独立 Agent 目录。备份整个数据目录，包含 transport/identity.json 和 secrets/agent-access.key，避免仅恢复数据库而丢失 CA 或接入密钥的解密材料；不要复制同一 Agent 身份到多台主机。内部设备身份与 Caddy 公网证书相互独立。
 
 内部设备证书有效期 365 天、服务端证书 825 天，均在到期前 30 天自动续签。设备经现有 mTLS 控制连接提交新的 CSR，私钥不离开 Agent；新证书先保存到磁盘，再确认替换。响应丢失会复用同一待签请求，安装确认丢失可由下一次 mTLS 连接补齐。续签保持设备 ID、服务绑定、配置版本及现有转发连接不变，新连接使用新证书。服务端使用原 CA 续签并热更新证书，无需重启监听器。
 
@@ -167,3 +167,5 @@ Server 在新增域名或服务域名变化后自动检查一次，解析成功�
 ## 多用户与热重载验收
 
 具体命令、覆盖场景和验证边界见 [多用户与热重载验收](../docs/network-experience.md#多用户与热重载验收)。
+
+共享密钥本地验收（无需 Docker/Caddy）：`python docker/shared-access-smoke.py --server-bin target/debug/nexo-server.exe --agent-bin target/debug/nexo-agent.exe`。验证多设备独立身份、TCP 转发、密钥重置、删除防重放和进程重启。

@@ -135,6 +135,14 @@ pub struct AgentEnrollmentResponse {
     pub message: String,
 }
 
+/// 共享接入密钥只授权新设备注册；返回的独立身份用于后续 mTLS，不提供接管已有设备的参数。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentRegistrationResponse {
+    pub device_id: String,
+    pub certificate_pem: String,
+    pub ca_certificate_pem: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentEnrollmentPollRequest {
     pub token: String,

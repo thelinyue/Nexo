@@ -3,10 +3,10 @@ import { InvitationScreen, UsersPage } from "./accounts";
 import type { ManagedWorkspace } from "./accounts";
 import { AuthScreen, Reauthenticate } from "./auth";
 import { createRoot } from "react-dom/client";
-import { Settings, Zap } from "lucide-react";
+import { Settings, UserRound, Zap } from "lucide-react";
 import { AgentsPage, DomainsPage, ManagePage, SessionsPage } from "./management";
 import { ServicesPage } from "./services";
-import { Brand, Loading, Notice, consumeModalNavigation, errorText, rememberInteraction, request, resumeSession, WorkspaceContext } from "./ui";
+import { Brand, Loading, Notice, consumeModalNavigation, errorText, rememberInteraction, request, resumeSession, WorkspaceContext, WorkspaceLabelContext } from "./ui";
 import type { Auth } from "./ui";
 import "./styles.css";
 
@@ -16,7 +16,7 @@ const tabs = [
 ];
 function readRoute() {
   const hash = window.location.hash;
-  return hash === "#/settings" ? "#/manage" : /^#\/(services|agents)(\/[^/]+)?$/.test(hash) || ["#/manage", "#/users", "#/domains", "#/settings/sessions"].includes(hash) ? hash : "#/services";
+  return hash === "#/settings" ? "#/manage" : /^#\/(services|agents|domains)(\/[^/]+)?$/.test(hash) || ["#/manage", "#/users", "#/domains", "#/settings/sessions"].includes(hash) ? hash : "#/services";
 }
 
 /** Hash 路由保持旧链接兼容；页面保持挂载，只有当前页面可见和接收焦点。 */
@@ -25,7 +25,7 @@ function Workspace({ auth, onAuth, onExpired, managed, onManage, message, onRena
   const positions = useRef(new Map<string, number>());
   const currentRoute = useRef(route);
   const lastServices = useRef("#/services"); const lastAgents = useRef("#/agents");
-  const agentReturn = useRef("#/agents");
+  const agentReturn = useRef("#/agents"); const domainReturn = useRef("#/domains");
   // 空间切换会重新挂载页面；显示新界面前接管路由，避免立即导航时丢失事件。
   useLayoutEffect(() => {
     const update = () => {
@@ -36,6 +36,7 @@ function Workspace({ auth, onAuth, onExpired, managed, onManage, message, onRena
       }
       // 只有从服务详情进入 Agent 才保留来源；列表和外部直达仍按管理层级返回。
       if (next.startsWith("#/agents/") && next !== currentRoute.current) agentReturn.current = currentRoute.current.startsWith("#/services/") ? currentRoute.current : "#/agents";
+      if (next.startsWith("#/domains/") && next !== currentRoute.current) domainReturn.current = currentRoute.current.startsWith("#/services/") ? currentRoute.current : "#/domains";
       positions.current.set(currentRoute.current, window.scrollY); currentRoute.current = next; setRoute(next);
     };
     window.addEventListener("hashchange", update);
@@ -48,6 +49,7 @@ function Workspace({ auth, onAuth, onExpired, managed, onManage, message, onRena
     const heading = document.querySelector<HTMLElement>(".page-slot:not([hidden]) h1");
     if (!document.querySelector("dialog[open]")) heading?.focus({ preventScroll: true });
   }, [route]);
+  const domainActive = route.startsWith("#/domains");
   const serviceActive = route.startsWith("#/services"); const agentActive = route.startsWith("#/agents");
   if (serviceActive) lastServices.current = route;
   if (agentActive) lastAgents.current = route;
@@ -58,7 +60,7 @@ function Workspace({ auth, onAuth, onExpired, managed, onManage, message, onRena
     const resume = () => { window.history.replaceState(null, "", "#/services"); onManage(value); };
     if (window.dispatchEvent(new CustomEvent("nexo:route-change", { cancelable: true, detail: { resume } }))) resume();
   }
-  return <WorkspaceContext.Provider value={managed?.id}><div className="app-shell" onPointerDownCapture={event => rememberInteraction(event.target)} onKeyDownCapture={() => rememberInteraction(null)}><aside className="sidebar"><Brand /><nav aria-label="主导航">{nav}</nav><div className="sidebar-footer">{auth.username}</div></aside><main className="content">{message && <p role="status" className="action-status">{message}</p>}{managed && <div className="workspace-banner" role="status"><div><strong>{managed.name}</strong><span>管理员访问{!managed.enabled && " · 用户已停用，服务暂停转发"}</span></div><button className="secondary-button" onClick={() => switchWorkspace(null)}>返回我的空间</button></div>}<section className="page-slot" hidden={!serviceActive}><ServicesPage route={lastServices.current} active={serviceActive} csrf={auth.csrf_token} /></section><section className="page-slot" hidden={!agentActive}><AgentsPage back={agentReturn.current} route={lastAgents.current} active={agentActive} csrf={auth.csrf_token} /></section><section className="page-slot" hidden={route !== "#/manage"}><ManagePage auth={auth} active={route === "#/manage"} onLogout={logout} onExpired={onExpired} /></section><section className="page-slot" hidden={route !== "#/users"}>{auth.role === "system_admin" ? <UsersPage active={route === "#/users"} auth={auth} onManage={switchWorkspace} onRenamed={onRenamed} onDeleted={onDeleted} onExpired={onExpired} /> : <Notice error="此页面需要管理员权限" />}</section><section className="page-slot" hidden={route !== "#/domains"}><DomainsPage active={route === "#/domains"} csrf={auth.csrf_token} /></section><section className="page-slot" hidden={route !== "#/settings/sessions"}><SessionsPage active={route === "#/settings/sessions"} auth={auth} onExpired={onExpired} /></section></main><nav className="bottom-nav" aria-label="底部导航">{nav}</nav></div></WorkspaceContext.Provider>;
+  return <WorkspaceContext.Provider value={managed?.id}><WorkspaceLabelContext.Provider value={managed?.name}><div className="app-shell" data-root-page={route === "#/services" || route === "#/manage"} data-detail-page={/^#\/(services|agents|domains)\//.test(route)} onPointerDownCapture={event => rememberInteraction(event.target)} onKeyDownCapture={() => rememberInteraction(null)}><aside className="sidebar"><div className="sidebar-brand">Nexo</div><nav aria-label="主导航">{nav}</nav><div className="sidebar-footer"><UserRound size={20} aria-hidden="true" /><div><span className="sidebar-username" title={auth.username}>{auth.username}</span><small>我的账号</small></div></div></aside><main className="content">{message && <p role="status" className="action-status">{message}</p>}{managed && <div className="workspace-banner" role="status"><div><strong>{managed.name}</strong><span>管理员访问{!managed.enabled && " · 用户已停用，服务暂停转发"}</span></div><button className="secondary-button" onClick={() => switchWorkspace(null)}>返回我的空间</button></div>}<section className="page-slot" hidden={!serviceActive}><ServicesPage route={lastServices.current} active={serviceActive} csrf={auth.csrf_token} /></section><section className="page-slot" hidden={!agentActive}><AgentsPage back={agentReturn.current} route={lastAgents.current} active={agentActive} csrf={auth.csrf_token} /></section><section className="page-slot" hidden={route !== "#/manage"}><WorkspaceLabelContext.Provider value={undefined}><ManagePage auth={auth} active={route === "#/manage"} onLogout={logout} onExpired={onExpired} /></WorkspaceLabelContext.Provider></section><section className="page-slot" hidden={route !== "#/users"}>{auth.role === "system_admin" ? <WorkspaceLabelContext.Provider value={undefined}><UsersPage active={route === "#/users"} auth={auth} onManage={switchWorkspace} onRenamed={onRenamed} onDeleted={onDeleted} onExpired={onExpired} /></WorkspaceLabelContext.Provider> : <Notice error="此页面需要管理员权限" />}</section><section className="page-slot" hidden={!domainActive}><DomainsPage active={domainActive} route={route} back={domainReturn.current} csrf={auth.csrf_token} /></section><section className="page-slot" hidden={route !== "#/settings/sessions"}><WorkspaceLabelContext.Provider value={undefined}><SessionsPage active={route === "#/settings/sessions"} auth={auth} onExpired={onExpired} /></WorkspaceLabelContext.Provider></section></main><nav className="bottom-nav" aria-label="底部导航">{nav}</nav></div></WorkspaceLabelContext.Provider></WorkspaceContext.Provider>;
 }
 
 /** 邀请/恢复也可在已打开的标签页进入；凭据读取后立即从地址栏移除。 */

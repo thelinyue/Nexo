@@ -69,6 +69,7 @@ test("服务状态自动更新，编辑和后台暂停，返回前台立即刷�
 });
 
 test("设备恢复凭证绑定原设备，批准前说明撤销旧身份", async ({ page }, testInfo) => {
+  await page.clock.install();
   const state = await installApiMocks(page);
   await page.goto("/#/agents/a-1");
   await page.getByRole("region", { name: "设备内部证书" }).locator("summary").click();
@@ -82,7 +83,7 @@ test("设备恢复凭证绑定原设备，批准前说明撤销旧身份", async
   state.enrollments = state.enrollments.filter(item => item.kind === "recovery"); state.enrollments[0].status = "awaiting_approval";
   await recovery.getByRole("button", { name: "关闭", exact: true }).click();
   await page.getByRole("link", { name: "返回", exact: true }).click();
-  await page.getByRole("button", { name: "刷新Agent" }).click();
+  await page.clock.fastForward(5000);
   await page.getByRole("button", { name: "批准", exact: true }).click();
   const confirm = page.getByRole("dialog", { name: "批准恢复 家庭 Agent 的身份？" });
   await expect(confirm).toContainText("旧证书及旧连接立即失效");

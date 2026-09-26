@@ -69,6 +69,8 @@ pub struct RecoverRequest {
 
 #[derive(Debug, Serialize)]
 pub struct SessionResponse {
+    pub browser: Option<String>,
+    pub os: Option<String>,
     pub id: String,
     pub created_at: i64,
     pub last_seen_at: i64,
@@ -156,6 +158,7 @@ pub fn require_csrf(state: &AppState, headers: &HeaderMap) -> Result<(), ApiErro
 pub async fn initialize(
     State(state): State<AppState>,
     Extension(security): Extension<RequestSecurity>,
+    headers: HeaderMap,
     Json(input): Json<InitializeRequest>,
 ) -> Result<Response, ApiError> {
     let expected = read_bootstrap_code(&state.data_dir)
@@ -180,7 +183,7 @@ pub async fn initialize(
     connection.execute("INSERT INTO users (id, tenant_id, username, role, password_hash, enabled, created_at) VALUES (?1,'default',?2,'system_admin',?3,1,?4)", params![user_id, input.username.trim(), hash, now]).map_err(internal)?;
     let _ = fs::remove_file(state.data_dir.join(BOOTSTRAP_FILE));
     let (session, csrf) =
-        create_session(&connection, &user_id, "default", now).map_err(internal)?;
+        create_session(&connection, &user_id, "default", now, &headers).map_err(internal)?;
     Ok(auth_response(
         StatusCode::OK,
         &session,
@@ -193,6 +196,7 @@ pub async fn initialize(
 pub async fn login(
     State(state): State<AppState>,
     Extension(security): Extension<RequestSecurity>,
+    headers: HeaderMap,
     Json(input): Json<LoginRequest>,
 ) -> Result<Response, ApiError> {
     if input.username.len() > 256 || input.password.len() > 1024 {
@@ -250,8 +254,8 @@ pub async fn login(
             "账号凭据已更新，请重新登录",
         ));
     }
-    let (session, csrf) =
-        create_session(&connection, &user_id, &tenant_id, unix_now()).map_err(internal)?;
+    let (session, csrf) = create_session(&connection, &user_id, &tenant_id, unix_now(), &headers)
+        .map_err(internal)?;
     Ok(auth_response(
         StatusCode::OK,
         &session,
@@ -350,7 +354,7 @@ pub async fn current_session_info(
 ) -> Result<Json<SessionResponse>, ApiError> {
     let session = require_session(&state, &headers)?;
     let connection = state.db.lock().map_err(|_| internal("数据库锁不可用"))?;
-    let row = connection.query_row("SELECT id, created_at, last_seen_at, expires_at FROM auth_sessions WHERE session_digest = ?1", params![digest(cookie(&headers, "nexo_session").as_deref().unwrap_or_default())], |row| Ok(SessionResponse { id: row.get(0)?, created_at: row.get(1)?, last_seen_at: row.get(2)?, expires_at: row.get(3)? })).map_err(internal)?;
+    let row = connection.query_row("SELECT id, created_at, last_seen_at, expires_at, browser, os FROM auth_sessions WHERE session_digest = ?1", params![digest(cookie(&headers, "nexo_session").as_deref().unwrap_or_default())], |row| Ok(SessionResponse { id: row.get(0)?, created_at: row.get(1)?, last_seen_at: row.get(2)?, expires_at: row.get(3)?, browser: row.get(4)?, os: row.get(5)? })).map_err(internal)?;
     let _ = session;
     Ok(Json(row))
 }
@@ -361,7 +365,7 @@ pub async fn list_sessions(
 ) -> Result<Json<Vec<SessionResponse>>, ApiError> {
     let session = require_session(&state, &headers)?;
     let connection = state.db.lock().map_err(|_| internal("数据库锁不可用"))?;
-    let mut query = connection.prepare("SELECT id, created_at, last_seen_at, expires_at FROM auth_sessions WHERE user_id = ?1 ORDER BY last_seen_at DESC").map_err(internal)?;
+    let mut query = connection.prepare("SELECT id, created_at, last_seen_at, expires_at, browser, os FROM auth_sessions WHERE user_id = ?1 ORDER BY last_seen_at DESC").map_err(internal)?;
     let rows = query
         .query_map(params![session.user_id], |row| {
             Ok(SessionResponse {
@@ -369,6 +373,8 @@ pub async fn list_sessions(
                 created_at: row.get(1)?,
                 last_seen_at: row.get(2)?,
                 expires_at: row.get(3)?,
+                browser: row.get(4)?,
+                os: row.get(5)?,
             })
         })
         .map_err(internal)?
@@ -570,11 +576,62 @@ fn load_session(state: &AppState, headers: &HeaderMap) -> Option<Session> {
     connection.query_row("SELECT s.user_id, s.tenant_id, s.csrf_digest FROM auth_sessions s JOIN users u ON u.id=s.user_id AND u.enabled=1 WHERE s.session_digest = ?1 AND s.expires_at > ?2", params![digest(&raw), unix_now()], |row| Ok(Session { user_id: row.get(0)?, tenant_id: row.get(1)?, csrf: row.get(2)? })).optional().ok().flatten()
 }
 
+/// 兼容已有 Tunnel 数据目录；旧会话没有设备标签，界面显示未知设备。
+pub(crate) fn initialize_session_labels(db: &rusqlite::Connection) -> anyhow::Result<()> {
+    for column in ["browser", "os"] {
+        let exists: bool = db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('auth_sessions') WHERE name=?1)",
+            [column],
+            |row| row.get(0),
+        )?;
+        if !exists {
+            db.execute_batch(&format!(
+                "ALTER TABLE auth_sessions ADD COLUMN {column} TEXT;"
+            ))?;
+        }
+    }
+    Ok(())
+}
+
+/// User-Agent 仅映射到固定展示标签，不保存原始内容，不用于认证、授权或设备身份判断。
+fn session_labels(headers: &HeaderMap) -> (Option<&'static str>, Option<&'static str>) {
+    let ua = headers
+        .get(header::USER_AGENT)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default();
+    let browser = if ua.contains("Edg/") || ua.contains("EdgiOS/") || ua.contains("EdgA/") {
+        Some("Edge")
+    } else if ua.contains("Firefox/") || ua.contains("FxiOS/") {
+        Some("Firefox")
+    } else if ua.contains("Chrome/") || ua.contains("CriOS/") {
+        Some("Chrome")
+    } else if ua.contains("Safari/") {
+        Some("Safari")
+    } else {
+        None
+    };
+    let os = if ua.contains("iPhone") || ua.contains("iPad") {
+        Some("iOS / iPadOS")
+    } else if ua.contains("Android") {
+        Some("Android")
+    } else if ua.contains("Windows") {
+        Some("Windows")
+    } else if ua.contains("Macintosh") {
+        Some("macOS")
+    } else if ua.contains("Linux") {
+        Some("Linux")
+    } else {
+        None
+    };
+    (browser, os)
+}
+
 pub(crate) fn create_session(
     connection: &rusqlite::Connection,
     user_id: &str,
     tenant_id: &str,
     now: i64,
+    headers: &HeaderMap,
 ) -> anyhow::Result<(String, String)> {
     let mut bytes = [0_u8; 32];
     OsRng.fill_bytes(&mut bytes);
@@ -582,7 +639,8 @@ pub(crate) fn create_session(
     let mut csrf_bytes = [0_u8; 32];
     OsRng.fill_bytes(&mut csrf_bytes);
     let csrf = hex::encode(csrf_bytes);
-    connection.execute("INSERT INTO auth_sessions (id,user_id,tenant_id,session_digest,csrf_digest,created_at,last_seen_at,expires_at) VALUES (?1,?2,?3,?4,?5,?6,?6,?7)", params![Uuid::new_v4().to_string(), user_id, tenant_id, digest(&raw), digest(&csrf), now, now + SESSION_SECONDS])?;
+    let (browser, os) = session_labels(headers);
+    connection.execute("INSERT INTO auth_sessions (id,user_id,tenant_id,session_digest,csrf_digest,created_at,last_seen_at,expires_at,browser,os) VALUES (?1,?2,?3,?4,?5,?6,?6,?7,?8,?9)", params![Uuid::new_v4().to_string(), user_id, tenant_id, digest(&raw), digest(&csrf), now, now + SESSION_SECONDS, browser, os])?;
     Ok((raw, csrf))
 }
 
@@ -690,6 +748,60 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     #[tokio::test]
+    async fn session_labels_preserve_existing_sessions_and_only_store_known_labels() {
+        let old = rusqlite::Connection::open_in_memory().unwrap();
+        old.execute_batch("CREATE TABLE auth_sessions(id TEXT PRIMARY KEY); INSERT INTO auth_sessions VALUES('old-session');").unwrap();
+        initialize_session_labels(&old).unwrap();
+        let migrated: (String, Option<String>, Option<String>) = old
+            .query_row("SELECT id,browser,os FROM auth_sessions", [], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })
+            .unwrap();
+        assert_eq!(migrated, ("old-session".into(), None, None));
+        let (state, headers) = crate::tests::domain_fixture();
+        let original = current_session_info(State(state.clone()), headers.clone())
+            .await
+            .unwrap()
+            .0;
+        assert!(original.browser.is_none());
+        {
+            let db = state.db.lock().unwrap();
+            initialize_session_labels(&db).unwrap();
+            initialize_session_labels(&db).unwrap();
+            let mut client = HeaderMap::new();
+            client.insert(
+                header::USER_AGENT,
+                HeaderValue::from_static(
+                    "Mozilla/5.0 (Windows NT 10.0) Chrome/130.0 Safari/537.36 Edg/130.0",
+                ),
+            );
+            let (raw, _) = create_session(&db, "u", "default", unix_now(), &client).unwrap();
+            let labels: (String, String) = db
+                .query_row(
+                    "SELECT browser,os FROM auth_sessions WHERE session_digest=?1",
+                    [digest(&raw)],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(labels, ("Edge".into(), "Windows".into()));
+            client.insert(
+                header::USER_AGENT,
+                HeaderValue::from_static("untrusted-device-name<script>"),
+            );
+            assert_eq!(session_labels(&client), (None, None));
+        }
+        let current = current_session_info(State(state.clone()), headers.clone())
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(original.id, current.id);
+        let sessions = list_sessions(State(state), headers).await.unwrap().0;
+        assert!(sessions
+            .iter()
+            .any(|session| session.browser.as_deref() == Some("Edge")));
+    }
+
+    #[tokio::test]
     async fn recovery_is_targeted_expiring_single_use_and_revokes_sessions_atomically() {
         let _guard = PASSWORD_TEST_LOCK.lock().await;
         let (mut state, _) = crate::tests::domain_fixture();
@@ -707,7 +819,7 @@ mod tests {
         {
             let db = state.db.lock().unwrap();
             db.execute("INSERT INTO users(id,tenant_id,username,role,password_hash,created_at) VALUES('other','default','other-admin','system_admin','untouched',0)",[]).unwrap();
-            create_session(&db, "other", "default", unix_now()).unwrap();
+            create_session(&db, "other", "default", unix_now(), &HeaderMap::new()).unwrap();
         }
         assert!(create_recovery_code(&directory, None).is_err());
         let (expired, _, _) = create_recovery_code(&directory, Some("admin")).unwrap();
@@ -796,6 +908,7 @@ mod tests {
         assert!(login(
             State(state.clone()),
             Extension(RequestSecurity { secure: false }),
+            HeaderMap::new(),
             Json(LoginRequest {
                 username: "admin".into(),
                 password: "old-password".into()
@@ -806,6 +919,7 @@ mod tests {
         assert!(login(
             State(state.clone()),
             Extension(RequestSecurity { secure: true }),
+            HeaderMap::new(),
             Json(LoginRequest {
                 username: "admin".into(),
                 password: "a-safe-new-password".into()

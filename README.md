@@ -12,7 +12,7 @@ Nexo 是一个自托管内网穿透平台，通过轻量 Agent 将内网 TCP、H
 | --- | --- |
 | TCP / HTTP / HTTPS | 配置本地目标、公网端口或域名，支持 WebSocket |
 | 可视化管理 | 创建、编辑、启停服务，查看状态并复制访问地址 |
-| Agent 身份管理 | 入网审批、mTLS 加密通道、证书自动续签与身份恢复 |
+| Agent 身份管理 | 共享密钥自动接入、mTLS 加密通道、证书自动续签与身份恢复 |
 | 多用户工作空间 | 邀请加入，分别管理 Agent、服务、域名和证书 |
 | 域名与证书 | 检查域名归属及解析，通过 Caddy 自动申请与续期证书，支持 Cloudflare DNS-01 |
 
@@ -97,7 +97,7 @@ docker compose -f compose.yml ps
 
 ### 2. 接入 Agent
 
-在管理页面进入“Agent → 添加 Agent”，生成并复制一次性入网凭证，有效期 1 小时。然后在能够访问内网应用的主机新建目录；已有 Agent 请使用原目录管理，避免丢失身份：
+在管理页面进入“Agent → 添加 Agent”，直接复制自动准备的 Compose 配置或 Docker run 命令。每个空间共用一把长期接入密钥，可部署多台设备，无需批准。以下为手动配置示例；已有 Agent 请使用原目录管理，避免丢失身份：
 
 ```bash
 mkdir "$HOME/nexo-agent-latest" && cd "$HOME/nexo-agent-latest"
@@ -134,10 +134,10 @@ chmod 600 .env
 ```dotenv
 TZ=Asia/Shanghai
 NEXO_SERVER_URL='https://nexo.example.com'
-NEXO_ENROLLMENT_TOKEN='替换为刚生成的入网凭证'
+NEXO_ENROLLMENT_TOKEN='替换为空间接入密钥'
 ```
 
-启动 Agent 后，回到管理页面核对入网申请，批准并设置名称，等待状态变为在线：
+启动 Agent 后将自动接入，在管理页面查看设备是否在线：
 
 ```bash
 # 避免当前 Shell 中的同名变量覆盖 .env。

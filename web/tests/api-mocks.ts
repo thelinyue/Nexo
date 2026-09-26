@@ -5,6 +5,7 @@ import type { Device, Domain, DomainEvent, Enrollment, TransportIdentity } from 
 export async function installApiMocks(page: Page, options: { empty?: boolean; anonymous?: boolean; initialize?: boolean } = {}) {
   const state = {
     authenticated: !options.anonymous,
+    accessKey: "nexo_join_shared-test-key",
     tunnels: options.empty ? [] : [{ id: "t-1", name: "媒体中心", protocol: "https", local_address: "127.0.0.1", local_port: 8096, public_port: null, public_address: "https://media.example.com/a-very-long-public-address", hostname: "media", public_domain: "example.com", device_id: "a-1", device_name: "家庭 Agent", enabled: true, apply_status: "ready", apply_error: null }] as any[],
     devices: [{ id: "a-1", name: "家庭 Agent", status: "online", os: "Linux", architecture: "amd64", last_seen_at: 1790000000, agent_version: "0.2.0", tunnel_count: 1 }, { id: "a-2", name: "备用 Agent", status: "offline", os: "Linux", agent_version: "0.2.0", tunnel_count: 0 }] as Device[],
     transportIdentity: { server: { status: "valid", expires_at: Math.floor(Date.now()/1000) + 825*86400, renew_after: Math.floor(Date.now()/1000) + 795*86400, error: null, next_retry_at: null }, ca_expires_at: Math.floor(Date.now()/1000) + 3650*86400, ca_needs_attention: false } as TransportIdentity,
@@ -36,13 +37,16 @@ export async function installApiMocks(page: Page, options: { empty?: boolean; an
     if (path === "/api/v1/auth/sessions") return respond(state.sessions);
     if (path.startsWith("/api/v1/auth/sessions/")) { state.sessions = state.sessions.filter(item => item.id !== path.split("/").pop()); return respond({}); }
     if (path.endsWith("/recovery") && path.startsWith("/api/v1/devices/")) { const invite: Enrollment = { id: "e-recovery", kind: "recovery", device_id: path.split("/")[4], status: "awaiting_agent", token: "recovery-token-for-test", expires_at: Math.floor(Date.now()/1000) + 3600 }; state.enrollments.push(invite); return respond(invite); }
+    if (path === "/api/v1/agent-access-key") return respond({ token: state.accessKey, created_at: 1790000000, updated_at: 1790000000 });
+    if (path === "/api/v1/agent-access-key/reset") { state.accessKey = "nexo_join_reset-test-key"; return respond({ token: state.accessKey, created_at: 1790000000, updated_at: Math.floor(Date.now()/1000) }); }
     if (path === "/api/v1/devices") return respond(state.devices);
     if (path === "/api/v1/transport-identity") return respond(state.transportIdentity);
     if (path.startsWith("/api/v1/devices/") && method === "DELETE") { state.devices = state.devices.filter(item => item.id !== path.split("/").pop()); return respond({}); }
     if (path === "/api/v1/enrollments" && method === "GET") return respond(state.enrollments);
-    if (path === "/api/v1/enrollments" && method === "POST") return respond({ id: "e-new", status: "awaiting_agent", token: "one-time-secret-enrollment-token", expires_at: Math.floor(Date.now()/1000) + 3600 });
+    if (path === "/api/v1/enrollments" && method === "POST") { const invite = { id: "e-new", status: "awaiting_agent", token: "one-time-secret-enrollment-token", expires_at: Math.floor(Date.now()/1000) + 3600 }; state.enrollments.push(invite); return respond(invite); }
+    if (path.startsWith("/api/v1/enrollments/") && method === "GET") return respond(state.enrollments.find(item => item.id === path.split("/").pop()) ?? { id: path.split("/").pop(), status: "awaiting_agent", expires_at: Math.floor(Date.now()/1000) + 3600 });
     if (path.startsWith("/api/v1/enrollments/") && method === "DELETE") { state.enrollments = state.enrollments.filter(item => item.id !== path.split("/").pop()); return respond({ revoked: true }); }
-    if (path.endsWith("/approve")) { state.enrollments = []; return respond({}); }
+    if (path.endsWith("/approve")) { const invite = state.enrollments.find(item => item.id === path.split("/").at(-2)); if (invite) Object.assign(invite, { status: "approved", device_id: invite.device_id ?? "a-1" }); return respond(invite ?? {}); }
     if (path.endsWith("/access")) { if (method === "POST") state.dnsChecked = true; return respond(access(state.domains.find(domain => domain.id === path.split("/")[4])?.domain ?? "example.com")); }
     if (path === "/api/v1/public-domains" && method === "GET") return respond(state.domains.map(domain => ({ ...domain, access: access(domain.domain) })));
     if (path === "/api/v1/public-domains" && method === "POST") { const item = { ...body, id: "d-2", is_primary: false, apply_status: "pending", runtime: { config_status: "pending", config_error: null, service_warning: null, checked_at: null, certificates: [] } }; state.domains.push(item); return respond(item, 201); }

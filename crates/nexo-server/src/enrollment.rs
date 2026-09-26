@@ -216,6 +216,7 @@ fn approve(
         expires_at: expires,
         device_id: Some(device),
         token: None,
+        ..Enrollment::default()
     })
 }
 
@@ -257,6 +258,7 @@ pub(crate) async fn create_recovery(
         expires_at: token.expires_at,
         device_id: Some(device),
         token: Some(token.secret),
+        ..Enrollment::default()
     }))
 }
 
@@ -359,6 +361,24 @@ mod tests {
         let _ = agent_enroll(State(state.clone()), Json(input.clone()))
             .await
             .unwrap();
+        // 审批页读取同一份申请的自报信息，不回传 CSR、私钥或一次性凭证。
+        let detail = get_enrollment(
+            State(state.clone()),
+            headers.clone(),
+            Path(invite.id.clone()),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(detail.device_name.as_deref(), Some("测试设备"));
+        assert_eq!(detail.os.as_deref(), Some("test"));
+        assert_eq!(detail.agent_version.as_deref(), Some("test"));
+        assert!(detail.token.is_none());
+        let listed = list_enrollments(State(state.clone()), headers.clone())
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(listed[0].device_name, detail.device_name);
         let rejected = agent_enroll(State(state.clone()), Json(request(&token)))
             .await
             .unwrap_err();

@@ -96,7 +96,7 @@ async fn main() -> Result<()> {
     }
 }
 
-/// 身份落盘后不再使用一次性 Token；响应丢失时复用原 CSR，避免生成第二个设备。
+/// 身份落盘后使用设备证书，共享密钥重置不影响已接入设备；响应丢失时复用原 CSR，避免生成第二个设备。
 async fn load_identity(config: &Config, directory: &std::path::Path) -> Result<DeviceIdentity> {
     let path = directory.join("identity.json");
     let previous = fs::read(&path);
@@ -154,6 +154,50 @@ async fn load_identity(config: &Config, directory: &std::path::Path) -> Result<D
         .no_proxy()
         .timeout(Duration::from_secs(15))
         .build()?;
+    // 明确的凭证前缀选择协议；共享注册失败不得降级到旧审批接口。
+    if config.enrollment_token.starts_with("nexo_join_") {
+        anyhow::ensure!(
+            !config.recover_identity,
+            "恢复原设备请使用设备详情生成的专用恢复凭证"
+        );
+        let response = client
+            .post(format!("{}/api/v1/agent/register", config.server_url))
+            .json(&AgentEnrollmentRequest {
+                token: config.enrollment_token.clone(),
+                device_name: config.device_name.clone(),
+                os: Some(env::consts::OS.into()),
+                architecture: Some(env::consts::ARCH.into()),
+                agent_version: config.agent_version.clone(),
+                csr_pem: Some(material.csr_pem.clone()),
+            })
+            .send()
+            .await
+            .context("无法连接 Server 注册接口，请确认 Server 支持共享接入密钥")?;
+        let result: nexo_protocol::AgentRegistrationResponse =
+            decode_response(response, &config.enrollment_token).await?;
+        identity::client_config(
+            &result.ca_certificate_pem,
+            &result.certificate_pem,
+            &material.key_pem,
+        )?;
+        anyhow::ensure!(
+            identity::certificate_info(&result.certificate_pem)?.0 == result.device_id,
+            "设备证书与识别码不一致"
+        );
+        let identity = DeviceIdentity {
+            server_url: config.server_url.clone(),
+            device_id: result.device_id,
+            certificate_pem: result.certificate_pem,
+            ca_pem: result.ca_certificate_pem,
+            key_pem: material.key_pem,
+            pending_key: None,
+            renewal_retry: Default::default(),
+        };
+        identity::write_private_file(&path, &serde_json::to_vec(&identity)?)?;
+        fs::remove_file(&request_path)?;
+        tracing::info!(device_id = %identity.device_id, "Agent 已接入，设备身份已保存");
+        return Ok(identity);
+    }
     let response = client
         .post(format!("{}/api/v1/agent/enroll", config.server_url))
         .json(&AgentEnrollmentRequest {
