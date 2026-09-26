@@ -12,7 +12,7 @@ use serde_json::{json, Value};
 use std::{
     collections::{HashMap, HashSet},
     fs,
-    net::{IpAddr, SocketAddr},
+    net::{IpAddr, Ipv4Addr, SocketAddr},
     path::Path,
     sync::{Arc, Mutex},
     time::Duration,
@@ -110,9 +110,17 @@ struct DomainSpec {
 }
 #[derive(Debug, Clone)]
 struct WebService {
+    id: String,
     hostname: String,
     protocol: String,
     upstream: Option<String>,
+    lan_redirect: Option<LanRedirect>,
+}
+/// 重定向仅存在于当前已认证 Agent 的出口快照中；离线或未开启的服务不生成规则。
+#[derive(Debug, Clone)]
+struct LanRedirect {
+    public_ipv4: Ipv4Addr,
+    origin: String,
 }
 impl DomainSpec {
     fn subjects(&self) -> Vec<String> {
@@ -149,6 +157,7 @@ impl DomainSpec {
 fn specifications(
     state: &AppState,
     upstreams: &HashMap<String, String>,
+    agent_public_ipv4s: &HashMap<String, Ipv4Addr>,
 ) -> Result<Vec<DomainSpec>> {
     let connection = state
         .db
@@ -208,18 +217,44 @@ fn specifications(
             };
             domain.token_reference = path.map(|path| format!("{{file.{}}}", path.display()));
         }
-        let mut services = connection.prepare("SELECT id,hostname,protocol FROM tunnels WHERE public_domain_id=?1 AND tenant_id=?2 AND enabled=1 AND deleted_at IS NULL AND protocol IN ('http','https')")?;
-        domain.services = services
-            .query_map(params![domain.id, domain.tenant_id], |row| {
-                let id: String = row.get(0)?;
-                let hostname: Option<String> = row.get(1)?;
-                Ok(WebService {
-                    hostname: format!("{}.{}", hostname.unwrap_or_default(), domain.name),
-                    protocol: row.get(2)?,
-                    upstream: upstreams.get(&id).cloned(),
+        let mut services = connection.prepare("SELECT id,hostname,protocol,device_id,lan_redirect_enabled,local_address,local_port,origin_protocol FROM tunnels WHERE public_domain_id=?1 AND tenant_id=?2 AND enabled=1 AND deleted_at IS NULL AND protocol IN ('http','https')")?;
+        let mut rows = services.query(params![domain.id, domain.tenant_id])?;
+        while let Some(row) = rows.next()? {
+            let id: String = row.get(0)?;
+            let hostname: Option<String> = row.get(1)?;
+            let device_id: Option<String> = row.get(3)?;
+            let redirect_enabled: bool = row.get(4)?;
+            // 只按本服务绑定的设备查询，其他 Agent 的公网出口不能授权此服务跳转。
+            let public_ipv4 = device_id
+                .as_ref()
+                .and_then(|id| agent_public_ipv4s.get(id))
+                .copied();
+            let lan_redirect = if let (true, Some(public_ipv4)) = (redirect_enabled, public_ipv4) {
+                let local_address: String = row.get(5)?;
+                let local_port: u16 = row.get(6)?;
+                let origin_protocol: Option<String> = row.get(7)?;
+                // 每轮根据当前本地目标生成地址；公网 HTTPS 不代表回源也使用 HTTPS。
+                let origin = crate::lan_redirect::target_url(
+                    &local_address,
+                    local_port,
+                    origin_protocol.as_deref(),
+                )
+                .map_err(|error| anyhow::anyhow!(error.message))?;
+                Some(LanRedirect {
+                    public_ipv4,
+                    origin,
                 })
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
+            } else {
+                None
+            };
+            domain.services.push(WebService {
+                hostname: format!("{}.{}", hostname.unwrap_or_default(), domain.name),
+                protocol: row.get(2)?,
+                upstream: upstreams.get(&id).cloned(),
+                id,
+                lan_redirect,
+            });
+        }
     }
     Ok(domains)
 }
@@ -281,11 +316,33 @@ fn build_config(settings: &CaddyRuntimeConfig, domains: &[DomainSpec]) -> Result
                 json!({"handler":"static_response","status_code":503,"body":"服务转发通道尚未就绪"})
             };
             let route = json!({"match":[{"host":[service.hostname]}],"handle":[handler]});
-            if service.protocol == "https" {
-                https.push(route);
+            let routes = if service.protocol == "https" {
+                &mut https
             } else {
-                http.push(route);
+                &mut http
+            };
+            if let Some(redirect) = &service.lan_redirect {
+                let origin = &redirect.origin;
+                // 使用真实 socket 来源而不是可伪造的转发头。只拦截页面导航，保留 API、
+                // WebSocket 和非幂等请求的穿透路径；临时跳转禁止缓存，避免跨网络复用。
+                routes.push(json!({
+                    "@id": format!("{}{}", caddy::LAN_REDIRECT_ROUTE_PREFIX, service.id),
+                    "match": [{
+                        "host": [service.hostname],
+                        "remote_ip": {"ranges": [format!("{}/32", redirect.public_ipv4)]},
+                        "method": ["GET", "HEAD"],
+                        "header": {"Sec-Fetch-Mode": ["navigate"], "Sec-Fetch-Dest": ["document"]},
+                        "not": [{"header": {"Upgrade": ["*"]}}]
+                    }],
+                    "handle": [{
+                        "handler": "static_response",
+                        "status_code": 307,
+                        "headers": {"Location": [format!("{origin}{{http.request.uri}}")], "Cache-Control": ["no-store"]}
+                    }],
+                    "terminal": true
+                }));
             }
+            routes.push(route);
         }
         let domain_subjects = domain.subjects();
         if !domain_subjects.is_empty() {
@@ -337,7 +394,8 @@ async fn reconcile(state: &AppState) -> Result<()> {
 /// 调用方必须持有 reconcile_lock；返回 false 表示配置或专属凭据仍待下一轮清理。
 pub(crate) async fn reconcile_locked(state: &AppState) -> Result<bool> {
     let upstreams = state.tunnel_runtime.web_upstreams().await;
-    let specs = specifications(state, &upstreams)?;
+    let agent_public_ipv4s = state.tunnel_runtime.agent_public_ipv4s().await;
+    let specs = specifications(state, &upstreams, &agent_public_ipv4s)?;
     let manager = &state.domain_runtime;
     let supervisor = &manager.supervisor;
     let settings = supervisor.config();
@@ -730,9 +788,11 @@ mod tests {
             certificate_mode: "cloudflare_dns".into(),
             dns: crate::domains::DnsSettings::default(),
             services: vec![WebService {
+                id: "nas".into(),
                 hostname: "nas.example.com".into(),
                 protocol: "https".into(),
                 upstream: None,
+                lan_redirect: None,
             }],
         }
     }
@@ -759,6 +819,143 @@ mod tests {
             false
         );
     }
+
+    #[tokio::test]
+    async fn lan_redirect_uses_the_bound_agent_and_current_local_target() {
+        let (state, headers) = crate::tests::domain_fixture();
+        let domain = crate::tests::add_test_domain(&state, &headers, "lan.test")
+            .await
+            .unwrap();
+        {
+            let db = state.db.lock().unwrap();
+            db.execute(
+                "UPDATE domain_settings SET verified=1 WHERE domain_id=?1",
+                [&domain.id],
+            )
+            .unwrap();
+            for id in ["first", "second", "offline"] {
+                db.execute("INSERT INTO devices (id,tenant_id,name,created_at,updated_at) VALUES (?1,'default',?1,0,0)", [id]).unwrap();
+                db.execute("INSERT INTO tunnels (id,tenant_id,device_id,name,protocol,local_address,local_port,hostname,public_domain_id,lan_redirect_enabled,created_at,updated_at) VALUES (?1,'default',?1,?1,'https','192.168.1.10',8080,?1,?2,1,0,0)", params![id, domain.id]).unwrap();
+            }
+        }
+        let addresses = HashMap::from([
+            ("first".into(), "8.8.8.8".parse().unwrap()),
+            ("second".into(), "1.1.1.1".parse().unwrap()),
+            ("unbound".into(), "9.9.9.9".parse().unwrap()),
+        ]);
+        let specs = specifications(&state, &HashMap::new(), &addresses).unwrap();
+        let services = &specs[0].services;
+        let find = |id: &str| services.iter().find(|service| service.id == id).unwrap();
+        assert_eq!(
+            find("first").lan_redirect.as_ref().unwrap().public_ipv4,
+            addresses["first"]
+        );
+        assert_eq!(
+            find("second").lan_redirect.as_ref().unwrap().public_ipv4,
+            addresses["second"]
+        );
+        assert!(find("offline").lan_redirect.is_none());
+        assert!(!build_config(&settings(Path::new("test")), &specs)
+            .unwrap()
+            .to_string()
+            .contains("9.9.9.9"));
+        let location = |specs: &[DomainSpec], id: &str| {
+            let config = build_config(&settings(Path::new("test")), specs).unwrap();
+            let route_id = format!("{}{id}", caddy::LAN_REDIRECT_ROUTE_PREFIX);
+            let routes = config["apps"]["http"]["servers"]["https"]["routes"]
+                .as_array()
+                .unwrap();
+            let route = routes
+                .iter()
+                .find(|route| route["@id"] == route_id)
+                .unwrap();
+            route["handle"][0]["headers"]["Location"][0]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        };
+        // 公网 HTTPS 服务默认仍按 HTTP 回源；地址和协议修改都直接反映到下一轮配置。
+        assert_eq!(
+            location(&specs, "first"),
+            "http://192.168.1.10:8080{http.request.uri}"
+        );
+        for (address, port, protocol, expected) in [
+            (
+                "192.168.2.30",
+                9090,
+                None,
+                "http://192.168.2.30:9090{http.request.uri}",
+            ),
+            (
+                "fd00::25",
+                8443,
+                Some("https"),
+                "https://[fd00::25]:8443{http.request.uri}",
+            ),
+        ] {
+            state.db.lock().unwrap().execute(
+                "UPDATE tunnels SET local_address=?1,local_port=?2,origin_protocol=?3 WHERE id='first'",
+                params![address, port, protocol],
+            ).unwrap();
+            let specs = specifications(&state, &HashMap::new(), &addresses).unwrap();
+            assert_eq!(location(&specs, "first"), expected);
+            assert_eq!(
+                location(&specs, "second"),
+                "http://192.168.1.10:8080{http.request.uri}"
+            );
+        }
+
+        state
+            .db
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE tunnels SET lan_redirect_enabled=0 WHERE id='first'",
+                [],
+            )
+            .unwrap();
+        let specs = specifications(&state, &HashMap::new(), &addresses).unwrap();
+        assert!(specs[0]
+            .services
+            .iter()
+            .find(|s| s.id == "first")
+            .unwrap()
+            .lan_redirect
+            .is_none());
+        let specs = specifications(&state, &HashMap::new(), &HashMap::new()).unwrap();
+        assert!(specs[0].services.iter().all(|s| s.lan_redirect.is_none()));
+    }
+
+    #[test]
+    fn startup_removes_dynamic_redirects_and_preserves_last_good_routes() {
+        let root = std::env::temp_dir().join(format!(
+            "nexo-caddy-redirect-startup-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let cfg = settings(&root);
+        let mut d = domain();
+        d.services[0].upstream = Some("127.0.0.1:18080".into());
+        d.services[0].lan_redirect = Some(LanRedirect {
+            public_ipv4: "8.8.8.8".parse().unwrap(),
+            origin: "http://192.168.1.10:8080".into(),
+        });
+        let applied = build_config(&cfg, &[d.clone()]).unwrap();
+        fs::create_dir_all(&root).unwrap();
+        fs::write(&cfg.applied_path, serde_json::to_vec(&applied).unwrap()).unwrap();
+        let supervisor = CaddySupervisor::new(cfg.clone());
+        supervisor
+            .write_startup_config(&json!({"invalid_desired":true}))
+            .unwrap();
+        d.services[0].lan_redirect = None;
+        let startup: Value = serde_json::from_slice(&fs::read(&cfg.config_path).unwrap()).unwrap();
+        assert_eq!(startup, build_config(&cfg, &[d]).unwrap());
+        assert_eq!(
+            serde_json::from_slice::<Value>(&fs::read(&cfg.applied_path).unwrap()).unwrap(),
+            applied
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn dns_credentials_remain_placeholders_and_http_only_has_no_certificates() {
         let mut d = domain();
@@ -792,24 +989,32 @@ mod tests {
         let mut d = domain();
         d.services.extend([
             WebService {
+                id: "media".into(),
                 hostname: "media.example.com".into(),
                 protocol: "https".into(),
                 upstream: None,
+                lan_redirect: None,
             },
             WebService {
+                id: "a.team".into(),
                 hostname: "a.team.example.com".into(),
                 protocol: "https".into(),
                 upstream: None,
+                lan_redirect: None,
             },
             WebService {
+                id: "b.team".into(),
                 hostname: "b.team.example.com".into(),
                 protocol: "https".into(),
                 upstream: None,
+                lan_redirect: None,
             },
             WebService {
+                id: "http-only".into(),
                 hostname: "a.http-only.example.com".into(),
                 protocol: "http".into(),
                 upstream: None,
+                lan_redirect: None,
             },
         ]);
         // 无凭据和有凭据的证书范围一致，不能回退为逐个服务签发。
@@ -833,9 +1038,11 @@ mod tests {
             }
             let subjects = d.subjects();
             d.services.push(WebService {
+                id: "next.team".into(),
                 hostname: "next.team.example.com".into(),
                 protocol: "https".into(),
                 upstream: None,
+                lan_redirect: None,
             });
             assert_eq!(d.subjects(), subjects);
             d.services.pop();
@@ -1023,6 +1230,214 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "需要 NEXO_TEST_CADDY_BIN；只在本机随机端口使用 Caddy 内部 CA，不安装系统信任"]
+    async fn real_caddy_redirects_only_navigation_and_discards_old_session_rules() {
+        use axum::{extract::Request, Router};
+        use reqwest::{Method, StatusCode};
+
+        let binary = std::env::var_os("NEXO_TEST_CADDY_BIN").expect("请提供测试 Caddy 二进制");
+        let root =
+            std::env::temp_dir().join(format!("nexo-caddy-lan-redirect-{}", uuid::Uuid::new_v4()));
+        let port = || {
+            std::net::TcpListener::bind("127.0.0.1:0")
+                .unwrap()
+                .local_addr()
+                .unwrap()
+                .port()
+        };
+        let upstream = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_address = upstream.local_addr().unwrap();
+        let upstream_task = tokio::spawn(async move {
+            axum::serve(
+                upstream,
+                Router::new().fallback(|request: Request| async move {
+                    (
+                        [("x-test-upstream", "true")],
+                        format!("{} {}", request.method(), request.uri()),
+                    )
+                }),
+            )
+            .await
+            .unwrap();
+        });
+        let mut cfg = settings(&root);
+        cfg.binary = binary.into();
+        cfg.admin_url = format!("http://127.0.0.1:{}", port());
+        cfg.http_listen = format!("127.0.0.1:{}", port());
+        cfg.https_listen = format!("127.0.0.1:{}", port());
+        let http_address: SocketAddr = cfg.http_listen.parse().unwrap();
+        let https_address: SocketAddr = cfg.https_listen.parse().unwrap();
+        let origin = "http://192.168.1.10:8080";
+        let mut d = domain();
+        d.name = "lan-redirect.localhost".into();
+        d.services[0].hostname = "nas.lan-redirect.localhost".into();
+        d.services[0].upstream = Some(upstream_address.to_string());
+        // 本机集成测试直接构造来源快照；生产入口只允许 transport 验证后的公网 IPv4。
+        d.services[0].lan_redirect = Some(LanRedirect {
+            public_ipv4: Ipv4Addr::LOCALHOST,
+            origin: origin.into(),
+        });
+        let mut http_service = d.services[0].clone();
+        http_service.id = "http".into();
+        http_service.hostname = "http.lan-redirect.localhost".into();
+        http_service.protocol = "http".into();
+        d.services.push(http_service);
+        let mut other_service = d.services[0].clone();
+        other_service.id = "other".into();
+        other_service.hostname = "other.lan-redirect.localhost".into();
+        other_service.lan_redirect.as_mut().unwrap().public_ipv4 = "8.8.8.8".parse().unwrap();
+        d.services.push(other_service);
+        let make_config = |d: DomainSpec| {
+            let mut config = build_config(&cfg, &[d]).unwrap();
+            config["apps"]["tls"]["automation"]["policies"] =
+                json!([{"issuers":[{"module":"internal"}]}]);
+            config
+        };
+        let enabled = make_config(d.clone());
+        let supervisor = Arc::new(CaddySupervisor::new(cfg.clone()));
+        supervisor.write_startup_config(&enabled).unwrap();
+        supervisor.clone().start().await.unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(25);
+        while supervisor.current_config().await.is_err()
+            || read_certificates(&cfg.storage_root).len() < 2
+        {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "Caddy 未就绪：{:?}",
+                supervisor.drain_log_events().await
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        let root_pem = fs::read(cfg.storage_root.join("pki/authorities/local/root.crt")).unwrap();
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .http1_only()
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(Duration::from_secs(5))
+            .add_root_certificate(reqwest::Certificate::from_pem(&root_pem).unwrap())
+            .resolve("nas.lan-redirect.localhost", https_address)
+            .resolve("http.lan-redirect.localhost", http_address)
+            .resolve("other.lan-redirect.localhost", https_address)
+            .build()
+            .unwrap();
+        let uri = "/photos/a%2Fb/%E4%B8%AD?next=%2Fhome%3Fa%3D1&name=a+b&raw=%252F";
+        let https_url = format!(
+            "https://nas.lan-redirect.localhost:{}{uri}",
+            https_address.port()
+        );
+        let http_url = format!(
+            "http://http.lan-redirect.localhost:{}{uri}",
+            http_address.port()
+        );
+        let other_url = format!(
+            "https://other.lan-redirect.localhost:{}{uri}",
+            https_address.port()
+        );
+        let navigation = |method: Method, url: &str| {
+            client
+                .request(method, url)
+                .header("Sec-Fetch-Mode", "navigate")
+                .header("Sec-Fetch-Dest", "document")
+        };
+        for url in [&https_url, &http_url] {
+            for method in [Method::GET, Method::HEAD] {
+                let response = navigation(method, url).send().await.unwrap();
+                assert_eq!(response.status(), StatusCode::TEMPORARY_REDIRECT);
+                assert_eq!(response.headers()["location"], format!("{origin}{uri}"));
+                assert_eq!(response.headers()["cache-control"], "no-store");
+                assert!(!response.headers().contains_key("x-test-upstream"));
+            }
+        }
+        // 同一浏览器来源不能匹配另一台 Agent；伪造转发头也不能替代真实连接来源。
+        let response = navigation(Method::GET, &other_url)
+            .header("X-Forwarded-For", "8.8.8.8")
+            .header("X-Real-IP", "8.8.8.8")
+            .header("Forwarded", "for=8.8.8.8")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.text().await.unwrap(), format!("GET {uri}"));
+        for request in [
+            client.get(&https_url),
+            client
+                .get(&https_url)
+                .header("Sec-Fetch-Mode", "cors")
+                .header("Sec-Fetch-Dest", "empty"),
+            client.get(&https_url).header("Sec-Fetch-Mode", "navigate"),
+            client
+                .get(&https_url)
+                .header("Sec-Fetch-Mode", "navigate")
+                .header("Sec-Fetch-Dest", "iframe"),
+            navigation(Method::GET, &https_url)
+                .header("Connection", "Upgrade")
+                .header("Upgrade", "websocket"),
+            client
+                .get(&https_url)
+                .header("Sec-Fetch-Mode", "websocket")
+                .header("Sec-Fetch-Dest", "empty")
+                .header("Connection", "Upgrade")
+                .header("Upgrade", "websocket"),
+            navigation(Method::POST, &https_url).body("kept on tunnel"),
+            navigation(Method::PUT, &https_url).body("kept on tunnel"),
+            navigation(Method::DELETE, &https_url),
+        ] {
+            let response = request.send().await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(response.headers()["x-test-upstream"], "true");
+            assert!(!response.headers().contains_key("location"));
+        }
+        let mut disabled = d.clone();
+        for service in &mut disabled.services {
+            service.lan_redirect = None;
+        }
+        let disabled = make_config(disabled);
+        supervisor.apply_json(&disabled).await.unwrap();
+        let response = navigation(Method::GET, &https_url).send().await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.text().await.unwrap(), format!("GET {uri}"));
+        supervisor.apply_json(&enabled).await.unwrap();
+        let mut rejected = disabled.clone();
+        rejected["apps"]["invalid_nexo_module"] = json!({});
+        assert!(supervisor.apply_json(&rejected).await.is_err());
+        assert_eq!(
+            navigation(Method::GET, &https_url)
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::TEMPORARY_REDIRECT
+        );
+        supervisor.shutdown().await.unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while supervisor.current_config().await.is_ok() {
+            assert!(tokio::time::Instant::now() < deadline, "Caddy 未停止");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let restarted = Arc::new(CaddySupervisor::new(cfg.clone()));
+        restarted
+            .write_startup_config(&build_config(&cfg, &[]).unwrap())
+            .unwrap();
+        restarted.clone().start().await.unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while restarted.current_config().await.is_err() {
+            assert!(tokio::time::Instant::now() < deadline, "Caddy 未重新启动");
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert_eq!(restarted.current_config().await.unwrap(), disabled);
+        let response = navigation(Method::GET, &https_url).send().await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.text().await.unwrap(), format!("GET {uri}"));
+        assert_eq!(
+            serde_json::from_slice::<Value>(&fs::read(&cfg.applied_path).unwrap()).unwrap(),
+            enabled
+        );
+        restarted.shutdown().await.unwrap();
+        upstream_task.abort();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "需要 NEXO_TEST_CADDY_BIN；只在本机随机端口使用 Caddy 内部 CA，不安装系统信任"]
     async fn real_caddy_reuses_wildcards_and_keeps_last_good_config() {
         let binary = std::env::var_os("NEXO_TEST_CADDY_BIN").expect("请提供测试 Caddy 二进制");
         let root =
@@ -1059,8 +1474,11 @@ mod tests {
         add_service("nas");
         add_service("a.team");
         // 模拟已有逐个子域名签发的配置，确认切换后旧证书文件不会妨碍泛域名复用。
-        let mut legacy =
-            build_config(&cfg, &specifications(&state, &HashMap::new()).unwrap()).unwrap();
+        let mut legacy = build_config(
+            &cfg,
+            &specifications(&state, &HashMap::new(), &HashMap::new()).unwrap(),
+        )
+        .unwrap();
         legacy["apps"]["tls"]["certificates"]["automate"] = json!([
             "caddy-integration.localhost",
             "nas.caddy-integration.localhost",

@@ -10,7 +10,13 @@ use nexo_tunnel::{
 };
 use rusqlite::params;
 use sha2::{Digest, Sha256};
-use std::{collections::HashMap, net::IpAddr, path::PathBuf, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    net::{IpAddr, Ipv4Addr},
+    path::PathBuf,
+    sync::Arc,
+    time::Duration,
+};
 use tokio::{
     io::{AsyncRead, AsyncWrite},
     net::{TcpListener, TcpStream},
@@ -57,6 +63,8 @@ struct DataSession {
 struct ControlSession {
     sender: mpsc::Sender<ServerControlMessage>,
     cancel: CancellationToken,
+    // 仅在 mTLS、设备身份和 Hello 全部通过后记录；连接替换或撤销时随会话清理。
+    public_ipv4: Option<Ipv4Addr>,
 }
 #[derive(Default)]
 struct Connections {
@@ -191,6 +199,18 @@ impl Runtime {
                 })
                 .flatten()
             })
+            .collect()
+    }
+
+    /// 按设备提供当前控制连接的真实公网出口；不使用转发头，也不持久化离线出口。
+    pub async fn agent_public_ipv4s(&self) -> HashMap<String, Ipv4Addr> {
+        self.connections
+            .lock()
+            .await
+            .control
+            .iter()
+            .filter(|(_, session)| !session.cancel.is_cancelled() && !session.sender.is_closed())
+            .filter_map(|(device, session)| session.public_ipv4.map(|ip| (device.clone(), ip)))
             .collect()
     }
 
@@ -393,6 +413,28 @@ fn ensure_device_enabled(db: &rusqlite::Connection, device: &str) -> Result<()> 
     Ok(())
 }
 
+/// 同出口仅是内网的近似判定，非公网或原生 IPv6 来源不参与，避免共享/保留网段误判。
+fn public_ipv4(peer: IpAddr) -> Option<Ipv4Addr> {
+    let ip = match peer {
+        IpAddr::V4(ip) => ip,
+        IpAddr::V6(ip) => ip.to_ipv4_mapped()?,
+    };
+    let [a, b, c, _] = ip.octets();
+    let reserved = a == 0
+        || a >= 240
+        || (a == 100 && (64..=127).contains(&b))
+        || (a == 192 && b == 0 && c == 0)
+        || (a == 192 && b == 88 && c == 99)
+        || (a == 198 && (b == 18 || b == 19));
+    (!reserved
+        && !ip.is_private()
+        && !ip.is_loopback()
+        && !ip.is_link_local()
+        && !ip.is_documentation()
+        && !ip.is_multicast())
+    .then_some(ip)
+}
+
 fn authenticated_device(
     state: &AppState,
     stream: &TlsStream<TcpStream>,
@@ -436,7 +478,7 @@ pub async fn serve(state: AppState, listener: TcpListener, data: bool) -> Result
                         nexo_tunnel::configure_tunnel_tcp_keepalive(&socket)?;
                         let stream = tokio::time::timeout(Duration::from_secs(10), acceptor.accept(socket)).await.context("Agent TLS 握手超时")??;
                         let (device, fingerprint) = authenticated_device(&state, &stream)?;
-                        if data { data_session(state, stream, device, fingerprint).await } else { control_session(state, stream, device, fingerprint).await }
+                        if data { data_session(state, stream, device, fingerprint).await } else { control_session(state, stream, device, fingerprint, peer.ip()).await }
                     }.await;
                     if let Err(error) = result { tracing::warn!(%peer, "Agent 连接结束：{error:#}"); }
                 });
@@ -453,6 +495,7 @@ async fn control_session(
     stream: TlsStream<TcpStream>,
     device: String,
     mut fingerprint: String,
+    peer: IpAddr,
 ) -> Result<()> {
     let (read, mut write) = tokio::io::split(stream);
     let mut lines = FramedRead::new(read, LinesCodec::new_with_max_length(MAX_CONTROL_FRAME));
@@ -477,19 +520,20 @@ async fn control_session(
             .map_err(|_| anyhow::anyhow!("数据库锁不可用"))?;
         ensure_device_enabled(&db, &device)?;
         crate::identity_runtime::accept_certificate(&db, &device, &fingerprint)?;
+        db.execute(
+            "UPDATE devices SET status='online',agent_version=?1,last_seen_at=?2 WHERE id=?3",
+            params![agent_version, unix_now(), device],
+        )?;
         if let Some(previous) = connections.control.insert(
             device.clone(),
             ControlSession {
                 sender: sender.clone(),
                 cancel: cancel.clone(),
+                public_ipv4: public_ipv4(peer),
             },
         ) {
             previous.cancel.cancel();
         }
-        db.execute(
-            "UPDATE devices SET status='online',agent_version=?1,last_seen_at=?2 WHERE id=?3",
-            params![agent_version, unix_now(), device],
-        )?;
     }
     let result: Result<()> = async {
         write_message(&mut write, &ServerControlMessage::HelloAccepted { server_time: unix_now(), tunnels: desired_tunnels(&state, &device)?, tunnel_endpoint: state.tunnel_endpoint.clone() }).await?;
@@ -774,6 +818,295 @@ mod tests {
     use super::*;
     use crate::{create_tunnel, TunnelInput};
     use axum::{extract::State, Json};
+    use tokio::io::{AsyncBufReadExt, BufReader};
+
+    type ClientStream = tokio_rustls::client::TlsStream<TcpStream>;
+
+    fn test_client_config(state: &AppState, device: &str) -> Arc<rustls::ClientConfig> {
+        let key = rcgen::KeyPair::generate().unwrap();
+        let csr = rcgen::CertificateParams::new(Vec::<String>::new())
+            .unwrap()
+            .serialize_request(&key)
+            .unwrap()
+            .pem()
+            .unwrap();
+        let certificate = state.authority.issue_device(&csr, device).unwrap();
+        state.db.lock().unwrap().execute(
+            "INSERT INTO device_identities (device_id,secret_digest,created_at) VALUES (?1,?2,0)",
+            params![device, crate::identity_runtime::fingerprint(&certificate).unwrap()],
+        ).unwrap();
+        nexo_tunnel::identity::client_config(
+            &state.authority.ca_pem(),
+            &certificate,
+            &key.serialize_pem(),
+        )
+        .unwrap()
+    }
+
+    // 使用真实 mTLS 和生产控制循环，仅替换 accept 的来源地址以模拟不同公网出口。
+    async fn test_control_connection(
+        state: &AppState,
+        config: Arc<rustls::ClientConfig>,
+        peer: &str,
+    ) -> (ClientStream, JoinHandle<Result<()>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let state = state.clone();
+        let peer = peer.parse().unwrap();
+        let task = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await?;
+            let stream = TlsAcceptor::from(state.authority.server_config())
+                .accept(socket)
+                .await?;
+            let (device, fingerprint) = authenticated_device(&state, &stream)?;
+            control_session(state, stream, device, fingerprint, peer).await
+        });
+        let client = tokio::time::timeout(Duration::from_secs(3), async {
+            tokio_rustls::TlsConnector::from(config)
+                .connect(
+                    nexo_tunnel::identity::SERVER_NAME.try_into().unwrap(),
+                    TcpStream::connect(address).await.unwrap(),
+                )
+                .await
+                .unwrap()
+        })
+        .await
+        .unwrap();
+        (client, task)
+    }
+
+    async fn test_hello(client: &mut ClientStream, device: &str) {
+        write_message(
+            client,
+            &AgentControlMessage::Hello {
+                device_id: device.into(),
+                agent_version: "test".into(),
+            },
+        )
+        .await
+        .unwrap();
+        let mut response = String::new();
+        tokio::time::timeout(
+            Duration::from_secs(3),
+            BufReader::new(client).read_line(&mut response),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(matches!(
+            serde_json::from_str::<ServerControlMessage>(&response).unwrap(),
+            ServerControlMessage::HelloAccepted { .. }
+        ));
+    }
+
+    async fn test_session_finished(task: JoinHandle<Result<()>>) -> Result<()> {
+        tokio::time::timeout(Duration::from_secs(3), task)
+            .await
+            .unwrap()
+            .unwrap()
+    }
+
+    #[test]
+    fn agent_exit_requires_public_ipv4_and_normalizes_mapped_addresses() {
+        for address in [
+            "0.0.0.0",
+            "0.1.2.3",
+            "10.1.2.3",
+            "100.64.0.1",
+            "100.127.255.254",
+            "127.0.0.1",
+            "169.254.1.2",
+            "172.16.0.1",
+            "172.31.255.254",
+            "192.168.1.1",
+            "192.0.0.1",
+            "192.0.2.1",
+            "192.88.99.1",
+            "198.18.0.1",
+            "198.19.255.254",
+            "198.51.100.1",
+            "203.0.113.1",
+            "224.0.0.1",
+            "239.255.255.255",
+            "240.0.0.1",
+            "255.255.255.255",
+            "::",
+            "::1",
+            "::8.8.8.8",
+            "fc00::1",
+            "2001:4860::8888",
+            "::ffff:192.168.1.2",
+            "::ffff:100.64.0.1",
+        ] {
+            assert_eq!(public_ipv4(address.parse().unwrap()), None, "{address}");
+        }
+        for address in [
+            "1.1.1.1",
+            "8.8.8.8",
+            "100.63.255.255",
+            "100.128.0.1",
+            "172.15.255.255",
+            "172.32.0.1",
+            "192.0.1.1",
+            "198.17.255.255",
+            "198.20.0.1",
+            "223.255.255.254",
+        ] {
+            assert_eq!(
+                public_ipv4(address.parse().unwrap()),
+                Some(address.parse().unwrap()),
+                "{address}"
+            );
+        }
+        assert_eq!(
+            public_ipv4("::ffff:8.8.8.8".parse().unwrap()),
+            Some("8.8.8.8".parse().unwrap())
+        );
+    }
+
+    #[tokio::test]
+    async fn exit_is_unavailable_until_certificate_identity_and_hello_are_accepted() {
+        let (state, _) = crate::tests::domain_fixture();
+        populate(&state);
+        let config = test_client_config(&state, "mine");
+        let (mut client, task) = test_control_connection(&state, config.clone(), "8.8.8.8").await;
+        assert!(state.tunnel_runtime.agent_public_ipv4s().await.is_empty());
+        write_message(
+            &mut client,
+            &AgentControlMessage::Hello {
+                device_id: "foreign".into(),
+                agent_version: "test".into(),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(test_session_finished(task).await.is_err());
+        assert!(state.tunnel_runtime.agent_public_ipv4s().await.is_empty());
+        state
+            .db
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE device_identities SET secret_digest='revoked' WHERE device_id='mine'",
+                [],
+            )
+            .unwrap();
+        let (_client, task) = test_control_connection(&state, config, "8.8.8.8").await;
+        assert!(test_session_finished(task).await.is_err());
+        assert!(state.tunnel_runtime.agent_public_ipv4s().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn new_exit_survives_old_connection_cleanup_and_disconnect_only_removes_its_device() {
+        let (state, _) = crate::tests::domain_fixture();
+        populate(&state);
+        let config = test_client_config(&state, "mine");
+        let foreign = test_client_config(&state, "foreign");
+        let (mut old, old_task) = test_control_connection(&state, config.clone(), "8.8.8.8").await;
+        test_hello(&mut old, "mine").await;
+        let (mut other, other_task) = test_control_connection(&state, foreign, "9.9.9.9").await;
+        test_hello(&mut other, "foreign").await;
+        let (mut new, new_task) = test_control_connection(&state, config, "::ffff:1.1.1.1").await;
+        test_hello(&mut new, "mine").await;
+        test_session_finished(old_task).await.unwrap();
+        assert_eq!(
+            state.tunnel_runtime.agent_public_ipv4s().await,
+            HashMap::from([
+                ("mine".into(), "1.1.1.1".parse().unwrap()),
+                ("foreign".into(), "9.9.9.9".parse().unwrap()),
+            ])
+        );
+        drop(new);
+        assert!(test_session_finished(new_task).await.is_err());
+        assert_eq!(
+            state.tunnel_runtime.agent_public_ipv4s().await,
+            HashMap::from([("foreign".into(), "9.9.9.9".parse().unwrap())])
+        );
+        state.tunnel_runtime.shutdown().await;
+        test_session_finished(other_task).await.unwrap();
+        assert!(state.tunnel_runtime.agent_public_ipv4s().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn failed_registration_preserves_the_existing_session_and_exit() {
+        let (state, _) = crate::tests::domain_fixture();
+        populate(&state);
+        let config = test_client_config(&state, "mine");
+        let (mut old, old_task) = test_control_connection(&state, config.clone(), "8.8.8.8").await;
+        test_hello(&mut old, "mine").await;
+        state.db.lock().unwrap().execute_batch(
+            "CREATE TRIGGER fail_online BEFORE UPDATE OF status ON devices WHEN NEW.status='online' BEGIN SELECT RAISE(ABORT,'test write failure'); END;",
+        ).unwrap();
+        let (mut new, new_task) = test_control_connection(&state, config, "1.1.1.1").await;
+        write_message(
+            &mut new,
+            &AgentControlMessage::Hello {
+                device_id: "mine".into(),
+                agent_version: "test".into(),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(test_session_finished(new_task).await.is_err());
+        assert_eq!(
+            state.tunnel_runtime.agent_public_ipv4s().await,
+            HashMap::from([("mine".into(), "8.8.8.8".parse().unwrap())])
+        );
+        assert!(!old_task.is_finished());
+        state.tunnel_runtime.shutdown().await;
+        test_session_finished(old_task).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancellation_identity_recovery_and_removed_ownership_revoke_exits() {
+        for reason in ["cancel", "identity", "workspace", "device", "tenant"] {
+            let (state, _) = crate::tests::domain_fixture();
+            populate(&state);
+            let config = test_client_config(&state, "mine");
+            let (mut client, task) = test_control_connection(&state, config, "8.8.8.8").await;
+            test_hello(&mut client, "mine").await;
+            assert_eq!(state.tunnel_runtime.agent_public_ipv4s().await.len(), 1);
+            match reason {
+                "cancel" => state.tunnel_runtime.connections.lock().await.control["mine"]
+                    .cancel
+                    .cancel(),
+                "identity" => state
+                    .tunnel_runtime
+                    .replace_identity("mine", || Ok(()))
+                    .await
+                    .unwrap(),
+                "workspace" => state
+                    .tunnel_runtime
+                    .remove_workspace(|| {
+                        state
+                            .db
+                            .lock()
+                            .unwrap()
+                            .execute("DELETE FROM tenants WHERE id='default'", [])
+                            .unwrap();
+                        Ok((vec!["mine".into()], vec!["own".into()]))
+                    })
+                    .await
+                    .unwrap(),
+                "device" | "tenant" => {
+                    let query = if reason == "device" {
+                        "DELETE FROM devices WHERE id='mine'"
+                    } else {
+                        "UPDATE tenants SET enabled=0 WHERE id='default'"
+                    };
+                    state.db.lock().unwrap().execute(query, []).unwrap();
+                    state.tunnel_runtime.reconcile(&state).await.unwrap();
+                }
+                _ => unreachable!(),
+            }
+            assert!(
+                state.tunnel_runtime.agent_public_ipv4s().await.is_empty(),
+                "{reason}"
+            );
+            test_session_finished(task).await.unwrap();
+            state.tunnel_runtime.shutdown().await;
+        }
+    }
 
     fn populate(state: &AppState) {
         state.db.lock().unwrap().execute_batch("INSERT INTO tenants(id,name,created_at) VALUES ('other','other',0);
@@ -831,6 +1164,7 @@ mod tests {
             hostname: None,
             enabled: Some(true),
             public_domain_id: None,
+            lan_redirect_enabled: None,
         };
         assert_eq!(
             create_tunnel(

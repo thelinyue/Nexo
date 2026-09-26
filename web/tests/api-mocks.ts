@@ -6,7 +6,7 @@ export async function installApiMocks(page: Page, options: { empty?: boolean; an
   const state = {
     authenticated: !options.anonymous,
     accessKey: "nexo_join_shared-test-key",
-    tunnels: options.empty ? [] : [{ id: "t-1", name: "媒体中心", protocol: "https", local_address: "127.0.0.1", local_port: 8096, public_port: null, public_address: "https://media.example.com/a-very-long-public-address", hostname: "media", public_domain: "example.com", device_id: "a-1", device_name: "家庭 Agent", enabled: true, apply_status: "ready", apply_error: null }] as any[],
+    tunnels: options.empty ? [] : [{ id: "t-1", name: "媒体中心", protocol: "https", local_address: "127.0.0.1", local_port: 8096, public_port: null, public_address: "https://media.example.com/a-very-long-public-address", hostname: "media", public_domain: "example.com", device_id: "a-1", device_name: "家庭 Agent", enabled: true, apply_status: "ready", apply_error: null, lan_redirect_enabled: false }] as any[],
     devices: [{ id: "a-1", name: "家庭 Agent", status: "online", os: "Linux", architecture: "amd64", last_seen_at: 1790000000, agent_version: "0.2.0", tunnel_count: 1 }, { id: "a-2", name: "备用 Agent", status: "offline", os: "Linux", agent_version: "0.2.0", tunnel_count: 0 }] as Device[],
     transportIdentity: { server: { status: "valid", expires_at: Math.floor(Date.now()/1000) + 825*86400, renew_after: Math.floor(Date.now()/1000) + 795*86400, error: null, next_retry_at: null }, ca_expires_at: Math.floor(Date.now()/1000) + 3650*86400, ca_needs_attention: false } as TransportIdentity,
     domains: [{ id: "d-1", domain: "example.com", is_primary: true, https_enabled: true, apply_status: "applied", runtime: { config_status: "applied", config_error: null, service_warning: null, checked_at: Math.floor(Date.now() / 1000), certificates: [{ hostname: "example.com", status: "issued", not_before: Math.floor(Date.now() / 1000) - 3600, expires_at: Math.floor(Date.now() / 1000) + 90 * 86400, error: null, next_retry_at: null }] } }] as Domain[],
@@ -53,10 +53,10 @@ export async function installApiMocks(page: Page, options: { empty?: boolean; an
     if (path === "/api/v1/public-domain-runtime-events") return respond({ events: state.domainEvents, next_cursor: null });
     if (path.startsWith("/api/v1/public-domains/") && method === "DELETE") { state.domains = state.domains.filter(item => item.id !== path.split("/").pop()); return respond({}); }
     if (path === "/api/v1/tunnels" && method === "GET") return respond(state.tunnels);
-    if (path === "/api/v1/tunnels" && method === "POST") { const item = { ...body, id: "t-new", public_address: "new.example.com", public_domain: "example.com", apply_status: "checking" }; state.tunnels.push(item); return respond(item, 201); }
+    if (path === "/api/v1/tunnels" && method === "POST") { const item = { lan_redirect_enabled: false, ...body, id: "t-new", public_address: "new.example.com", public_domain: "example.com", apply_status: "checking" }; state.tunnels.push(item); return respond(item, 201); }
     const toggle = path.match(/^\/api\/v1\/tunnels\/([^/]+)\/(enable|disable)$/);
     if (toggle) { const item = state.tunnels.find(item => item.id === toggle[1]); Object.assign(item, { enabled: toggle[2] === "enable", apply_status: toggle[2] === "enable" ? "checking" : "disabled" }); return respond(item); }
-    if (path.startsWith("/api/v1/tunnels/") && method === "PUT") { const item = state.tunnels.find(item => item.id === path.split("/").pop()); Object.assign(item, body); return respond(item); }
+    if (path.startsWith("/api/v1/tunnels/") && method === "PUT") { const item = state.tunnels.find(item => item.id === path.split("/").pop()); Object.assign(item, body, { lan_redirect_enabled: body.protocol === "tcp" ? false : body.lan_redirect_enabled ?? item.lan_redirect_enabled ?? false }); return respond(item); }
     if (path.startsWith("/api/v1/tunnels/") && method === "DELETE") { state.tunnels = state.tunnels.filter(item => item.id !== path.split("/").pop()); return respond({}); }
     return respond({ error: `未模拟的接口 ${method} ${path}` }, 404);
   });

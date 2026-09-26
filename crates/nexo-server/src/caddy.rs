@@ -29,6 +29,8 @@ use tokio::{
 pub const CADDY_VERSION: &str = "2.11.4";
 pub const XCADDY_VERSION: &str = "0.4.7";
 pub const CLOUDFLARE_MODULE_VERSION: &str = "0.2.4";
+/// 内网重定向依赖本次进程内的已认证会话，不能把旧出口当作跨重启的可信配置。
+pub(crate) const LAN_REDIRECT_ROUTE_PREFIX: &str = "nexo-lan-redirect-";
 
 #[derive(Debug, Clone)]
 pub struct CaddyRuntimeConfig {
@@ -482,16 +484,22 @@ impl CaddySupervisor {
     /// 如果上一份 Applied 配置存在，优先用它启动 Caddy，再由协调器把
     /// SQLite 中的 Desired State 通过 Admin API 应用。这样 Server 重启时
     /// 不会因为一次尚未验证的新配置覆盖掉上一份可用边缘配置。
+    /// 内网重定向规则例外：上次认证会话已失效，必须等待 Agent 重新连接后重建。
     pub fn write_startup_config(&self, config: &Value) -> Result<()> {
         let body = match fs::read(&self.config.applied_path) {
-            Ok(applied) if serde_json::from_slice::<Value>(&applied).is_ok() => applied,
-            Ok(_) => {
-                tracing::warn!(
-                    path = %self.config.applied_path.display(),
-                    "上一份 Caddy Applied 配置不是有效 JSON，将使用当前 Desired State"
-                );
-                serde_json::to_vec(config)?
-            }
+            Ok(applied) => match serde_json::from_slice::<Value>(&applied) {
+                Ok(mut config) => {
+                    strip_lan_redirect_routes(&mut config);
+                    serde_json::to_vec(&config)?
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        path = %self.config.applied_path.display(),
+                        "上一份 Caddy Applied 配置不是有效 JSON，将使用当前 Desired State"
+                    );
+                    serde_json::to_vec(config)?
+                }
+            },
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 serde_json::to_vec(config)?
             }
@@ -615,6 +623,30 @@ impl CaddySupervisor {
         }
         *child = None;
         Ok(())
+    }
+}
+
+/// 仅按本功能拥有的路由 ID 删除动态规则，其他路由、证书与凭据保持上一份可用配置。
+fn strip_lan_redirect_routes(value: &mut Value) {
+    match value {
+        Value::Object(map) => {
+            if let Some(Value::Array(routes)) = map.get_mut("routes") {
+                routes.retain(|route| {
+                    !route["@id"]
+                        .as_str()
+                        .is_some_and(|id| id.starts_with(LAN_REDIRECT_ROUTE_PREFIX))
+                });
+            }
+            for value in map.values_mut() {
+                strip_lan_redirect_routes(value);
+            }
+        }
+        Value::Array(values) => {
+            for value in values {
+                strip_lan_redirect_routes(value);
+            }
+        }
+        _ => {}
     }
 }
 

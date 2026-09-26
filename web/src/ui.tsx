@@ -3,7 +3,7 @@ import type { InputHTMLAttributes, ReactNode } from "react";
 import { ArrowLeft, Check, ChevronRight, Copy, FileQuestion, Globe2, Network, Plus, Search, Server, ShieldCheck, Users, X } from "lucide-react";
 
 export type Auth = { initialized: boolean; authenticated: boolean; user_id?: string; username?: string; role?: "system_admin" | "tenant"; workspace_id?: string; csrf_token?: string | null; local_http_warning?: boolean };
-export type Tunnel = { id: string; name: string; protocol: string; local_address: string; local_port: number; public_port?: number | null; public_address?: string | null; device_id?: string | null; device_name?: string | null; hostname?: string | null; enabled: boolean; apply_status: string; apply_error?: string | null; public_domain?: string | null };
+export type Tunnel = { id: string; name: string; protocol: string; local_address: string; local_port: number; public_port?: number | null; public_address?: string | null; device_id?: string | null; device_name?: string | null; hostname?: string | null; enabled: boolean; apply_status: string; apply_error?: string | null; public_domain?: string | null; lan_redirect_enabled: boolean };
 export type IdentityCertificate = { status: string; expires_at: number | null; renew_after: number | null; error: string | null; next_retry_at: number | null };
 export type TransportIdentity = { server: IdentityCertificate; ca_expires_at: number | null; ca_needs_attention: boolean };
 export type Device = { id: string; name: string; status: string; os?: string | null; architecture?: string | null; agent_version?: string | null; tunnel_count: number; enrolled_at?: number | null; last_seen_at?: number | null; certificate?: IdentityCertificate };

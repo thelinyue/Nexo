@@ -3,6 +3,7 @@ import type { FormEvent } from "react";
 import { ChevronRight, Search, Trash2 } from "lucide-react";
 import { Confirm, CopyButton, CreateButton, DetailField, Empty, Loading, Modal, Notice, PageHeader, Status, errorText, localTarget, navigate, useApi, useResource } from "./ui";
 import type { Device, Domain, Tunnel } from "./ui";
+import { isLanRedirectAddress } from "./lan-redirect";
 
 type ServiceData = { tunnels: Tunnel[]; devices: Device[]; domains: Domain[] };
 const loadServices = async (request: ReturnType<typeof useApi>): Promise<ServiceData> => { const [tunnels, devices, domains] = await Promise.all([request<Tunnel[]>("/api/v1/tunnels"), request<Device[]>("/api/v1/devices"), request<Domain[]>("/api/v1/public-domains")]); return { tunnels, devices, domains: domains.filter(domain => domain.verification_status !== "pending") }; };
@@ -10,13 +11,19 @@ const loadServices = async (request: ReturnType<typeof useApi>): Promise<Service
 /** 表单草稿只驻留内存；跳转配置 Agent / 域名时暂时隐藏，返回后继续填写。 */
 function ServiceEditor({ tunnel, data, active, csrf, onClose, onSaved }: { tunnel?: Tunnel; data: ServiceData; active: boolean; csrf?: string | null; onClose: () => void; onSaved: (item: Tunnel) => void }) {
   const request = useApi();
-  const initial = useMemo(() => ({ name: tunnel?.name ?? "", protocol: tunnel?.protocol ?? "tcp", device_id: tunnel?.device_id ?? data.devices.find(item => item.status === "online")?.id ?? data.devices[0]?.id ?? "", local_address: tunnel?.local_address ?? "127.0.0.1", local_port: String(tunnel?.local_port ?? ""), public_port: String(tunnel?.public_port ?? ""), hostname: tunnel?.hostname ?? "", public_domain_id: tunnel ? data.domains.find(item => item.domain === tunnel.public_domain)?.id ?? "" : data.domains.length === 1 ? data.domains[0].id : "" }), []);
+  const initial = useMemo(() => ({ name: tunnel?.name ?? "", protocol: tunnel?.protocol ?? "tcp", device_id: tunnel?.device_id ?? data.devices.find(item => item.status === "online")?.id ?? data.devices[0]?.id ?? "", local_address: tunnel?.local_address ?? "127.0.0.1", local_port: String(tunnel?.local_port ?? ""), public_port: String(tunnel?.public_port ?? ""), hostname: tunnel?.hostname ?? "", public_domain_id: tunnel ? data.domains.find(item => item.domain === tunnel.public_domain)?.id ?? "" : data.domains.length === 1 ? data.domains[0].id : "", lan_redirect_enabled: tunnel?.protocol !== "tcp" && (tunnel?.lan_redirect_enabled ?? false) }), []);
   const [draft, setDraft] = useState(initial); const [busy, setBusy] = useState(false); const [error, setError] = useState<string | null>(null);
   const [invalidField, setInvalidField] = useState<keyof typeof initial | null>(null);
   const formRef = useRef<HTMLFormElement>(null);
   const [advancedOpen, setAdvancedOpen] = useState(Boolean(tunnel?.public_port));
   const dirty = JSON.stringify(draft) !== JSON.stringify(initial);
-  const update = (field: keyof typeof draft, value: string) => { setDraft(current => ({ ...current, [field]: value })); if (field === invalidField) { setInvalidField(null); setError(null); } };
+  const update = (field: keyof typeof draft, value: string | boolean) => {
+    setDraft(current => {
+      if (field === "protocol" && value === "tcp") return { ...current, protocol: value, lan_redirect_enabled: false };
+      return { ...current, [field]: value };
+    });
+    if (field === invalidField || (invalidField === "local_address" && (field === "lan_redirect_enabled" || field === "protocol"))) { setInvalidField(null); setError(null); }
+  };
   const devices = [...data.devices].sort((a, b) => Number(b.status === "online") - Number(a.status === "online"));
   const selectedDomain = data.domains.find(item => item.id === draft.public_domain_id);
   const finalAddress = draft.protocol === "tcp" ? `公网端口 ${draft.public_port || "自动分配"}` : `${draft.protocol}://${draft.hostname || "主机名"}.${selectedDomain?.domain || tunnel?.public_domain || "根域名"}`;
@@ -47,9 +54,10 @@ function ServiceEditor({ tunnel, data, active, csrf, onClose, onSaved }: { tunne
     if (draft.protocol === "tcp" && draft.public_port && (!/^\d+$/.test(draft.public_port) || Number(draft.public_port) < 20000 || Number(draft.public_port) > 29999)) { fail("public_port", "公网端口需要是 20000–29999 之间的整数，留空自动分配"); return; }
     if (draft.protocol !== "tcp" && !draft.hostname.trim()) { fail("hostname", "请填写主机名"); return; }
     if (draft.protocol !== "tcp" && !data.domains.some(item => item.id === draft.public_domain_id)) { fail("public_domain_id", "请选择根域名"); return; }
+    if (draft.protocol !== "tcp" && draft.lan_redirect_enabled && !isLanRedirectAddress(draft.local_address)) { fail("local_address", "开启内网重定向时，本地地址必须是私有 IPv4 或 IPv6 ULA；回环地址和主机名不能供浏览器直连"); return; }
     setBusy(true);
     try {
-      const body = { ...draft, name: draft.name.trim(), local_address: draft.local_address.trim(), local_port: Number(draft.local_port), public_port: draft.protocol === "tcp" && draft.public_port ? Number(draft.public_port) : null, hostname: draft.protocol === "tcp" ? null : draft.hostname.trim(), public_domain_id: draft.protocol === "tcp" ? null : draft.public_domain_id, enabled: tunnel?.enabled ?? true };
+      const body = { ...draft, name: draft.name.trim(), local_address: draft.local_address.trim(), local_port: Number(draft.local_port), public_port: draft.protocol === "tcp" && draft.public_port ? Number(draft.public_port) : null, hostname: draft.protocol === "tcp" ? null : draft.hostname.trim(), public_domain_id: draft.protocol === "tcp" ? null : draft.public_domain_id, enabled: tunnel?.enabled ?? true, lan_redirect_enabled: draft.protocol !== "tcp" && draft.lan_redirect_enabled };
       onSaved(await request<Tunnel>(tunnel ? `/api/v1/tunnels/${encodeURIComponent(tunnel.id)}` : "/api/v1/tunnels", { method: tunnel ? "PUT" : "POST", body: JSON.stringify(body) }, csrf));
       onClose();
     } catch (e) { setError(errorText(e)); } finally { setBusy(false); }
@@ -58,9 +66,9 @@ function ServiceEditor({ tunnel, data, active, csrf, onClose, onSaved }: { tunne
   return <Modal title={tunnel ? "编辑服务" : "创建服务"} full dirty={dirty} busy={busy} onClose={onClose}>
     <form ref={formRef} onSubmit={save} noValidate className="modal-form service-form" onKeyDown={event => {
       // 软键盘的“下一项”只切换文本字段，最后一项收起键盘，避免误触 Enter 直接提交。
-      if (event.key !== "Enter" || event.nativeEvent.isComposing || !(event.target instanceof HTMLInputElement) || event.target.type === "radio") return;
+      if (event.key !== "Enter" || event.nativeEvent.isComposing || !(event.target instanceof HTMLInputElement) || event.target.type === "radio" || event.target.type === "checkbox") return;
       event.preventDefault();
-      const inputs = Array.from(formRef.current!.querySelectorAll<HTMLInputElement>('input:not([type="radio"]):not(:disabled)')).filter(input => !input.closest("details:not([open])") && input.getClientRects().length > 0);
+      const inputs = Array.from(formRef.current!.querySelectorAll<HTMLInputElement>('input:not([type="radio"]):not([type="checkbox"]):not(:disabled)')).filter(input => !input.closest("details:not([open])") && input.getClientRects().length > 0);
       const next = inputs[inputs.indexOf(event.target) + 1];
       if (next) { next.focus(); next.scrollIntoView({ block: "nearest" }); } else event.target.blur();
     }}>
@@ -79,6 +87,9 @@ function ServiceEditor({ tunnel, data, active, csrf, onClose, onSaved }: { tunne
           <label className="service-field"><span>主机名</span><input {...fieldProps("hostname")} value={draft.hostname} onChange={e => update("hostname", e.target.value)} placeholder="例如：nas" enterKeyHint="done" autoComplete="off" autoCorrect="off" autoCapitalize="none" spellCheck={false} required /></label>
           <label className="service-field"><span>根域名</span><select {...fieldProps("public_domain_id")} aria-label="根域名" value={draft.public_domain_id} onChange={e => update("public_domain_id", e.target.value)} required disabled={Boolean(tunnel)}><option value="">选择域名</option>{data.domains.map(item => <option key={item.id} value={item.id}>{item.domain}</option>)}</select></label>
         </div>{!data.domains.length && <div className="notice"><span>Web 服务需要根域名。</span><button type="button" className="text-button" onClick={() => navigate("#/domains", true)}>添加域名</button></div>}{tunnel && <p className="helper">现有服务保留原根域名；更换根域名请创建新服务。</p>}</section>}
+        {draft.protocol !== "tcp" && <section className="service-form-section"><div className="service-field-group">
+          <label className="service-field service-toggle-field"><span>内网重定向</span><input {...fieldProps("lan_redirect_enabled")} type="checkbox" checked={draft.lan_redirect_enabled} onChange={e => update("lan_redirect_enabled", e.target.checked)} /></label>
+        </div>{draft.protocol === "http" && draft.lan_redirect_enabled && <p className="helper" role="status">部分浏览器访问 HTTP 域名时无法触发重定向，建议使用 HTTPS。</p>}</section>}
         {tunnel && !tunnel.public_domain && <p className="helper">此服务未绑定域名；需要 Web 访问时，请创建新服务。</p>}
       </fieldset></div>
       <footer className="modal-actions">{draft.protocol !== "tcp" && <div className="service-submit-preview"><span>访问地址</span><code>{finalAddress}</code></div>}{error && <p id="service-form-error" className="form-error" role="alert">{error}</p>}<button type="submit" className="primary-button" disabled={busy || !devices.length || (draft.protocol !== "tcp" && !data.domains.length)}>{busy ? "保存中…" : "保存服务"}</button></footer>
@@ -125,6 +136,7 @@ export function ServicesPage({ route, active, csrf }: { route: string; active: b
         <dl>
           <DetailField label="公网地址"><div className="service-detail-address">{detail.public_address && detail.protocol !== "tcp" ? <a className="service-public-link" href={detail.public_address} target="_blank" rel="noopener noreferrer" title="在新标签页打开"><code>{detail.public_address}</code></a> : <code>{detail.public_address ?? "等待配置"}</code>}{detail.public_address && <CopyButton value={detail.public_address} label="复制公网地址" iconOnly />}</div></DetailField>
           <DetailField label="本地目标"><div className="service-detail-address"><code>{localTarget(detail)}</code><CopyButton value={localTarget(detail)} label="复制本地目标" iconOnly /></div></DetailField>
+          {detail.protocol !== "tcp" && <DetailField label="内网重定向" className="service-detail-meta">{detail.lan_redirect_enabled ? "已开启" : "未开启"}</DetailField>}
           <DetailField label="协议" className="service-detail-meta">{detail.protocol.toUpperCase()}</DetailField>
           <DetailField label="Agent" className="service-detail-meta">{detail.device_id ? <a className="text-link" href={`#/agents/${encodeURIComponent(detail.device_id)}`}>{detail.device_name ?? "查看 Agent"}</a> : "未分配 Agent"}</DetailField>
         </dl>
