@@ -90,7 +90,7 @@ for (const protocol of ["tcp", "http", "https"]) {
     await dialog.getByLabel("服务名称").fill("新服务");
     await dialog.getByRole("radio", { name: protocol.toUpperCase(), exact: true }).check();
     await dialog.getByLabel("本地端口").fill("8080");
-    if (protocol !== "tcp") { await dialog.getByLabel("主机名").fill("new"); await dialog.getByLabel("根域名").selectOption("d-1"); }
+    if (protocol !== "tcp") { await dialog.getByLabel("主机名").fill("new"); await dialog.getByRole("combobox", { name: "根域名", exact: true }).click(); await dialog.getByRole("option", { name: "example.com", exact: true }).click(); }
     state.failures.set("POST /api/v1/tunnels", "暂时无法保存");
     await dialog.getByRole("button", { name: "保存服务" }).click();
     await expect(dialog.getByRole("alert")).toContainText("暂时无法保存");
@@ -112,8 +112,8 @@ test("编辑预填域名，保存不丢失原配置", async ({ page }) => {
   await page.goto("/#/services/t-1");
   await page.getByRole("button", { name: "编辑服务" }).click();
   const dialog = page.getByRole("dialog", { name: "编辑服务" });
-  await expect(dialog.getByLabel("根域名")).toHaveValue("d-1");
-  await expect(dialog.getByLabel("根域名")).toBeDisabled();
+  await expect(dialog.getByRole("combobox", { name: "根域名", exact: true })).toContainText("example.com");
+  await expect(dialog.getByRole("combobox", { name: "根域名", exact: true })).toBeDisabled();
   await dialog.getByLabel("服务名称").fill("改名的服务");
   await dialog.getByRole("button", { name: "保存服务" }).click();
   await expect(page.getByRole("heading", { name: "改名的服务" })).toBeVisible();
@@ -154,12 +154,17 @@ test("无域名时跳转配置并恢复服务草稿", async ({ page }) => {
   await add.getByLabel("域名", { exact: true }).fill("new.example.com");
   await add.getByRole("button", { name: "添加域名", exact: true }).click();
   await expect(add).not.toBeVisible();
+  await expect(page).toHaveURL(/#\/domains\/d-2$/);
   await page.getByRole("dialog", { name: /^配置 / }).getByRole("button", { name: "关闭", exact: true }).click();
   await page.goBack();
+  await expect(page).toHaveURL(/#\/domains$/);
+  await expect(visiblePage(page).getByRole("heading", { name: "域名与证书", exact: true })).toBeVisible();
   await page.goBack();
   await expect(editor.getByLabel("服务名称")).toHaveValue("草稿服务");
   await expect(editor.getByRole("radio", { name: "HTTPS", exact: true })).toBeChecked();
-  await expect(editor.getByLabel("根域名").getByRole("option", { name: "new.example.com" })).toHaveCount(1);
+  await expect(editor.getByRole("combobox", { name: "根域名", exact: true })).toContainText("new.example.com");
+  await editor.getByRole("combobox", { name: "根域名", exact: true }).click();
+  await expect(editor.getByRole("option", { name: "new.example.com", exact: true })).toHaveAttribute("aria-selected", "true");
 });
 
 test("批量操作一次确认并逐项呈现失败", async ({ page }) => {
@@ -346,7 +351,8 @@ test("尚无 Agent 时禁止保存，并保留跳转前的草稿", async ({ page
   state.devices = devices;
   await page.goBack();
   await expect(editor.getByLabel("服务名称")).toHaveValue("等待 Agent 的服务");
-  await editor.getByLabel("Agent", { exact: true }).selectOption("a-1");
+  await editor.getByRole("combobox", { name: "Agent", exact: true }).click();
+  await editor.getByRole("option", { name: "家庭 Agent 在线", exact: true }).click();
   await expect(editor.getByRole("button", { name: "保存服务" })).toBeEnabled();
 });
 

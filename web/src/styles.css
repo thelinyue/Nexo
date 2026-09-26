@@ -220,7 +220,7 @@ dd>code { display:block; margin-bottom:10px; user-select:text; font-size:.9375re
 .form-section+ .form-section { padding-top:24px; border-top:1px solid var(--border); }
 .form-section h3 { color:var(--secondary); }
 .form-grid { display:grid; gap:16px; }
-/* 创建服务按 iOS 分组表单组织：常用项直接可见，原生选择器保留系统触控体验。 */
+/* 创建服务按分组表单组织，选择浮层与文本字段共享紧凑的行布局。 */
 .modal:has(>.service-form) { background:var(--bg); }
 .service-form>.modal-body { padding:16px; scroll-padding-block:12px; }
 .service-form>.modal-body>fieldset { gap:16px; }
@@ -231,6 +231,7 @@ dd>code { display:block; margin-bottom:10px; user-select:text; font-size:.9375re
 .protocol-option:has(input:focus-visible) { outline:3px solid var(--primary); outline-offset:1px; }
 .protocol-option:has(input:disabled) { opacity:.5; cursor:default; }
 .protocol-hint { margin-top:-8px; text-align:center; color:var(--secondary); font-size:.875rem; }
+.service-form-section { min-width:0; }
 .service-form-section h3 { margin:0 0 8px 4px; color:var(--secondary); font-size:.875rem; font-weight:600; }
 .service-field-group,.service-advanced { min-width:0; border:1px solid color-mix(in srgb,var(--border) 45%,transparent); background:var(--surface); border-radius:20px; }
 .service-field { display:flex; flex-wrap:wrap; align-items:center; gap:0 12px; padding:3px 14px; font-size:.875rem; font-weight:500; }
@@ -238,6 +239,28 @@ dd>code { display:block; margin-bottom:10px; user-select:text; font-size:.9375re
 .service-field>input,.service-field>select { flex:1 1 140px; width:0; min-width:0; min-height:48px; padding:8px 0; border:0; border-radius:8px; background:transparent; text-align:right; font-size:1rem; }
 .service-field:has([aria-invalid=true]) { box-shadow:inset 0 0 0 2px var(--danger); border-radius:12px; }
 .service-field+.service-field { border-top:1px solid var(--border); }
+.service-select-field { padding:0; }
+.service-select-trigger { display:flex; align-items:center; gap:12px; width:100%; min-width:0; min-height:54px; padding:10px 14px; border:0; border-radius:12px; background:transparent; color:var(--text); text-align:left; }
+.service-select-trigger:focus-visible { outline:2px solid var(--primary); outline-offset:-4px; }
+.service-select-trigger:active:not(:disabled) { background:var(--surface-soft); }
+.service-select-caption { flex:0 0 5rem; font-size:.875rem; font-weight:500; }
+.service-select-value { display:flex; align-items:center; justify-content:flex-end; gap:10px; flex:1; min-width:0; font-size:1rem; font-weight:400; }
+.service-select-value.placeholder { color:var(--muted); }
+.service-select-name { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.service-select-status { display:inline-flex; align-items:center; gap:5px; flex-shrink:0; color:var(--secondary); font-size:.8125rem; font-weight:400; white-space:nowrap; }
+.service-select-status i { width:6px; height:6px; border-radius:50%; background:var(--muted); }
+.service-select-status.online i { background:var(--success); }
+.service-select-trigger>svg { color:var(--secondary); transition:transform 140ms ease; }
+.service-select-trigger[aria-expanded=true]>svg { transform:rotate(180deg); }
+.service-select-trigger:disabled>svg { opacity:0; }
+.service-select-menu { position:fixed; inset:auto; margin:0; padding:6px; overflow-y:auto; overscroll-behavior:contain; border:1px solid var(--border); border-radius:12px; background:var(--surface); color:var(--text); box-shadow:0 8px 28px #0002,0 2px 6px #0001; }
+.service-select-option { display:flex; align-items:center; gap:12px; min-height:48px; padding:10px; border-radius:7px; font-size:1rem; font-weight:400; cursor:pointer; }
+.service-select-option-name { flex:1; min-width:0; overflow-wrap:anywhere; }
+.service-select-option[data-active=true] { background:var(--surface-raised); }
+.service-select-option[aria-selected=true] { background:color-mix(in srgb,var(--primary) 10%,var(--surface)); }
+.service-select-check { color:var(--primary); visibility:hidden; }
+.service-select-option[aria-selected=true]>.service-select-check { visibility:visible; }
+.service-select-field:has(.service-select-trigger:focus-visible) .service-select-option[data-active=true] { outline:2px solid var(--primary); outline-offset:-2px; }
 .service-toggle-field { min-height:54px; cursor:pointer; }
 .service-toggle-field>span { flex:1; }
 .service-toggle-field>input[type=checkbox] { flex:0 0 20px; width:20px; height:20px; min-height:20px; margin:0; padding:0; }

@@ -1,12 +1,92 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useId, useMemo, useRef, useState } from "react";
 import type { FormEvent } from "react";
-import { ChevronRight, Search, Trash2 } from "lucide-react";
+import { Check, ChevronDown, ChevronRight, Search, Trash2 } from "lucide-react";
 import { Confirm, CopyButton, CreateButton, DetailField, Empty, Loading, Modal, Notice, PageHeader, Status, errorText, localTarget, navigate, useApi, useResource } from "./ui";
 import type { Device, Domain, Tunnel } from "./ui";
 import { isLanRedirectAddress } from "./lan-redirect";
 
 type ServiceData = { tunnels: Tunnel[]; devices: Device[]; domains: Domain[] };
 const loadServices = async (request: ReturnType<typeof useApi>): Promise<ServiceData> => { const [tunnels, devices, domains] = await Promise.all([request<Tunnel[]>("/api/v1/tunnels"), request<Device[]>("/api/v1/devices"), request<Domain[]>("/api/v1/public-domains")]); return { tunnels, devices, domains: domains.filter(domain => domain.verification_status !== "pending") }; };
+
+type ServiceSelectOption = { value: string; label: string; status?: "online" | "offline" };
+
+/** 两个表单选择器共享原生顶层浮层，避免被 dialog 的滚动区裁切。焦点留在触发按钮，方向键仅移动候选项，确认后才修改草稿。 */
+function ServiceSelect({ label, name, value, placeholder, options, disabled, onChange, ...validation }: {
+  label: string; name: string; value: string; placeholder: string; options: ServiceSelectOption[]; disabled?: boolean;
+  onChange: (value: string) => void; "aria-invalid"?: boolean; "aria-describedby"?: string;
+}) {
+  const id = useId();
+  const triggerRef = useRef<HTMLButtonElement>(null); const menuRef = useRef<HTMLDivElement>(null);
+  const [open, setOpen] = useState(false); const [highlighted, setHighlighted] = useState(0);
+  const selected = options.find(option => option.value === value);
+  function close(restoreFocus = false) {
+    menuRef.current?.hidePopover(); setOpen(false);
+    if (restoreFocus) triggerRef.current?.focus({ preventScroll: true });
+  }
+  function position() {
+    const trigger = triggerRef.current; const menu = menuRef.current;
+    if (!trigger || !menu?.matches(":popover-open")) return;
+    const body = trigger.closest(".modal-body")!.getBoundingClientRect(); const row = trigger.getBoundingClientRect();
+    const viewport = window.visualViewport;
+    const top = Math.max(body.top, viewport?.offsetTop ?? 0) + 6;
+    const bottom = Math.min(body.bottom, (viewport?.offsetTop ?? 0) + (viewport?.height ?? window.innerHeight)) - 6;
+    const left = Math.max(body.left, viewport?.offsetLeft ?? 0) + 6;
+    const right = Math.min(body.right, (viewport?.offsetLeft ?? 0) + (viewport?.width ?? window.innerWidth)) - 6;
+    if (row.bottom <= top || row.top >= bottom) { close(); return; }
+    const width = Math.min(row.width, right - left);
+    menu.style.width = `${width}px`; menu.style.left = `${Math.max(left, Math.min(row.left, right - width))}px`;
+    const desired = Math.min(menu.scrollHeight + 2, 300);
+    const below = Math.max(0, bottom - row.bottom - 6); const above = Math.max(0, row.top - top - 6);
+    const down = below >= desired || below >= above;
+    const height = Math.min(desired, down ? below : above);
+    menu.style.maxHeight = `${height}px`;
+    menu.style.top = `${down ? row.bottom + 6 : row.top - 6 - height}px`;
+  }
+  function show() {
+    if (disabled || !options.length) return;
+    setHighlighted(Math.max(0, options.findIndex(option => option.value === value)));
+    triggerRef.current?.scrollIntoView({ block: "nearest" });
+    triggerRef.current?.focus({ preventScroll: true });
+    menuRef.current?.showPopover(); position(); setOpen(true);
+  }
+  function choose(index: number) {
+    if (options[index]) onChange(options[index].value);
+    close(true);
+  }
+  useEffect(() => { if (disabled) close(); }, [disabled]);
+  useEffect(() => {
+    if (!open) return;
+    // 定位以可见表单区为边界，软键盘、横竖屏和表单滚动时仍保留标题与保存栏。
+    const body = triggerRef.current!.closest(".modal-body")!;
+    const observer = new ResizeObserver(position); observer.observe(body); observer.observe(triggerRef.current!);
+    body.addEventListener("scroll", position); window.addEventListener("resize", position);
+    window.visualViewport?.addEventListener("resize", position); window.visualViewport?.addEventListener("scroll", position);
+    return () => { observer.disconnect(); body.removeEventListener("scroll", position); window.removeEventListener("resize", position); window.visualViewport?.removeEventListener("resize", position); window.visualViewport?.removeEventListener("scroll", position); };
+  }, [open]);
+  useEffect(() => {
+    const menu = menuRef.current; const option = menu?.children[highlighted] as HTMLElement | undefined;
+    if (!open || !menu || !option) return;
+    if (option.offsetTop < menu.scrollTop) menu.scrollTop = option.offsetTop;
+    else if (option.offsetTop + option.offsetHeight > menu.scrollTop + menu.clientHeight) menu.scrollTop = option.offsetTop + option.offsetHeight - menu.clientHeight;
+  }, [open, highlighted]);
+  const status = (option: ServiceSelectOption) => option.status && <span className={`service-select-status ${option.status}`}><i aria-hidden="true" />{option.status === "online" ? "在线" : "离线"}</span>;
+  return <div className="service-field service-select-field">
+    <button ref={triggerRef} type="button" role="combobox" name={name} value={value} className="service-select-trigger" aria-label={label} aria-haspopup="listbox" aria-expanded={open} aria-controls={id} aria-activedescendant={open ? `${id}-${highlighted}` : undefined} aria-required="true" {...validation} disabled={disabled || !options.length} onClick={() => open ? close() : show()} onKeyDown={event => {
+      if (event.nativeEvent.isComposing) return;
+      if (event.key === "Tab") { close(); return; }
+      if (event.key === "Escape" && open) { event.preventDefault(); event.stopPropagation(); close(true); return; }
+      if (["Enter", " ", "ArrowDown", "ArrowUp", "Home", "End"].includes(event.key)) {
+        event.preventDefault();
+        if (!open) { show(); return; }
+        if (event.key === "Enter" || event.key === " ") choose(highlighted);
+        else setHighlighted(current => event.key === "Home" ? 0 : event.key === "End" ? options.length - 1 : Math.max(0, Math.min(options.length - 1, current + (event.key === "ArrowDown" ? 1 : -1))));
+      }
+    }}><span className="service-select-caption">{label}</span><span className={`service-select-value${selected ? "" : " placeholder"}`}><span className="service-select-name" title={selected?.label}>{selected?.label ?? placeholder}</span>{selected && status(selected)}</span><ChevronDown size={17} aria-hidden="true" /></button>
+    <div ref={menuRef} id={id} popover="auto" role="listbox" aria-label={`${label}选项`} className="service-select-menu" onToggle={event => setOpen(event.currentTarget.matches(":popover-open"))} onMouseDown={event => event.preventDefault()}>
+      {options.map((option, index) => <div key={option.value} id={`${id}-${index}`} role="option" aria-selected={option.value === value} data-active={highlighted === index} className="service-select-option" onPointerMove={event => { if (event.pointerType === "mouse") setHighlighted(index); }} onClick={() => choose(index)}><span className="service-select-option-name">{option.label}</span>{status(option)}<Check size={18} className="service-select-check" aria-hidden="true" /></div>)}
+    </div>
+  </div>;
+}
 
 /** 表单草稿只驻留内存；跳转配置 Agent / 域名时暂时隐藏，返回后继续填写。 */
 function ServiceEditor({ tunnel, data, active, csrf, onClose, onSaved }: { tunnel?: Tunnel; data: ServiceData; active: boolean; csrf?: string | null; onClose: () => void; onSaved: (item: Tunnel) => void }) {
@@ -77,7 +157,7 @@ function ServiceEditor({ tunnel, data, active, csrf, onClose, onSaved }: { tunne
         <p className="protocol-hint">{draft.protocol === "tcp" ? "通过公网端口访问本地服务" : draft.protocol === "http" ? "通过域名访问 Web 服务" : "通过 HTTPS 域名访问 Web 服务"}</p>
         <section className="service-form-section"><div className="service-field-group">
           <label className="service-field"><span>服务名称</span><input {...fieldProps("name")} value={draft.name} onChange={e => update("name", e.target.value)} placeholder="例如：家庭 NAS" enterKeyHint="next" autoComplete="off" required /></label>
-          <label className="service-field"><span>Agent</span><select {...fieldProps("device_id")} aria-label="Agent" value={draft.device_id} onChange={e => update("device_id", e.target.value)} required><option value="">选择 Agent</option>{devices.map(item => <option key={item.id} value={item.id}>{item.name} · {item.status === "online" ? "在线" : "离线"}</option>)}</select></label>
+          <ServiceSelect {...fieldProps("device_id")} label="Agent" value={draft.device_id} placeholder="选择 Agent" options={devices.map(item => ({ value: item.id, label: item.name, status: item.status === "online" ? "online" : "offline" }))} disabled={busy} onChange={value => update("device_id", value)} />
         </div>{!devices.length && <div className="notice"><span>请先接入一台 Agent。</span><button type="button" className="text-button" onClick={() => navigate("#/agents", true)}>配置 Agent</button></div>}{devices.find(item => item.id === draft.device_id)?.status === "offline" && <p className="helper" role="status">Agent 当前离线，可保存配置，连接恢复后下发。</p>}</section>
         <section className="service-form-section"><h3>本地目标</h3><div className="service-field-group">
           <label className="service-field"><span>地址</span><input aria-label="本地地址" {...fieldProps("local_address")} value={draft.local_address} onChange={e => update("local_address", e.target.value)} inputMode="url" enterKeyHint="next" autoComplete="off" autoCorrect="off" autoCapitalize="none" spellCheck={false} required /></label>
@@ -85,7 +165,7 @@ function ServiceEditor({ tunnel, data, active, csrf, onClose, onSaved }: { tunne
         </div><p className="helper">127.0.0.1 指 Agent 所在设备。</p></section>
         {draft.protocol === "tcp" ? <details className="service-advanced" open={advancedOpen} onToggle={event => setAdvancedOpen(event.currentTarget.open)}><summary><span>公网端口</span><span>{draft.public_port || "自动分配"}</span><ChevronRight size={17} /></summary><label className="service-field"><span>指定端口</span><input {...fieldProps("public_port")} aria-label="公网端口" type="text" inputMode="numeric" enterKeyHint="done" autoComplete="off" value={draft.public_port} onChange={e => update("public_port", e.target.value)} placeholder="留空自动分配" /></label><p className="helper">可填写 20000–29999，通常无需修改。</p></details> : <section className="service-form-section"><h3>公网入口</h3><div className="service-field-group">
           <label className="service-field"><span>主机名</span><input {...fieldProps("hostname")} value={draft.hostname} onChange={e => update("hostname", e.target.value)} placeholder="例如：nas" enterKeyHint="done" autoComplete="off" autoCorrect="off" autoCapitalize="none" spellCheck={false} required /></label>
-          <label className="service-field"><span>根域名</span><select {...fieldProps("public_domain_id")} aria-label="根域名" value={draft.public_domain_id} onChange={e => update("public_domain_id", e.target.value)} required disabled={Boolean(tunnel)}><option value="">选择域名</option>{data.domains.map(item => <option key={item.id} value={item.id}>{item.domain}</option>)}</select></label>
+          <ServiceSelect {...fieldProps("public_domain_id")} label="根域名" value={draft.public_domain_id} placeholder="选择域名" options={data.domains.map(item => ({ value: item.id, label: item.domain }))} disabled={busy || Boolean(tunnel)} onChange={value => update("public_domain_id", value)} />
         </div>{!data.domains.length && <div className="notice"><span>Web 服务需要根域名。</span><button type="button" className="text-button" onClick={() => navigate("#/domains", true)}>添加域名</button></div>}{tunnel && <p className="helper">现有服务保留原根域名；更换根域名请创建新服务。</p>}</section>}
         {draft.protocol !== "tcp" && <section className="service-form-section"><div className="service-field-group">
           <label className="service-field service-toggle-field"><span>内网重定向</span><input {...fieldProps("lan_redirect_enabled")} type="checkbox" checked={draft.lan_redirect_enabled} onChange={e => update("lan_redirect_enabled", e.target.checked)} /></label>
