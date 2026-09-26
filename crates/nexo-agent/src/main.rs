@@ -16,6 +16,8 @@ use tokio::{net::TcpStream, sync::watch, task::JoinSet};
 use tokio_rustls::TlsConnector;
 use tokio_util::codec::{FramedRead, LinesCodec};
 mod certificate;
+#[cfg(test)]
+mod origin_tests;
 
 #[derive(Debug, Parser)]
 #[command(name = "nexo-agent", about = "Nexo 内网穿透 Agent")]

@@ -3,6 +3,33 @@ import { installApiMocks } from "./api-mocks";
 
 const visiblePage = (page: import("@playwright/test").Page) => page.locator(".page-slot:not([hidden])");
 
+test("网页类型包含 HTTP 和 HTTPS，内网 IPv6 地址单行展示并完整复制", async ({ page }, info) => {
+  const state = await installApiMocks(page);
+  const ip = "fd12:3456:789a:bcde:1234:5678:90ab:cdef";
+  Object.assign(state.tunnels[0], { origin_protocol: "https", local_address: ip, local_port: 8443 });
+  state.tunnels.push({ ...state.tunnels[0], id: "plain", name: "普通网页", protocol: "http", origin_protocol: "http" }, { ...state.tunnels[0], id: "tcp", name: "TCP 应用", protocol: "tcp" });
+  await page.goto("/#/services");
+  const filter = page.getByLabel("类型筛选");
+  await expect(filter.locator("option")).toHaveText(["全部类型", "网页服务", "TCP 服务"]);
+  await filter.selectOption("web");
+  await expect(page.locator(".service-row")).toHaveCount(2);
+  await expect(page.locator(".service-meta")).toHaveText(["网页服务 · 家庭 Agent", "网页服务 · 家庭 Agent"]);
+  await page.getByRole("link", { name: "媒体中心", exact: true }).click();
+  const field = page.locator(".detail-field", { has: page.getByText("内网地址", { exact: true }) });
+  const code = field.locator("code");
+  await expect(code).toHaveText(`https://[${ip}]:8443`);
+  await expect(code).toHaveCSS("white-space", "nowrap");
+  await page.evaluate(() => Object.defineProperty(navigator, "clipboard", { configurable: true, value: { writeText: async (value: string) => { document.body.dataset.copiedAddress = value; } } }));
+  await field.getByRole("button", { name: "复制内网地址" }).click();
+  await expect(page.locator("body")).toHaveAttribute("data-copied-address", `https://[${ip}]:8443`);
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBeTruthy();
+  await page.screenshot({ path: info.outputPath("compact-service-detail.png"), animations: "disabled" });
+  await page.getByRole("button", { name: "编辑服务" }).click();
+  const editor = page.getByRole("dialog", { name: "编辑服务" });
+  await expect(editor.getByLabel("内网协议")).toHaveValue("https");
+  await expect(editor.getByLabel("内网地址", { exact: true })).toHaveValue(ip);
+});
+
 test("两入口导航、旧链接和不存在的详情均可返回", async ({ page }) => {
   await installApiMocks(page);
   await page.goto("/#/services");
@@ -88,8 +115,9 @@ for (const protocol of ["tcp", "http", "https"]) {
     await page.getByRole("button", { name: "创建服务", exact: true }).click();
     const dialog = page.getByRole("dialog", { name: "创建服务" });
     await dialog.getByLabel("服务名称").fill("新服务");
-    await dialog.getByRole("radio", { name: protocol.toUpperCase(), exact: true }).check();
-    await dialog.getByLabel("本地端口").fill("8080");
+    await dialog.getByRole("radio", { name: protocol === "tcp" ? "TCP 服务" : "网页服务", exact: true }).check();
+    if (protocol !== "tcp") await dialog.getByLabel("公网协议").selectOption(protocol);
+    await dialog.getByLabel("内网端口").fill("8080");
     if (protocol !== "tcp") { await dialog.getByLabel("主机名").fill("new"); await dialog.getByRole("combobox", { name: "根域名", exact: true }).click(); await dialog.getByRole("option", { name: "example.com", exact: true }).click(); }
     state.failures.set("POST /api/v1/tunnels", "暂时无法保存");
     await dialog.getByRole("button", { name: "保存服务" }).click();
@@ -147,7 +175,7 @@ test("无域名时跳转配置并恢复服务草稿", async ({ page }) => {
   await page.getByRole("button", { name: "创建服务", exact: true }).click();
   const editor = page.getByRole("dialog", { name: "创建服务" });
   await editor.getByLabel("服务名称").fill("草稿服务");
-  await editor.getByRole("radio", { name: "HTTPS", exact: true }).check();
+  await editor.getByRole("radio", { name: "网页服务", exact: true }).check();
   await editor.getByRole("button", { name: "添加域名", exact: true }).click();
   await page.getByRole("button", { name: "添加 域名", exact: true }).click();
   const add = page.getByRole("dialog", { name: "添加域名" });
@@ -161,7 +189,7 @@ test("无域名时跳转配置并恢复服务草稿", async ({ page }) => {
   await expect(visiblePage(page).getByRole("heading", { name: "域名与证书", exact: true })).toBeVisible();
   await page.goBack();
   await expect(editor.getByLabel("服务名称")).toHaveValue("草稿服务");
-  await expect(editor.getByRole("radio", { name: "HTTPS", exact: true })).toBeChecked();
+  await expect(editor.getByRole("radio", { name: "网页服务", exact: true })).toBeChecked();
   await expect(editor.getByRole("combobox", { name: "根域名", exact: true })).toContainText("new.example.com");
   await editor.getByRole("combobox", { name: "根域名", exact: true }).click();
   await expect(editor.getByRole("option", { name: "new.example.com", exact: true })).toHaveAttribute("aria-selected", "true");

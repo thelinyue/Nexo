@@ -155,7 +155,8 @@ test("代管空间中重新认证保留原空间及服务草稿", async ({ page 
   });
   await page.goto("/#/users");await page.getByRole("button",{name:"管理 alice 的空间"}).click();
   await page.getByRole("button",{name:"创建服务"}).click();const editor=page.getByRole("dialog",{name:"创建服务"});
-  await editor.getByLabel("服务名称").fill("保留代管草稿");await editor.getByLabel("本地端口").fill("8080");
+  await editor.getByLabel("服务名称").fill("保留代管草稿");await editor.getByLabel("内网端口").fill("8080");
+  await editor.getByLabel("主机名").fill("reauth");
   await editor.getByRole("button",{name:"保存服务"}).click();const login=page.getByRole("dialog",{name:"登录已过期"});
   await login.getByLabel("密码",{exact:true}).fill("admin-password");expired=false;
   await login.getByRole("button",{name:"登录",exact:true}).click();
@@ -282,7 +283,8 @@ test("重新认证可输入新用户名，切换账号清除代管和旧草稿",
   await page.goto("/#/users"); await page.getByRole("button", { name: "管理 alice 的空间" }).click();
   await page.getByRole("button", { name: "创建第一个服务", exact: true }).click();
   const editor = page.getByRole("dialog", { name: "创建服务" });
-  await editor.getByLabel("服务名称").fill("旧账号未保存草稿"); await editor.getByLabel("本地端口").fill("8080");
+  await editor.getByLabel("服务名称").fill("旧账号未保存草稿"); await editor.getByLabel("内网端口").fill("8080");
+  await editor.getByLabel("主机名").fill("reauth");
   await editor.getByRole("button", { name: "保存服务" }).click();
   const login = page.getByRole("dialog", { name: "登录已过期" });
   await login.getByLabel("用户名", { exact: true }).fill("bob-new");

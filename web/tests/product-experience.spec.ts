@@ -50,7 +50,7 @@ test("协议、状态和 Agent 筛选组合可清空，空状态按资源给出�
   const state = await installApiMocks(page);
   state.tunnels.push({ ...state.tunnels[0], id: "t-2", protocol: "tcp", enabled: false, device_id: "a-2", name: "备用服务" });
   await page.goto("/#/services");
-  await page.getByLabel("协议筛选").selectOption("tcp");
+  await page.getByLabel("类型筛选").selectOption("tcp");
   await page.getByLabel("服务筛选").selectOption("disabled");
   await page.getByLabel("Agent 筛选").selectOption("a-2");
   await expect(page.locator(".service-row")).toHaveCount(1);

@@ -171,6 +171,8 @@ struct Tunnel {
     device_name: Option<String>,
     name: String,
     protocol: String,
+    /// 内网回源协议独立于公网协议；TCP 不使用，旧网页服务默认 HTTP。
+    origin_protocol: Option<String>,
     local_address: String,
     local_port: u16,
     public_port: Option<u16>,
@@ -189,6 +191,8 @@ struct TunnelInput {
     device_id: Option<String>,
     name: String,
     protocol: String,
+    /// 内网回源协议独立于公网协议；TCP 不使用，旧网页服务默认 HTTP。
+    origin_protocol: Option<String>,
     local_address: String,
     local_port: u16,
     public_port: Option<u16>,
@@ -660,7 +664,7 @@ async fn create_tunnel(
         let db = state.db.lock().map_err(|_| db_error("数据库锁不可用"))?;
         let db = db.unchecked_transaction().map_err(db_error)?;
         prepare_tunnel(&db, &session.tenant_id, &id, &mut input)?;
-        db.execute("INSERT INTO tunnels (id,tenant_id,device_id,name,protocol,local_address,local_port,public_port,hostname,enabled,apply_status,apply_revision,public_domain_id,created_at,updated_at,lan_redirect_enabled) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,'checking',1,?11,?12,?12,?13)",params![id,session.tenant_id,input.device_id,input.name.trim(),input.protocol,input.local_address.trim(),input.local_port,input.public_port,input.hostname,input.enabled.unwrap_or(true),input.public_domain_id,unix_now(),input.lan_redirect_enabled.unwrap_or(false)]).map_err(db_error)?;
+        db.execute("INSERT INTO tunnels (id,tenant_id,device_id,name,protocol,local_address,local_port,public_port,hostname,enabled,apply_status,apply_revision,public_domain_id,created_at,updated_at,lan_redirect_enabled,origin_protocol) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,'checking',1,?11,?12,?12,?13,?14)",params![id,session.tenant_id,input.device_id,input.name.trim(),input.protocol,input.local_address.trim(),input.local_port,input.public_port,input.hostname,input.enabled.unwrap_or(true),input.public_domain_id,unix_now(),input.lan_redirect_enabled.unwrap_or(false),input.origin_protocol]).map_err(db_error)?;
         accounts::audit(&db, &session, "service_created", "service", &id)?;
         db.commit().map_err(db_error)?;
     }
@@ -683,7 +687,7 @@ async fn update_tunnel(
         let db = db.unchecked_transaction().map_err(db_error)?;
         if !db.query_row("SELECT EXISTS(SELECT 1 FROM tunnels WHERE id=?1 AND tenant_id=?2 AND deleted_at IS NULL)",params![id,session.tenant_id], |r| r.get::<_,bool>(0)).map_err(db_error)? { return Err(ApiError::new(StatusCode::NOT_FOUND,"服务不存在")); }
         prepare_tunnel(&db, &session.tenant_id, &id, &mut input)?;
-        db.execute("UPDATE tunnels SET device_id=?1,name=?2,protocol=?3,local_address=?4,local_port=?5,public_port=?6,hostname=?7,enabled=?8,apply_revision=apply_revision+1,apply_status='checking',updated_at=?9,public_domain_id=?12,lan_redirect_enabled=?13 WHERE id=?10 AND tenant_id=?11 AND deleted_at IS NULL",params![input.device_id,input.name.trim(),input.protocol,input.local_address.trim(),input.local_port,input.public_port,input.hostname,input.enabled.unwrap_or(true),unix_now(),id,session.tenant_id,input.public_domain_id,input.lan_redirect_enabled.unwrap_or(false)]).map_err(db_error)?;
+        db.execute("UPDATE tunnels SET device_id=?1,name=?2,protocol=?3,local_address=?4,local_port=?5,public_port=?6,hostname=?7,enabled=?8,apply_revision=apply_revision+1,apply_status='checking',updated_at=?9,public_domain_id=?12,lan_redirect_enabled=?13,origin_protocol=?14 WHERE id=?10 AND tenant_id=?11 AND deleted_at IS NULL",params![input.device_id,input.name.trim(),input.protocol,input.local_address.trim(),input.local_port,input.public_port,input.hostname,input.enabled.unwrap_or(true),unix_now(),id,session.tenant_id,input.public_domain_id,input.lan_redirect_enabled.unwrap_or(false),input.origin_protocol]).map_err(db_error)?;
         accounts::audit(&db, &session, "service_updated", "service", &id)?;
         db.commit().map_err(db_error)?;
     }
@@ -1011,7 +1015,7 @@ fn query_tunnels(
         .get(axum::http::header::HOST)
         .and_then(|value| value.to_str().ok())
         .and_then(|host| host.parse::<axum::http::uri::Authority>().ok());
-    let sql="SELECT t.id,t.tenant_id,t.device_id,d.name,t.name,t.protocol,t.local_address,t.local_port,t.public_port,t.hostname,t.enabled,t.apply_status,t.apply_error,t.apply_revision,t.public_domain_id,t.deleted_at,p.domain,t.lan_redirect_enabled FROM tunnels t LEFT JOIN devices d ON d.id=t.device_id LEFT JOIN public_domains p ON p.id=t.public_domain_id WHERE t.tenant_id=?1 AND t.deleted_at IS NULL AND (?2 IS NULL OR t.id=?2) ORDER BY t.created_at DESC";
+    let sql="SELECT t.id,t.tenant_id,t.device_id,d.name,t.name,t.protocol,t.local_address,t.local_port,t.public_port,t.hostname,t.enabled,t.apply_status,t.apply_error,t.apply_revision,t.public_domain_id,t.deleted_at,p.domain,t.lan_redirect_enabled,CASE WHEN t.protocol='tcp' THEN NULL ELSE COALESCE(t.origin_protocol,'http') END FROM tunnels t LEFT JOIN devices d ON d.id=t.device_id LEFT JOIN public_domains p ON p.id=t.public_domain_id WHERE t.tenant_id=?1 AND t.deleted_at IS NULL AND (?2 IS NULL OR t.id=?2) ORDER BY t.created_at DESC";
     let mut q = connection.prepare(sql)?;
     let rows = q
         .query_map(params![tenant, only], |row| {
@@ -1035,6 +1039,7 @@ fn query_tunnels(
                 device_name: row.get(3)?,
                 name: row.get(4)?,
                 protocol,
+                origin_protocol: row.get(18)?,
                 local_address: row.get(6)?,
                 local_port: row.get(7)?,
                 public_port: port,
@@ -1060,6 +1065,20 @@ fn prepare_tunnel(
     input: &mut TunnelInput,
 ) -> Result<(), ApiError> {
     validate_tunnel(input)?;
+    // 先确定本次有效回源协议，随后重定向验证、持久化与 Agent 下发使用同一份值。
+    // 旧客户端更新时省略字段必须保留已有 HTTPS，不能意外降级。
+    input.origin_protocol = if input.protocol == "tcp" {
+        None
+    } else {
+        Some(match input.origin_protocol.take() {
+            Some(protocol) => protocol,
+            None => db.query_row(
+                "SELECT origin_protocol FROM tunnels WHERE id=?1 AND tenant_id=?2 AND deleted_at IS NULL",
+                params![id, tenant],
+                |row| row.get::<_, Option<String>>(0),
+            ).optional().map_err(db_error)?.flatten().unwrap_or_else(|| "http".into()),
+        })
+    };
     lan_redirect::prepare(db, tenant, id, input)?;
     if let Some(device) = &input.device_id {
         let owned: bool = db
@@ -1161,14 +1180,24 @@ fn validate_tunnel(input: &TunnelInput) -> Result<(), ApiError> {
             "协议必须是 TCP、HTTP 或 HTTPS",
         ));
     }
+    if input
+        .origin_protocol
+        .as_deref()
+        .is_some_and(|value| !matches!(value, "http" | "https"))
+    {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "内网协议必须是 HTTP 或 HTTPS",
+        ));
+    }
     if input.local_address.trim().is_empty() || input.local_address.contains(['/', '\\', ' ']) {
         return Err(ApiError::new(
             StatusCode::BAD_REQUEST,
-            "本地地址必须是主机名或 IP，不含网址前缀或路径",
+            "内网地址必须是主机名或 IP，不含网址前缀或路径",
         ));
     }
     if input.local_port == 0 {
-        return Err(ApiError::new(StatusCode::BAD_REQUEST, "本地端口无效"));
+        return Err(ApiError::new(StatusCode::BAD_REQUEST, "内网端口无效"));
     }
     Ok(())
 }

@@ -29,7 +29,8 @@ test("保存遇到会话过期后重新登录，保留原服务草稿", async ({
   await page.getByRole("button", { name: "创建服务" }).click();
   const editor = page.getByRole("dialog", { name: "创建服务" });
   await editor.getByLabel("服务名称").fill("保留我的草稿");
-  await editor.getByLabel("本地端口").fill("8080");
+  await editor.getByLabel("内网端口").fill("8080");
+  await editor.getByLabel("主机名").fill("reauth");
   state.failures.set("POST /api/v1/tunnels", "登录已过期"); state.failureStatuses.set("POST /api/v1/tunnels", 401);
   await editor.getByRole("button", { name: "保存服务" }).click();
   const login = page.getByRole("dialog", { name: "登录已过期" });
@@ -44,7 +45,7 @@ test("保存遇到会话过期后重新登录，保留原服务草稿", async ({
   await login.getByRole("button", { name: "登录", exact: true }).click();
   await expect(login).toBeHidden();
   await expect(editor.getByLabel("服务名称")).toHaveValue("保留我的草稿");
-  await expect(editor.getByLabel("本地端口")).toHaveValue("8080");
+  await expect(editor.getByLabel("内网端口")).toHaveValue("8080");
   await editor.getByRole("button", { name: "保存服务" }).click();
   await expect(editor).toBeHidden();
   expect(state.tunnels.some(item => item.name === "保留我的草稿")).toBeTruthy();
@@ -123,13 +124,13 @@ test("DNS 状态在列表与详情自动更新，后台暂停读取且不触发�
   const entry = page.locator(".domain-access-button");
   await expect(entry).toHaveText("解析待检查");
   state.dnsChecked = true; state.dnsMatches = false;
-  await page.clock.fastForward(5000);
+  await page.clock.runFor(5000);
   await expect(entry).toHaveText("解析需核对");
   await entry.click();
   const dialog = page.getByRole("dialog", { name: "域名解析", exact: true });
   await expect(dialog.getByText(/部分解析地址与 Server 不同/)).toBeVisible();
   state.dnsMatches = true;
-  await page.clock.fastForward(5000);
+  await page.clock.runFor(5000);
   await expect(dialog.getByText("与 Server 地址一致。")).toBeVisible();
   expect(state.calls.every(call => call.method === "GET")).toBeTruthy();
   await page.evaluate(() => Object.defineProperty(document, "visibilityState", { configurable: true, get: () => "hidden" }));

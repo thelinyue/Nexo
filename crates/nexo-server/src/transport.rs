@@ -1158,6 +1158,7 @@ mod tests {
             device_id: Some(device.into()),
             name: "test".into(),
             protocol: "tcp".into(),
+            origin_protocol: None,
             local_address: "127.0.0.1".into(),
             local_port: 1234,
             public_port: Some(port),

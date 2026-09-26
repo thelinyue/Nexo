@@ -3,7 +3,7 @@ import type { InputHTMLAttributes, ReactNode } from "react";
 import { ArrowLeft, Check, ChevronRight, Copy, FileQuestion, Globe2, Network, Plus, Search, Server, ShieldCheck, Users, X } from "lucide-react";
 
 export type Auth = { initialized: boolean; authenticated: boolean; user_id?: string; username?: string; role?: "system_admin" | "tenant"; workspace_id?: string; csrf_token?: string | null; local_http_warning?: boolean };
-export type Tunnel = { id: string; name: string; protocol: string; local_address: string; local_port: number; public_port?: number | null; public_address?: string | null; device_id?: string | null; device_name?: string | null; hostname?: string | null; enabled: boolean; apply_status: string; apply_error?: string | null; public_domain?: string | null; lan_redirect_enabled: boolean };
+export type Tunnel = { id: string; name: string; protocol: string; origin_protocol?: "http" | "https" | null; local_address: string; local_port: number; public_port?: number | null; public_address?: string | null; device_id?: string | null; device_name?: string | null; hostname?: string | null; enabled: boolean; apply_status: string; apply_error?: string | null; public_domain?: string | null; lan_redirect_enabled: boolean };
 export type IdentityCertificate = { status: string; expires_at: number | null; renew_after: number | null; error: string | null; next_retry_at: number | null };
 export type TransportIdentity = { server: IdentityCertificate; ca_expires_at: number | null; ca_needs_attention: boolean };
 export type Device = { id: string; name: string; status: string; os?: string | null; architecture?: string | null; agent_version?: string | null; tunnel_count: number; enrolled_at?: number | null; last_seen_at?: number | null; certificate?: IdentityCertificate };
@@ -47,7 +47,8 @@ export function consumeModalNavigation(route: string) { const retained = allowed
 // Safari 的触摸点击不一定聚焦按钮，显式记住触发控件用于弹层关闭后的焦点恢复。
 let interactionTarget: HTMLElement | null = null;
 export function rememberInteraction(target: EventTarget | null) { interactionTarget = target instanceof Element ? target.closest<HTMLElement>("button,a,input,textarea,select") : null; }
-export const localTarget = (item: Tunnel) => `${item.local_address.includes(":") ? `[${item.local_address.replace(/^\[|\]$/g, "")}]` : item.local_address}:${item.local_port}`;
+// 网页服务展示真实内网协议，避免把公网 HTTPS 误认为内网也使用 HTTPS。
+export const localTarget = (item: Tunnel) => `${item.protocol === "tcp" ? "" : `${item.origin_protocol ?? "http"}://`}${item.local_address.includes(":") ? `[${item.local_address.replace(/^\[|\]$/g, "")}]` : item.local_address}:${item.local_port}`;
 export const dateText = (value?: number | null) => value ? new Date(value * 1000).toLocaleString("zh-CN", { year: "numeric", month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit", hour12: false }) : "暂无记录";
 
 /** 密码显隐只改变当前输入的呈现，不改变自动填充语义或保存密码。 */

@@ -1,6 +1,74 @@
 import { expect, test } from "@playwright/test";
 import { installApiMocks } from "./api-mocks";
 
+for (const protocol of ["http", "https"]) for (const origin of ["http", "https"]) {
+  test(`公网 ${protocol} 与内网 ${origin} 独立保存、回填且切换不改端口`, async ({ page }) => {
+    const state = await installApiMocks(page);
+    await page.goto("/#/services");
+    await page.getByRole("button", { name: "创建服务", exact: true }).click();
+    const dialog = page.getByRole("dialog", { name: "创建服务" });
+    await dialog.getByLabel("服务名称").fill("独立协议");
+    await dialog.getByLabel("内网地址", { exact: true }).fill("192.168.1.10");
+    await dialog.getByLabel("内网端口").fill("8443");
+    await dialog.getByLabel("主机名").fill("independent");
+    await dialog.getByLabel("公网协议").selectOption(protocol);
+    await dialog.getByLabel("内网协议").selectOption(origin);
+    await dialog.getByRole("radio", { name: "TCP 服务" }).check();
+    await dialog.getByRole("radio", { name: "网页服务" }).check();
+    await expect(dialog.getByLabel("公网协议")).toHaveValue(protocol);
+    await expect(dialog.getByLabel("内网协议")).toHaveValue(origin);
+    await expect(dialog.getByLabel("内网端口")).toHaveValue("8443");
+    await dialog.getByRole("button", { name: "保存服务" }).click();
+    await expect(dialog).toBeHidden();
+    expect(state.calls.find(call => call.method === "POST")?.body).toMatchObject({ protocol, origin_protocol: origin, local_port: 8443, public_port: null });
+    await page.getByRole("link", { name: "独立协议", exact: true }).click();
+    await expect(page.locator(".detail-field", { has: page.getByText("内网地址", { exact: true }) })).toContainText(`${origin}://192.168.1.10:8443`);
+    await page.getByRole("button", { name: "编辑服务" }).click();
+    const editor = page.getByRole("dialog", { name: "编辑服务" });
+    await expect(editor.getByLabel("公网协议")).toHaveValue(protocol);
+    await expect(editor.getByLabel("内网协议")).toHaveValue(origin);
+    const next = origin === "http" ? "https" : "http";
+    await editor.getByLabel("内网协议").selectOption(next);
+    await editor.getByRole("button", { name: "保存服务" }).click();
+    await expect(editor).toBeHidden();
+    expect(state.calls.find(call => call.method === "PUT")?.body).toMatchObject({ protocol, origin_protocol: next, local_port: 8443 });
+  });
+}
+
+test("窄屏两个地址组保持同行，长地址仍可编辑且保存按钮可见", async ({ page }, info) => {
+  await installApiMocks(page);
+  await page.goto("/#/services");
+  await page.getByRole("button", { name: "创建服务", exact: true }).click();
+  const dialog = page.getByRole("dialog", { name: "创建服务" });
+  await dialog.getByLabel("服务名称").fill("家庭 NAS");
+  await dialog.getByLabel("内网地址", { exact: true }).fill("192.168.1.10");
+  await dialog.getByLabel("内网端口").fill("65535");
+  await dialog.getByLabel("主机名").fill("nas");
+  for (const width of [page.viewportSize()!.width, 320]) {
+    await page.setViewportSize({ width, height: page.viewportSize()!.height });
+    for (const selector of [".service-address-input", ".service-public-input"]) {
+      const group = dialog.locator(selector);
+      const boxes = await group.locator(":scope > input, :scope > select, :scope > .service-select-field").evaluateAll(elements => elements.map(element => { const r = element.getBoundingClientRect(); return { x: r.x, y: r.y, right: r.right, height: r.height }; }));
+      expect(boxes).toHaveLength(3);
+      for (const box of boxes) {
+        expect(Math.abs(box.y - boxes[0].y)).toBeLessThanOrEqual(1);
+        expect(box.height).toBeGreaterThanOrEqual(44);
+        expect(box.x).toBeGreaterThanOrEqual(0);
+        expect(box.right).toBeLessThanOrEqual(width);
+      }
+      for (let i = 1; i < boxes.length; i++) expect(boxes[i].x).toBeGreaterThanOrEqual(boxes[i - 1].right);
+    }
+    await expect(dialog.getByRole("button", { name: "保存服务" })).toBeInViewport();
+    expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBeTruthy();
+    await page.screenshot({ path: info.outputPath(`compact-web-${width}.png`), animations: "disabled" });
+  }
+  const address = dialog.getByLabel("内网地址", { exact: true });
+  await address.fill("fd12:3456:789a:bcde:1234:5678:90ab:cdef");
+  await address.press("End");
+  await expect(address).toHaveValue("fd12:3456:789a:bcde:1234:5678:90ab:cdef");
+  await expect(address).toBeFocused();
+});
+
 test("协议直接点选且单域名自动填入，打开表单不抢占输入焦点", async ({ page }, testInfo) => {
   await installApiMocks(page);
   await page.goto("/#/services");
@@ -8,9 +76,12 @@ test("协议直接点选且单域名自动填入，打开表单不抢占输入�
   const dialog = page.getByRole("dialog", { name: "创建服务" });
   await expect(dialog).toBeVisible();
   expect(await page.evaluate(() => document.activeElement instanceof HTMLInputElement)).toBeFalsy();
-  await expect(dialog.getByRole("radio", { name: "TCP", exact: true })).toBeChecked();
+  await expect(dialog.getByRole("radio", { name: "网页服务", exact: true })).toBeChecked();
+  await expect(dialog.locator(".protocol-option")).toHaveText(["网页服务", "TCP 服务"]);
+  await expect(dialog.getByLabel("公网协议")).toHaveValue("https");
+  await expect(dialog.getByLabel("内网协议")).toHaveValue("http");
   await expect(dialog.getByLabel("公网端口", { exact: true })).toBeHidden();
-  await dialog.getByRole("radio", { name: "HTTPS", exact: true }).check();
+  await dialog.getByRole("radio", { name: "网页服务", exact: true }).check();
   await expect(dialog.getByRole("combobox", { name: "根域名", exact: true })).toContainText("example.com");
   await dialog.getByLabel("主机名").fill("nas");
   await expect(dialog.locator(".service-submit-preview code")).toHaveText("https://nas.example.com");
@@ -22,16 +93,17 @@ test("错误定位到具体字段，折叠的无效端口自动展开，未通�
   await page.goto("/#/services");
   await page.getByRole("button", { name: "创建服务", exact: true }).click();
   const dialog = page.getByRole("dialog", { name: "创建服务" });
+  await dialog.getByRole("radio", { name: "TCP 服务", exact: true }).check();
   const save = dialog.getByRole("button", { name: "保存服务" });
   await save.click();
   await expect(dialog.getByLabel("服务名称")).toBeFocused();
   await expect(dialog.getByLabel("服务名称")).toHaveAttribute("aria-invalid", "true");
   await dialog.getByLabel("服务名称").fill("手机创建");
-  await dialog.getByLabel("本地端口").fill("65536");
+  await dialog.getByLabel("内网端口").fill("65536");
   await save.click();
-  await expect(dialog.getByLabel("本地端口")).toBeFocused();
+  await expect(dialog.getByLabel("内网端口")).toBeFocused();
   await expect(dialog.getByRole("alert")).toContainText("1–65535");
-  await dialog.getByLabel("本地端口").fill("8080");
+  await dialog.getByLabel("内网端口").fill("8080");
   await dialog.locator("summary").click();
   await dialog.getByLabel("公网端口", { exact: true }).fill("19999");
   await dialog.locator("summary").click();
@@ -53,9 +125,9 @@ test("键盘下一项不误提交，可视区域缩小后字段和保存按钮�
   const dialog = page.getByRole("dialog", { name: "创建服务" });
   await dialog.getByLabel("服务名称").fill("键盘测试");
   await dialog.getByLabel("服务名称").press("Enter");
-  await expect(dialog.getByLabel("本地地址")).toBeFocused();
-  await dialog.getByLabel("本地地址").press("Enter");
-  const port = dialog.getByLabel("本地端口");
+  await expect(dialog.getByLabel("内网地址")).toBeFocused();
+  await dialog.getByLabel("内网地址").press("Enter");
+  const port = dialog.getByLabel("内网端口");
   await expect(port).toBeFocused();
   await port.fill("8080");
   await page.setViewportSize({ width: 390, height: 420 });
@@ -78,18 +150,19 @@ test("协议切换保留输入，但不提交其他协议的端口；多域名�
   await page.goto("/#/services");
   await page.getByRole("button", { name: "创建服务", exact: true }).click();
   const dialog = page.getByRole("dialog", { name: "创建服务" });
+  await dialog.getByRole("radio", { name: "TCP 服务", exact: true }).check();
   await dialog.getByLabel("服务名称").fill("Web 服务");
-  await dialog.getByLabel("本地端口").fill("8080");
+  await dialog.getByLabel("内网端口").fill("8080");
   await dialog.locator("summary").click();
   await dialog.getByLabel("公网端口", { exact: true }).fill("21000");
-  await dialog.getByRole("radio", { name: "HTTPS", exact: true }).check();
+  await dialog.getByRole("radio", { name: "网页服务", exact: true }).check();
   await expect(dialog.getByRole("combobox", { name: "根域名", exact: true })).toContainText("选择域名");
   await dialog.getByLabel("主机名").fill("nas");
   await dialog.getByRole("combobox", { name: "根域名", exact: true }).click();
   await dialog.getByRole("option", { name: "second.example.com", exact: true }).click();
-  await dialog.getByRole("radio", { name: "TCP", exact: true }).check();
+  await dialog.getByRole("radio", { name: "TCP 服务", exact: true }).check();
   await expect(dialog.getByLabel("公网端口", { exact: true })).toHaveValue("21000");
-  await dialog.getByRole("radio", { name: "HTTPS", exact: true }).check();
+  await dialog.getByRole("radio", { name: "网页服务", exact: true }).check();
   await expect(dialog.getByLabel("主机名")).toHaveValue("nas");
   await dialog.getByRole("button", { name: "保存服务" }).click();
   await expect(dialog).not.toBeVisible();
@@ -117,7 +190,8 @@ test("Agent 浮层显示当前选择，离线 Agent 可选择并提交", async (
   await expect(agent).toBeFocused();
   await expect(dialog.getByRole("status")).toContainText("Agent 当前离线");
   await dialog.getByLabel("服务名称").fill("备用设备服务");
-  await dialog.getByLabel("本地端口").fill("8080");
+  await dialog.getByLabel("主机名").fill("backup");
+  await dialog.getByLabel("内网端口").fill("8080");
   await dialog.getByRole("button", { name: "保存服务" }).click();
   await expect(dialog).toBeHidden();
   expect(state.calls.find(call => call.method === "POST" && call.path === "/api/v1/tunnels")?.body.device_id).toBe("a-2");
@@ -130,9 +204,9 @@ test("两个选择框互斥，键盘确认和取消不误提交或关闭表单",
   await page.getByRole("button", { name: "创建服务", exact: true }).click();
   const dialog = page.getByRole("dialog", { name: "创建服务" });
   const agent = dialog.getByRole("combobox", { name: "Agent", exact: true });
-  await dialog.getByRole("radio", { name: "HTTPS", exact: true }).check();
+  await dialog.getByRole("radio", { name: "网页服务", exact: true }).check();
   await dialog.getByLabel("服务名称").fill("键盘选择");
-  await dialog.getByLabel("本地端口").fill("8080");
+  await dialog.getByLabel("内网端口").fill("8080");
   await dialog.getByLabel("主机名").fill("nas");
   await dialog.getByRole("button", { name: "保存服务" }).click();
   const domain = dialog.getByRole("combobox", { name: "根域名", exact: true });
@@ -172,7 +246,7 @@ test("两个选择框互斥，键盘确认和取消不误提交或关闭表单",
   await agent.press("ArrowDown");
   await agent.press("Tab");
   await expect(agent).toHaveAttribute("aria-expanded", "false");
-  await expect(dialog.getByLabel("本地地址")).toBeFocused();
+  await expect(dialog.getByLabel("内网协议")).toBeFocused();
   await agent.click();
   await dialog.getByLabel("服务名称").click();
   await expect(agent).toHaveAttribute("aria-expanded", "false");
@@ -187,7 +261,7 @@ test("长名称和长域名浮层在窄屏、横屏及低高度视口内可滚�
   await page.goto("/#/services");
   await page.getByRole("button", { name: "创建服务", exact: true }).click();
   const dialog = page.getByRole("dialog", { name: "创建服务" });
-  await dialog.getByRole("radio", { name: "HTTPS", exact: true }).check();
+  await dialog.getByRole("radio", { name: "网页服务", exact: true }).check();
   for (const viewport of [{ width: 320, height: 568 }, { width: 390, height: 420 }, { width: 812, height: 375 }]) {
     await page.setViewportSize(viewport);
     for (const label of ["Agent", "根域名"]) {
@@ -197,7 +271,7 @@ test("长名称和长域名浮层在窄屏、横屏及低高度视口内可滚�
       await expect(list).toBeVisible();
       await expect.poll(async () => {
         const box = await list.boundingBox(); const body = await dialog.locator(".modal-body").boundingBox(); const row = await trigger.boundingBox();
-        return Boolean(box && body && row && box.y >= body.y && box.y + box.height <= body.y + body.height && box.x >= 0 && box.x + box.width <= viewport.width && Math.abs(box.width - row.width) <= 1 && box.height >= 48);
+        return Boolean(box && body && row && box.y >= body.y && box.y + box.height <= body.y + body.height && box.x >= 0 && box.x + box.width <= viewport.width && (label === "根域名" ? box.width >= row.width : Math.abs(box.width - row.width) <= 1) && box.height >= 48);
       }).toBeTruthy();
       expect(await list.evaluate(element => element.scrollWidth <= element.clientWidth)).toBeTruthy();
       await trigger.press("End");
@@ -218,7 +292,7 @@ test("无 Agent 或域名时保留配置入口，选择框和保存禁用", asyn
   const dialog = page.getByRole("dialog", { name: "创建服务" });
   await expect(dialog.getByRole("combobox", { name: "Agent", exact: true })).toBeDisabled();
   await expect(dialog.getByRole("button", { name: "配置 Agent", exact: true })).toBeVisible();
-  await dialog.getByRole("radio", { name: "HTTPS", exact: true }).check();
+  await dialog.getByRole("radio", { name: "网页服务", exact: true }).check();
   await expect(dialog.getByRole("combobox", { name: "根域名", exact: true })).toBeDisabled();
   await expect(dialog.getByRole("button", { name: "添加域名", exact: true })).toBeVisible();
   await expect(dialog.getByRole("button", { name: "保存服务" })).toBeDisabled();
@@ -231,7 +305,7 @@ test("展开中的浮层跟随表单滚动和视口变化", async ({ page }) => 
   await page.goto("/#/services");
   await page.getByRole("button", { name: "创建服务", exact: true }).click();
   const dialog = page.getByRole("dialog", { name: "创建服务" });
-  await dialog.getByRole("radio", { name: "HTTPS", exact: true }).check();
+  await dialog.getByRole("radio", { name: "网页服务", exact: true }).check();
   const agent = dialog.getByRole("combobox", { name: "Agent", exact: true });
   const list = dialog.getByRole("listbox", { name: "Agent选项" });
   await agent.click();
@@ -252,9 +326,9 @@ test("保存期间禁用两个选择框，失败后恢复选择和草稿", async
   await page.goto("/#/services");
   await page.getByRole("button", { name: "创建服务", exact: true }).click();
   const dialog = page.getByRole("dialog", { name: "创建服务" });
-  await dialog.getByRole("radio", { name: "HTTPS", exact: true }).check();
+  await dialog.getByRole("radio", { name: "网页服务", exact: true }).check();
   await dialog.getByLabel("服务名称").fill("保存期间");
-  await dialog.getByLabel("本地端口").fill("8080");
+  await dialog.getByLabel("内网端口").fill("8080");
   await dialog.getByLabel("主机名").fill("nas");
   await page.route("**/api/v1/tunnels", async route => {
     if (route.request().method() !== "POST") return route.fallback();

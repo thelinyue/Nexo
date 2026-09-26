@@ -92,7 +92,10 @@ pub fn prepare(
         target_url(
             &input.local_address,
             input.local_port,
-            origin_protocol.as_deref(),
+            input
+                .origin_protocol
+                .as_deref()
+                .or(origin_protocol.as_deref()),
         )?;
     }
     input.lan_redirect_enabled = Some(enabled);
@@ -128,6 +131,153 @@ mod tests {
             "local_port":8080, "hostname":"nas", "public_domain_id":domain.id,
         });
         (state, headers, body)
+    }
+
+    #[tokio::test]
+    async fn origin_protocol_roundtrips_independently_and_reaches_agent() {
+        for public in ["http", "https"] {
+            for origin in ["http", "https"] {
+                let (state, headers, mut body) = web_fixture().await;
+                state.db.lock().unwrap().execute("INSERT INTO devices(id,tenant_id,name,created_at,updated_at) VALUES('origin-agent','default','Agent',0,0)", []).unwrap();
+                body["device_id"] = json!("origin-agent");
+                body["protocol"] = json!(public);
+                body["origin_protocol"] = json!(origin);
+                body["lan_redirect_enabled"] = json!(true);
+                let Json(created) = crate::create_tunnel(
+                    State(state.clone()),
+                    headers.clone(),
+                    Json(serde_json::from_value(body.clone()).unwrap()),
+                )
+                .await
+                .unwrap();
+                assert_eq!(created.protocol, public);
+                assert_eq!(created.origin_protocol.as_deref(), Some(origin));
+                let Json(list) = crate::list_tunnels(State(state.clone()), headers.clone())
+                    .await
+                    .unwrap();
+                assert_eq!(list[0].origin_protocol, created.origin_protocol);
+                let desired = crate::desired_tunnels(&state, "origin-agent").unwrap();
+                assert_eq!(desired[0].protocol, public);
+                assert_eq!(desired[0].origin_protocol.as_deref(), Some(origin));
+
+                // 同一次更新改变协议与地址，重定向也必须使用新的有效目标。
+                let next = if origin == "http" { "https" } else { "http" };
+                body["origin_protocol"] = json!(next);
+                body["local_address"] = json!("fd00::12");
+                body["local_port"] = json!(8443);
+                let Json(updated) = crate::update_tunnel(
+                    State(state.clone()),
+                    headers.clone(),
+                    Path(created.id.clone()),
+                    Json(serde_json::from_value(body.clone()).unwrap()),
+                )
+                .await
+                .unwrap();
+                assert_eq!(updated.origin_protocol.as_deref(), Some(next));
+                assert_eq!(
+                    target_url(
+                        &updated.local_address,
+                        updated.local_port,
+                        updated.origin_protocol.as_deref()
+                    )
+                    .unwrap(),
+                    format!("{next}://[fd00::12]:8443")
+                );
+                let desired = crate::desired_tunnels(&state, "origin-agent").unwrap();
+                assert_eq!(desired[0].origin_protocol.as_deref(), Some(next));
+                assert!(desired[0].revision > created.apply_revision);
+
+                // 旧客户端只改名称，不得把 HTTPS 回源意外降为 HTTP。
+                body.as_object_mut().unwrap().remove("origin_protocol");
+                body["name"] = json!("renamed");
+                let Json(legacy_update) = crate::update_tunnel(
+                    State(state.clone()),
+                    headers.clone(),
+                    Path(created.id.clone()),
+                    Json(serde_json::from_value(body.clone()).unwrap()),
+                )
+                .await
+                .unwrap();
+                assert_eq!(legacy_update.origin_protocol.as_deref(), Some(next));
+                body["protocol"] = json!("tcp");
+                body["lan_redirect_enabled"] = json!(false);
+                let Json(tcp) = crate::update_tunnel(
+                    State(state.clone()),
+                    headers,
+                    Path(created.id),
+                    Json(serde_json::from_value(body).unwrap()),
+                )
+                .await
+                .unwrap();
+                assert!(tcp.origin_protocol.is_none());
+                assert!(crate::desired_tunnels(&state, "origin-agent").unwrap()[0]
+                    .origin_protocol
+                    .is_none());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn origin_protocol_defaults_and_invalid_input_are_safe() {
+        let (state, headers, mut body) = web_fixture().await;
+        let Json(created) = crate::create_tunnel(
+            State(state.clone()),
+            headers.clone(),
+            Json(serde_json::from_value(body.clone()).unwrap()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(created.origin_protocol.as_deref(), Some("http"));
+        state
+            .db
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE tunnels SET origin_protocol=NULL WHERE id=?1",
+                [&created.id],
+            )
+            .unwrap();
+        assert_eq!(
+            crate::list_tunnels(State(state.clone()), headers.clone())
+                .await
+                .unwrap()
+                .0[0]
+                .origin_protocol
+                .as_deref(),
+            Some("http")
+        );
+        for invalid in ["ftp", "tcp", "HTTPS", ""] {
+            body["origin_protocol"] = json!(invalid);
+            let error = crate::update_tunnel(
+                State(state.clone()),
+                headers.clone(),
+                Path(created.id.clone()),
+                Json(serde_json::from_value(body.clone()).unwrap()),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(error.status, StatusCode::BAD_REQUEST);
+        }
+        assert_eq!(
+            crate::list_tunnels(State(state.clone()), headers.clone())
+                .await
+                .unwrap()
+                .0[0]
+                .origin_protocol
+                .as_deref(),
+            Some("http")
+        );
+        body["origin_protocol"] = json!("https");
+        body["lan_redirect_enabled"] = json!(true);
+        body["local_address"] = json!("127.0.0.1");
+        assert!(crate::update_tunnel(
+            State(state),
+            headers,
+            Path(created.id),
+            Json(serde_json::from_value(body).unwrap())
+        )
+        .await
+        .is_err());
     }
 
     #[test]
