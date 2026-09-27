@@ -255,7 +255,7 @@ test("公网 HTTP 页面可复制服务地址和弹窗内的 Compose 配置", as
   await page.goto("http://copy.example.test:4173/#/agents");
   await page.getByRole("button", { name: "添加 Agent", exact: true }).click();
   const dialog = page.getByRole("dialog", { name: "添加 Agent" });
-  await dialog.getByRole("button", { name: "复制 Compose 部署命令", exact: true }).click();
+  await dialog.getByRole("button", { name: "复制 Compose 配置", exact: true }).click();
   await expect(dialog.getByRole("status")).toHaveText("已复制");
   expect(await page.evaluate(() => (window as any).copiedFallback)).toContain("nexo_join_shared-test-key");
 });

@@ -19,7 +19,7 @@ export function AgentEnrollment({ csrf, onClose, onCreated }: { csrf?: string | 
   const addressField = useRef<HTMLDivElement>(null); const input = useRef<HTMLInputElement>(null);
   const normalizedUrl = normalizeAgentServerUrl(serverUrl);
   const isCompose = method === "compose";
-  const deploymentName = isCompose ? "Compose 部署命令" : "Docker run 部署命令";
+  const deploymentName = isCompose ? "Compose 配置" : "docker run 命令";
   const token = credential.data?.token;
   const deployment = useMemo(() => {
     if (!token || !normalizedUrl) return { content: "", error: null };
@@ -40,12 +40,12 @@ export function AgentEnrollment({ csrf, onClose, onCreated }: { csrf?: string | 
         {!normalizedUrl && <p className="form-error" id="agent-server-error" role="alert">请输入 HTTP/HTTPS 地址，不含用户名、密码、查询参数或片段。</p>}</div>
         <label>设备名称（可选）<input value={name} maxLength={80} placeholder="例如：家庭 NAS" onChange={e => setName(e.target.value)} /></label>
         <div className="agent-deployment-method" role="group" aria-label="部署方式"><button type="button" aria-pressed={isCompose} onClick={() => setMethod("compose")}>Docker Compose</button><button type="button" aria-pressed={!isCompose} onClick={() => setMethod("docker")}>docker run</button></div>
-        <p className="helper">在已安装 Docker 的 Linux / NAS 主机终端粘贴执行，自动保存配置并启动 Agent，无需单独复制 TOML。{isCompose && "Compose 文件保存为 ./compose.agent.yml。"}</p>
-        <p className="helper">命令含接入密钥，请勿分享。每台主机使用独立数据目录，已有配置不会覆盖。</p>
+        <p className="helper">{isCompose ? "保存为 compose.agent.yml，执行 docker compose -f compose.agent.yml up -d；也可粘贴到 NAS 的 Compose 项目。" : "在已安装 Docker 的 Linux / NAS 主机终端执行。"}</p>
+        <p className="helper">含接入密钥，请勿分享。每台主机使用独立数据目录；已有 Agent 保留原目录。</p>
         {credential.busy && !token && <p role="status">正在准备配置…</p>}
         <Notice error={credential.error ?? (credential.data && !token ? "服务器未返回接入密钥，请重试。" : null)} onRetry={() => void credential.reload()} />
         {deployment.content && <CopyButton value={deployment.content} label={`复制 ${deploymentName}`} />}
-        {deployment.content && <details className="agent-command"><summary>查看部署命令</summary><pre tabIndex={0} aria-label={deploymentName}><code>{deployment.content}</code></pre></details>}
+        {deployment.content && <details className="agent-command"><summary>查看 {deploymentName}</summary><pre tabIndex={0} aria-label={deploymentName}><code>{deployment.content}</code></pre></details>}
         <section className="enrollment-progress" aria-label="最近接入设备"><h3>最近接入</h3>
           <Notice error={devices.error} onRetry={() => void devices.reload()} />
           {!devices.data ? <p>正在读取设备…</p> : !recent.length ? <p>等待 Agent 连接，启动后会自动接入。</p> : <ul className="recent-agents">{recent.map(device => <li key={device.id}><div><strong>{device.name}</strong><small title={device.id}>{device.id.slice(0, 8)}</small></div><Status kind="agent" value={device.status} /></li>)}</ul>}

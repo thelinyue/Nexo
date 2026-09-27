@@ -80,7 +80,7 @@ test("部署命令可直接复制，弹窗显示多台独立设备", async ({ pa
   state.devices.push({ id: "nas-one-uuid", name: "家庭 NAS", status: "online", tunnel_count: 0, enrolled_at: 1790000001 }, { id: "nas-two-uuid", name: "家庭 NAS", status: "offline", tunnel_count: 0, enrolled_at: 1790000002 });
   await page.evaluate(() => window.dispatchEvent(new Event("focus")));
   await expect(progress.locator("li")).toHaveCount(2);
-  await expect(dialog.getByRole("button", { name: "复制 Compose 部署命令", exact: true })).toBeVisible();
+  await expect(dialog.getByRole("button", { name: "复制 Compose 配置", exact: true })).toBeVisible();
   await expect(dialog.getByRole("button", { name: "批准入网" })).toHaveCount(0);
   expect(state.calls.some(call => call.path.endsWith("/approve"))).toBeFalsy();
   await page.screenshot({ path: info.outputPath("shared-agent-devices.png") });

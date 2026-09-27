@@ -44,11 +44,11 @@ Server 部署在公网可达的 Linux 主机上，提供管理页面和公网入
 | UDP `9891` | Agent QUIC 数据通道 | 使用 UDP 或 TCP+UDP 时开放，直连 Server；普通 HTTP 代理不支持 |
 | UDP `443` | HTTP/3 | 可选；普通 HTTPS 不要求此项 |
 
-**版本要求：** 本次发布 Server v0.2.6，Agent 保持 v0.2.5。已有 v0.2.5 部署可保留数据，只更新 Server。从 v0.2.4 或更早版本安装时，两端均须使用独立空数据目录或仅预置新版 TOML，不迁移旧数据库或身份。读取失败会报错并保留文件。
+**版本要求：** 本次发布 Server 与 Agent v0.2.7。页面生成的原生 Compose / docker run 需要 Agent v0.2.7；已有 v0.2.5 / v0.2.6 部署可保留数据和身份。从 v0.2.4 或更早版本安装时，两端均须使用独立空数据目录，不迁移旧数据库或身份。读取失败会报错并保留文件。
 
 ## 快速部署
 
-默认镜像标签为 `latest`；固定版本部署及已有 v0.2.5 Server 更新步骤见 [v0.2.6 发布说明](docs/releases/v0.2.6.md)。Server 与 Agent 独立发布，镜像版本可以不同。
+默认镜像标签为 `latest`；固定版本部署及已有实例更新步骤见 [v0.2.7 发布说明](docs/releases/v0.2.7.md)。Server 与 Agent 按实际代码变化独立发布。
 
 ### 1. 启动 Server
 
@@ -115,7 +115,7 @@ docker compose -f compose.yml logs nexo-server
 
 ### 2. 接入 Agent
 
-在管理页面进入“Agent → 添加 Agent”，选择 Compose 或 docker run，复制部署命令到已安装 Docker 的 Linux / NAS 主机终端执行，自动创建配置并启动 Agent，无需单独复制 TOML。命令含接入密钥，请勿分享；已有配置时会停止，避免覆盖。每个空间共用一把长期接入密钥，可部署多台设备，无需批准。以下为手动配置示例；已有 Agent 请使用原目录管理，避免丢失身份：
+在管理页面进入“Agent → 添加 Agent”。Compose 模式复制原生 YAML，可直接粘贴到 NAS 的 Compose 项目，或保存为 `compose.agent.yml`；docker run 模式复制单条启动命令到 Linux / NAS 终端执行。两种方式均已填入地址、接入密钥和设备名称，无需另外准备 TOML，也不包含安装脚本。配置含接入密钥，请勿分享。每个空间共用一把长期密钥，可接入多台设备，无需批准。以下为手动填写示例；已有 Agent 请使用原目录管理，保留身份：
 
 ```bash
 mkdir "$HOME/nexo-agent-latest" && cd "$HOME/nexo-agent-latest"
@@ -126,7 +126,7 @@ mkdir "$HOME/nexo-agent-latest" && cd "$HOME/nexo-agent-latest"
 ```yaml
 name: nexo-agent
 
-# 手动部署时先准备 ./data/nexo-agent/agent.toml；页面部署命令会自动保存。
+# Agent v0.2.7 起可直接通过环境变量连接，无需预先创建 TOML。
 services:
   nexo-agent:
     image: ghcr.io/thelinyue/nexo-agent:latest
@@ -134,12 +134,15 @@ services:
     network_mode: host
     environment:
       TZ: Asia/Shanghai
+      NEXO_SERVER_URL: "https://nexo.example.com"
+      NEXO_ENROLLMENT_TOKEN: "替换为空间接入密钥"
+      NEXO_DEVICE_NAME: "家庭 NAS"
     volumes:
       - ./data/nexo-agent:/data/nexo-agent
     restart: unless-stopped
 ```
 
-手动部署时，从 [Agent 配置模板](config/agent.toml) 创建 `./data/nexo-agent/agent.toml`，填写 Server 地址与空间接入密钥（页面“高级：接入密钥”可复制）；Linux 执行 `chmod 600 ./data/nexo-agent/agent.toml`。随后再启动以下 Compose。
+手动部署时，替换示例中的 Server 地址与空间接入密钥（页面“高级：接入密钥”可复制）。也可继续使用 [Agent TOML 配置](config/agent.toml)，此时删除上述三个环境变量或将它们留空。非空环境变量逐项优先于 TOML，不回写文件。
 
 启动 Agent 后将自动接入，在管理页面查看设备是否在线：
 
@@ -149,7 +152,7 @@ docker compose -f compose.agent.yml up -d nexo-agent
 docker compose -f compose.agent.yml logs --tail=50 nexo-agent
 ```
 
-Agent 身份保存在 `data/nexo-agent`。接入成功后可手动清空 `agent.toml` 中的 `enrollment_token`，后续重启复用身份；不要把同一身份目录复制到多台主机。
+Agent 身份保存在 `data/nexo-agent`。接入成功后可清空 `NEXO_ENROLLMENT_TOKEN` 或 `agent.toml` 中的 `enrollment_token`，保留 Server 地址，后续重启复用身份；不要把同一身份目录复制到多台主机。
 
 ## 发布第一个服务
 
@@ -175,11 +178,11 @@ Agent 身份保存在 `data/nexo-agent`。接入成功后可手动清空 `agent.
 
 ## 配置与备份
 
-启动参数从数据目录中的 TOML 读取，修改后重启对应组件。`--config` 可指定独立配置文件，`--data-dir` 指定持久化目录；相对文件路径按 TOML 所在目录解析。仅管理员首次初始化支持非空 `NEXO_ADMIN_USERNAME` / `NEXO_ADMIN_PASSWORD` 覆盖 TOML；其他 `NEXO_*` 启动环境变量不生效，`TZ` 保留。
+启动参数从数据目录中的 TOML 读取，修改后重启对应组件。`--config` 可指定独立配置文件，`--data-dir` 指定持久化目录；相对文件路径按 TOML 所在目录解析。Server 首次初始化支持非空 `NEXO_ADMIN_USERNAME` / `NEXO_ADMIN_PASSWORD`；Agent 支持非空 `NEXO_SERVER_URL` / `NEXO_ENROLLMENT_TOKEN` / `NEXO_DEVICE_NAME` 逐项覆盖 TOML。其他 `NEXO_*` 启动环境变量不生效，`TZ` 保留。
 
-管理地址、可信代理 IP、公网 IP 在“账号设置 → 管理员功能 → 服务器设置”保存到 SQLite，立即生效。首次 Agent 接入只需复制页面生成的部署命令执行，自动保存 `agent.toml`（权限 0600）并启动容器；Compose 方式同时保存 `compose.agent.yml`。接入后可清空凭据，重启复用身份。
+管理地址、可信代理 IP、公网 IP 在“账号设置 → 管理员功能 → 服务器设置”保存到 SQLite，立即生效。首次 Agent 接入使用页面生成的 Compose 配置或 docker run 命令；环境变量不回写 TOML。接入成功后可清空 `NEXO_ENROLLMENT_TOKEN`，保留 Server 地址及数据目录，重启复用身份。
 
-v0.2.5 部署可按发布说明仅更新 Server；v0.2.4 及更早版本不提供原地升级。备份时先停止对应组件，复制整个持久化目录；恢复到空目录并使用备份时的版本。Server 自动管理容器内部的 `/run/nexo`，无需额外挂载，也不备份其中的 Socket。详见 [配置、备份与恢复](docker/README.md)。
+v0.2.5 / v0.2.6 部署可按发布说明保留目录更新组件；v0.2.4 及更早版本不提供原地升级。备份时先停止对应组件，复制整个持久化目录；恢复到空目录并使用备份时的版本。Server 自动管理容器内部的 `/run/nexo`，无需额外挂载，也不备份其中的 Socket。详见 [配置、备份与恢复](docker/README.md)。
 
 | 需要帮助 | 文档 |
 | --- | --- |

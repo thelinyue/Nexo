@@ -1,4 +1,5 @@
 # Nexo Agent 启动配置。首次接入填写地址和空间接入密钥；后续重启复用身份。
+# 非空 NEXO_SERVER_URL / NEXO_ENROLLMENT_TOKEN / NEXO_DEVICE_NAME 分别覆盖对应字段，不回写文件。
 server_url = "" # 必填，例如 https://nexo.example.com
 enrollment_token = "" # 首次接入使用；身份保存成功后请清空
 # 设备名称只在首次接入时使用。

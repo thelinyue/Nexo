@@ -2,6 +2,12 @@
 
 本项目使用 [Semantic Versioning](https://semver.org/) 记录公开版本。
 
+## [0.2.7]
+
+- 修复 Agent 部署入口回退为 Shell 安装脚本的问题：Compose 直接返回原生 YAML，docker run 返回单条启动命令，均预填连接参数。
+- Agent 支持 `NEXO_SERVER_URL`、`NEXO_ENROLLMENT_TOKEN`、`NEXO_DEVICE_NAME`，非空值逐项覆盖 TOML，不回写配置文件；已有身份继续复用。
+- 本次发布 Server 与 Agent，已有 v0.2.5 / v0.2.6 数据和身份可保留。详情见 [v0.2.7 发布说明](docs/releases/v0.2.7.md)。
+
 ## [0.2.6]
 
 - Server 首次创建管理员支持非空环境变量逐项覆盖 TOML，并明确区分随机密码、指定密码及已有账号的日志。

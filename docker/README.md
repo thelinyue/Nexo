@@ -1,8 +1,8 @@
 # 容器、配置与维护
 
-本次发布 Server v0.2.6，Agent 保持 v0.2.5。已有 v0.2.5 数据可继续使用，只更新 Server；从 v0.2.4 及更早版本安装仍要求两端使用全新目录，不导入旧数据库或旧身份。当前格式的数据读取失败时停止启动并保留文件。正常重启、身份恢复、续签和备份恢复继续支持。
+本次发布 Server 与 Agent v0.2.7。已有 v0.2.5 / v0.2.6 数据和身份可继续使用；从 v0.2.4 及更早版本安装仍要求两端使用全新目录，不导入旧数据库或旧身份。当前格式的数据读取失败时停止启动并保留文件。正常重启、身份恢复、续签和备份恢复继续支持。
 
-本仓库模板配合 Server v0.2.6、Agent v0.2.5 使用；本次只发布 Server，不自动部署 VPS。更新步骤见 [v0.2.6 发布说明](../docs/releases/v0.2.6.md)。
+本仓库环境变量模板配合 v0.2.7 镜像使用；本次两端均有代码变化，不自动部署 VPS。更新步骤见 [v0.2.7 发布说明](../docs/releases/v0.2.7.md)。
 
 ## 部署与首次启动
 
@@ -16,18 +16,18 @@ Server 首次启动自动生成 `./data/nexo/server.toml`（容器内 `/data/nex
 
 Agent 操作顺序：
 
-1. 在页面“添加 Agent”填写 Server 地址及设备名称，选择 Compose 或 docker run，复制部署命令。
-2. 在已安装 Docker 的 Linux / NAS 主机终端执行。命令自动创建 `./data/nexo-agent/agent.toml`（权限 0600）并启动；Compose 方式还会保存 `./compose.agent.yml`，后续通过 `docker compose -f compose.agent.yml` 管理。
-3. 回到页面查看“最近接入”。命令含接入密钥，请勿分享；每台主机使用独立数据目录。已有配置时命令停止，不覆盖；已有 Agent 使用原配置管理。
-4. 接入后可清空 TOML 中的 `enrollment_token`；正常重启复用身份，无需重新接入。
+1. 在页面“添加 Agent”填写 Server 地址及设备名称，选择 Compose 或 docker run。
+2. Compose 直接复制 YAML 到 NAS 的 Compose 项目，或保存为 `compose.agent.yml` 后执行 `docker compose -f compose.agent.yml up -d`；docker run 直接复制单条命令到终端执行。两种方式均内嵌连接环境变量，无需预先保存 TOML。
+3. 回到页面查看“最近接入”。配置含接入密钥，且 Docker 管理员可通过容器信息查看，请勿分享；每台主机使用独立数据目录。已有 Agent 保留原目录和身份。
+4. 接入后可清空环境变量 `NEXO_ENROLLMENT_TOKEN` 或 TOML 中的 `enrollment_token`；保留 Server 地址，正常重启复用身份，无需重新接入。
 
-新 Agent 没有配置时会生成模板并退出，指出缺少的字段及文件位置。共享接入密钥可用于多台设备；重置密钥不撤销已接入设备。缺少或损坏身份不能通过复制其他设备目录解决。
+新 Agent 没有 TOML 时会生成权限为 `0600` 的模板，再读取连接环境变量；两者均未提供必要配置时明确退出。环境变量不回写模板。共享接入密钥可用于多台设备；重置密钥不撤销已接入设备。缺少或损坏身份不能通过复制其他设备目录解决。
 
 ## 启动配置
 
 两端统一支持 `--config`、`--data-dir`。默认读取数据目录中的对应 TOML。相对文件路径按 TOML 所在目录解析；配置只在启动读取，修改后重启。未知字段、类型错误和非法地址报错，程序不覆盖已有配置或修改排版。自动创建的 Linux TOML 权限为 `0600`。
 
-完整中文模板：[server.toml](../config/server.toml)、[agent.toml](../config/agent.toml)。仅 Server 首次创建管理员读取 `NEXO_ADMIN_USERNAME` / `NEXO_ADMIN_PASSWORD`；其他 `NEXO_*` 启动环境变量不生效，`TZ` 等通用系统变量保留。
+完整中文模板：[server.toml](../config/server.toml)、[agent.toml](../config/agent.toml)。Server 首次创建管理员读取 `NEXO_ADMIN_USERNAME` / `NEXO_ADMIN_PASSWORD`；Agent 读取 `NEXO_SERVER_URL` / `NEXO_ENROLLMENT_TOKEN` / `NEXO_DEVICE_NAME`。非空值逐项覆盖 TOML，空值回退到 TOML，均不回写文件。显式身份恢复的命令行凭证优先于环境变量。其他 `NEXO_*` 启动环境变量不生效，`TZ` 等通用系统变量保留。
 
 | Server 字段 | 默认值 / 用途 |
 | --- | --- |

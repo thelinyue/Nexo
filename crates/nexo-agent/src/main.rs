@@ -35,7 +35,7 @@ struct Cli {
     enrollment_token: Option<String>,
 }
 
-/// TOML 保存连接参数；操作标志和软件版本来自本次运行，不允许文件伪造。
+/// TOML 保存连接参数，容器部署可用三个非空环境变量逐项覆盖；操作标志和版本来自本次运行。
 #[derive(Deserialize)]
 #[serde(default, deny_unknown_fields)]
 struct Config {
@@ -100,9 +100,22 @@ async fn main() -> Result<()> {
         nexo_core::config::absolute(&cli.config.unwrap_or_else(|| directory.join("agent.toml")))?;
     let mut config: Config =
         nexo_core::config::load(&path, include_str!("../../../config/agent.toml"))?;
+    // Compose 和 docker run 直接传入连接参数，无需 Shell 预先写文件。
+    // 空值沿用 TOML，非空值仅作用于本次启动，不覆盖配置文件或已有设备身份。
+    for (name, target) in [
+        ("NEXO_SERVER_URL", &mut config.server_url),
+        ("NEXO_ENROLLMENT_TOKEN", &mut config.enrollment_token),
+        ("NEXO_DEVICE_NAME", &mut config.device_name),
+    ] {
+        if let Ok(value) = env::var(name) {
+            if !value.is_empty() {
+                *target = value;
+            }
+        }
+    }
     anyhow::ensure!(
         !config.server_url.trim().is_empty(),
-        "请填写 {} 中的 server_url 和首次接入凭证 enrollment_token 后重启",
+        "请设置 NEXO_SERVER_URL 和首次接入凭证 NEXO_ENROLLMENT_TOKEN，或填写 {} 中的 server_url / enrollment_token 后重启",
         path.display()
     );
     anyhow::ensure!(
@@ -150,7 +163,7 @@ async fn main() -> Result<()> {
         .await
         .with_context(|| format!("Agent 初始化失败，请检查 {}", path.display()))?;
     if !config.enrollment_token.is_empty() {
-        tracing::info!("身份已保存，请清除 agent.toml 中的接入凭证");
+        tracing::info!("身份已保存，请清除 agent.toml 或 NEXO_ENROLLMENT_TOKEN 中的接入凭证；保留 Server 地址和数据目录，重启复用已有身份");
     }
     if config.recover_identity {
         tracing::info!(device_id = %identity.device_id, "设备身份已恢复，原设备 ID 和服务绑定保留；请正常启动 Agent");
@@ -207,7 +220,7 @@ async fn load_identity(config: &Config, directory: &std::path::Path) -> Result<D
     }
     anyhow::ensure!(
         !config.enrollment_token.trim().is_empty(),
-        "请填写 agent.toml 中的 enrollment_token，或为恢复操作提供专用凭证"
+        "请设置 NEXO_ENROLLMENT_TOKEN 或 agent.toml 中的 enrollment_token，恢复身份时需提供专用凭证"
     );
     let request_path = directory.join(if config.recover_identity {
         "recovery-key.json"
