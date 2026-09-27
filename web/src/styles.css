@@ -251,7 +251,6 @@ dd>code { display:block; margin-bottom:10px; user-select:text; font-size:.9375re
 .modal:has(>.service-form) { background:var(--bg); }
 .service-form>.modal-body { padding:16px; scroll-padding-block:12px; }
 .service-form>.modal-body>fieldset { gap:16px; }
-.service-form .service-protocol-picker { border-radius:12px; }
 .protocol-picker { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:4px; padding:4px; background:var(--surface-raised); border-radius:999px; }
 .protocol-option { position:relative; display:flex; align-items:center; justify-content:center; min-height:44px; border-radius:999px; font-size:.875rem; color:var(--secondary); cursor:pointer; }
 .protocol-option input { position:absolute; inset:0; width:100%; height:100%; min-height:44px; padding:0; margin:0; opacity:0; cursor:inherit; }
@@ -259,7 +258,7 @@ dd>code { display:block; margin-bottom:10px; user-select:text; font-size:.9375re
 .protocol-option:has(input:focus-visible) { outline:3px solid var(--primary); outline-offset:1px; }
 .protocol-option:has(input:disabled) { opacity:.5; cursor:default; }
 .service-form-section { min-width:0; }
-.service-form-section h3 { margin:0 0 8px 4px; color:var(--secondary); font-size:.875rem; font-weight:600; }
+.service-form-section h3 { margin:0 15px 8px; color:var(--secondary); font-size:.875rem; font-weight:600; }
 .service-field-group,.service-advanced { min-width:0; border:1px solid color-mix(in srgb,var(--border) 45%,transparent); background:var(--surface); border-radius:20px; }
 .service-field { display:flex; flex-wrap:nowrap; align-items:center; gap:0 12px; padding:3px 14px; font-size:.875rem; font-weight:500; }
 .service-field>span { flex:0 0 5rem; }
@@ -303,15 +302,22 @@ dd>code { display:block; margin-bottom:10px; user-select:text; font-size:.9375re
 @media (prefers-reduced-motion:reduce) { .service-switch-track,.service-switch-track::after { transition:none; } }
 @media (forced-colors:active) { .service-switch-track { background:Canvas; outline:1px solid ButtonText; forced-color-adjust:none; } .service-switch-track::after { background:ButtonText; } .service-switch input:checked+.service-switch-track { background:Highlight; } .service-switch input:checked+.service-switch-track::after { background:HighlightText; } }
 /* 两个地址组在窄屏仍按阅读顺序同行；输入只在自身内部滚动，不挤出保存栏。 */
-.service-address-input,.service-public-input { display:grid; align-items:center; gap:4px; padding:3px 8px; }
-.service-address-input { grid-template-columns:5rem minmax(0,1fr) auto 4rem; }
-.service-public-input { grid-template-columns:5rem minmax(0,.7fr) auto minmax(0,1fr); }
+.service-address-input,.service-public-input { display:grid; align-items:center; gap:4px; padding:3px 10px; }
+.service-address-input { grid-template-columns:6.5rem minmax(0,1fr) auto 4rem; }
+.service-public-input { grid-template-columns:6.5rem minmax(0,.7fr) auto minmax(0,1fr); }
 .service-address-input>input,.service-address-input>select,.service-public-input>input,.service-public-input>select { width:100%; min-width:0; min-height:48px; padding:8px 4px; border:0; border-radius:8px; background:transparent; font-size:1rem; }
+.service-address-input>input:last-child { text-align:right; }
 .service-address-input [aria-invalid=true],.service-public-input [aria-invalid=true] { box-shadow:inset 0 0 0 2px var(--danger); }
-.service-fixed-protocol { display:flex; align-items:center; min-height:48px; padding:8px 4px; font-size:1rem; color:var(--secondary); }
 /* 协议仍使用原生选择菜单，仅移除浏览器自带的灰色按钮外观。 */
 .service-address-input>select,.service-public-input>select { appearance:none; -webkit-appearance:none; box-shadow:none; padding-right:18px; cursor:pointer; background-image:linear-gradient(45deg,transparent 50%,var(--secondary) 50%),linear-gradient(135deg,var(--secondary) 50%,transparent 50%); background-position:calc(100% - 9px) center,calc(100% - 5px) center; background-size:4px 4px; background-repeat:no-repeat; }
-.service-address-input>select:focus-visible,.service-public-input>select:focus-visible { outline:2px solid var(--primary); outline-offset:-2px; }
+/* 复合地址作为完整的一行反馈焦点，避免单个输入框的粗描边割裂协议、地址和端口。 */
+.service-address-input:focus-within,.service-public-input:focus-within { border-color:color-mix(in srgb,var(--secondary) 45%,var(--border)); }
+.service-field:has(>input:focus-visible) { outline:1px solid color-mix(in srgb,var(--secondary) 45%,var(--border)); outline-offset:-1px; border-radius:12px; }
+.service-field>input:focus-visible,.service-address-input>input:focus-visible,.service-public-input>input:focus-visible { outline:none; }
+.service-address-input>select:focus-visible,.service-public-input>select:focus-visible,.service-public-input .service-select-trigger:focus-visible { outline:none; }
+.service-address-input>select:focus-visible:not([aria-invalid=true]),.service-public-input>select:focus-visible:not([aria-invalid=true]),.service-public-input .service-select-trigger:focus-visible:not([aria-invalid=true]) { box-shadow:inset 0 -2px 0 var(--secondary); }
+@media (prefers-contrast:more) { .service-address-input:focus-within,.service-public-input:focus-within { border-color:var(--text); } .service-field:has(>input:focus-visible) { outline-color:var(--text); } }
+@media (forced-colors:active) { .service-field>input:focus-visible,.service-address-input>input:focus-visible,.service-public-input>input:focus-visible,.service-address-input>select:focus-visible,.service-public-input>select:focus-visible,.service-public-input .service-select-trigger:focus-visible { outline:2px solid Highlight; outline-offset:-2px; } }
 .service-address-separator { color:var(--secondary); }
 .service-select-compact { min-width:0; }
 .service-select-compact .service-select-trigger { min-height:48px; padding:8px 4px; gap:4px; }
@@ -323,8 +329,8 @@ dd>code { display:block; margin-bottom:10px; user-select:text; font-size:.9375re
 .service-detail .service-detail-address code { display:block; white-space:nowrap; overflow-x:auto; overflow-wrap:normal; }
 .service-detail .service-public-link { min-width:0; }
 .service-detail .service-detail-meta dd { min-width:0; white-space:nowrap; overflow-x:auto; }
-.service-form-section>.helper { margin:6px 4px 0; font-size:.875rem; }
-.service-advanced summary { display:flex; align-items:center; gap:8px; min-height:52px; padding:10px 14px; cursor:pointer; list-style:none; font-size:.875rem; }
+.service-form-section>.helper { margin:6px 15px 0; font-size:.875rem; }
+.service-advanced summary { display:flex; align-items:center; gap:8px; min-height:54px; padding:10px 14px; cursor:pointer; list-style:none; font-size:.875rem; }
 .service-advanced summary::-webkit-details-marker { display:none; }
 .service-advanced summary>span:first-child { flex:1; }
 .service-advanced summary>span:nth-child(2) { color:var(--secondary); overflow-wrap:anywhere; }
@@ -845,11 +851,13 @@ dd>code { display:block; margin-bottom:10px; user-select:text; font-size:.9375re
   .modal:has(>.service-form)>.modal-heading h2 { font-size:1.25rem; letter-spacing:-.02em; }
   .service-form>.modal-body { padding:20px 24px 24px; }
   .service-form>.modal-body>fieldset { gap:20px; }
-  .service-form .protocol-picker { width:300px; max-width:100%; padding:4px; border-radius:12px; }
+  .service-form .protocol-picker { width:100%; padding:4px; border-radius:12px; }
   .service-form .protocol-option { border-radius:9px; min-height:36px; }
   .service-form .desktop-form-label { display:block; }
   .service-form .service-field-group,.service-form .service-advanced { border-radius:14px; }
   .service-form .service-field:not(.service-toggle-field)>input { text-align:left; }
+  /* 普通字段值与复合地址的输入起点对齐；手机继续使用右对齐的分组表单。 */
+  .service-form .service-field:not(.service-toggle-field)>span,.service-form .service-select-caption { flex-basis:6rem; }
   .service-form .service-select-field:not(.service-select-compact) .service-select-value { justify-content:flex-start; }
   .service-form .modal-actions { grid-template-columns:minmax(0,1fr) auto auto; align-items:center; column-gap:10px; padding:16px 24px; background:var(--surface); }
   .service-form .modal-actions>.service-submit-preview { grid-column:1; grid-row:1; display:grid; gap:4px; }

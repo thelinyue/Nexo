@@ -94,7 +94,7 @@ CREATE TABLE "tunnels" (
     origin_protocol TEXT, origin_tls_server_name TEXT, origin_tls_verification TEXT NOT NULL DEFAULT 'system',
     public_domain_id TEXT REFERENCES public_domains(id) ON DELETE SET NULL,
     deleted_at INTEGER, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
-, service_mode TEXT NOT NULL DEFAULT 'tunnel' CHECK(service_mode IN ('tunnel','reverse_proxy')), lan_redirect_enabled INTEGER NOT NULL DEFAULT 0, access_mode TEXT NOT NULL DEFAULT 'public' CHECK(access_mode IN ('public','password')), access_password_hash TEXT, protocol_statuses TEXT NOT NULL DEFAULT '{}');
+, http_redirect_enabled INTEGER NOT NULL DEFAULT 0, service_mode TEXT NOT NULL DEFAULT 'tunnel' CHECK(service_mode IN ('tunnel','reverse_proxy')), lan_redirect_enabled INTEGER NOT NULL DEFAULT 0, access_mode TEXT NOT NULL DEFAULT 'public' CHECK(access_mode IN ('public','password')), access_password_hash TEXT, protocol_statuses TEXT NOT NULL DEFAULT '{}');
 
 CREATE TABLE traffic_minutes (
         tenant_id TEXT NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,

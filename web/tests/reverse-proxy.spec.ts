@@ -18,7 +18,7 @@ test("独立反代入口无需 Agent，创建服务入口保持内网穿透", as
   await expect(dialog.getByLabel("目标端口")).toHaveValue("3000");
   await expect(dialog.getByRole("combobox", { name: "Agent", exact: true })).toHaveCount(0);
   await expect(dialog.getByLabel("内网重定向")).toHaveCount(0);
-  await expect(dialog.getByRole("radio", { name: "TCP 服务", exact: true })).toHaveCount(0);
+  await expect(dialog.getByLabel("目标协议").locator("option")).toHaveText(["HTTP", "HTTPS"]);
   await dialog.getByLabel("主机名").fill("app");
   await page.screenshot({ path: info.outputPath("reverse-proxy-form.png"), animations: "disabled" });
   await dialog.getByRole("button", { name: "保存服务" }).click();
@@ -124,4 +124,34 @@ test("普通用户不提供反代创建入口且不能编辑管理员配置的�
   await expect(page.getByRole("button", { name: "编辑服务", exact: true })).toBeDisabled();
   await expect(page.getByRole("button", { name: "关闭服务", exact: true })).toBeDisabled();
   await expect(page.getByRole("button", { name: "删除服务", exact: true })).toBeDisabled();
+});
+
+
+test("反向代理默认强制 HTTPS，切换协议保留选择，编辑读取保存值", async ({ page }) => {
+  const state = await installApiMocks(page); state.tunnels = [];
+  await page.goto("/#/services");
+  await openServiceEditor(page, "reverse_proxy");
+  const dialog = page.getByRole("dialog", { name: "添加反向代理" });
+  const force = dialog.getByRole("switch", { name: "强制 HTTPS" });
+  await expect(force).toBeChecked();
+  await force.uncheck();
+  await dialog.getByLabel("公网协议", { exact: true }).selectOption("http");
+  await expect(force).toHaveCount(0);
+  await dialog.getByLabel("公网协议", { exact: true }).selectOption("https");
+  await expect(force).not.toBeChecked();
+  await dialog.getByLabel("服务名称").fill("跳转应用");
+  await dialog.getByLabel("目标端口").fill("3000");
+  await dialog.getByLabel("主机名").fill("redirect");
+  await dialog.getByRole("button", { name: "保存服务" }).click();
+  await expect(dialog).toBeHidden();
+  expect(state.calls.find(call => call.method === "POST" && call.path.endsWith("/tunnels"))?.body).toMatchObject({ http_redirect_enabled: false });
+  const created = state.tunnels.find(item => item.name === "跳转应用")!;
+  await page.goto(`/#/services/${created.id}`);
+  await page.getByRole("button", { name: "编辑服务" }).click();
+  const editor = page.getByRole("dialog", { name: "编辑服务" });
+  await expect(editor.getByRole("switch", { name: "强制 HTTPS" })).not.toBeChecked();
+  await editor.getByRole("switch", { name: "强制 HTTPS" }).check();
+  await editor.getByRole("button", { name: "保存服务" }).click();
+  await expect(editor).toBeHidden();
+  expect(state.calls.find(call => call.method === "PUT")?.body).toMatchObject({ http_redirect_enabled: true });
 });

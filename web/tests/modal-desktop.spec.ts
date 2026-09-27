@@ -48,19 +48,22 @@ test.beforeEach(async ({ page }, info) => {
 
 test("账号与服务器设置弹窗居中，长表单内部滚动", async ({ page }, info) => {
   await installApiMocks(page);
-  await page.route("**/api/v1/admin/server-settings", route => route.fulfill({ json: { public_url: "", trusted_proxies: [], public_ips: [] } }));
+  await page.route("**/api/v1/admin/server-settings", route => route.fulfill({ json: { management_entry: null, public_url: "", public_ips: [], domains: [{ id: "d", domain: "example.test" }], caddy_enabled: true, status: "disabled", error: null } }));
   await page.goto("/#/manage");
   await page.getByRole("button", { name: "修改密码", exact: true }).click();
   await centered(page, info, "password");
   await page.keyboard.press("Escape");
   await page.getByRole("button", { name: "服务器设置", exact: true }).click();
-  await expect(page.getByLabel("管理地址", { exact: true })).toBeVisible();
+  await expect(page.getByRole("switch", { name: "HTTPS 管理入口" })).toBeVisible();
+  await page.getByRole("switch", { name: "HTTPS 管理入口" }).check();
+  await page.getByText("公网 IP 校验（可选）", { exact: true }).click();
   await centered(page, info, "server-settings");
   await page.setViewportSize({ width: 901, height: 600 });
   const body = page.getByRole("dialog").locator(".modal-body");
   await expect.poll(() => body.evaluate(element => element.scrollHeight > element.clientHeight)).toBeTruthy();
   await body.evaluate(element => { element.scrollTop = element.scrollHeight; });
   await expect(page.getByRole("button", { name: "保存设置" })).toBeInViewport();
+  await page.getByRole("switch", { name: "HTTPS 管理入口" }).uncheck();
   await page.keyboard.press("Escape");
   await page.goto("/#/settings/sessions");
   await page.getByRole("button", { name: "结束会话", exact: true }).first().click();

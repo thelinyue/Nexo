@@ -59,9 +59,9 @@ test("切换 TCP 清除认证草稿，反向代理支持认证", async ({ page }
   await form.locator("summary", { hasText: "高级设置" }).click();
   await form.getByRole("radio", { name: "认证访问", exact: true }).check();
   await form.getByLabel("访问密码", { exact: true }).fill("1234");
-  await form.getByRole("radio", { name: "TCP 服务" }).check();
+  await form.getByLabel("内网协议").selectOption("tcp");
   await expect(form.getByRole("radio", { name: "认证访问", exact: true })).toHaveCount(0);
-  await form.getByRole("radio", { name: "网页服务" }).check();
+  await form.getByLabel("内网协议").selectOption("http");
   await form.locator("summary", { hasText: "高级设置" }).click();
   await expect(form.getByRole("radio", { name: "公开访问", exact: true })).toBeChecked();
   await form.getByRole("button", { name: "取消", exact: true }).click();

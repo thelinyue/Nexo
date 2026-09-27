@@ -142,6 +142,7 @@ fn owned(db: &Connection, tenant: &str, id: &str) -> Result<String, ApiError> {
 
 /// 在写事务内占用域名范围；未验证记录不能抢占其他用户域名，父子域也不能跨空间重叠。
 fn claim(db: &Connection, tenant: &str, id: &str, domain: &str) -> Result<(), ApiError> {
+    crate::server_settings::ensure_host_available(db, domain)?;
     let mut query=db.prepare("SELECT p.domain FROM public_domains p LEFT JOIN domain_settings s ON s.domain_id=p.id WHERE p.tenant_id!=?1 AND COALESCE(s.verified,1)=1").map_err(db_error)?;
     for existing in query
         .query_map([tenant], |r| r.get::<_, String>(0))

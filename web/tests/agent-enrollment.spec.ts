@@ -40,7 +40,6 @@ test("一次复制即可配置并启动 Agent，两种部署方式均不写入�
   await expect(dialog.getByRole("button", { name: "复制 Agent TOML" })).toHaveCount(0);
   expect(compose).toContain('NEXO_SERVER_URL: "https://nexo.example.com/prefix"');
   expect(compose).toContain('NEXO_ENROLLMENT_TOKEN: "nexo_join_shared-test-key"');
-  await page.screenshot({ path: info.outputPath("agent-compose-native.png") });
   await dialog.getByRole("button", { name: "docker run", exact: true }).click();
   await dialog.getByRole("button", { name: "复制 docker run 命令", exact: true }).click();
   const docker = await page.evaluate(() => (window as any).copiedCommand as string);

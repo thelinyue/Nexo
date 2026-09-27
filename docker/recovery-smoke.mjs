@@ -77,7 +77,7 @@ try {
   assert.equal((await call("auth/logout", "POST", {}, { Origin: "https://attacker.invalid" })).status, 403);
   assert.equal((await call("auth/logout", "POST", {}, { "x-nexo-csrf": "wrong" })).status, 403);
   check("未信任的 HTTPS 请求头无效，跨站和缺少 CSRF 的写入被拒绝");
-  await api("admin/server-settings", "PUT", { public_url: "", trusted_proxies: [], public_ips: ["127.0.0.1"] });
+  await api("admin/server-settings", "PUT", { management_entry: null, public_ips: ["127.0.0.1"] });
 
   const invite = await api("agent-access-key", "POST", {});
   agent = launch("agent", agentBin, { ...agentConfig, enrollment_token: invite.token });
@@ -150,18 +150,18 @@ try {
   assert.equal((await api("devices"))[0].id, device);
   check("本机 CLI 生成一次性恢复码，重设密码撤销旧会话和旧密码，业务数据保留");
 
-  await api("admin/server-settings", "PUT", { public_url: "", trusted_proxies: ["127.0.0.1"], public_ips: ["127.0.0.1"] });
-  await api("admin/server-settings", "PUT", { public_url: `https://${new URL(url).host}`, trusted_proxies: ["127.0.0.1"], public_ips: ["127.0.0.1"] }, { "x-forwarded-proto": "https", Origin: `https://${new URL(url).host}` });
+  await api("admin/server-settings", "PUT", { management_entry: null, public_ips: ["127.0.0.1"] });
   await stop(server);
   server = launch("server-proxy", serverBin, serverConfig);
-  await wait(async () => (await call("auth/status")).status === 403, "HTTPS 强制保护");
-  const proxyHeaders = { "x-forwarded-proto": "https", Origin: `https://${new URL(url).host}` };
-  const secured = await call("auth/login", "POST", { username: "admin", password: "recovered-test-password-1234" }, proxyHeaders);
-  assert.equal(secured.status, 200); assert(secured.cookies.every(value => value.includes("; Secure")));
-  assert.equal((await api("auth/status", "GET", undefined, proxyHeaders)).local_http_warning, false);
-  assert.equal((await call("auth/status", "GET", undefined, { "x-forwarded-proto": "https,http" })).status, 403);
+  await wait(async () => (await call("auth/status")).status === 200, "HTTP 原入口重启恢复");
+  const proxyHeaders = { "x-forwarded-proto": "https", Origin: url };
+  assert.equal((await call("auth/login", "POST", { username: "admin", password: "recovered-test-password-1234" }, { ...proxyHeaders, Origin: `https://${new URL(url).host}` })).status, 403);
+  const direct = await call("auth/login", "POST", { username: "admin", password: "recovered-test-password-1234" }, proxyHeaders);
+  assert.equal(direct.status, 200);
+  assert(direct.cookies.every(value => !value.includes("; Secure")));
+  assert.equal((await api("auth/status", "GET", undefined, proxyHeaders)).local_http_warning, true);
   assert.equal((await call("auth/logout", "POST", {}, { ...proxyHeaders, Origin: "https://attacker.invalid" })).status, 403);
-  check("可信代理 HTTPS 识别、Secure Cookie、管理入口约束和来源校验");
+  check("HTTP 原入口保留，未配置管理域名时不采信伪造协议头，来源校验生效");
   let throttled = false;
   for (let attempt = 0; attempt < 12; attempt++) {
     const result = await call("auth/login", "POST", { username: "admin", password: "incorrect-password" }, proxyHeaders);

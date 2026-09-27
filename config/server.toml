@@ -1,4 +1,4 @@
-# Nexo Server 启动配置。修改后重启；管理地址、可信代理和公网 IP 在管理页面设置。
+# Nexo Server 启动配置。修改后重启；管理域名和可选公网 IP 在管理页面设置，内置 Caddy 自动配置代理。
 http_addr = "0.0.0.0:8280" # 网页与 API
 control_addr = "0.0.0.0:9890" # Agent 控制连接
 tunnel_addr = "0.0.0.0:9891" # TCP 数据连接

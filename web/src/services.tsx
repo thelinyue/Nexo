@@ -93,7 +93,7 @@ function ServiceSelect({ label, name, value, placeholder, options, disabled, com
 /** 表单草稿只驻留内存；跳转配置 Agent / 域名时暂时隐藏，返回后继续填写。 */
 function ServiceEditor({ tunnel, mode, data, active, csrf, onClose, onSaved }: { tunnel?: Tunnel; mode: "tunnel" | "reverse_proxy"; data: ServiceData; active: boolean; csrf?: string | null; onClose: () => void; onSaved: (item: Tunnel) => void }) {
   const request = useApi();
-  const initial = useMemo(() => ({ access_mode: tunnel?.access_mode ?? "public", access_password: "", service_mode: tunnel?.service_mode ?? mode, name: tunnel?.name ?? "", protocol: tunnel?.protocol ?? "https", origin_protocol: tunnel?.origin_protocol ?? "http", device_id: tunnel?.device_id ?? data.devices.find(item => item.status === "online")?.id ?? data.devices[0]?.id ?? "", local_address: tunnel?.local_address ?? "127.0.0.1", local_port: String(tunnel?.local_port ?? ""), public_port: String(tunnel?.public_port ?? ""), hostname: tunnel?.hostname ?? "", public_domain_id: tunnel ? data.domains.find(item => item.domain === tunnel.public_domain)?.id ?? "" : data.domains.length === 1 ? data.domains[0].id : "", lan_redirect_enabled: !isPortProtocol(tunnel?.protocol) && (tunnel?.lan_redirect_enabled ?? false) }), []);
+  const initial = useMemo(() => ({ http_redirect_enabled: tunnel ? tunnel.http_redirect_enabled ?? false : mode === "reverse_proxy", access_mode: tunnel?.access_mode ?? "public", access_password: "", service_mode: tunnel?.service_mode ?? mode, name: tunnel?.name ?? "", protocol: tunnel?.protocol ?? "https", origin_protocol: tunnel?.origin_protocol ?? "http", device_id: tunnel?.device_id ?? data.devices.find(item => item.status === "online")?.id ?? data.devices[0]?.id ?? "", local_address: tunnel?.local_address ?? "127.0.0.1", local_port: String(tunnel?.local_port ?? ""), public_port: String(tunnel?.public_port ?? ""), hostname: tunnel?.hostname ?? "", public_domain_id: tunnel ? data.domains.find(item => item.domain === tunnel.public_domain)?.id ?? "" : data.domains.length === 1 ? data.domains[0].id : "", lan_redirect_enabled: !isPortProtocol(tunnel?.protocol) && (tunnel?.lan_redirect_enabled ?? false) }), []);
   const webProtocol = useRef(!isPortProtocol(tunnel?.protocol) && tunnel?.protocol ? tunnel.protocol : "https");
   const [draft, setDraft] = useState(initial); const [busy, setBusy] = useState(false); const [error, setError] = useState<string | null>(null);
   const [invalidField, setInvalidField] = useState<keyof typeof initial | null>(null);
@@ -104,13 +104,21 @@ function ServiceEditor({ tunnel, mode, data, active, csrf, onClose, onSaved }: {
   const update = (field: keyof typeof draft, value: string | boolean) => {
     if (field === "protocol" && !isPortProtocol(String(value))) webProtocol.current = String(value);
     setDraft(current => {
-      if (field === "protocol" && isPortProtocol(String(value))) return { ...current, protocol: value, lan_redirect_enabled: false, access_mode: "public", access_password: "" };
+      if (field === "protocol" && typeof value === "string" && isPortProtocol(value)) return { ...current, protocol: value, lan_redirect_enabled: false, access_mode: "public", access_password: "" };
       if (field === "access_mode" && value === "public") return { ...current, access_mode: "public", access_password: "" };
       return { ...current, [field]: value };
     });
     if (field === invalidField || (invalidField === "access_password" && (field === "access_mode" || (field === "protocol" && isPortProtocol(String(value))))) || (invalidField === "local_address" && (field === "lan_redirect_enabled" || field === "protocol"))) { setInvalidField(null); setError(null); }
   };
   const devices = [...data.devices].sort((a, b) => Number(b.status === "online") - Number(a.status === "online"));
+  // 地址行统一选择内网协议；网页服务的公网协议独立保存，跨类型返回时恢复原选择。
+  function updateOriginProtocol(value: string) {
+    if (isPortProtocol(value)) update("protocol", value);
+    else {
+      if (isPortProtocol(draft.protocol)) update("protocol", webProtocol.current);
+      update("origin_protocol", value);
+    }
+  }
   const selectedDomain = data.domains.find(item => item.id === draft.public_domain_id);
   const finalAddress = isPortProtocol(draft.protocol) ? `公网端口 ${draft.public_port || "自动分配"}` : `${draft.protocol}://${draft.hostname || "主机名"}.${selectedDomain?.domain || tunnel?.public_domain || "根域名"}`;
   // 从域名配置返回时，只有一个可用域名即可直接填入，多个域名仍由用户明确选择。
@@ -161,13 +169,12 @@ function ServiceEditor({ tunnel, mode, data, active, csrf, onClose, onSaved }: {
     }}>
       <div className="modal-body"><fieldset disabled={busy}>
         {direct && <p className="helper">由 Nexo Server 直接访问目标，无需 Agent。仅管理员可管理，不计入穿透流量。</p>}
-        {!direct && <fieldset className="protocol-picker service-protocol-picker"><legend className="sr-only">服务类型</legend>{[["web", "网页服务"], ["tcp", "TCP 服务"], ["udp", "UDP 服务"], ["tcp_udp", "TCP+UDP"]].map(([type, label]) => <label className="protocol-option" key={type}><input type="radio" name="service_type" value={type} checked={(isPortProtocol(draft.protocol) ? draft.protocol : "web") === type} disabled={Boolean(tunnel && !tunnel.public_domain && type === "web")} onChange={() => update("protocol", type === "web" ? webProtocol.current : type)} /><span>{label}</span></label>)}</fieldset>}
         <section className="service-form-section"><h3 className="desktop-form-label">基本信息</h3><div className="service-field-group">
           <label className="service-field"><span>服务名称</span><input {...fieldProps("name")} value={draft.name} onChange={e => update("name", e.target.value)} placeholder="例如：家庭 NAS" enterKeyHint="next" autoComplete="off" required /></label>
           {!direct && <ServiceSelect {...fieldProps("device_id")} label="Agent" value={draft.device_id} placeholder="选择 Agent" options={devices.map(item => ({ value: item.id, label: item.name, status: item.status === "online" ? "online" : "offline" }))} disabled={busy} onChange={value => update("device_id", value)} />}
         </div>{!direct && !devices.length && <div className="notice"><span>请关闭表单，到设备页添加 Agent。</span></div>}{!direct && devices.find(item => item.id === draft.device_id)?.status === "offline" && <p className="helper" role="status">Agent 当前离线，可保存配置，连接恢复后下发。</p>}</section>
         <section className="service-form-section"><h3>{direct ? "目标地址" : "内网地址"}</h3><div className="service-field-group service-address-input" role="group" aria-label={direct ? "目标连接" : "内网连接"}>
-          {isPortProtocol(draft.protocol) ? <span className="service-fixed-protocol">{protocolLabel(draft.protocol)}</span> : <select aria-label={direct ? "目标协议" : "内网协议"} {...fieldProps("origin_protocol")} value={draft.origin_protocol} onChange={e => update("origin_protocol", e.target.value)}><option value="http">HTTP</option><option value="https">HTTPS</option></select>}
+          <select aria-label={direct ? "目标协议" : "内网协议"} {...fieldProps("origin_protocol")} value={isPortProtocol(draft.protocol) ? draft.protocol : draft.origin_protocol} onChange={e => updateOriginProtocol(e.target.value)}><option value="http" disabled={Boolean(!direct && tunnel && !tunnel.public_domain)}>HTTP</option><option value="https" disabled={Boolean(!direct && tunnel && !tunnel.public_domain)}>HTTPS</option>{!direct && <><option value="tcp">TCP</option><option value="udp">UDP</option><option value="tcp_udp">TCP+UDP</option></>}</select>
           <input aria-label={direct ? "目标地址" : "内网地址"} {...fieldProps("local_address")} value={draft.local_address} onChange={e => update("local_address", e.target.value)} placeholder="IP 或主机名" inputMode="url" enterKeyHint="next" autoComplete="off" autoCorrect="off" autoCapitalize="none" spellCheck={false} required />
           <span className="service-address-separator" aria-hidden="true">:</span>
           <input aria-label={direct ? "目标端口" : "内网端口"} {...fieldProps("local_port")} value={draft.local_port} onChange={e => update("local_port", e.target.value)} placeholder="端口" type="text" inputMode="numeric" enterKeyHint={isPortProtocol(draft.protocol) ? "done" : "next"} autoComplete="off" required />
@@ -178,6 +185,7 @@ function ServiceEditor({ tunnel, mode, data, active, csrf, onClose, onSaved }: {
           <span className="service-address-separator" aria-hidden="true">.</span>
           <ServiceSelect compact {...fieldProps("public_domain_id")} label="根域名" value={draft.public_domain_id} placeholder="选择域名" options={data.domains.map(item => ({ value: item.id, label: item.domain }))} disabled={busy || Boolean(tunnel)} onChange={value => update("public_domain_id", value)} />
         </div>{!data.domains.length && <div className="notice"><span>网页服务需要域名，请关闭表单后到域名页添加。</span></div>}{tunnel && <p className="helper">现有服务保留原根域名；更换根域名请创建新服务。</p>}</section>}
+        {direct && draft.protocol === "https" && <div className="service-field-group"><label className="service-field service-toggle-field"><span>强制 HTTPS</span><span className="service-switch"><input type="checkbox" role="switch" checked={draft.http_redirect_enabled} onChange={e => update("http_redirect_enabled", e.target.checked)} /><span className="service-switch-track" aria-hidden="true" /></span></label></div>}
         {!isPortProtocol(draft.protocol) && <details className="service-advanced"><summary><span>高级设置</span><ChevronRight size={17} /></summary><div className="service-advanced-content">
           <section className="service-form-section"><h3>访问规则</h3>
             <fieldset className="protocol-picker"><legend className="sr-only">访问规则</legend>{[["public", "公开访问"], ["password", "认证访问"]].map(([mode, label]) => <label className="protocol-option" key={mode}><input type="radio" name="access_mode" value={mode} checked={draft.access_mode === mode} onChange={() => update("access_mode", mode)} /><span>{label}</span></label>)}</fieldset>

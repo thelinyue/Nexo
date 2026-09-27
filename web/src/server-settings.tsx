@@ -1,13 +1,15 @@
 import { useEffect, useState } from "react";
-import { Loading, Modal, Notice, errorText, request } from "./ui";
+import { CopyButton, Loading, Modal, Notice, errorText, request } from "./ui";
 
-type Settings = { public_url: string; trusted_proxies: string[]; public_ips: string[] };
-type Fields = { public_url: string; trusted_proxies: string; public_ips: string };
-const fields = (value: Settings): Fields => ({ public_url: value.public_url, trusted_proxies: value.trusted_proxies.join(", "), public_ips: value.public_ips.join(", ") });
-const addresses = (value: string) => value.split(/[\s,，]+/).filter(Boolean);
+type Entry = { domain_id: string; hostname: string };
+type Settings = { management_entry: Entry | null; public_url: string; public_ips: string[]; domains: { id: string; domain: string }[]; caddy_enabled: boolean; status: string; error: string | null };
+type Fields = { enabled: boolean; domain_id: string; hostname: string; public_ips: string };
+const fields = (value: Settings): Fields => ({ enabled: Boolean(value.management_entry), domain_id: value.management_entry?.domain_id ?? (value.domains.length === 1 ? value.domains[0].id : ""), hostname: value.management_entry?.hostname ?? "nexo", public_ips: value.public_ips.join(", ") });
+const statusLabel: Record<string, string> = { disabled: "未开启", pending: "正在配置", certificate_pending: "等待证书", ready: "已配置", failed: "配置失败" };
 
-/** 平台设置不跟随代管空间；编辑失败保留输入，关闭和离开沿用弹窗的未保存保护。 */
+/** 表单只保存期望配置；轮询运行状态不覆盖草稿，证书签发期间仍可关闭或修正入口。 */
 export function ServerSettings({ csrf, onClose }: { csrf?: string | null; onClose: () => void }) {
+  const [settings, setSettings] = useState<Settings | null>(null);
   const [saved, setSaved] = useState<Fields | null>(null);
   const [value, setValue] = useState<Fields | null>(null);
   const [loading, setLoading] = useState(true); const [busy, setBusy] = useState(false);
@@ -18,37 +20,52 @@ export function ServerSettings({ csrf, onClose }: { csrf?: string | null; onClos
     let cancelled = false;
     setLoading(true); setError(null);
     request<Settings>("/api/v1/admin/server-settings").then(result => {
-      if (!cancelled) { setSaved(fields(result)); setValue(fields(result)); }
+      if (!cancelled) { setSettings(result); setSaved(fields(result)); setValue(fields(result)); }
     }).catch(e => { if (!cancelled) setError(errorText(e)); }).finally(() => { if (!cancelled) setLoading(false); });
     return () => { cancelled = true; };
   }, [retry]);
-  function update(key: keyof Fields, text: string) {
+  useEffect(() => {
+    if (loading || busy || !settings) return;
+    let cancelled = false;
+    const timer = window.setInterval(() => {
+      void request<Settings>("/api/v1/admin/server-settings").then(result => { if (!cancelled) setSettings(result); }).catch(e => { if (!cancelled) setError(errorText(e)); });
+    }, 5000);
+    return () => { cancelled = true; window.clearInterval(timer); };
+  }, [loading, busy, Boolean(settings)]);
+  function update<K extends keyof Fields>(key: K, text: Fields[K]) {
     setValue(previous => previous && ({ ...previous, [key]: text })); setError(null); setMessage(null);
   }
+  const selected = settings?.domains.find(domain => domain.id === value?.domain_id);
+  const preview = value?.enabled && selected && value.hostname.trim() ? `https://${value.hostname.trim().toLowerCase()}.${selected.domain}` : "";
   return <Modal title="服务器设置" full dirty={dirty} busy={busy} onClose={onClose}>{close =>
     <form className="modal-form" onSubmit={async event => {
       event.preventDefault(); if (!value || busy) return;
       setBusy(true); setError(null); setMessage(null);
       try {
-        const result = await request<Settings>("/api/v1/admin/server-settings", { method: "PUT", body: JSON.stringify({ public_url: value.public_url.trim(), trusted_proxies: addresses(value.trusted_proxies), public_ips: addresses(value.public_ips) }) }, csrf);
-        setSaved(fields(result)); setValue(fields(result)); setMessage("已保存并生效。公网 IP 变更后，请重新检查域名解析。");
+        const result = await request<Settings>("/api/v1/admin/server-settings", { method: "PUT", body: JSON.stringify({ management_entry: value.enabled ? { domain_id: value.domain_id, hostname: value.hostname.trim() } : null, public_ips: value.public_ips.split(/[\s,，]+/).filter(Boolean) }) }, csrf);
+        setSettings(result); setSaved(fields(result)); setValue(fields(result)); setMessage("设置已保存。");
       } catch (e) { setError(errorText(e)); } finally { setBusy(false); }
     }}>
       <div className="modal-body">
         {loading && <Loading />}
-        {value && <fieldset disabled={busy}>
-          <label htmlFor="server-public-url">管理地址<input id="server-public-url" type="url" value={value.public_url} onChange={e => update("public_url", e.target.value)} placeholder="https://nexo.example.com" autoCapitalize="none" spellCheck={false} aria-describedby="server-public-url-help" /></label>
-          <p className="helper" id="server-public-url-help">留空按当前地址校验。填写 HTTPS 地址后，仅接受可信代理转发的 HTTPS 请求；需自行配置反向代理和证书。</p>
-          <label htmlFor="server-trusted-proxies">可信代理 IP<input id="server-trusted-proxies" value={value.trusted_proxies} onChange={e => update("trusted_proxies", e.target.value)} placeholder="127.0.0.1, ::1" autoCapitalize="none" spellCheck={false} aria-describedby="server-trusted-proxies-help" /></label>
-          <p className="helper" id="server-trusted-proxies-help">仅填写你控制且直接连接 Server 的代理 IP，逗号分隔，不支持 CIDR。留空不信任代理协议头。</p>
-          <label htmlFor="server-public-ips">公网 IP<input id="server-public-ips" value={value.public_ips} onChange={e => update("public_ips", e.target.value)} placeholder="203.0.113.10, 2001:db8::10" autoCapitalize="none" spellCheck={false} aria-describedby="server-public-ips-help" /></label>
-          <p className="helper" id="server-public-ips-help">用于核对 A/AAAA 解析，逗号分隔。留空不核对指向；不会修改 DNS 或监听地址。</p>
-          <details className="recovery-help"><summary>首次配置 HTTPS 或更换管理地址</summary><p>先配置 HTTPS 反向代理，保留原始 Host，并覆盖 X-Forwarded-Proto 为 https。在当前 HTTP 入口先保存可信代理 IP，管理地址留空；随后从 HTTPS 地址重新登录，再填写该管理地址并保存。</p><p>更换已有管理地址时，先从原入口清空管理地址并保存，再从新入口登录设置。保存时会检查当前连接，避免填写错误后无法继续管理。</p></details>
+        {value && settings && <fieldset disabled={busy}>
+          <div className="service-field-group"><label className="service-field service-toggle-field"><span>HTTPS 管理入口</span><span className="service-switch"><input type="checkbox" role="switch" checked={value.enabled} onChange={e => update("enabled", e.target.checked)} disabled={!settings.caddy_enabled && !value.enabled} /><span className="service-switch-track" aria-hidden="true" /></span></label></div>
+          {!settings.caddy_enabled && <p className="notice">内置 Caddy 未启用，请在服务器启动配置中启用。</p>}
+          {value.enabled && <>
+            <label>域名<select value={value.domain_id} onChange={e => update("domain_id", e.target.value)} required><option value="">选择域名</option>{settings.domains.map(domain => <option key={domain.id} value={domain.id}>{domain.domain}</option>)}</select></label>
+            {!settings.domains.length && <p className="helper">请先关闭此窗口，到域名管理验证域名并开启 HTTPS。</p>}
+            <label>子域名<input value={value.hostname} onChange={e => update("hostname", e.target.value)} placeholder="nexo" autoCapitalize="none" spellCheck={false} pattern="[a-zA-Z0-9](([a-zA-Z0-9]|-){0,61}[a-zA-Z0-9])?" required /></label>
+            {preview && <div className="service-detail-address"><code>{preview}</code><CopyButton value={preview} iconOnly label="复制管理地址" /></div>}
+            <p className="helper">已启用强制 HTTPS，证书沿用域名配置。请将此子域名解析到服务器。</p>
+          </>}
+          <p className="helper">原 IP 管理入口继续可用。</p>
+          {settings.management_entry && <div role="status"><p>{statusLabel[settings.status] ?? "正在检查"}</p>{settings.error && <p className="form-error">{settings.error}</p>}{settings.status === "ready" && <a className="text-button" href={settings.public_url} target="_blank" rel="noopener noreferrer">打开管理入口</a>}</div>}
+          <details className="recovery-help"><summary>公网 IP 校验（可选）</summary><label>公网 IP<input value={value.public_ips} onChange={e => update("public_ips", e.target.value)} placeholder="203.0.113.10, 2001:db8::10" autoCapitalize="none" spellCheck={false} /></label><p className="helper">用于核对域名解析，逗号分隔；留空不核对指向，不会修改 DNS。</p></details>
         </fieldset>}
         <Notice error={error} onRetry={!value && !loading ? () => setRetry(previous => previous + 1) : undefined} />
         {message && <p role="status" className="action-status">{message}</p>}
       </div>
-      <footer className="modal-actions"><button type="button" className="secondary-button desktop-modal-cancel" onClick={close} disabled={busy}>取消</button><button className="primary-button" disabled={loading || busy || !value || !dirty}>{busy ? "保存中…" : "保存设置"}</button></footer>
+      <footer className="modal-actions"><button type="button" className="secondary-button desktop-modal-cancel" onClick={close} disabled={busy}>取消</button><button className="primary-button" disabled={loading || busy || !value || !dirty || (value.enabled && (!settings?.caddy_enabled || !selected))}>{busy ? "保存中…" : "保存设置"}</button></footer>
     </form>}
   </Modal>;
 }

@@ -95,6 +95,30 @@ async fn real_caddy_direct_proxy_lifecycle_tls_websocket_and_quota_isolation() {
     let https_address: SocketAddr = cfg.https_listen.parse().unwrap();
     let (mut state, headers) = crate::tests::domain_fixture();
     state.domain_runtime = Arc::new(DomainRuntimeManager::new(cfg.clone()));
+    let api_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let api_address = api_listener.local_addr().unwrap();
+    state.config = Arc::new(crate::config::Config {
+        http_addr: api_address,
+        ..Default::default()
+    });
+    let app = crate::router(state.clone());
+    let api_task = tokio::spawn(async move {
+        axum::serve(
+            api_listener,
+            app.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .await
+        .unwrap();
+    });
+    state
+        .db
+        .lock()
+        .unwrap()
+        .execute(
+            "UPDATE users SET password_hash=?1 WHERE id='u'",
+            [crate::auth::hash_password("test-password-1234").unwrap()],
+        )
+        .unwrap();
     // localhost 由 Caddy 内部 CA 管理，无公网 DNS 或 ACME 副作用。
     state.db.lock().unwrap().execute("INSERT INTO public_domains(id,tenant_id,domain,https_enabled,created_at,updated_at) VALUES('domain','default','reverse.localhost',1,0,0)", []).unwrap();
     state.db.lock().unwrap().execute("INSERT INTO domain_settings(domain_id,certificate_mode,verified,verification_token) VALUES('domain','http01',1,'test-proof')", []).unwrap();
@@ -110,15 +134,19 @@ async fn real_caddy_direct_proxy_lifecycle_tls_websocket_and_quota_isolation() {
     }
     // 独立测试预置内部 CA 证书；生产仍使用正常 HTTP-01 设置，不依赖缺失凭据的回退。
     let mut local_ca = build_config(&cfg, &[]).unwrap();
-    local_ca["apps"]["tls"] = json!({"certificates":{"automate":["reverse.localhost","app.reverse.localhost"]},"automation":{"policies":[{"issuers":[{"module":"internal"}]}]}});
+    local_ca["apps"]["tls"] = json!({"certificates":{"automate":["reverse.localhost","app.reverse.localhost","manage.reverse.localhost"]},"automation":{"policies":[{"issuers":[{"module":"internal"}]}]}});
     supervisor.apply_json(&local_ca).await.unwrap();
     let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
-    while read_certificates(&cfg.storage_root).len() < 2 {
+    while read_certificates(&cfg.storage_root).len() < 3 {
         assert!(tokio::time::Instant::now() < deadline);
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     // HTTP-01 从 ACME 的存储命名空间加载已有证书；夹具复制内部 CA 证书，避免访问公共 CA。
-    for host in ["reverse.localhost", "app.reverse.localhost"] {
+    for host in [
+        "reverse.localhost",
+        "app.reverse.localhost",
+        "manage.reverse.localhost",
+    ] {
         let source = cfg.storage_root.join("certificates/local").join(host);
         let target = cfg
             .storage_root
@@ -173,6 +201,7 @@ async fn real_caddy_direct_proxy_lifecycle_tls_websocket_and_quota_isolation() {
         .timeout(Duration::from_secs(5))
         .add_root_certificate(reqwest::Certificate::from_pem(&pem).unwrap())
         .resolve("app.reverse.localhost", https_address)
+        .resolve("manage.reverse.localhost", https_address)
         .build()
         .unwrap();
     let url = format!("https://app.reverse.localhost:{}", https_address.port());
@@ -193,6 +222,161 @@ async fn real_caddy_direct_proxy_lifecycle_tls_websocket_and_quota_isolation() {
     )));
     assert!(text.contains("x-forwarded-proto: https"));
     assert!(!text.contains("6.6.6.6"));
+    // 默认重定向保留 URI，关闭后 HTTP 不能偷偷变成明文代理。
+    let no_redirect = reqwest::Client::builder()
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(Duration::from_secs(5))
+        .build()
+        .unwrap();
+    let redirect = no_redirect
+        .post(format!("http://{http_address}/a%2Fb?x=a+b&y=%2F"))
+        .header("Host", "app.reverse.localhost")
+        .body("payload")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(redirect.status(), 307);
+    assert_eq!(
+        redirect.headers()["location"],
+        "https://app.reverse.localhost/a%2Fb?x=a+b&y=%2F"
+    );
+    assert_eq!(redirect.headers()["cache-control"], "no-store");
+    let mut unforced = input(origin_port, "http");
+    unforced.http_redirect_enabled = Some(false);
+    let _ = update_tunnel(
+        State(state.clone()),
+        headers.clone(),
+        Path(proxy.id.clone()),
+        Json(unforced),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        no_redirect
+            .get(format!("http://{http_address}/"))
+            .header("Host", "app.reverse.localhost")
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        404
+    );
+    let mut forced = input(origin_port, "http");
+    forced.http_redirect_enabled = Some(true);
+    let _ = update_tunnel(
+        State(state.clone()),
+        headers.clone(),
+        Path(proxy.id.clone()),
+        Json(forced),
+    )
+    .await
+    .unwrap();
+    // 真实 HTTP 原入口保存管理配置，再经过真实 Caddy TLS 验证登录、安全 Cookie 和双入口写入。
+    let settings_url = format!("http://{api_address}/api/v1/admin/server-settings");
+    let management_body =
+        json!({"management_entry":{"domain_id":"domain","hostname":"manage"},"public_ips":[]});
+    let saved = no_redirect
+        .put(&settings_url)
+        .headers(headers.clone())
+        .header("Origin", format!("http://{api_address}"))
+        .json(&management_body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(saved.status(), 200, "{}", saved.text().await.unwrap());
+    let management_url = format!("https://manage.reverse.localhost:{}", https_address.port());
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        if client
+            .get(format!("{management_url}/health"))
+            .header("Host", "manage.reverse.localhost")
+            .send()
+            .await
+            .is_ok_and(|r| r.status() == 200)
+        {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "管理 HTTPS 未就绪：{:?}",
+            supervisor.drain_log_events().await
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    // 预置 CertMagic 分布式 challenge，验证真实 HTTP 验证处理优先于管理重定向；不访问公共 CA。
+    let challenge_dir = cfg
+        .storage_root
+        .join("acme/acme-v02.api.letsencrypt.org-directory/challenge_tokens");
+    fs::create_dir_all(&challenge_dir).unwrap();
+    let challenge_file = challenge_dir.join("manage.reverse.localhost.json");
+    fs::write(&challenge_file, serde_json::to_vec(&json!({"type":"http-01","token":"nexo-test-token","keyAuthorization":"nexo-test-token.proof","identifier":{"type":"dns","value":"manage.reverse.localhost"}})).unwrap()).unwrap();
+    let challenge = no_redirect
+        .get(format!(
+            "http://{http_address}/.well-known/acme-challenge/nexo-test-token"
+        ))
+        .header("Host", "manage.reverse.localhost")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(challenge.status(), 200);
+    assert_eq!(challenge.text().await.unwrap(), "nexo-test-token.proof");
+    fs::remove_file(challenge_file).unwrap();
+    let login = client
+        .post(format!("{management_url}/api/v1/auth/login"))
+        .header("Host", "manage.reverse.localhost")
+        .header("Origin", "https://manage.reverse.localhost")
+        .header("X-Forwarded-Proto", "http")
+        .json(&json!({"username":"admin","password":"test-password-1234"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(login.status(), 200);
+    assert!(login
+        .headers()
+        .get_all("set-cookie")
+        .iter()
+        .all(|v| v.to_str().unwrap().contains("; Secure")));
+    let https_saved = client
+        .put(format!("{management_url}/api/v1/admin/server-settings"))
+        .headers(headers.clone())
+        .header("Host", "manage.reverse.localhost")
+        .header("Origin", "https://manage.reverse.localhost")
+        .json(&management_body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(https_saved.status(), 200);
+    let status = https_saved.json::<Value>().await.unwrap();
+    assert_eq!(status["status"], "ready");
+    let forbidden = client
+        .put(format!("{management_url}/api/v1/admin/server-settings"))
+        .headers(headers.clone())
+        .header("Host", "manage.reverse.localhost")
+        .header("Origin", "https://attacker.invalid")
+        .json(&management_body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(forbidden.status(), 403);
+    let redirect = no_redirect
+        .get(format!("http://{http_address}/#/manage"))
+        .header("Host", "manage.reverse.localhost")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(redirect.status(), 307);
+    let direct = no_redirect
+        .get(format!("http://{api_address}/api/v1/auth/status"))
+        .headers(headers.clone())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(direct.status(), 200);
+    assert_eq!(
+        direct.json::<Value>().await.unwrap()["local_http_warning"],
+        true
+    );
     // TCP 上的真实 WebSocket 握手与帧经过相同反代目标。
     let mut plain = input(origin_port, "http");
     plain.protocol = "http".into();
@@ -344,7 +528,7 @@ async fn real_caddy_direct_proxy_lifecycle_tls_websocket_and_quota_isolation() {
     origin_task.await.ok();
     assert_eq!(client.get(&url).send().await.unwrap().status(), 502);
     // 新 manager 接管已恢复的 Caddy，验证 API 删除真实撤销路由。
-    let _ = delete_tunnel(State(state.clone()), headers, Path(proxy.id))
+    let _ = delete_tunnel(State(state.clone()), headers.clone(), Path(proxy.id))
         .await
         .unwrap();
     // HTTP-01 的停用服务不会继续自动管理该主机证书；通过 HTTP 入口验证路由已撤销。
@@ -358,6 +542,27 @@ async fn real_caddy_direct_proxy_lifecycle_tls_websocket_and_quota_isolation() {
         .await
         .unwrap();
     assert_eq!(removed.status(), 404);
+    let disabled = no_redirect
+        .put(&settings_url)
+        .headers(headers.clone())
+        .header("Origin", format!("http://{api_address}"))
+        .json(&json!({"management_entry":null,"public_ips":[]}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(disabled.status(), 200);
+    assert_eq!(
+        no_redirect
+            .get(format!("http://{http_address}/"))
+            .header("Host", "manage.reverse.localhost")
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        404
+    );
+    api_task.abort();
+    api_task.await.ok();
     restarted.shutdown().await.unwrap();
     tls_task.abort();
     tls_task.await.ok();

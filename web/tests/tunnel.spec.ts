@@ -114,7 +114,7 @@ for (const protocol of ["tcp", "http", "https"]) {
     await openServiceEditor(page);
     const dialog = page.getByRole("dialog", { name: "创建服务" });
     await dialog.getByLabel("服务名称").fill("新服务");
-    await dialog.getByRole("radio", { name: protocol === "tcp" ? "TCP 服务" : "网页服务", exact: true }).check();
+    await dialog.getByLabel("内网协议").selectOption(protocol === "tcp" ? "tcp" : "http");
     if (protocol !== "tcp") await dialog.getByLabel("公网协议").selectOption(protocol);
     await dialog.getByLabel("内网端口").fill("8080");
     if (protocol !== "tcp") { await dialog.getByLabel("主机名").fill("new"); await dialog.getByRole("combobox", { name: "根域名", exact: true }).click(); await dialog.getByRole("option", { name: "example.com", exact: true }).click(); }
@@ -174,7 +174,7 @@ test("无域名时先关闭表单再配置，不允许跨页保留编辑窗口",
   await openServiceEditor(page);
   const editor = page.getByRole("dialog", { name: "创建服务" });
   await editor.getByLabel("服务名称").fill("草稿服务");
-  await editor.getByRole("radio", { name: "网页服务", exact: true }).check();
+  await editor.getByLabel("内网协议").selectOption("http");
   await expect(editor.getByText("网页服务需要域名，请关闭表单后到域名页添加。", { exact: true })).toBeVisible();
   await page.evaluate(() => { window.location.hash = "#/domains"; });
   await expect(page).toHaveURL(/#\/services$/);

@@ -2,7 +2,14 @@
 
 本项目使用 [Semantic Versioning](https://semver.org/) 记录公开版本。
 
-## [0.2.7]
+## [0.2.8]
+
+- 内置 Caddy 支持 HTTPS 管理入口，复用域名证书，保留原 IP 入口及管理员、来源和 CSRF 校验。
+- HTTPS 反向代理新增强制 HTTPS 开关；使用保留方法、路径及查询参数的 307 跳转，已有服务保持原行为。
+- 完善服务表单、移动端添加入口和服务器设置反馈。
+- 包含 v0.2.7 未完成发布的原生 Agent Compose / docker run 及环境变量修复；相对上一正式版发布 Server 与 Agent。更新与数据库变更说明见 [v0.2.8 发布说明](docs/releases/v0.2.8.md)。
+
+## [0.2.7]（发布未完成，改动纳入 v0.2.8）
 
 - 修复 Agent 部署入口回退为 Shell 安装脚本的问题：Compose 直接返回原生 YAML，docker run 返回单条启动命令，均预填连接参数。
 - Agent 支持 `NEXO_SERVER_URL`、`NEXO_ENROLLMENT_TOKEN`、`NEXO_DEVICE_NAME`，非空值逐项覆盖 TOML，不回写配置文件；已有身份继续复用。

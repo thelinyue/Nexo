@@ -189,6 +189,7 @@ struct Tunnel {
     hostname: Option<String>,
     enabled: bool,
     lan_redirect_enabled: bool,
+    http_redirect_enabled: bool,
     apply_status: String,
     apply_error: Option<String>,
     apply_revision: i64,
@@ -213,6 +214,7 @@ struct TunnelInput {
     enabled: Option<bool>,
     public_domain_id: Option<String>,
     lan_redirect_enabled: Option<bool>,
+    http_redirect_enabled: Option<bool>,
 }
 #[derive(Debug, Serialize)]
 struct PublicDomain {
@@ -281,7 +283,10 @@ async fn main() -> Result<()> {
     )?);
     connection.execute("UPDATE devices SET status='offline'", [])?;
     let state = AppState {
-        security: Arc::new(security::Security::new(server_settings::load(&connection)?)),
+        security: Arc::new(security::Security::new(server_settings::load_for_runtime(
+            &connection,
+            config.http_addr,
+        )?)),
         domain_access: Arc::new(domain_access::Runtime::default()),
         authority,
         tunnel_runtime: Arc::new(transport::Runtime::new(config.public_bind)),
@@ -513,10 +518,13 @@ fn initialize_database(connection: &Connection, is_new: bool) -> Result<()> {
             .context("无法初始化数据库，已回滚")?;
         tx.commit()?;
     }
-    // 正常读取当前业务必需的字段，错误直接返回；不探测或转换历史结构。
+    // 先验证当前业务结构，再为现有版本添加强制 HTTPS 字段；不转换旧版 mesh 数据。
     server_settings::load(connection).context("无法读取服务器设置")?;
     connection.prepare("SELECT enabled FROM tenants")?;
     connection.prepare("SELECT service_mode,protocol_statuses,access_mode FROM tunnels")?;
+    if !connection.query_row("SELECT EXISTS(SELECT 1 FROM pragma_table_info('tunnels') WHERE name='http_redirect_enabled')", [], |r| r.get::<_, bool>(0))? {
+        connection.execute("ALTER TABLE tunnels ADD COLUMN http_redirect_enabled INTEGER NOT NULL DEFAULT 0", [])?;
+    }
     Ok(())
 }
 
@@ -674,7 +682,7 @@ async fn create_tunnel(
             &mut input,
             access_hash.as_deref(),
         )?;
-        db.execute("INSERT INTO tunnels (id,tenant_id,device_id,name,protocol,local_address,local_port,public_port,hostname,enabled,apply_status,apply_revision,public_domain_id,created_at,updated_at,lan_redirect_enabled,origin_protocol,service_mode) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,'checking',1,?11,?12,?12,?13,?14,?15)",params![id,session.tenant_id,input.device_id,input.name.trim(),input.protocol,input.local_address.trim(),input.local_port,input.public_port,input.hostname,input.enabled.unwrap_or(true),input.public_domain_id,unix_now(),input.lan_redirect_enabled.unwrap_or(false),input.origin_protocol,input.service_mode]).map_err(db_error)?;
+        db.execute("INSERT INTO tunnels (id,tenant_id,device_id,name,protocol,local_address,local_port,public_port,hostname,enabled,apply_status,apply_revision,public_domain_id,created_at,updated_at,lan_redirect_enabled,origin_protocol,service_mode,http_redirect_enabled) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,'checking',1,?11,?12,?12,?13,?14,?15,?16)",params![id,session.tenant_id,input.device_id,input.name.trim(),input.protocol,input.local_address.trim(),input.local_port,input.public_port,input.hostname,input.enabled.unwrap_or(true),input.public_domain_id,unix_now(),input.lan_redirect_enabled.unwrap_or(false),input.origin_protocol,input.service_mode,input.http_redirect_enabled.unwrap_or(false)]).map_err(db_error)?;
         service_access::save(&db, &id, &input, access_hash.as_deref())?;
         accounts::audit(&db, &session, "service_created", "service", &id)?;
         db.commit().map_err(db_error)?;
@@ -707,7 +715,7 @@ async fn update_tunnel(
             &mut input,
             access_hash.as_deref(),
         )?;
-        db.execute("UPDATE tunnels SET device_id=?1,name=?2,protocol=?3,local_address=?4,local_port=?5,public_port=?6,hostname=?7,enabled=?8,apply_revision=apply_revision+1,apply_status='checking',updated_at=?9,public_domain_id=?12,lan_redirect_enabled=?13,origin_protocol=?14,service_mode=?15 WHERE id=?10 AND tenant_id=?11 AND deleted_at IS NULL",params![input.device_id,input.name.trim(),input.protocol,input.local_address.trim(),input.local_port,input.public_port,input.hostname,input.enabled.unwrap_or(true),unix_now(),id,session.tenant_id,input.public_domain_id,input.lan_redirect_enabled.unwrap_or(false),input.origin_protocol,input.service_mode]).map_err(db_error)?;
+        db.execute("UPDATE tunnels SET device_id=?1,name=?2,protocol=?3,local_address=?4,local_port=?5,public_port=?6,hostname=?7,enabled=?8,apply_revision=apply_revision+1,apply_status='checking',updated_at=?9,public_domain_id=?12,lan_redirect_enabled=?13,origin_protocol=?14,service_mode=?15,http_redirect_enabled=?16 WHERE id=?10 AND tenant_id=?11 AND deleted_at IS NULL",params![input.device_id,input.name.trim(),input.protocol,input.local_address.trim(),input.local_port,input.public_port,input.hostname,input.enabled.unwrap_or(true),unix_now(),id,session.tenant_id,input.public_domain_id,input.lan_redirect_enabled.unwrap_or(false),input.origin_protocol,input.service_mode,input.http_redirect_enabled.unwrap_or(false)]).map_err(db_error)?;
         service_access::save(&db, &id, &input, access_hash.as_deref())?;
         accounts::audit(&db, &session, "service_updated", "service", &id)?;
         db.commit().map_err(db_error)?;
@@ -931,6 +939,7 @@ async fn create_domain(
             "域名已存在，请使用其他域名",
         ));
     }
+    server_settings::ensure_host_available(&connection, &domain)?;
     let primary: i64 = connection
         .query_row(
             "SELECT COUNT(*) FROM public_domains WHERE tenant_id=?1",
@@ -1022,6 +1031,7 @@ async fn delete_domain(
     if !exists {
         return Err(ApiError::new(StatusCode::NOT_FOUND, "域名不存在或已被删除"));
     }
+    server_settings::ensure_domain_unused(&tx, &id)?;
     let related = {
         let mut query = tx.prepare("SELECT CASE WHEN tenant_id=?2 THEN name ELSE '其他工作空间服务' END FROM tunnels WHERE public_domain_id=?1 AND deleted_at IS NULL ORDER BY name LIMIT 4").map_err(db_error)?;
         let rows = query
@@ -1077,7 +1087,7 @@ fn query_tunnels(
         .get(axum::http::header::HOST)
         .and_then(|value| value.to_str().ok())
         .and_then(|host| host.parse::<axum::http::uri::Authority>().ok());
-    let sql="SELECT t.id,t.tenant_id,t.device_id,d.name,t.name,t.protocol,t.local_address,t.local_port,t.public_port,t.hostname,t.enabled,t.apply_status,t.apply_error,t.apply_revision,t.public_domain_id,t.deleted_at,p.domain,t.lan_redirect_enabled,CASE WHEN t.protocol IN ('tcp','udp','tcp_udp') THEN NULL ELSE COALESCE(t.origin_protocol,'http') END,t.service_mode,t.access_mode,t.protocol_statuses FROM tunnels t LEFT JOIN devices d ON d.id=t.device_id LEFT JOIN public_domains p ON p.id=t.public_domain_id WHERE t.tenant_id=?1 AND t.deleted_at IS NULL AND (?2 IS NULL OR t.id=?2) ORDER BY t.created_at DESC";
+    let sql="SELECT t.id,t.tenant_id,t.device_id,d.name,t.name,t.protocol,t.local_address,t.local_port,t.public_port,t.hostname,t.enabled,t.apply_status,t.apply_error,t.apply_revision,t.public_domain_id,t.deleted_at,p.domain,t.lan_redirect_enabled,CASE WHEN t.protocol IN ('tcp','udp','tcp_udp') THEN NULL ELSE COALESCE(t.origin_protocol,'http') END,t.service_mode,t.access_mode,t.protocol_statuses,t.http_redirect_enabled FROM tunnels t LEFT JOIN devices d ON d.id=t.device_id LEFT JOIN public_domains p ON p.id=t.public_domain_id WHERE t.tenant_id=?1 AND t.deleted_at IS NULL AND (?2 IS NULL OR t.id=?2) ORDER BY t.created_at DESC";
     let mut q = connection.prepare(sql)?;
     let rows = q
         .query_map(params![tenant, only], |row| {
@@ -1112,6 +1122,7 @@ fn query_tunnels(
                 hostname: hostname.clone(),
                 enabled: row.get::<_, i64>(10)? != 0,
                 lan_redirect_enabled: row.get(17)?,
+                http_redirect_enabled: row.get(22)?,
                 apply_status: row.get(11)?,
                 apply_error: row.get(12)?,
                 apply_revision: row.get(13)?,
@@ -1228,6 +1239,7 @@ fn prepare_tunnel(
             .ok_or_else(|| ApiError::new(StatusCode::BAD_REQUEST, "服务子域名无效"))?
             .to_owned();
         let occupied: bool = db.query_row("SELECT EXISTS(SELECT 1 FROM tunnels t JOIN public_domains p ON p.id=t.public_domain_id WHERE t.hostname||'.'||p.domain=?1 AND t.id!=?2 AND t.deleted_at IS NULL) OR EXISTS(SELECT 1 FROM public_domains p LEFT JOIN domain_settings s ON s.domain_id=p.id WHERE p.domain=?1 AND COALESCE(s.verified,1)=1)",params![full,id],|r|r.get(0)).map_err(db_error)?;
+        server_settings::ensure_host_available(db, &full)?;
         if occupied {
             return Err(ApiError::new(StatusCode::CONFLICT, "该服务域名已被使用"));
         }

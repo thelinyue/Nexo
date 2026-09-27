@@ -59,6 +59,8 @@ async fn real_caddy_access_password_cookie_proxy_and_lan_priority() {
     };
     for (id, protocol) in [("web", "https"), ("plain", "http"), ("public", "https")] {
         domain.services.push(WebService {
+            management: false,
+            http_redirect_enabled: false,
             id: id.into(),
             hostname: format!("{id}.access.localhost"),
             protocol: protocol.into(),

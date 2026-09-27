@@ -44,11 +44,11 @@ Server 部署在公网可达的 Linux 主机上，提供管理页面和公网入
 | UDP `9891` | Agent QUIC 数据通道 | 使用 UDP 或 TCP+UDP 时开放，直连 Server；普通 HTTP 代理不支持 |
 | UDP `443` | HTTP/3 | 可选；普通 HTTPS 不要求此项 |
 
-**版本要求：** 本次发布 Server 与 Agent v0.2.7。页面生成的原生 Compose / docker run 需要 Agent v0.2.7；已有 v0.2.5 / v0.2.6 部署可保留数据和身份。从 v0.2.4 或更早版本安装时，两端均须使用独立空数据目录，不迁移旧数据库或身份。读取失败会报错并保留文件。
+**版本要求：** 本次发布 Server 与 Agent v0.2.8，包含 v0.2.7 未完成发布的 Agent 部署修复。已有 v0.2.5 / v0.2.6 / v0.2.7 部署可保留数据和身份，Server 自动补充强制 HTTPS 配置字段。从 v0.2.4 或更早版本安装时，两端均须使用独立空数据目录，不迁移旧数据库或身份。读取失败会报错并保留文件。
 
 ## 快速部署
 
-默认镜像标签为 `latest`；固定版本部署及已有实例更新步骤见 [v0.2.7 发布说明](docs/releases/v0.2.7.md)。Server 与 Agent 按实际代码变化独立发布。
+默认镜像标签为 `latest`；固定版本部署及已有实例更新步骤见 [v0.2.8 发布说明](docs/releases/v0.2.8.md)。Server 与 Agent 按实际代码变化独立发布。
 
 ### 1. 启动 Server
 
@@ -111,7 +111,7 @@ docker compose -f compose.yml logs nexo-server
 
 从可信网络打开 `http://服务器地址:8280`，直接使用上述账号登录。自动密码只在成功创建账号时输出一次，请妥善保存，分享日志前删除凭据。已有账号不会因重启而重设；密码遗失时执行 `docker compose -f compose.yml exec nexo-server nexo --data-dir /data/nexo admin recover`，然后在登录页选择“忘记密码”。持久数据位于当前目录的 `data/nexo`。
 
-面向公网使用前，为管理入口配置 HTTPS。管理员登录后，在“账号设置 → 管理员功能 → 服务器设置”中配置管理地址、可信代理 IP 和可选公网 IP；设置保存到数据目录，立即生效，无需环境变量或重启。完整说明见 [管理入口](https://github.com/thelinyue/Nexo/blob/master/docker/README.md#管理入口与账号恢复)。Agent 的 Server URL 也应使用此 HTTPS 地址。
+面向公网使用前，为管理入口配置 HTTPS。管理员登录后，在“账号设置 → 管理员功能 → 服务器设置”中选择已验证域名并填写子域名，内置 Caddy 自动配置反向代理、证书和强制 HTTPS；原 IP 管理入口保留，设置无需重启。完整说明见 [管理入口](https://github.com/thelinyue/Nexo/blob/master/docker/README.md#管理入口与账号恢复)。Agent 的 Server URL 也应使用此 HTTPS 地址。
 
 ### 2. 接入 Agent
 
@@ -180,7 +180,7 @@ Agent 身份保存在 `data/nexo-agent`。接入成功后可清空 `NEXO_ENROLLM
 
 启动参数从数据目录中的 TOML 读取，修改后重启对应组件。`--config` 可指定独立配置文件，`--data-dir` 指定持久化目录；相对文件路径按 TOML 所在目录解析。Server 首次初始化支持非空 `NEXO_ADMIN_USERNAME` / `NEXO_ADMIN_PASSWORD`；Agent 支持非空 `NEXO_SERVER_URL` / `NEXO_ENROLLMENT_TOKEN` / `NEXO_DEVICE_NAME` 逐项覆盖 TOML。其他 `NEXO_*` 启动环境变量不生效，`TZ` 保留。
 
-管理地址、可信代理 IP、公网 IP 在“账号设置 → 管理员功能 → 服务器设置”保存到 SQLite，立即生效。首次 Agent 接入使用页面生成的 Compose 配置或 docker run 命令；环境变量不回写 TOML。接入成功后可清空 `NEXO_ENROLLMENT_TOKEN`，保留 Server 地址及数据目录，重启复用身份。
+管理入口域名与可选公网 IP 在“账号设置 → 管理员功能 → 服务器设置”保存到 SQLite，由内置 Caddy 自动应用。首次 Agent 接入使用页面生成的 Compose 配置或 docker run 命令；环境变量不回写 TOML。接入成功后可清空 `NEXO_ENROLLMENT_TOKEN`，保留 Server 地址及数据目录，重启复用身份。
 
 v0.2.5 / v0.2.6 部署可按发布说明保留目录更新组件；v0.2.4 及更早版本不提供原地升级。备份时先停止对应组件，复制整个持久化目录；恢复到空目录并使用备份时的版本。Server 自动管理容器内部的 `/run/nexo`，无需额外挂载，也不备份其中的 Socket。详见 [配置、备份与恢复](docker/README.md)。
 

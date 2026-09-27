@@ -395,3 +395,49 @@ fn current_database_keeps_tunnels_on_restart() {
         "tunnel"
     );
 }
+
+#[tokio::test]
+async fn force_https_defaults_for_new_proxy_and_preserves_edits() {
+    let (state, headers) = crate::tests::domain_fixture();
+    let domain = crate::tests::add_test_domain(&state, &headers, "redirect.example.test")
+        .await
+        .unwrap();
+    state
+        .db
+        .lock()
+        .unwrap()
+        .execute(
+            "UPDATE domain_settings SET verified=1 WHERE domain_id=?1",
+            [&domain.id],
+        )
+        .unwrap();
+    let mut value = input("app");
+    value.public_domain_id = Some(domain.id.clone());
+    value.protocol = "https".into();
+    let created = create_tunnel(State(state.clone()), headers.clone(), Json(value))
+        .await
+        .unwrap()
+        .0;
+    assert!(created.http_redirect_enabled);
+    let mut value = input("app");
+    value.public_domain_id = Some(domain.id.clone());
+    value.http_redirect_enabled = Some(false);
+    let edited = update_tunnel(
+        State(state.clone()),
+        headers.clone(),
+        Path(created.id.clone()),
+        Json(value),
+    )
+    .await
+    .unwrap()
+    .0;
+    assert!(!edited.http_redirect_enabled);
+    let mut value = input("app");
+    value.public_domain_id = Some(domain.id);
+    value.protocol = "https".into();
+    let edited = update_tunnel(State(state), headers, Path(created.id), Json(value))
+        .await
+        .unwrap()
+        .0;
+    assert!(!edited.http_redirect_enabled);
+}

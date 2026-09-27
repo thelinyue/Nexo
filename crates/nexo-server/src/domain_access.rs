@@ -195,6 +195,13 @@ fn load(state: &AppState, tenant: &str, id: &str) -> Result<Access, ApiError> {
         .map_err(db_error)?
         .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "域名不存在"))?;
     let mut hosts = vec![domain.clone()];
+    if let Some(entry) = crate::server_settings::load(&db)
+        .map_err(db_error)?
+        .management_entry
+        .filter(|entry| entry.domain_id == id)
+    {
+        hosts.push(format!("{}.{}", entry.hostname, domain));
+    }
     let mut query=db.prepare("SELECT DISTINCT hostname FROM tunnels WHERE public_domain_id=?1 AND tenant_id=?2 AND protocol!='tcp' AND hostname IS NOT NULL AND hostname!='' AND deleted_at IS NULL ORDER BY hostname").map_err(db_error)?;
     for name in query
         .query_map(params![id, tenant], |r| r.get::<_, String>(0))

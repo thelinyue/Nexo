@@ -110,6 +110,29 @@ pub fn prepare(
         input.local_address = url.host_str().unwrap().trim_matches(['[', ']']).to_owned();
         input.lan_redirect_enabled = Some(false);
     }
+    // 创建默认强制 HTTPS；局部更新保留选择，HTTP 模式只暂存此偏好。
+    input.http_redirect_enabled = Some(if mode == MODE {
+        match input.http_redirect_enabled {
+            Some(value) => value,
+            None => db
+                .query_row(
+                    "SELECT http_redirect_enabled FROM tunnels WHERE id=?1 AND tenant_id=?2",
+                    params![id, session.tenant_id],
+                    |r| r.get(0),
+                )
+                .optional()
+                .map_err(db_error)?
+                .unwrap_or(true),
+        }
+    } else {
+        if input.http_redirect_enabled == Some(true) {
+            return Err(ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "强制 HTTPS 仅支持反向代理",
+            ));
+        }
+        false
+    });
     input.service_mode = Some(mode);
     Ok(())
 }

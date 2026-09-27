@@ -119,6 +119,8 @@ struct DomainSpec {
 }
 #[derive(Debug, Clone)]
 struct WebService {
+    management: bool,
+    http_redirect_enabled: bool,
     id: String,
     hostname: String,
     protocol: String,
@@ -208,7 +210,7 @@ fn specifications(
                 .transpose()?;
             domain.token_reference = path.map(|path| format!("{{file.{}}}", path.display()));
         }
-        let mut services = connection.prepare("SELECT id,hostname,protocol,device_id,lan_redirect_enabled,local_address,local_port,origin_protocol,service_mode FROM tunnels WHERE public_domain_id=?1 AND tenant_id=?2 AND enabled=1 AND deleted_at IS NULL AND protocol IN ('http','https')")?;
+        let mut services = connection.prepare("SELECT id,hostname,protocol,device_id,lan_redirect_enabled,local_address,local_port,origin_protocol,service_mode,http_redirect_enabled FROM tunnels WHERE public_domain_id=?1 AND tenant_id=?2 AND enabled=1 AND deleted_at IS NULL AND protocol IN ('http','https')")?;
         let mut rows = services.query(params![domain.id, domain.tenant_id])?;
         while let Some(row) = rows.next()? {
             let id: String = row.get(0)?;
@@ -240,6 +242,8 @@ fn specifications(
                 None
             };
             domain.services.push(WebService {
+                management: false,
+                http_redirect_enabled: direct && row.get(9)?,
                 hostname: format!("{}.{}", hostname.unwrap_or_default(), domain.name),
                 protocol: row.get(2)?,
                 upstream: if direct {
@@ -255,6 +259,27 @@ fn specifications(
                 },
                 id,
                 lan_redirect,
+            });
+        }
+    }
+    // 管理入口只增加专用路由，不伪造普通服务，沿用所选域名的证书策略。
+    let management = crate::server_settings::load(&connection)?.management_entry;
+    if let Some(entry) = management {
+        if let Some(domain) = domains
+            .iter_mut()
+            .find(|domain| domain.id == entry.domain_id)
+        {
+            domain.services.push(WebService {
+                management: true,
+                http_redirect_enabled: true,
+                id: "management".into(),
+                hostname: format!("{}.{}", entry.hostname, domain.name),
+                protocol: "https".into(),
+                upstream: Some(format!(
+                    "http://{}",
+                    crate::server_settings::upstream(state.config.http_addr)
+                )),
+                lan_redirect: None,
             });
         }
     }
@@ -301,6 +326,11 @@ fn proxy_handler(upstream: &str) -> Result<Value> {
     Ok(handler)
 }
 
+/// 只跳到配置中的域名，保留原方法与 URI；禁止缓存以便关闭和换域名后立即恢复。
+fn https_redirect(hostname: &str) -> Value {
+    json!({"match":[{"host":[hostname]}],"handle":[{"handler":"static_response","status_code":307,"headers":{"Location":[format!("https://{hostname}{{http.request.uri}}")],"Cache-Control":["no-store"]}}],"terminal":true})
+}
+
 /// 只发布显式域名；未知主机返回 404。没有可信 Tunnel socket 时明确返回 503，不连接 Agent 的私网地址。
 fn build_config(settings: &CaddyRuntimeConfig, domains: &[DomainSpec]) -> Result<Value> {
     let mut http = Vec::new();
@@ -332,11 +362,20 @@ fn build_config(settings: &CaddyRuntimeConfig, domains: &[DomainSpec]) -> Result
             if service.protocol == "https" && !domain.https {
                 continue;
             }
-            let handler = if let Some(upstream) = &service.upstream {
+            let mut handler = if let Some(upstream) = &service.upstream {
                 proxy_handler(upstream)?
             } else {
                 json!({"handler":"static_response","status_code":503,"body":"服务转发通道尚未就绪"})
             };
+            if service.protocol == "https" && service.http_redirect_enabled {
+                http.push(https_redirect(&service.hostname));
+            }
+            if service.management {
+                // 明确覆盖协议头，不采信访问者自行传入的值。
+                handler["headers"]["request"]["set"]["X-Forwarded-Proto"] = json!(["https"]);
+                https.push(json!({"match":[{"host":[service.hostname]}],"handle":[handler],"terminal":true}));
+                continue;
+            }
             let (access_endpoint, access_check) =
                 crate::service_access::handlers(&settings.access_address, &service.id);
             let route =
@@ -821,6 +860,8 @@ mod tests {
             certificate_mode: "cloudflare_dns".into(),
             dns: crate::domains::DnsSettings::default(),
             services: vec![WebService {
+                management: false,
+                http_redirect_enabled: false,
                 id: "nas".into(),
                 hostname: "nas.example.com".into(),
                 protocol: "https".into(),
@@ -829,6 +870,38 @@ mod tests {
             }],
         }
     }
+    #[test]
+    fn management_route_reuses_certificates_without_service_access_and_forces_https() {
+        let mut domain = domain();
+        domain.services[0].management = true;
+        domain.services[0].http_redirect_enabled = true;
+        domain.services[0].upstream = Some("http://127.0.0.1:8280".into());
+        let cfg = build_config(&settings(Path::new("test")), &[domain.clone()]).unwrap();
+        let http = &cfg["apps"]["http"]["servers"]["http"]["routes"];
+        assert_eq!(http[0]["handle"][0]["status_code"], 307);
+        assert_eq!(
+            http[0]["handle"][0]["headers"]["Location"],
+            json!(["https://nas.example.com{http.request.uri}"])
+        );
+        let route = &cfg["apps"]["http"]["servers"]["https"]["routes"][1];
+        assert_eq!(route["handle"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            route["handle"][0]["headers"]["request"]["set"]["X-Forwarded-Proto"],
+            json!(["https"])
+        );
+        assert!(!cfg.to_string().contains("/.nexo-access/"));
+        assert_eq!(
+            cfg["apps"]["tls"]["certificates"]["automate"],
+            json!(["*.example.com", "example.com"])
+        );
+        domain.certificate_mode = "http01".into();
+        let cfg = build_config(&settings(Path::new("test")), &[domain]).unwrap();
+        assert_eq!(
+            cfg["apps"]["tls"]["certificates"]["automate"],
+            json!(["example.com", "nas.example.com"])
+        );
+    }
+
     #[test]
     fn routes_share_wildcard_without_dns_credentials_and_do_not_fake_a_working_tunnel() {
         let cfg = build_config(&settings(Path::new("test")), &[domain()]).unwrap();
@@ -1027,6 +1100,8 @@ mod tests {
         let mut d = domain();
         d.services.extend([
             WebService {
+                management: false,
+                http_redirect_enabled: false,
                 id: "media".into(),
                 hostname: "media.example.com".into(),
                 protocol: "https".into(),
@@ -1034,6 +1109,8 @@ mod tests {
                 lan_redirect: None,
             },
             WebService {
+                management: false,
+                http_redirect_enabled: false,
                 id: "a.team".into(),
                 hostname: "a.team.example.com".into(),
                 protocol: "https".into(),
@@ -1041,6 +1118,8 @@ mod tests {
                 lan_redirect: None,
             },
             WebService {
+                management: false,
+                http_redirect_enabled: false,
                 id: "b.team".into(),
                 hostname: "b.team.example.com".into(),
                 protocol: "https".into(),
@@ -1048,6 +1127,8 @@ mod tests {
                 lan_redirect: None,
             },
             WebService {
+                management: false,
+                http_redirect_enabled: false,
                 id: "http-only".into(),
                 hostname: "a.http-only.example.com".into(),
                 protocol: "http".into(),
@@ -1076,6 +1157,8 @@ mod tests {
             }
             let subjects = d.subjects();
             d.services.push(WebService {
+                management: false,
+                http_redirect_enabled: false,
                 id: "next.team".into(),
                 hostname: "next.team.example.com".into(),
                 protocol: "https".into(),

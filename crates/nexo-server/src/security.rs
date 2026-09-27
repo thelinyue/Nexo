@@ -76,7 +76,7 @@ pub async fn protect(
     let secure = settings.secure(peer, request.headers());
     let path = request.uri().path();
     if path.starts_with("/api/") {
-        if settings.public_url.starts_with("https://") && !secure {
+        if !settings.managed && settings.public_url.starts_with("https://") && !secure {
             return ApiError::new(
                 StatusCode::FORBIDDEN,
                 "管理入口要求 HTTPS，请检查可信反向代理配置",
@@ -89,7 +89,7 @@ pub async fn protect(
         ) {
             // 浏览器跨站写入在认证前拒绝；无 Origin 的本机 CLI 仍由 Token/CSRF 验证。
             if let Some(origin) = request.headers().get(header::ORIGIN) {
-                let expected = if !settings.public_url.is_empty() {
+                let expected = if !settings.managed && !settings.public_url.is_empty() {
                     settings.public_url.clone()
                 } else {
                     format!(
