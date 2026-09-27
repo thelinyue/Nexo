@@ -137,16 +137,21 @@ test("普通用户使用本人入网接口", async ({ page }) => {
 
 test("管理员代管空间时在目标空间生成凭证", async ({ page }) => {
   const state = await installApiMocks(page); const posts: string[] = [];
+  const pageErrors: string[] = []; page.on("pageerror", error => pageErrors.push(error.message));
   await page.route("**/api/v1/admin/**", route => {
     const path = new URL(route.request().url()).pathname;
     if (path === "/api/v1/admin/users") return route.fulfill({ json: [{ id: "alice", username: "alice", role: "tenant", workspace_id: "alice-space", workspace_name: "alice 的工作空间", enabled: true, devices: 1, services: 1, domains: 1 }] });
-    if (route.request().method() === "POST") { posts.push(path); return route.fulfill({ json: { id: "scoped", status: "awaiting_agent", token: "nexo_join_scoped-secret", expires_at: Math.floor(Date.now()/1000) + 3600 } }); }
-    return route.fulfill({ json: path.endsWith("/devices") ? state.devices : path.endsWith("/tunnels") ? state.tunnels : [] });
+    if (route.request().method() === "POST" && path.endsWith("/agent-access-key")) { posts.push(path); return route.fulfill({ json: { token: "nexo_join_scoped-secret", created_at: 1790000000, updated_at: 1790000000 } }); }
+    if (path.endsWith("/devices") || path.endsWith("/tunnels")) return route.fulfill({ json: path.endsWith("/devices") ? state.devices : state.tunnels });
+    if (path === "/api/v1/admin/workspaces/alice-space/enrollments") return route.fulfill({ json: [] });
+    return route.fallback();
   });
   await page.goto("/#/users");
   await page.getByRole("button", { name: "管理 alice 的空间" }).click();
-  await page.evaluate(() => { window.location.hash = "#/agents"; });
+  await expect(page.locator(".workspace-banner")).toContainText("alice 的工作空间");
+  await page.getByRole("link", { name: "设备", exact: true }).click();
   await page.getByRole("button", { name: "添加 Agent", exact: true }).click();
   await expect(page.getByLabel("Agent TOML", { exact: true })).toContainText("nexo_join_scoped-secret");
   expect(posts).toEqual(["/api/v1/admin/workspaces/alice-space/agent-access-key"]);
+  expect(pageErrors).toEqual([]);
 });
