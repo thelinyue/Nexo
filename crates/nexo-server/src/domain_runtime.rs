@@ -173,10 +173,8 @@ fn specifications(
         .lock()
         .map_err(|_| anyhow::anyhow!("数据库锁不可用"))?;
     let settings = state.domain_runtime.supervisor.config();
-    let tokens = caddy::read_domain_tokens(&settings.cloudflare_token_root);
-    let global_dns = std::env::var("NEXO_CLOUDFLARE_API_TOKEN").is_ok_and(|v| !v.trim().is_empty());
     let mut query = connection.prepare(
-        "SELECT p.id,p.tenant_id,p.domain,p.https_enabled FROM public_domains p JOIN tenants w ON w.id=p.tenant_id LEFT JOIN domain_settings s ON s.domain_id=p.id WHERE w.enabled=1 AND COALESCE(s.verified,1)=1 ORDER BY p.domain,p.id",
+        "SELECT p.id,p.tenant_id,p.domain,p.https_enabled FROM public_domains p JOIN tenants w ON w.id=p.tenant_id JOIN domain_settings s ON s.domain_id=p.id WHERE w.enabled=1 AND s.verified=1 ORDER BY p.domain,p.id",
     )?;
     let mut domains = query
         .query_map([], |row| {
@@ -198,32 +196,16 @@ fn specifications(
         domain.certificate_mode = options.certificate_mode;
         domain.dns = options.dns;
         if domain.certificate_mode == "cloudflare_dns" {
-            let path = if let Some(file) = options.credential_file {
-                Some(crate::domains::credential_path(
-                    &settings.cloudflare_token_root,
-                    &domain.id,
-                    &file,
-                )?)
-            } else {
-                let own = tokens
-                    .iter()
-                    .find(|(id, _)| id == &domain.id)
-                    .map(|(_, token)| token.clone());
-                let admin: bool = connection.query_row(
-                    "SELECT EXISTS(SELECT 1 FROM users WHERE tenant_id=?1 AND role='system_admin')",
-                    [&domain.tenant_id],
-                    |r| r.get(0),
-                )?;
-                let legacy = own.or_else(|| {
-                    (options.legacy && admin && global_dns)
-                        .then(|| std::env::var("NEXO_CLOUDFLARE_API_TOKEN").unwrap_or_default())
-                });
-                legacy
-                    .map(|token| {
-                        caddy::snapshot_token(&settings.cloudflare_token_root, &domain.id, &token)
-                    })
-                    .transpose()?
-            };
+            let path = options
+                .credential_file
+                .map(|file| {
+                    crate::domains::credential_path(
+                        &settings.cloudflare_token_root,
+                        &domain.id,
+                        &file,
+                    )
+                })
+                .transpose()?;
             domain.token_reference = path.map(|path| format!("{{file.{}}}", path.display()));
         }
         let mut services = connection.prepare("SELECT id,hostname,protocol,device_id,lan_redirect_enabled,local_address,local_port,origin_protocol,service_mode FROM tunnels WHERE public_domain_id=?1 AND tenant_id=?2 AND enabled=1 AND deleted_at IS NULL AND protocol IN ('http','https')")?;
@@ -1015,7 +997,7 @@ mod tests {
     #[test]
     fn dns_credentials_remain_placeholders_and_http_only_has_no_certificates() {
         let mut d = domain();
-        d.token_reference = Some("{env.NEXO_CLOUDFLARE_TOKEN_D}".into());
+        d.token_reference = Some("{file./credential-test.token}".into());
         let cfg = build_config(&settings(Path::new("test")), &[d.clone()]).unwrap();
         assert_eq!(
             cfg["apps"]["tls"]["certificates"]["automate"],
@@ -1028,7 +1010,7 @@ mod tests {
         assert_eq!(
             cfg["apps"]["tls"]["automation"]["policies"][0]["issuers"][0]["challenges"]["dns"]
                 ["provider"]["api_token"],
-            "{env.NEXO_CLOUDFLARE_TOKEN_D}"
+            "{file./credential-test.token}"
         );
         assert_eq!(
             cfg["apps"]["tls"]["automation"]["policies"][0]["issuers"][0]["challenges"]["dns"]
@@ -1074,7 +1056,7 @@ mod tests {
             },
         ]);
         // 无凭据和有凭据的证书范围一致，不能回退为逐个服务签发。
-        for token in [None, Some("{env.NEXO_CLOUDFLARE_TOKEN_D}".into())] {
+        for token in [None, Some("{file./credential-test.token}".into())] {
             d.token_reference = token;
             let cfg = build_config(&settings(Path::new("test")), &[d.clone()]).unwrap();
             assert_eq!(
@@ -1246,14 +1228,7 @@ mod tests {
             }
         });
         // 删除正在等待旧加载；并发产生的入网凭证也必须随最终事务消失。
-        let pending = crate::create_enrollment(
-            axum::extract::State(state.clone()),
-            alice,
-            Json(crate::CreateEnrollment { ttl_seconds: None }),
-        )
-        .await
-        .unwrap()
-        .0;
+        let pending = crate::tests::recovery_fixture(&state, &alice).await;
         release.notify_one();
         pending_config.await.unwrap();
         let result = tokio::time::timeout(Duration::from_secs(5), deletion)
@@ -1383,6 +1358,7 @@ mod tests {
         let client = reqwest::Client::builder()
             .no_proxy()
             .http1_only()
+            .pool_max_idle_per_host(0)
             .redirect(reqwest::redirect::Policy::none())
             .timeout(Duration::from_secs(5))
             .add_root_certificate(reqwest::Certificate::from_pem(&root_pem).unwrap())
@@ -1547,8 +1523,13 @@ mod tests {
         let domain = crate::tests::add_test_domain(&state, &headers, "caddy-integration.localhost")
             .await
             .unwrap();
-        // 本机测试显式置入已验证的旧 DNS 模式，仅让 .localhost 走 Caddy 内部 CA。
-        state.db.lock().unwrap().execute("UPDATE domain_settings SET verified=1,certificate_mode='cloudflare_dns',legacy=1 WHERE domain_id=?1",[&domain.id]).unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        while supervisor.current_config().await.is_err() {
+            assert!(tokio::time::Instant::now() < deadline);
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        // 本机夹具显式验证域名；localhost 仅由 Caddy 内部 CA 签发。
+        state.db.lock().unwrap().execute("UPDATE domain_settings SET verified=1,certificate_mode='cloudflare_dns' WHERE domain_id=?1",[&domain.id]).unwrap();
         let add_service = |hostname: &str| {
             state.db.lock().unwrap().execute(
                 "INSERT INTO tunnels (id,tenant_id,name,protocol,local_address,local_port,hostname,public_domain_id,created_at,updated_at) VALUES (?1,'default',?1,'https','127.0.0.1',8080,?1,?2,0,0)",
@@ -1558,22 +1539,22 @@ mod tests {
         add_service("nas");
         add_service("a.team");
         // 模拟已有逐个子域名签发的配置，确认切换后旧证书文件不会妨碍泛域名复用。
-        let mut legacy = build_config(
+        let mut individual = build_config(
             &cfg,
             &specifications(&state, &HashMap::new(), &HashMap::new()).unwrap(),
         )
         .unwrap();
-        legacy["apps"]["tls"]["certificates"]["automate"] = json!([
+        individual["apps"]["tls"]["certificates"]["automate"] = json!([
             "caddy-integration.localhost",
             "nas.caddy-integration.localhost",
             "a.team.caddy-integration.localhost"
         ]);
-        supervisor.apply_json(&legacy).await.unwrap();
+        supervisor.apply_json(&individual).await.unwrap();
         let deadline = tokio::time::Instant::now() + Duration::from_secs(25);
         while read_certificates(&cfg.storage_root).len() < 3 {
             assert!(
                 tokio::time::Instant::now() < deadline,
-                "旧配置未完成签发：{:?}",
+                "逐域名配置未完成签发：{:?}",
                 supervisor.drain_log_events().await
             );
             tokio::time::sleep(Duration::from_millis(250)).await;

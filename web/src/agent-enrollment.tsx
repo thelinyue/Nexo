@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { agentDeploymentContent, normalizeAgentServerUrl } from "./agent-deployment";
+import { agentDeploymentContent, agentToml, normalizeAgentServerUrl } from "./agent-deployment";
 import type { DeploymentMethod } from "./agent-deployment";
-import { Confirm, CopyButton, Modal, Notice, Status, copyText, useApi, useResource } from "./ui";
+import { Confirm, CopyButton, Modal, Notice, Status, useApi, useResource } from "./ui";
 import type { Device } from "./ui";
 
 declare const __AGENT_COMPOSE_TEMPLATE__: string;
@@ -17,30 +17,23 @@ export function AgentEnrollment({ csrf, onClose, onCreated }: { csrf?: string | 
   const [method, setMethod] = useState<DeploymentMethod>("compose");
   const [resetting, setResetting] = useState(false);
   const [expanded, setExpanded] = useState(true);
-  const [copyState, setCopyState] = useState<"idle" | "copied" | "failed">("idle");
   const addressField = useRef<HTMLDivElement>(null); const input = useRef<HTMLInputElement>(null); const preview = useRef<HTMLDetailsElement>(null);
   const normalizedUrl = normalizeAgentServerUrl(serverUrl);
   const isCompose = method === "compose";
   const deploymentName = isCompose ? "Compose 配置文件" : "Docker run 命令";
   const token = credential.data?.token;
   const deployment = useMemo(() => {
-    if (!token || !normalizedUrl) return { content: "", error: null };
-    try { return { content: agentDeploymentContent(__AGENT_COMPOSE_TEMPLATE__, normalizedUrl, token, method, name), error: null }; }
-    catch (e) { return { content: "", error: e instanceof Error ? e.message : "配置准备失败" }; }
+    if (!token || !normalizedUrl) return { content: "", toml: "", error: null };
+    try { return { content: agentDeploymentContent(__AGENT_COMPOSE_TEMPLATE__, normalizedUrl, token, method, name), toml: agentToml(normalizedUrl, token, name), error: null }; }
+    catch (e) { return { content: "", toml: "", error: e instanceof Error ? e.message : "配置准备失败" }; }
   }, [token, normalizedUrl, method, name]);
+  const toml = deployment.toml;
   const recent = [...(devices.data ?? [])].sort((a, b) => (b.enrolled_at ?? 0) - (a.enrolled_at ?? 0)).slice(0, 5);
-  useEffect(() => { setCopyState("idle"); }, [deployment.content]);
-  useEffect(() => { if (copyState !== "copied") return; const timer = window.setTimeout(() => setCopyState("idle"), 2500); return () => clearTimeout(timer); }, [copyState]);
   useEffect(() => {
     const reveal = () => requestAnimationFrame(() => { if (document.activeElement === input.current) addressField.current?.scrollIntoView({ block: "nearest" }); });
     reveal(); window.visualViewport?.addEventListener("resize", reveal);
     return () => window.visualViewport?.removeEventListener("resize", reveal);
   }, [normalizedUrl]);
-  async function copy() {
-    if (!deployment.content) return;
-    try { await copyText(deployment.content); setCopyState("copied"); }
-    catch { setCopyState("failed"); setExpanded(true); requestAnimationFrame(() => preview.current?.scrollIntoView({ block: "nearest" })); }
-  }
   const close = () => { onClose(); void onCreated(); };
   return <Modal title="添加 Agent" full onClose={close}>
     <div className="modal-form agent-enrollment">
@@ -49,10 +42,14 @@ export function AgentEnrollment({ csrf, onClose, onCreated }: { csrf?: string | 
         {!normalizedUrl && <p className="form-error" id="agent-server-error" role="alert">请输入 HTTP/HTTPS 地址，不含用户名、密码、查询参数或片段。</p>}</div>
         <label>设备名称（可选）<input value={name} maxLength={80} placeholder="例如：家庭 NAS" onChange={e => setName(e.target.value)} /></label>
         <div className="agent-deployment-method" role="group" aria-label="部署方式"><button type="button" aria-pressed={isCompose} onClick={() => setMethod("compose")}>Docker Compose</button><button type="button" aria-pressed={!isCompose} onClick={() => setMethod("docker")}>docker run</button></div>
+        <p className="helper">先创建 ./data/nexo-agent 目录，将下面的 TOML 保存为该目录内的 agent.toml（Linux 权限 0600）。接入成功后可清空 enrollment_token。</p>
+        {toml && <section className="agent-command"><h3>1. 保存 agent.toml</h3><pre tabIndex={0} aria-label="Agent TOML"><code>{toml}</code></pre><CopyButton value={toml} label="复制 Agent TOML" /></section>}
+        <h3>2. 启动 Agent</h3>
         <p className="helper">{isCompose ? "保存为 compose.yml，执行 docker compose up -d。" : "在已安装 Docker 的主机执行以下命令。"}配置可用于多台主机，每台主机须使用独立数据目录。</p>
         {credential.busy && !token && <p role="status">正在准备配置…</p>}
         <Notice error={credential.error ?? (credential.data && !token ? "服务器未返回接入密钥，请重试。" : null)} onRetry={() => void credential.reload()} />
         {deployment.content && <details className="agent-command" ref={preview} open={expanded} onToggle={e => setExpanded(e.currentTarget.open)}><summary>{isCompose ? "查看 compose.yml" : "查看 docker run 命令"}</summary><pre tabIndex={0} aria-label={deploymentName}><code>{deployment.content}</code></pre></details>}
+        {deployment.content && <CopyButton value={deployment.content} label={`复制 ${isCompose ? "Compose 配置文件" : "Docker run 命令"}`} />}
         <section className="enrollment-progress" aria-label="最近接入设备"><h3>最近接入</h3>
           <Notice error={devices.error} onRetry={() => void devices.reload()} />
           {!devices.data ? <p>正在读取设备…</p> : !recent.length ? <p>等待 Agent 连接，启动后会自动接入。</p> : <ul className="recent-agents">{recent.map(device => <li key={device.id}><div><strong>{device.name}</strong><small title={device.id}>{device.id.slice(0, 8)}</small></div><Status kind="agent" value={device.status} /></li>)}</ul>}
@@ -60,10 +57,8 @@ export function AgentEnrollment({ csrf, onClose, onCreated }: { csrf?: string | 
         {token && <details className="recovery-help"><summary>高级：接入密钥</summary><p>长期有效，可接入多台设备。重置只影响新设备接入，已接入设备不受影响。请勿分享配置或复制设备数据目录。</p><code className="token">{token}</code><div className="action-row"><CopyButton value={token} label="复制接入密钥" /><button className="text-button danger-text" onClick={() => setResetting(true)}>重置接入密钥</button></div></details>}
       </div>
       <footer className="modal-actions"><Notice error={deployment.error} />
-        {copyState === "failed" && <p className="form-error" role="alert">无法复制，请在展开的{deploymentName}中长按选择并手动复制。</p>}
-        {copyState === "copied" && <span className="sr-only" role="status">{deploymentName}已复制</span>}
+
         <button type="button" className="secondary-button" onClick={close}>完成</button>
-        <button type="button" className="primary-button" disabled={!deployment.content || credential.busy} onClick={() => void copy()}>{copyState === "copied" ? "已复制" : `复制${isCompose ? " Compose 配置文件" : " Docker run 命令"}`}</button>
       </footer>
     </div>
     {resetting && <Confirm title="重置接入密钥？" description="旧配置将不能用于新增设备。已接入 Agent 和现有服务不受影响，请保存重置后的新配置。" label="重置密钥" onClose={() => setResetting(false)} onConfirm={async () => {

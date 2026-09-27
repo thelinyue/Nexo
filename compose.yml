@@ -1,20 +1,29 @@
 name: nexo
 
-# Nexo 最新稳定版 Server。首次安装使用空数据目录，更新时保留原目录。
+# Nexo 最新稳定版 Server。本版本要求全新安装，配置保存在 data/nexo/server.toml。
 services:
   nexo-server:
     image: ghcr.io/thelinyue/nexo-server:latest
     container_name: nexo-server
     network_mode: host
+    # host 网络直接使用宿主机端口，不提供以下 ports 映射；部分 Compose 版本可能拒绝两者同时配置。
+    # 按需保留此端口清单；实际监听与对外开放由 Server 和宿主机防火墙决定。
+    ports:
+      - "80:80/tcp"                    # Web Tunnel 与 HTTP-01 证书验证
+      - "443:443/tcp"                  # HTTPS Web Tunnel
+      - "443:443/udp"                  # 可选：HTTP/3
+      - "8280:8280/tcp"                # Web 管理与入网 API；桥接发布时应限制可信来源
+      - "9890:9890/tcp"                # Agent mTLS 控制连接
+      - "9891:9891/tcp"                # Agent TCP Tunnel 数据
+      - "9891:9891/udp"                # Agent QUIC 数据
+      - "20000-29999:20000-29999/tcp"  # 自动分配的公网 TCP 服务端口
+      - "20000-29999:20000-29999/udp"  # 自动分配的公网 UDP 服务端口
     environment:
-      TZ: ${TZ:-Asia/Shanghai}
-      NEXO_ADMIN_USERNAME: ${NEXO_ADMIN_USERNAME:-admin}
-      NEXO_ADMIN_PASSWORD: ${NEXO_ADMIN_PASSWORD:-}
-      NEXO_PUBLIC_URL: ${NEXO_PUBLIC_URL:-}
-      NEXO_TRUSTED_PROXIES: ${NEXO_TRUSTED_PROXIES:-}
-      NEXO_PUBLIC_IPS: ${NEXO_PUBLIC_IPS:-}
+      TZ: Asia/Shanghai
     volumes:
       - ./data/nexo:/data/nexo
+    tmpfs:
+      - /run/nexo:mode=0700
     restart: unless-stopped
     healthcheck:
       test: ["CMD-SHELL", "curl --fail --silent http://127.0.0.1:8280/health >/dev/null"]

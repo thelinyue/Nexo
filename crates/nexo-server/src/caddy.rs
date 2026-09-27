@@ -6,7 +6,7 @@
 //! 上一份可用配置。
 
 use std::{
-    env, fs,
+    fs,
     path::{Path, PathBuf},
     process::Stdio,
     sync::{
@@ -275,31 +275,19 @@ fn parse_retry_after(message: &str) -> Option<u64> {
 }
 
 impl CaddyRuntimeConfig {
-    pub fn from_env(data_dir: impl Into<PathBuf>) -> Self {
+    pub fn new(data_dir: impl Into<PathBuf>, settings: &crate::config::Caddy) -> Self {
         let data_dir = data_dir.into();
-        let binary = env::var_os("NEXO_CADDY_BIN")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("caddy"));
-        let enabled = env::var("NEXO_CADDY_ENABLED")
-            .map(|value| {
-                matches!(
-                    value.trim().to_ascii_lowercase().as_str(),
-                    "1" | "true" | "yes" | "on"
-                )
-            })
-            .unwrap_or(true);
         Self {
             access_address: "127.0.0.1:0".into(),
-            binary,
-            config_path: data_dir.join("caddy").join("config.json"),
-            applied_path: data_dir.join("caddy").join("applied.json"),
-            cloudflare_token_root: data_dir.join("secrets").join("public-domains"),
+            binary: settings.binary.clone(),
+            enabled: settings.enabled,
+            config_path: data_dir.join("caddy/config.json"),
+            applied_path: data_dir.join("caddy/applied.json"),
+            cloudflare_token_root: data_dir.join("secrets/public-domains"),
             storage_root: data_dir.join("caddy-storage"),
-            admin_url: env::var("NEXO_CADDY_ADMIN_URL")
-                .unwrap_or_else(|_| "http://127.0.0.1:8290".to_owned()),
-            enabled,
-            http_listen: env::var("NEXO_CADDY_HTTP_LISTEN").unwrap_or_else(|_| ":80".into()),
-            https_listen: env::var("NEXO_CADDY_HTTPS_LISTEN").unwrap_or_else(|_| ":443".into()),
+            admin_url: settings.admin_url.clone(),
+            http_listen: settings.http_listen.clone(),
+            https_listen: settings.https_listen.clone(),
         }
     }
 }
@@ -630,7 +618,7 @@ impl CaddySupervisor {
     }
 }
 
-/// Server 重启后旧随机端口不再可信；旧版路由也可能完全没有认证处理器。
+/// Server 重启后上次运行的 Socket 和随机端口不再可信。
 /// 保留证书配置，但先关闭恢复的代理，等待协调器以当前数据库和本次监听地址重建。
 fn close_restored_proxies(value: &mut Value) {
     if value.get("handler").and_then(Value::as_str) == Some("reverse_proxy") {
@@ -719,22 +707,6 @@ fn spawn_caddy_log_reader<R>(
     });
 }
 
-/// 手工维护的旧 cloudflare.token 转成不可覆盖的候选文件，避免更新失败后重启丢失旧凭据。
-pub fn snapshot_token(root: &Path, id: &str, token: &str) -> Result<PathBuf> {
-    if let Ok(files) = fs::read_dir(root.join(id)) {
-        for file in files.flatten() {
-            let name = file.file_name().to_string_lossy().to_string();
-            if name.starts_with("credential-")
-                && fs::read_to_string(file.path()).is_ok_and(|value| value == token)
-            {
-                return crate::domains::credential_path(root, id, &name);
-            }
-        }
-    }
-    let name = crate::domains::write_credential(root, id, token)?;
-    crate::domains::credential_path(root, id, &name)
-}
-
 fn credential_signature(config: &Value) -> Result<Option<String>> {
     fn collect(value: &Value, files: &mut Vec<String>) {
         match value {
@@ -774,26 +746,6 @@ fn credential_signature(config: &Value) -> Result<Option<String>> {
         digest.update(fs::read(&path).context("无法读取 Caddy 凭据文件")?);
     }
     Ok(Some(hex::encode(digest.finalize())))
-}
-
-/// 兼容已有的按域名凭据文件；转换为文件引用后通过 Admin API 热加载。
-pub fn read_domain_tokens(root: &Path) -> Vec<(String, String)> {
-    let Ok(mut entries) = fs::read_dir(root).map(|entries| entries.flatten().collect::<Vec<_>>())
-    else {
-        return Vec::new();
-    };
-    entries.sort_by_key(|left| left.file_name());
-    entries
-        .into_iter()
-        .filter_map(|entry| {
-            let id = entry.file_name().to_string_lossy().to_string();
-            let token = fs::read_to_string(entry.path().join("cloudflare.token"))
-                .ok()?
-                .trim()
-                .to_owned();
-            (!token.is_empty()).then_some((id, token))
-        })
-        .collect()
 }
 
 fn set_private_directory(path: &Path) -> std::io::Result<()> {
@@ -893,11 +845,6 @@ pub fn redact(message: &str, token_root: &Path) -> String {
             }
         }
     }
-    if let Ok(token) = env::var("NEXO_CLOUDFLARE_API_TOKEN") {
-        if !token.is_empty() {
-            value = value.replace(&token, "[已隐藏凭据]");
-        }
-    }
     truncate(&value)
 }
 #[cfg(test)]
@@ -949,10 +896,10 @@ mod tests {
 
     #[test]
     fn credentials_are_removed_before_truncating_unicode_errors() {
-        let root = env::temp_dir().join(format!("nexo-redaction-{}", uuid::Uuid::new_v4()));
+        let root = std::env::temp_dir().join(format!("nexo-redaction-{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(root.join("domain")).unwrap();
         fs::write(
-            root.join("domain/cloudflare.token"),
+            root.join("domain/credential-test.token"),
             "secret-cloudflare-token",
         )
         .unwrap();
@@ -960,7 +907,7 @@ mod tests {
         let public = redact(&error, &root);
         assert!(!public.contains("secret"));
         assert!(public.contains("[已隐藏凭据]"));
-        fs::remove_file(root.join("domain/cloudflare.token")).unwrap();
+        fs::remove_file(root.join("domain/credential-test.token")).unwrap();
         fs::remove_dir(root.join("domain")).unwrap();
         fs::remove_dir(root).unwrap();
     }

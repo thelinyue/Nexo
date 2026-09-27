@@ -28,13 +28,13 @@ class Harness(smoke.Harness):
     """复用进程与临时目录隔离；每台 Agent 使用独立目录，所有密钥只留在测试目录内。"""
     def start_server(self):
         self.server = self.launch("server", self.args.server_bin, {
-            "NEXO_ADMIN_USERNAME": "admin", "NEXO_ADMIN_PASSWORD": "Local-shared-smoke-4821!",
-            "NEXO_DATA_DIR": str(self.root / "server"),
-            "NEXO_HTTP_ADDR": f"127.0.0.1:{self.ports['api']}",
-            "NEXO_CONTROL_ADDR": f"127.0.0.1:{self.ports['control']}",
-            "NEXO_TUNNEL_ADDR": f"127.0.0.1:{self.ports['data']}",
-            "NEXO_TUNNEL_ENDPOINT": f"127.0.0.1:{self.ports['data']}",
-            "NEXO_PUBLIC_BIND": "127.0.0.1", "NEXO_CADDY_ENABLED": "false",
+            "admin.username": "admin", "admin.password": "Local-shared-smoke-4821!",
+            "data_dir": str(self.root / "server"),
+            "http_addr": f"127.0.0.1:{self.ports['api']}",
+            "control_addr": f"127.0.0.1:{self.ports['control']}",
+            "tunnel_addr": f"127.0.0.1:{self.ports['data']}",
+            "tunnel_endpoint": f"127.0.0.1:{self.ports['data']}",
+            "public_bind": "127.0.0.1", "caddy.enabled": False,
         })
         smoke.wait_for(lambda: self.api("auth/status"), "Server 启动")
 

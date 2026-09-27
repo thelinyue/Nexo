@@ -1,0 +1,21 @@
+# Nexo Server 启动配置。修改后重启；管理地址、可信代理和公网 IP 在管理页面设置。
+http_addr = "0.0.0.0:8280" # 网页与 API
+control_addr = "0.0.0.0:9890" # Agent 控制连接
+tunnel_addr = "0.0.0.0:9891" # TCP 数据连接
+udp_addr = "0.0.0.0:9891" # QUIC 数据连接
+public_bind = "0.0.0.0" # 公网服务监听 IP
+tunnel_endpoint = "" # 可选：Agent 可达的数据地址，主机:端口
+udp_endpoint = "" # 可选：Agent 可达的 QUIC 地址
+runtime_dir = "/run/nexo" # Linux 临时运行目录，不备份；非 root 或多实例请改为独占可写目录
+web_dir = "" # 留空使用程序旁 web 目录，开发环境使用工作目录 web/dist
+
+[admin]
+username = "admin"
+password = "" # 仅初始化使用；留空生成随机密码，指定密码至少 6 个字符。成功后请清空。
+
+[caddy]
+enabled = true
+binary = "caddy" # 程序名从 PATH 查找；带目录的相对路径按本文件目录解析
+admin_url = "http://127.0.0.1:8290" # 仅允许本机回环 IP
+http_listen = ":80"
+https_listen = ":443"

@@ -4,26 +4,6 @@ use axum::{body::Body, http::Request, middleware::Next};
 
 const WORKSPACE_HEADER: &str = "x-nexo-internal-workspace";
 
-pub fn initialize_schema(db: &Connection) -> Result<()> {
-    auth::initialize_session_labels(db)?;
-    let has_enabled: bool = db.query_row(
-        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('tenants') WHERE name='enabled')",
-        [],
-        |r| r.get(0),
-    )?;
-    if !has_enabled {
-        db.execute_batch("ALTER TABLE tenants ADD COLUMN enabled INTEGER NOT NULL DEFAULT 1;")?;
-    }
-    db.execute_batch(
-        "CREATE TABLE IF NOT EXISTS user_invitations (
-        id TEXT PRIMARY KEY, token_digest TEXT NOT NULL UNIQUE,
-        created_by TEXT NOT NULL REFERENCES users(id), created_at INTEGER NOT NULL,
-        expires_at INTEGER NOT NULL, used_by TEXT REFERENCES users(id), revoked_at INTEGER
-    );",
-    )?;
-    Ok(())
-}
-
 pub fn require_admin(state: &AppState, headers: &HeaderMap) -> Result<auth::Session, ApiError> {
     let session = auth::require_session(state, headers)?;
     let db = state.db.lock().map_err(|_| db_error("数据库锁不可用"))?;
@@ -839,13 +819,7 @@ pub(crate) mod tests {
     async fn disabling_revokes_sessions_and_enrollment_without_losing_service_flags() {
         let (state, admin) = crate::tests::domain_fixture();
         let alice = add_user(&state, "alice");
-        let Json(invite) = create_enrollment(
-            State(state.clone()),
-            alice.clone(),
-            Json(CreateEnrollment { ttl_seconds: None }),
-        )
-        .await
-        .unwrap();
+        let invite = crate::tests::recovery_fixture(&state, &alice).await;
         let Json(recovery) =
             create_recovery(State(state.clone()), admin.clone(), Path("alice".into()))
                 .await
@@ -1105,14 +1079,7 @@ pub(crate) mod tests {
             .await
             .unwrap()
             .0;
-        let pending = create_enrollment(
-            State(state.clone()),
-            alice.clone(),
-            Json(CreateEnrollment { ttl_seconds: None }),
-        )
-        .await
-        .unwrap()
-        .0;
+        let pending = crate::tests::recovery_fixture(&state, &alice).await;
         let _ = create_recovery(State(state.clone()), admin.clone(), Path("alice".into()))
             .await
             .unwrap();

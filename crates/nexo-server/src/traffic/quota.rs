@@ -5,23 +5,6 @@ use tokio_util::sync::CancellationToken;
 const MAX_BYTES: u64 = 9_007_199_254_740_991;
 pub const EXHAUSTED: &str = "本月流量额度已用尽，隧道转发已暂停";
 
-pub(super) fn initialize_schema(db: &Connection) -> Result<()> {
-    db.execute_batch("CREATE TABLE IF NOT EXISTS traffic_quota_state (
-        id INTEGER PRIMARY KEY CHECK(id=1), started_at INTEGER NOT NULL);
-        CREATE TABLE IF NOT EXISTS traffic_quota_limits (
-        tenant_id TEXT PRIMARY KEY REFERENCES tenants(id) ON DELETE CASCADE,
-        monthly_limit_bytes INTEGER CHECK(monthly_limit_bytes>0 AND monthly_limit_bytes<=9007199254740991));
-        CREATE TABLE IF NOT EXISTS traffic_quota_months (
-        tenant_id TEXT NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
-        month INTEGER NOT NULL, used_bytes INTEGER NOT NULL,
-        PRIMARY KEY(tenant_id,month));")?;
-    db.execute(
-        "INSERT OR IGNORE INTO traffic_quota_state VALUES (1,?1)",
-        [unix_now()],
-    )?;
-    Ok(())
-}
-
 fn period(now: i64) -> (i64, i64) {
     let date = time::OffsetDateTime::from_unix_timestamp(now + 8 * 3600)
         .expect("有效的系统时间")

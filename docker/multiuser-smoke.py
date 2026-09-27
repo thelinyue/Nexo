@@ -119,12 +119,11 @@ class MultiuserHarness(smoke.Harness):
         denied(lambda: alice.api("admin/users"), 403)
         self.check("邀请创建独立工作空间，普通用户不能访问管理员资源或其他空间")
 
-        invite = alice.api("enrollments", "POST", {})
+        invite = alice.api("agent-access-key", "POST", {})
         original_agent = self.agent
         agent = self.start_agent(invite["token"], "alice-agent")
         self.agent = original_agent
-        smoke.wait_for(lambda: any(row["status"] == "awaiting_approval" for row in alice.api("enrollments")), "Alice Agent 提交身份")
-        alice_device = alice.api(f"enrollments/{invite['id']}/approve", "POST", {"device_name": "Alice Agent"})["device_id"]
+        alice_device = smoke.wait_for(lambda: next((r["id"] for r in alice.api("devices") if r["status"] == "online"), None), "Alice 共享密钥接入")
         smoke.wait_for(lambda: any(row["status"] == "online" for row in alice.api("devices")), "Alice Agent 上线")
         assert len(self.api(prefix + "/devices")) == 1
         domain = alice.api("public-domains", "POST", {"domain": "alice-smoke.localhost", "https_enabled": False})
@@ -138,7 +137,7 @@ class MultiuserHarness(smoke.Harness):
         public_port = smoke.port()
         alice_tcp = alice.api("tunnels", "POST", {"name": "alice-tcp", "protocol": "tcp", "device_id": alice_device, "local_address": "127.0.0.1", "local_port": tcp["local_port"], "public_port": public_port})
         smoke.wait_for(lambda: all(item["apply_status"] == "ready" for item in alice.api("tunnels")), "Alice HTTP/TCP 转发就绪")
-        pending = alice.api("enrollments", "POST", {})
+        pending = alice.api(f"devices/{alice_device}/recovery", "POST", {})
         recovery = self.api(f"admin/users/{user['user_id']}/recovery", "POST")
         self.check("用户自助入网；未验证域名禁止发布，跨空间凭据更新被拒绝")
 
@@ -212,7 +211,7 @@ class MultiuserHarness(smoke.Harness):
         self.check("改名撤销旧会话和旧登录名，保留用户身份、工作空间及真实转发")
         web = alice.api("tunnels", "POST", web_input)
         smoke.wait_for(lambda: all(item["apply_status"] == "ready" for item in alice.api("tunnels")), "整空间删除前恢复 Web 服务")
-        alice.api("enrollments", "POST", {})
+        alice.api(f"devices/{alice_device}/recovery", "POST", {})
         final_recovery = self.api(f"admin/users/{user['user_id']}/recovery", "POST")
         # 本机 HTTP 域名的专属测试凭据没有接入签发，不调用 Cloudflare。
         secret_dir = self.root / "server/secrets/public-domains" / domain["id"]

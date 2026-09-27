@@ -55,22 +55,19 @@ fn calendar_uses_beijing_monday_month_year_and_leap_boundaries() {
 }
 
 #[test]
-fn migration_backfills_once_and_month_survives_minute_retention() {
+fn month_survives_minute_retention_and_restart() {
     let (state, _) = crate::tests::domain_fixture();
     let now = timestamp(2026, 9, 26, 12);
     let old = timestamp(2026, 9, 2, 12);
     {
         let db = state.db.lock().unwrap();
-        db.execute("DELETE FROM traffic_usage_state", []).unwrap();
         db.execute(
-            "INSERT INTO traffic_minutes VALUES ('default','old-tunnel',?1,120,80)",
+            "INSERT INTO traffic_daily VALUES ('default',?1,120,80)",
             [old],
         )
         .unwrap();
         db.execute("INSERT INTO traffic_coverage VALUES (?1,60)", [old])
             .unwrap();
-        initialize_schema(&db).unwrap();
-        initialize_schema(&db).unwrap();
     }
     let result = usage(&state, all(), now).unwrap().0;
     assert_eq!(result.month.total.to_origin, 120);
@@ -254,7 +251,7 @@ async fn reset_preserves_history_handles_unsampled_bytes_failure_and_restart() {
             .to_public,
         8.8
     );
-    initialize_schema(&state.db.lock().unwrap()).unwrap();
+    crate::initialize_database(&state.db.lock().unwrap(), false).unwrap();
     let mut restarted = state.clone();
     restarted.tunnel_runtime = Arc::new(transport::Runtime::new("127.0.0.1".parse().unwrap()));
     assert_eq!(

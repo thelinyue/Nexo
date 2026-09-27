@@ -55,7 +55,7 @@ test("所有页面在移动尺寸和明暗主题中无溢出，输出实际截�
       await page.keyboard.press("Escape");
       await page.goto("/#/agents");
       await page.getByRole("button", { name: "批准", exact: true }).click();
-      await expect(page.getByRole("dialog").getByRole("button", { name: "批准入网" })).toBeInViewport();
+      await expect(page.getByRole("dialog").getByRole("button", { name: "批准恢复" })).toBeInViewport();
       await page.screenshot({ path: testInfo.outputPath(`${name}-${theme}-approve.png`) });
       await page.keyboard.press("Escape");
     }

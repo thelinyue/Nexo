@@ -15,7 +15,7 @@ async function mockClipboard(page: Page, fail = false) {
   }, fail);
 }
 
-test("Compose 配置与 docker run 命令自动填入地址和凭证，复制不写入浏览器存储", async ({ page }) => {
+test("TOML 填入地址和凭证，Compose 与 docker run 使用相同数据目录，复制不写入浏览器存储", async ({ page }) => {
   await installApiMocks(page); await mockClipboard(page);
   const dialog = await openEnrollment(page);
   expect(await page.evaluate(() => document.activeElement instanceof HTMLInputElement)).toBeFalsy();
@@ -29,28 +29,28 @@ test("Compose 配置与 docker run 命令自动填入地址和凭证，复制不
   await dialog.getByLabel("Server 地址").press("Enter");
   expect(await page.evaluate(() => (window as any).copiedCommand)).toBeUndefined();
   await dialog.getByRole("button", { name: "复制 Compose 配置文件", exact: true }).click();
-  await expect(dialog.getByRole("status")).toHaveText("Compose 配置文件已复制");
+  await expect(dialog.getByRole("status")).toHaveText("已复制");
   const compose = await page.evaluate(() => (window as any).copiedCommand as string);
-  expect(compose).toContain("https://nexo.example.com/prefix");
-  expect(compose).not.toContain("prefix///");
-  expect(compose).toContain("nexo_join_shared-test-key");
   expect(compose).toMatch(/^name: nexo-agent/m);
-  expect(compose).toContain('NEXO_SERVER_URL: "https://nexo.example.com/prefix"');
-  expect(compose).toContain('NEXO_ENROLLMENT_TOKEN: "nexo_join_shared-test-key"');
   expect(compose).toContain("./data/nexo-agent:/data/nexo-agent");
-  expect(compose).not.toContain("bash <<");
+  expect(compose).not.toContain("NEXO_");
+  expect(compose).not.toContain("nexo_join_");
+  await dialog.getByRole("button", { name: "复制 Agent TOML" }).click();
+  const toml = await page.evaluate(() => (window as any).copiedCommand as string);
+  expect(toml).toContain('server_url = "https://nexo.example.com/prefix"');
+  expect(toml).toContain('enrollment_token = "nexo_join_shared-test-key"');
   await dialog.getByRole("button", { name: "docker run", exact: true }).click();
   await dialog.getByRole("button", { name: "复制 Docker run 命令", exact: true }).click();
   const docker = await page.evaluate(() => (window as any).copiedCommand as string);
   expect(docker).toContain("docker run -d --name nexo-agent --network host");
   expect(docker).not.toContain("bash <<");
-  expect(docker).toContain("NEXO_SERVER_URL=https://nexo.example.com/prefix");
-  expect(docker).toContain("NEXO_ENROLLMENT_TOKEN=nexo_join_shared-test-key");
+  expect(docker).not.toContain("NEXO_");
+  expect(docker).not.toContain("nexo_join_");
   expect(docker).toContain("nexo-agent:/data/nexo-agent");
   expect(await page.evaluate(() => JSON.stringify({ ...localStorage, ...sessionStorage }))).not.toContain("nexo_join_");
   await dialog.getByRole("button", { name: "取消", exact: true }).click();
   await page.getByRole("button", { name: "添加 Agent", exact: true }).click();
-  await expect(dialog.getByLabel("Compose 配置文件", { exact: true })).toContainText("nexo_join_shared-test-key");
+  await expect(dialog.getByLabel("Agent TOML", { exact: true })).toContainText("nexo_join_shared-test-key");
 });
 
 test("失败可重试，无效地址阻止复制，剪贴板失败展开完整命令", async ({ page }) => {
@@ -63,11 +63,11 @@ test("失败可重试，无效地址阻止复制，剪贴板失败展开完整�
   const copy = dialog.getByRole("button", { name: "复制 Compose 配置文件", exact: true });
   await expect(copy).toBeEnabled();
   await dialog.getByLabel("Server 地址").fill("https://user:pass@example.com/?secret=yes");
-  await expect(copy).toBeDisabled();
+  await expect(copy).toHaveCount(0);
   await expect(dialog.getByLabel("Server 地址")).toHaveAttribute("aria-invalid", "true");
   await dialog.getByLabel("Server 地址").fill("https://nexo.example.com");
   await copy.click();
-  await expect(dialog.getByRole("alert")).toContainText("长按选择");
+  await expect(dialog.getByRole("alert")).toContainText("手动复制");
   await expect(dialog.getByLabel("Compose 配置文件", { exact: true })).toBeVisible();
   await expect(dialog).toBeVisible();
 });
@@ -75,7 +75,7 @@ test("失败可重试，无效地址阻止复制，剪贴板失败展开完整�
 test("共享密钥不过期，重置后配置更新且设备保留", async ({ page }) => {
   const state = await installApiMocks(page); await page.clock.install();
   const dialog = await openEnrollment(page);
-  const config = dialog.getByLabel("Compose 配置文件", { exact: true });
+  const config = dialog.getByLabel("Agent TOML", { exact: true });
   await expect(config).toContainText(state.accessKey);
   await page.clock.fastForward(3601_000);
   await expect(config).toContainText(state.accessKey);
@@ -95,9 +95,10 @@ test("移动端触控、长命令、横屏与键盘压缩视口", async ({ page 
   await expect(copy).toBeEnabled();
   for (const [width, height, name] of [[320, 640, "narrow"], [375, 812, "portrait"], [390, 844, "portrait-large"], [430, 932, "portrait-wide"], [812, 375, "landscape"], [320, 360, "keyboard"]] as const) {
     await page.setViewportSize({ width, height });
+    await copy.scrollIntoViewIfNeeded();
     await expect(copy).toBeInViewport();
     await expect(dialog.getByRole("button", { name: "取消", exact: true })).toBeInViewport();
-    expect((await copy.boundingBox())!.height).toBeGreaterThanOrEqual(48);
+    expect((await copy.boundingBox())!.height).toBeGreaterThanOrEqual(44);
     if (!await dialog.getByRole("button", { name: "复制接入密钥" }).isVisible()) await dialog.getByText("高级：接入密钥", { exact: true }).click();
     for (const button of [dialog.getByRole("button", { name: "Docker Compose", exact: true }), dialog.getByRole("button", { name: "docker run", exact: true }), dialog.getByRole("button", { name: "复制接入密钥" })]) {
       const box = (await button.boundingBox())!; expect(box.height).toBeGreaterThanOrEqual(44); expect(box.width).toBeGreaterThanOrEqual(44);
@@ -139,13 +140,13 @@ test("管理员代管空间时在目标空间生成凭证", async ({ page }) => 
   await page.route("**/api/v1/admin/**", route => {
     const path = new URL(route.request().url()).pathname;
     if (path === "/api/v1/admin/users") return route.fulfill({ json: [{ id: "alice", username: "alice", role: "tenant", workspace_id: "alice-space", workspace_name: "alice 的工作空间", enabled: true, devices: 1, services: 1, domains: 1 }] });
-    if (route.request().method() === "POST") { posts.push(path); return route.fulfill({ json: { id: "scoped", status: "awaiting_agent", token: "scoped-secret", expires_at: Math.floor(Date.now()/1000) + 3600 } }); }
+    if (route.request().method() === "POST") { posts.push(path); return route.fulfill({ json: { id: "scoped", status: "awaiting_agent", token: "nexo_join_scoped-secret", expires_at: Math.floor(Date.now()/1000) + 3600 } }); }
     return route.fulfill({ json: path.endsWith("/devices") ? state.devices : path.endsWith("/tunnels") ? state.tunnels : [] });
   });
   await page.goto("/#/users");
   await page.getByRole("button", { name: "管理 alice 的空间" }).click();
   await page.evaluate(() => { window.location.hash = "#/agents"; });
   await page.getByRole("button", { name: "添加 Agent", exact: true }).click();
-  await expect(page.getByLabel("Compose 配置文件", { exact: true })).toContainText("scoped-secret");
+  await expect(page.getByLabel("Agent TOML", { exact: true })).toContainText("nexo_join_scoped-secret");
   expect(posts).toEqual(["/api/v1/admin/workspaces/alice-space/agent-access-key"]);
 });

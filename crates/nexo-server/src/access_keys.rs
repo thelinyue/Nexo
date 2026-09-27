@@ -8,23 +8,6 @@ use chacha20poly1305::{
 use nexo_protocol::AgentRegistrationResponse;
 use rand::{rngs::OsRng, RngCore};
 
-pub fn initialize_schema(db: &Connection) -> Result<()> {
-    db.execute_batch(
-        "CREATE TABLE IF NOT EXISTS agent_access_keys (
-        tenant_id TEXT PRIMARY KEY REFERENCES tenants(id) ON DELETE CASCADE,
-        token_digest TEXT NOT NULL UNIQUE, encrypted_token BLOB NOT NULL,
-        created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
-    );
-    CREATE TABLE IF NOT EXISTS agent_registrations (
-        tenant_id TEXT NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
-        csr_pem TEXT NOT NULL, device_id TEXT REFERENCES devices(id) ON DELETE SET NULL,
-        certificate_pem TEXT NOT NULL, created_at INTEGER NOT NULL,
-        PRIMARY KEY(tenant_id,csr_pem)
-    );",
-    )?;
-    Ok(())
-}
-
 #[derive(Serialize)]
 pub(crate) struct AccessKey {
     token: String,
@@ -167,10 +150,7 @@ pub(crate) async fn register(
             "请使用空间接入密钥",
         ));
     }
-    let csr = input
-        .csr_pem
-        .as_deref()
-        .ok_or_else(|| ApiError::new(StatusCode::BAD_REQUEST, "设备 CSR 不能为空"))?;
+    let csr = input.csr_pem.as_str();
     nexo_tunnel::identity::validate_csr(csr)
         .map_err(|_| ApiError::new(StatusCode::BAD_REQUEST, "设备 CSR 无效"))?;
     if input.device_name.len() > 256
@@ -261,7 +241,7 @@ mod tests {
             os: Some("test".into()),
             architecture: None,
             agent_version: "test".into(),
-            csr_pem: Some(csr),
+            csr_pem: csr,
         }
     }
 
@@ -552,7 +532,7 @@ mod tests {
             State(state.clone()),
             headers,
             Path(invitation.id),
-            Json(ApproveEnrollment { device_name: None }),
+            Json(ApproveEnrollment {}),
         )
         .await
         .unwrap()

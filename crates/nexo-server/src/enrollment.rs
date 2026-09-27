@@ -2,44 +2,19 @@
 use crate::*;
 use nexo_tunnel::identity::validate_csr;
 
-/// 这是现有 Tunnel 数据目录的增量表；旧 mesh 数据仍由 initialize_database 拒绝。
-pub fn initialize_schema(connection: &Connection) -> Result<()> {
-    let has_kind: bool = connection.query_row(
-        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('pending_enrollments') WHERE name='kind')",
-        [],
-        |r| r.get(0),
-    )?;
-    if !has_kind {
-        connection.execute_batch(
-            "ALTER TABLE pending_enrollments ADD COLUMN kind TEXT NOT NULL DEFAULT 'enroll';",
-        )?;
-    }
-    connection.execute_batch(
-        "CREATE TABLE IF NOT EXISTS enrollment_requests (
-        enrollment_id TEXT PRIMARY KEY REFERENCES pending_enrollments(id) ON DELETE CASCADE,
-        csr_pem TEXT NOT NULL, device_name TEXT NOT NULL, os TEXT, architecture TEXT,
-        agent_version TEXT NOT NULL, certificate_pem TEXT
-    );",
-    )?;
-    crate::identity_runtime::initialize_schema(connection)
-}
+// 一次性凭证仅用于已有设备的身份恢复；新设备通过共享接入密钥注册。
 
 pub(crate) async fn agent_enroll(
     State(state): State<AppState>,
     Json(input): Json<AgentEnrollmentRequest>,
 ) -> Result<Json<AgentEnrollmentResponse>, ApiError> {
-    let csr = input.csr_pem.as_deref().ok_or_else(|| {
-        ApiError::new(
-            StatusCode::BAD_REQUEST,
-            "Agent 必须提供设备 CSR，请升级 Agent 后重试",
-        )
-    })?;
+    let csr = input.csr_pem.as_str();
     validate_csr(csr).map_err(|e| ApiError::new(StatusCode::BAD_REQUEST, e.to_string()))?;
     let db = state.db.lock().map_err(|_| db_error("数据库锁不可用"))?;
     let tx = db.unchecked_transaction().map_err(db_error)?;
     let row = tx
         .query_row(
-            "SELECT id,status,expires_at,kind,device_id FROM pending_enrollments WHERE token_digest=?1 AND EXISTS(SELECT 1 FROM tenants w WHERE w.id=pending_enrollments.tenant_id AND w.enabled=1)",
+            "SELECT id,status,expires_at,kind,device_id FROM pending_enrollments WHERE token_digest=?1 AND kind='recovery' AND EXISTS(SELECT 1 FROM tenants w WHERE w.id=pending_enrollments.tenant_id AND w.enabled=1)",
             [EnrollmentToken::digest(&input.token)],
             |r| {
                 Ok((
@@ -57,7 +32,7 @@ pub(crate) async fn agent_enroll(
     if row.2 <= unix_now() {
         return Err(ApiError::new(StatusCode::UNAUTHORIZED, "入网凭证已过期"));
     }
-    if row.3 == "recovery" && row.4.is_none() {
+    if row.4.is_none() {
         return Err(ApiError::new(
             StatusCode::UNAUTHORIZED,
             "原设备已删除，恢复凭证已失效",
@@ -102,8 +77,7 @@ pub(crate) async fn agent_enroll(
     Ok(Json(AgentEnrollmentResponse {
         enrollment_id: row.0,
         status: EnrollmentStatus::AwaitingApproval,
-        device_id: if row.3 == "recovery" { row.4 } else { None },
-        server_endpoint: None,
+        device_id: row.4,
         certificate_pem: None,
         ca_certificate_pem: None,
         message: "入网请求已接收，请在所属工作空间批准".into(),
@@ -138,13 +112,13 @@ fn approve(
     state: &AppState,
     session: &auth::Session,
     id: String,
-    input: ApproveEnrollment,
+    _input: ApproveEnrollment,
 ) -> Result<Enrollment, ApiError> {
     let db = state.db.lock().map_err(|_| db_error("数据库锁不可用"))?;
     accounts::ensure_workspace_enabled(&db, &session.tenant_id)?;
     let tx = db.unchecked_transaction().map_err(db_error)?;
     let (status, expires, kind, target): (String, i64, String, Option<String>) = tx.query_row(
-        "SELECT status,expires_at,kind,device_id FROM pending_enrollments WHERE id=?1 AND tenant_id=?2",
+        "SELECT status,expires_at,kind,device_id FROM pending_enrollments WHERE id=?1 AND tenant_id=?2 AND kind='recovery'",
         params![id,session.tenant_id], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?)))
         .optional().map_err(db_error)?.ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND,"入网请求不存在"))?;
     if expires <= unix_now() {
@@ -159,12 +133,8 @@ fn approve(
             "请等待 Agent 提交设备身份后再批准",
         ));
     }
-    let recovery = kind == "recovery";
-    let device = if recovery {
-        target.ok_or_else(|| ApiError::new(StatusCode::CONFLICT, "原设备已删除，不能恢复身份"))?
-    } else {
-        Uuid::new_v4().to_string()
-    };
+    let device =
+        target.ok_or_else(|| ApiError::new(StatusCode::CONFLICT, "原设备已删除，不能恢复身份"))?;
     let csr: String = tx
         .query_row(
             "SELECT csr_pem FROM enrollment_requests WHERE enrollment_id=?1",
@@ -177,7 +147,7 @@ fn approve(
         .issue_device(&csr, &device)
         .map_err(db_error)?;
     let fingerprint = identity_runtime::fingerprint(&cert).map_err(db_error)?;
-    if recovery {
+    {
         let changed = tx
             .execute(
                 "UPDATE devices SET status='offline',updated_at=?1 WHERE id=?2 AND tenant_id=?3",
@@ -190,9 +160,6 @@ fn approve(
         // 服务主键、设备绑定和启停状态保持不变，只重新要求 Agent 上报应用结果。
         tx.execute("DELETE FROM tunnel_applied_states WHERE tunnel_id IN (SELECT id FROM tunnels WHERE device_id=?1)",[&device]).map_err(db_error)?;
         tx.execute("UPDATE tunnels SET apply_revision=apply_revision+1,apply_status=CASE WHEN enabled=1 THEN 'checking' ELSE 'disabled' END WHERE device_id=?1 AND deleted_at IS NULL",[&device]).map_err(db_error)?;
-    } else {
-        let name = input.device_name.filter(|v| !v.trim().is_empty());
-        tx.execute("INSERT INTO devices (id,tenant_id,name,os,architecture,agent_version,status,enrolled_at,created_at,updated_at) SELECT ?1,?2,COALESCE(?3,device_name),os,architecture,agent_version,'offline',?4,?4,?4 FROM enrollment_requests WHERE enrollment_id=?5",params![device,session.tenant_id,name,unix_now(),id]).map_err(db_error)?;
     }
     tx.execute("INSERT INTO device_identities (device_id,secret_digest,created_at) VALUES (?1,?2,?3) ON CONFLICT(device_id) DO UPDATE SET secret_digest=excluded.secret_digest,created_at=excluded.created_at",params![device,fingerprint,unix_now()]).map_err(db_error)?;
     tx.execute("INSERT INTO device_certificates (device_id,certificate_pem) VALUES (?1,?2) ON CONFLICT(device_id) DO UPDATE SET certificate_pem=excluded.certificate_pem,pending_csr_pem=NULL,pending_certificate_pem=NULL,retry_failures=0,renewal_error=NULL,next_retry_at=NULL",params![device,cert]).map_err(db_error)?;
@@ -206,7 +173,7 @@ fn approve(
         params![device, id],
     )
     .map_err(db_error)?;
-    tx.execute("INSERT INTO audit_events(tenant_id,actor_user_id,event_type,resource_type,resource_id,created_at) VALUES (?1,?2,?3,'device',?4,?5)",params![session.tenant_id,session.user_id,if recovery {"identity_recovered"} else {"enrollment_approved"},device,unix_now()]).map_err(db_error)?;
+    tx.execute("INSERT INTO audit_events(tenant_id,actor_user_id,event_type,resource_type,resource_id,created_at) VALUES (?1,?2,?3,'device',?4,?5)",params![session.tenant_id,session.user_id,"identity_recovered",device,unix_now()]).map_err(db_error)?;
     tx.commit().map_err(db_error)?;
     Ok(Enrollment {
         id,
@@ -339,23 +306,14 @@ mod tests {
             os: Some("test".into()),
             architecture: None,
             agent_version: "test".into(),
-            csr_pem: Some(csr),
+            csr_pem: csr,
         }
     }
 
     #[tokio::test]
     async fn enrollment_binds_csr_and_response_retries_reuse_one_identity() {
         let (state, headers) = crate::tests::domain_fixture();
-        let invite = create_enrollment(
-            State(state.clone()),
-            headers.clone(),
-            Json(CreateEnrollment {
-                ttl_seconds: Some(3600),
-            }),
-        )
-        .await
-        .unwrap()
-        .0;
+        let invite = crate::tests::recovery_fixture(&state, &headers).await;
         let token = invite.token.unwrap();
         let input = request(&token);
         let _ = agent_enroll(State(state.clone()), Json(input.clone()))
@@ -387,7 +345,7 @@ mod tests {
             State(state.clone()),
             headers,
             Path(invite.id.clone()),
-            Json(ApproveEnrollment { device_name: None }),
+            Json(ApproveEnrollment {}),
         )
         .await
         .unwrap()
@@ -453,22 +411,13 @@ mod tests {
     #[tokio::test]
     async fn approval_requires_csr_and_unexpired_owned_invitation() {
         let (state, headers) = crate::tests::domain_fixture();
-        let invite = create_enrollment(
-            State(state.clone()),
-            headers.clone(),
-            Json(CreateEnrollment {
-                ttl_seconds: Some(3600),
-            }),
-        )
-        .await
-        .unwrap()
-        .0;
+        let invite = crate::tests::recovery_fixture(&state, &headers).await;
         assert_eq!(
             approve_enrollment(
                 State(state.clone()),
                 headers.clone(),
                 Path(invite.id.clone()),
-                Json(ApproveEnrollment { device_name: None })
+                Json(ApproveEnrollment {})
             )
             .await
             .unwrap_err()
@@ -476,7 +425,7 @@ mod tests {
             StatusCode::CONFLICT
         );
         let mut invalid = request(invite.token.as_deref().unwrap());
-        invalid.csr_pem = Some("invalid".into());
+        invalid.csr_pem = "invalid".into();
         assert_eq!(
             agent_enroll(State(state.clone()), Json(invalid))
                 .await
@@ -504,7 +453,7 @@ mod tests {
                 State(state.clone()),
                 headers,
                 Path(invite.id),
-                Json(ApproveEnrollment { device_name: None })
+                Json(ApproveEnrollment {})
             )
             .await
             .unwrap_err()
@@ -526,16 +475,7 @@ mod tests {
     #[tokio::test]
     async fn recovery_preserves_device_and_services_and_rejects_revoked_keys() {
         let (state, headers) = crate::tests::domain_fixture();
-        let invite = create_enrollment(
-            State(state.clone()),
-            headers.clone(),
-            Json(CreateEnrollment {
-                ttl_seconds: Some(3600),
-            }),
-        )
-        .await
-        .unwrap()
-        .0;
+        let invite = crate::tests::recovery_fixture(&state, &headers).await;
         let token = invite.token.unwrap();
         let _ = agent_enroll(State(state.clone()), Json(request(&token)))
             .await
@@ -544,9 +484,7 @@ mod tests {
             State(state.clone()),
             headers.clone(),
             Path(invite.id.clone()),
-            Json(ApproveEnrollment {
-                device_name: Some("原设备".into()),
-            }),
+            Json(ApproveEnrollment {}),
         )
         .await
         .unwrap()
@@ -597,9 +535,7 @@ mod tests {
             State(state.clone()),
             headers.clone(),
             Path(invite.id.clone()),
-            Json(ApproveEnrollment {
-                device_name: Some("不应重命名".into()),
-            }),
+            Json(ApproveEnrollment {}),
         )
         .await
         .unwrap()

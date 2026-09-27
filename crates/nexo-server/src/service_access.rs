@@ -19,38 +19,6 @@ const PREFIX: &str = "/.nexo-access/";
 const COOKIE: &str = "nexo_access_";
 const LIFETIME: i64 = 86400;
 
-pub fn initialize_schema(db: &Connection) -> anyhow::Result<()> {
-    for (name, definition) in [
-        (
-            "access_mode",
-            "TEXT NOT NULL DEFAULT 'public' CHECK(access_mode IN ('public','password'))",
-        ),
-        ("access_password_hash", "TEXT"),
-    ] {
-        let exists: bool = db.query_row(
-            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('tunnels') WHERE name=?1)",
-            [name],
-            |r| r.get(0),
-        )?;
-        if !exists {
-            db.execute_batch(&format!(
-                "ALTER TABLE tunnels ADD COLUMN {name} {definition}"
-            ))?;
-        }
-    }
-    // 撤销与服务写入共用事务，覆盖单项、批量操作及域名删除，不依赖调用方记得清理。
-    db.execute_batch("CREATE TABLE IF NOT EXISTS service_access_sessions (
-        digest TEXT PRIMARY KEY, service_id TEXT NOT NULL REFERENCES tunnels(id) ON DELETE CASCADE,
-        expires_at INTEGER NOT NULL);
-        CREATE INDEX IF NOT EXISTS service_access_sessions_service ON service_access_sessions(service_id);
-        CREATE TRIGGER IF NOT EXISTS revoke_service_access AFTER UPDATE ON tunnels
-        WHEN OLD.access_mode IS NOT NEW.access_mode OR OLD.access_password_hash IS NOT NEW.access_password_hash
-          OR OLD.hostname IS NOT NEW.hostname OR OLD.public_domain_id IS NOT NEW.public_domain_id
-          OR OLD.protocol IS NOT NEW.protocol OR NEW.enabled=0 OR NEW.deleted_at IS NOT NULL
-        BEGIN DELETE FROM service_access_sessions WHERE service_id=NEW.id; END;")?;
-    Ok(())
-}
-
 pub fn validate_password(password: &str) -> Result<(), ApiError> {
     if !(4..=16).contains(&password.len()) || !password.bytes().all(|b| b.is_ascii_graphic()) {
         return Err(ApiError::new(

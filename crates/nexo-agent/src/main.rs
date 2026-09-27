@@ -20,20 +20,49 @@ mod certificate;
 mod origin_tests;
 mod udp;
 
-#[derive(Debug, Parser)]
+#[derive(Parser)]
 #[command(name = "nexo-agent", about = "Nexo 内网穿透 Agent")]
-struct Config {
-    /// 使用恢复凭证替换本机身份；审批和落盘成功后退出，再按正常方式启动 Agent。
+struct Cli {
+    #[arg(long, default_value = "./data/nexo-agent")]
+    data_dir: PathBuf,
+    #[arg(long)]
+    config: Option<PathBuf>,
+    /// 使用一次性恢复凭证，成功保存身份后退出。
     #[arg(long)]
     recover_identity: bool,
-    #[arg(long, default_value = "")]
+    /// 仅供显式恢复身份操作，不覆盖普通启动配置。
+    #[arg(long, requires = "recover_identity")]
+    enrollment_token: Option<String>,
+}
+
+/// TOML 保存连接参数；操作标志和软件版本来自本次运行，不允许文件伪造。
+#[derive(Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct Config {
     server_url: String,
-    #[arg(long, default_value = "")]
     enrollment_token: String,
-    #[arg(long, default_value = "Nexo Agent")]
     device_name: String,
-    #[arg(long, default_value=env!("CARGO_PKG_VERSION"))]
+    control_endpoint: String,
+    tunnel_endpoint: String,
+    udp_endpoint: String,
+    #[serde(skip)]
+    recover_identity: bool,
+    #[serde(skip)]
     agent_version: String,
+}
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            server_url: String::new(),
+            enrollment_token: String::new(),
+            device_name: "Nexo Agent".into(),
+            control_endpoint: String::new(),
+            tunnel_endpoint: String::new(),
+            udp_endpoint: String::new(),
+            recover_identity: false,
+            agent_version: env!("CARGO_PKG_VERSION").into(),
+        }
+    }
 }
 #[derive(Clone, Serialize, Deserialize)]
 struct DeviceIdentity {
@@ -65,26 +94,73 @@ async fn main() -> Result<()> {
         .with_target(false)
         .compact()
         .init();
-    let mut config = Config::parse();
-    if config.server_url.is_empty() {
-        config.server_url = env::var("NEXO_SERVER_URL").context("NEXO_SERVER_URL 不能为空")?;
+    let cli = Cli::parse();
+    let directory = nexo_core::config::absolute(&cli.data_dir)?;
+    let path =
+        nexo_core::config::absolute(&cli.config.unwrap_or_else(|| directory.join("agent.toml")))?;
+    let mut config: Config =
+        nexo_core::config::load(&path, include_str!("../../../config/agent.toml"))?;
+    anyhow::ensure!(
+        !config.server_url.trim().is_empty(),
+        "请填写 {} 中的 server_url 和首次接入凭证 enrollment_token 后重启",
+        path.display()
+    );
+    anyhow::ensure!(
+        !config
+            .server_url
+            .chars()
+            .any(|c| c.is_control() || c == '\\'),
+        "server_url 不允许控制字符或反斜杠"
+    );
+    let url = reqwest::Url::parse(&config.server_url).context("server_url 不是有效地址")?;
+    anyhow::ensure!(
+        matches!(url.scheme(), "http" | "https")
+            && url.host_str().is_some()
+            && url.username().is_empty()
+            && url.password().is_none()
+            && url.query().is_none()
+            && url.fragment().is_none(),
+        "server_url 必须是 HTTP/HTTPS 地址，不含账号或参数"
+    );
+    config.server_url = url.as_str().trim_end_matches('/').into();
+    for (name, address) in [
+        ("control_endpoint", &config.control_endpoint),
+        ("tunnel_endpoint", &config.tunnel_endpoint),
+        ("udp_endpoint", &config.udp_endpoint),
+    ] {
+        if !address.is_empty() {
+            let parsed = reqwest::Url::parse(&format!("tcp://{address}"));
+            anyhow::ensure!(
+                parsed.is_ok_and(|u| u.host_str().is_some()
+                    && u.port().is_some_and(|p| p > 0)
+                    && u.username().is_empty()
+                    && u.password().is_none()
+                    && u.path().is_empty()
+                    && u.query().is_none()
+                    && u.fragment().is_none()),
+                "{name} 必须是主机:端口"
+            );
+        }
     }
-    config.server_url = config.server_url.trim_end_matches('/').into();
-    if config.enrollment_token.is_empty() {
-        config.enrollment_token = env::var("NEXO_ENROLLMENT_TOKEN").unwrap_or_default();
+    config.recover_identity = cli.recover_identity;
+    if let Some(token) = cli.enrollment_token {
+        config.enrollment_token = token;
     }
-    if config.device_name == "Nexo Agent" {
-        config.device_name = env::var("NEXO_DEVICE_NAME").unwrap_or(config.device_name);
+    let mut identity = load_identity(&config, &directory)
+        .await
+        .with_context(|| format!("Agent 初始化失败，请检查 {}", path.display()))?;
+    if !config.enrollment_token.is_empty() {
+        tracing::info!("身份已保存，请清除 agent.toml 中的接入凭证");
     }
-    let directory =
-        PathBuf::from(env::var("NEXO_STATE_DIR").unwrap_or_else(|_| "./data/nexo-agent".into()));
-    let mut identity = load_identity(&config, &directory).await?;
     if config.recover_identity {
         tracing::info!(device_id = %identity.device_id, "设备身份已恢复，原设备 ID 和服务绑定保留；请正常启动 Agent");
         return Ok(());
     }
-    let address =
-        env::var("NEXO_CONTROL_ENDPOINT").unwrap_or(endpoint_address(&config.server_url, 9890)?);
+    let address = if config.control_endpoint.is_empty() {
+        endpoint_address(&config.server_url, 9890)?
+    } else {
+        config.control_endpoint.clone()
+    };
     loop {
         let result = run_control(
             &config,
@@ -131,7 +207,7 @@ async fn load_identity(config: &Config, directory: &std::path::Path) -> Result<D
     }
     anyhow::ensure!(
         !config.enrollment_token.trim().is_empty(),
-        "首次入网需要 NEXO_ENROLLMENT_TOKEN"
+        "请填写 agent.toml 中的 enrollment_token，或为恢复操作提供专用凭证"
     );
     let request_path = directory.join(if config.recover_identity {
         "recovery-key.json"
@@ -158,11 +234,11 @@ async fn load_identity(config: &Config, directory: &std::path::Path) -> Result<D
         .no_proxy()
         .timeout(Duration::from_secs(15))
         .build()?;
-    // 明确的凭证前缀选择协议；共享注册失败不得降级到旧审批接口。
-    if config.enrollment_token.starts_with("nexo_join_") {
+    // 新设备使用共享密钥注册；恢复操作始终使用专用凭证。
+    if !config.recover_identity {
         anyhow::ensure!(
-            !config.recover_identity,
-            "恢复原设备请使用设备详情生成的专用恢复凭证"
+            config.enrollment_token.starts_with("nexo_join_"),
+            "新设备请使用空间共享接入密钥"
         );
         let response = client
             .post(format!("{}/api/v1/agent/register", config.server_url))
@@ -172,11 +248,11 @@ async fn load_identity(config: &Config, directory: &std::path::Path) -> Result<D
                 os: Some(env::consts::OS.into()),
                 architecture: Some(env::consts::ARCH.into()),
                 agent_version: config.agent_version.clone(),
-                csr_pem: Some(material.csr_pem.clone()),
+                csr_pem: material.csr_pem.clone(),
             })
             .send()
             .await
-            .context("无法连接 Server 注册接口，请确认 Server 支持共享接入密钥")?;
+            .context("无法连接 Server 注册接口，请检查 server_url 和网络")?;
         let result: nexo_protocol::AgentRegistrationResponse =
             decode_response(response, &config.enrollment_token).await?;
         identity::client_config(
@@ -210,7 +286,7 @@ async fn load_identity(config: &Config, directory: &std::path::Path) -> Result<D
             os: Some(env::consts::OS.into()),
             architecture: Some(env::consts::ARCH.into()),
             agent_version: config.agent_version.clone(),
-            csr_pem: Some(material.csr_pem),
+            csr_pem: material.csr_pem,
         })
         .send()
         .await
@@ -370,15 +446,17 @@ async fn run_control(
     write_message(
         &mut write,
         &AgentControlMessage::Hello {
-            capabilities: vec!["udp-v1".into()],
             device_id: device.clone(),
             agent_version: config.agent_version.clone(),
         },
     )
     .await?;
     let fallback = TunnelDataEndpoint {
-        address: env::var("NEXO_TUNNEL_ENDPOINT")
-            .unwrap_or(endpoint_address(&config.server_url, 9891)?),
+        address: if config.tunnel_endpoint.is_empty() {
+            endpoint_address(&config.server_url, 9891)?
+        } else {
+            config.tunnel_endpoint.clone()
+        },
         server_name: SERVER_NAME.into(),
     };
     let (desired, receiver) = watch::channel(Desired {
@@ -425,7 +503,7 @@ async fn run_control(
                 deadline.as_mut().reset(tokio::time::Instant::now()+Duration::from_secs(45));
                 match serde_json::from_str::<ServerControlMessage>(&line)? {
                     ServerControlMessage::HelloAccepted { tunnels,tunnel_endpoint,udp_endpoint,.. } | ServerControlMessage::HeartbeatAck { tunnels,tunnel_endpoint,udp_endpoint,.. } => {
-                        let next = Desired { udp_endpoint: udp_endpoint.map(|mut endpoint| { if endpoint.address.is_empty() { endpoint.address = env::var("NEXO_UDP_ENDPOINT").unwrap_or_else(|_| fallback.address.clone()); } endpoint }), endpoint: tunnel_endpoint.unwrap_or_else(||fallback.clone()),tunnels:tunnels.clone() };
+                        let next = Desired { udp_endpoint: udp_endpoint.map(|mut endpoint| { if endpoint.address.is_empty() { endpoint.address = if config.udp_endpoint.is_empty() { fallback.address.clone() } else { config.udp_endpoint.clone() }; } endpoint }), endpoint: tunnel_endpoint.unwrap_or_else(||fallback.clone()),tunnels:tunnels.clone() };
                         if *desired.borrow() != next { desired.send_replace(next); }
                         if !accepted { accepted=true; data_tasks.spawn(run_data(connector_updates.clone(),receiver.clone())); data_tasks.spawn(udp::run(connector_updates.clone(),receiver.clone())); }
                         probes.abort_all();

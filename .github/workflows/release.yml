@@ -115,7 +115,8 @@ jobs:
           set -euo pipefail
           bundle="nexo-v${VERSION}-docker"
           mkdir -p "dist/${bundle}"
-          cp compose.yml compose.agent.yml .env.example README.md LICENSE THIRD_PARTY_NOTICES.md "dist/${bundle}/"
+          cp compose.yml compose.agent.yml README.md LICENSE THIRD_PARTY_NOTICES.md "dist/${bundle}/"
+          cp -R config "dist/${bundle}/config"
           cp -R licenses "dist/${bundle}/licenses"
           tar -C dist -czf "dist/${bundle}.tar.gz" "${bundle}"
           (cd dist && sha256sum "${bundle}.tar.gz" > SHA256SUMS)

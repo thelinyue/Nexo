@@ -8,6 +8,7 @@ fn input(host: &str) -> TunnelInput {
 fn fixture() -> (AppState, HeaderMap) {
     let (state, headers) = crate::tests::domain_fixture();
     state.db.lock().unwrap().execute("INSERT INTO public_domains(id,tenant_id,domain,https_enabled,created_at,updated_at) VALUES('domain','default','example.com',1,0,0)", []).unwrap();
+    state.db.lock().unwrap().execute("INSERT INTO domain_settings(domain_id,verification_token,certificate_mode,verified) VALUES('domain','test-proof','http01',1)", []).unwrap();
     (state, headers)
 }
 
@@ -380,9 +381,9 @@ async fn invalid_direct_combinations_targets_and_foreign_domains_are_rejected() 
 }
 
 #[test]
-fn existing_database_upgrade_keeps_old_tunnels_and_is_repeatable() {
+fn current_database_keeps_tunnels_on_restart() {
     let db = Connection::open_in_memory().unwrap();
-    db.execute_batch(include_str!("../../../../migrations/v0.2.0_baseline.sql"))
+    db.execute_batch(include_str!("../../../../migrations/schema.sql"))
         .unwrap();
     db.execute("INSERT INTO tunnels(id,tenant_id,name,protocol,local_address,local_port,created_at,updated_at) VALUES('old','default','old','http','127.0.0.1',80,0,0)", []).unwrap();
     initialize_database(&db, false).unwrap();

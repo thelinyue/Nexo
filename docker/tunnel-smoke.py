@@ -11,9 +11,11 @@ import json
 import os
 from pathlib import Path
 import socket
+import shutil
 import socketserver
 import ssl
 import sqlite3
+import stat
 import subprocess
 import tempfile
 import threading
@@ -139,24 +141,54 @@ class Harness:
         with self.opener.open(request, timeout=10) as response:
             return json.load(response)
 
-    def launch(self, name, binary, env):
+    def launch(self, name, binary, config):
         log = open(self.root / f"{name}-{len(self.logs)}.log", "wb")
         self.logs.append(log)
-        process = subprocess.Popen([str(Path(binary).resolve())], env={**os.environ, **env}, stdout=log, stderr=subprocess.STDOUT, creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0)
+        directory = Path(config.pop("data_dir"))
+        directory.mkdir(parents=True, exist_ok=True)
+        component = "agent" if "server_url" in config else "server"
+        if component == "server":
+            config["runtime_dir"] = str(self.root / "runtime")
+        (directory / f"{component}.toml").write_text("\n".join(f"{key} = {json.dumps(value, ensure_ascii=False)}" for key, value in config.items()), encoding="utf-8")
+        process = subprocess.Popen([str(Path(binary).resolve()), "--data-dir", str(directory)], env=os.environ.copy(), stdout=log, stderr=subprocess.STDOUT, creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0)
         self.processes.append(process)
         return process
 
+    def prepare_local_certificates(self):
+        # HTTP-01 仍按产品默认规则生成；测试提前放入内部 CA 证书，避免借用已删除的旧 DNS 凭据回退。
+        # 此夹具只使用 .localhost，Caddy 不会向公共 CA 申请这些名字。
+        storage = self.root / "server/caddy-storage"
+        if storage.exists():
+            return
+        config = self.root / "local-ca.json"
+        config.write_text(json.dumps({"admin": {"listen": f"127.0.0.1:{self.ports['admin']}"},
+            "storage": {"module": "file_system", "root": str(storage)},
+            "apps": {"pki": {"certificate_authorities": {"local": {"install_trust": False}}},
+                "tls": {"certificates": {"automate": ["nexo-smoke.localhost", "secure.nexo-smoke.localhost"]},
+                    "automation": {"policies": [{"issuers": [{"module": "internal"}]}]}}}}), encoding="utf-8")
+        log = open(self.root / "local-ca.log", "wb")
+        process = subprocess.Popen([str(Path(self.args.caddy_bin).resolve()), "run", "--config", str(config)], stdout=log, stderr=subprocess.STDOUT,
+            creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0)
+        try:
+            wait_for(lambda: len(list((storage / "certificates/local").glob("*/*.crt"))) == 2, "生成内部 CA 测试证书")
+        finally:
+            process.terminate()
+            process.wait(timeout=10)
+            log.close()
+        # ACME 模式读取它的存储命名空间；仅在测试目录准备已有证书，不修改生产凭据或签发策略。
+        shutil.copytree(storage / "certificates/local", storage / "certificates/acme-v02.api.letsencrypt.org-directory")
+
     def start_server(self):
+        self.prepare_local_certificates()
         self.server = self.launch("server", self.args.server_bin, {
-            "NEXO_ADMIN_USERNAME": "admin", "NEXO_ADMIN_PASSWORD": "Test-tunnel-only-4821!",
-            "NEXO_DATA_DIR": str(self.root / "server"), "NEXO_HTTP_ADDR": f"127.0.0.1:{self.ports['api']}",
-            "NEXO_CONTROL_ADDR": f"127.0.0.1:{self.ports['control']}", "NEXO_TUNNEL_ADDR": f"127.0.0.1:{self.ports['data']}",
-            "NEXO_UDP_ADDR": f"127.0.0.1:{self.ports['data']}", "NEXO_UDP_ENDPOINT": f"127.0.0.1:{self.ports['data']}",
-            "NEXO_TUNNEL_ENDPOINT": f"127.0.0.1:{self.ports['data']}", "NEXO_PUBLIC_BIND": "127.0.0.1",
-            "NEXO_CADDY_BIN": str(Path(self.args.caddy_bin).resolve()), "NEXO_CADDY_ENABLED": "true",
-            "NEXO_CADDY_ADMIN_URL": f"http://127.0.0.1:{self.ports['admin']}",
-            "NEXO_CADDY_HTTP_LISTEN": f"127.0.0.1:{self.ports['http']}", "NEXO_CADDY_HTTPS_LISTEN": f"127.0.0.1:{self.ports['https']}",
-            "NEXO_CLOUDFLARE_API_TOKEN": "",
+            "admin.username": "admin", "admin.password": "Test-tunnel-only-4821!",
+            "data_dir": str(self.root / "server"), "http_addr": f"127.0.0.1:{self.ports['api']}",
+            "control_addr": f"127.0.0.1:{self.ports['control']}", "tunnel_addr": f"127.0.0.1:{self.ports['data']}",
+            "udp_addr": f"127.0.0.1:{self.ports['data']}", "udp_endpoint": f"127.0.0.1:{self.ports['data']}",
+            "tunnel_endpoint": f"127.0.0.1:{self.ports['data']}", "public_bind": "127.0.0.1",
+            "caddy.binary": str(Path(self.args.caddy_bin).resolve()), "caddy.enabled": True,
+            "caddy.admin_url": f"http://127.0.0.1:{self.ports['admin']}",
+            "caddy.http_listen": f"127.0.0.1:{self.ports['http']}", "caddy.https_listen": f"127.0.0.1:{self.ports['https']}",
         })
         def started():
             assert self.server.poll() is None, f"Server 已退出，请查看 {self.logs[-1].name}"
@@ -165,8 +197,8 @@ class Harness:
 
     def start_agent(self, token="", directory="agent"):
         self.agent = self.launch(directory, self.args.agent_bin, {
-            "NEXO_SERVER_URL": self.url, "NEXO_STATE_DIR": str(self.root / directory), "NEXO_ENROLLMENT_TOKEN": token,
-            "NEXO_CONTROL_ENDPOINT": f"127.0.0.1:{self.ports['control']}", "NEXO_TUNNEL_ENDPOINT": f"127.0.0.1:{self.ports['data']}",
+            "server_url": self.url, "data_dir": str(self.root / directory), "enrollment_token": token,
+            "control_endpoint": f"127.0.0.1:{self.ports['control']}", "tunnel_endpoint": f"127.0.0.1:{self.ports['data']}",
         })
         return self.agent
 
@@ -176,7 +208,7 @@ class Harness:
             self.server.wait(timeout=10)
             if os.name != "nt":
                 assert self.server.returncode == 0, "Server 未正常处理 SIGTERM"
-                assert not list((self.root / "server/tunnel-sockets").glob("*.sock")), "退出后仍残留 Unix socket"
+                assert not list((self.root / "runtime/tunnel-sockets").glob("*.sock")), "退出后仍残留 Unix socket"
         # Windows 强制结束父进程不会运行 Rust Drop；只停止本测试独占端口上的 Caddy。
         try:
             request = urllib.request.Request(f"http://127.0.0.1:{self.ports['admin']}/stop", data=b"", method="POST")
@@ -210,16 +242,15 @@ class Harness:
             result = self.api("auth/login", "POST", {"username": "admin", "password": "Test-tunnel-only-4821!"})
             self.csrf = result["csrf_token"]
             assert self.api("auth/status")["authenticated"], "登录后状态查询失败"
-            invitation = self.api("enrollments", "POST", {"ttl_seconds": 3600})
+            invitation = self.api("agent-access-key", "POST", {})
             self.start_agent(invitation["token"])
-            wait_for(lambda: any(row["status"] == "awaiting_approval" for row in self.api("enrollments")), "Agent 提交 CSR")
-            device = self.api(f"enrollments/{invitation['id']}/approve", "POST", {"device_name": "验收 Agent"})["device_id"]
+            device = wait_for(lambda: next((r["id"] for r in self.api("devices") if r["status"] == "online"), None), "共享密钥接入")
             wait_for(lambda: any(row["id"] == device and row["status"] == "online" for row in self.api("devices")), "mTLS 控制上线")
-            self.check("真实入网审批与 mTLS 控制连接")
+            self.check("共享密钥注册与 mTLS 控制连接")
             domain = self.api("public-domains", "POST", {"domain": "nexo-smoke.localhost", "https_enabled": True})
             # 归属验证由独立测试覆盖；本地固定夹具不查询公网 DNS、不触发公网 ACME。
             with sqlite3.connect(self.root / "server/nexo.db") as db:
-                db.execute("UPDATE domain_settings SET verified=1,certificate_mode='cloudflare_dns',legacy=1 WHERE domain_id=?", (domain["id"],))
+                db.execute("UPDATE domain_settings SET verified=1,certificate_mode='http01' WHERE domain_id=?", (domain["id"],))
             def create(protocol, name, local_port, public_port=None):
                 return self.api("tunnels", "POST", {"name": name, "protocol": protocol, "device_id": device, "local_address": "127.0.0.1", "local_port": local_port, "enabled": True, "public_port": public_port, "hostname": name if protocol != "tcp" else None, "public_domain_id": domain["id"] if protocol != "tcp" else None})
             tcp = create("tcp", "echo", echo.server_address[1], self.ports["public"])
@@ -230,6 +261,19 @@ class Harness:
             assert secure["public_address"] == "https://secure.nexo-smoke.localhost"
             for tunnel in [tcp, web, secure]:
                 wait_for(lambda: self.ready(tunnel["id"]), f"{tunnel['protocol']} 服务就绪")
+            if os.name != "nt":
+                runtime = self.root / "runtime"
+                for directory in [runtime, runtime / "tunnel-sockets"]:
+                    assert stat.S_IMODE(directory.stat().st_mode) == 0o700
+                for service in [web, secure]:
+                    node = runtime / "tunnel-sockets" / f"{service['id']}.sock"
+                    assert stat.S_ISSOCK(node.stat().st_mode) and stat.S_IMODE(node.stat().st_mode) == 0o600
+                assert not (self.root / "server/tunnel-sockets").exists()
+                self.api(f"tunnels/{web['id']}/disable", "POST", {})
+                assert not (runtime / "tunnel-sockets" / f"{web['id']}.sock").exists()
+                self.api(f"tunnels/{web['id']}/enable", "POST", {})
+                wait_for(lambda: self.ready(web["id"]), "Socket 重新启用")
+                self.check("Linux Socket 目录 0700、节点 0600，停用清理且不进入持久化目录")
             exchange(self.ports["public"], bytes(range(256)) * 32768)
             self.check("TCP 8 MiB 双向传输、背压与半关闭")
             with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
@@ -424,6 +468,11 @@ class Harness:
             wait_for(lambda: self.ready(tcp["id"]), "重新启用 TCP")
             exchange(self.ports["public"], b"enabled")
             self.check("停用关闭公网监听和已有连接，启用恢复")
+            def persisted_traffic():
+                with sqlite3.connect(self.root / "server/nexo.db") as db:
+                    return db.execute("SELECT COALESCE(SUM(to_origin),0),COALESCE(SUM(to_public),0) FROM traffic_minutes").fetchone()
+            # 续签钩子也会重启 Server；在任何强制结束之前等待本轮大流量落库。
+            wait_for(lambda: persisted_traffic()[0] >= 9 * 1024 * 1024, "流量分钟批次落库", timeout=75)
             self.before_restart(device, tcp, secure)
             before = (self.root / "agent/identity.json").read_bytes()
             self.agent.terminate()
@@ -434,23 +483,33 @@ class Harness:
             assert (self.root / "agent/identity.json").read_bytes() == before
             exchange(self.ports["public"], b"agent-restarted")
             self.check("Agent 无入网 Token 重启，复用原身份并恢复数据连接")
-            def persisted_traffic():
-                with sqlite3.connect(self.root / "server/nexo.db") as db:
-                    return db.execute("SELECT COALESCE(SUM(to_origin),0),COALESCE(SUM(to_public),0) FROM traffic_minutes").fetchone()
-            # Windows 的 terminate 是强制结束；先等定时落库，验证重启保留已保存历史。
-            wait_for(lambda: persisted_traffic()[0] >= 9 * 1024 * 1024, "流量分钟批次落库", timeout=75)
             saved_traffic = persisted_traffic()
             with sqlite3.connect(self.root / "server/nexo.db") as db:
                 saved_quota = db.execute("SELECT COALESCE(SUM(used_bytes),0) FROM traffic_quota_months").fetchone()[0]
             assert saved_quota > 0
             limit_to(saved_quota + 1024 * 1024 * 1024)
             self.stop_server()
+            if os.name != "nt":
+                # 仅删除本测试的两个空目录，模拟 tmpfs 随容器重建后为空。
+                (self.root / "runtime/tunnel-sockets").rmdir()
+                (self.root / "runtime").rmdir()
+            self.agent.terminate()
+            self.agent.wait(timeout=10)
+            # 两端停止后复制完整持久目录到空目录；运行目录不进入备份。
+            restored_root = self.root / "restored"
+            shutil.copytree(self.root / "server", restored_root / "server")
+            shutil.copytree(self.root / "agent", restored_root / "agent")
+            self.root = restored_root
+            assert not (self.root / "runtime").exists()
+            assert (self.root / "agent/identity.json").read_bytes() == before
             self.start_server()
+            self.start_agent()
             wait_for(lambda: self.ready(secure["id"]), "Server 重启后恢复 HTTPS")
             exchange(self.ports["public"], b"server-restarted")
             assert self.web("secure.nexo-smoke.localhost", True)[0] == 200
             assert len(self.api("devices")) == 1
-            self.check("Server 重启恢复监听、CA、证书与 Agent 自动重连")
+            assert self.api("agent-access-key")["token"] == invitation["token"]
+            self.check("完整离线备份恢复到空目录，保留账号、服务、CA、证书、密钥解密和 Agent 身份，重新建立监听")
             restored = self.api("traffic/history?range=1h")["total"]
             assert restored["to_origin"] >= saved_traffic[0] and restored["to_public"] >= saved_traffic[1]
             self.check("Server 重启保留已落库流量历史")
@@ -460,6 +519,8 @@ class Harness:
             self.check("Server 重启恢复独立月额度消耗与配置")
             self.api(f"tunnels/{web['id']}", "DELETE")
             wait_for(lambda: self.web("web.nexo-smoke.localhost")[0] != 200, "删除 HTTP 撤销路由")
+            if os.name != "nt":
+                assert not (self.root / "runtime/tunnel-sockets" / f"{web['id']}.sock").exists()
             self.api(f"devices/{device}", "DELETE")
             wait_for(lambda: not self.api("devices"), "删除 Agent")
             rejected(context, device)

@@ -116,11 +116,11 @@ class Harness(base.Harness):
 
     def start_server(self):
         self.server = self.launch("server", self.args.server_bin, {
-            "NEXO_ADMIN_USERNAME": "admin", "NEXO_ADMIN_PASSWORD": "Test-udp-only-4821!",
-            "NEXO_DATA_DIR": str(self.root / "server"), "NEXO_HTTP_ADDR": f"127.0.0.1:{self.ports['api']}",
-            "NEXO_CONTROL_ADDR": f"127.0.0.1:{self.ports['control']}", "NEXO_TUNNEL_ADDR": f"127.0.0.1:{self.ports['data']}",
-            "NEXO_TUNNEL_ENDPOINT": f"127.0.0.1:{self.ports['data']}", "NEXO_PUBLIC_BIND": "127.0.0.1",
-            "NEXO_UDP_ADDR": f"127.0.0.1:{self.ports['data']}", "NEXO_UDP_ENDPOINT": f"127.0.0.1:{self.proxy.port}", "NEXO_CADDY_ENABLED": "false",
+            "admin.username": "admin", "admin.password": "Test-udp-only-4821!",
+            "data_dir": str(self.root / "server"), "http_addr": f"127.0.0.1:{self.ports['api']}",
+            "control_addr": f"127.0.0.1:{self.ports['control']}", "tunnel_addr": f"127.0.0.1:{self.ports['data']}",
+            "tunnel_endpoint": f"127.0.0.1:{self.ports['data']}", "public_bind": "127.0.0.1",
+            "udp_addr": f"127.0.0.1:{self.ports['data']}", "udp_endpoint": f"127.0.0.1:{self.proxy.port}", "caddy.enabled": False,
         })
         base.wait_for(lambda: self.api("auth/status"), "Server 启动")
 
@@ -133,10 +133,9 @@ class Harness(base.Harness):
         try:
             self.start_server()
             self.csrf = self.api("auth/login", "POST", {"username": "admin", "password": "Test-udp-only-4821!"})["csrf_token"]
-            invite = self.api("enrollments", "POST", {"ttl_seconds": 3600})
+            invite = self.api("agent-access-key", "POST", {})
             self.start_agent(invite["token"])
-            base.wait_for(lambda: any(r["status"] == "awaiting_approval" for r in self.api("enrollments")), "Agent CSR")
-            device = self.api(f"enrollments/{invite['id']}/approve", "POST", {"device_name": "UDP 验收 Agent"})["device_id"]
+            device = base.wait_for(lambda: next((r["id"] for r in self.api("devices") if r["status"] == "online"), None), "共享密钥接入")
             base.wait_for(lambda: any(d["id"] == device and d["status"] == "online" for d in self.api("devices")), "控制通道上线")
             time.sleep(.3)
             assert self.proxy.received == 0, "未启用 UDP 服务时不应建立 QUIC"

@@ -15,6 +15,8 @@ license = "AGPL-3.0-only"
 
 [workspace.dependencies]
 anyhow = "1"
+toml = "0.8"
+tempfile = "3"
 argon2 = "0.5"
 axum = "0.8"
 base64 = "0.22"

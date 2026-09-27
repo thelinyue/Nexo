@@ -8,7 +8,7 @@ export type Tunnel = { protocol_statuses?: Record<string, { status: string; erro
 export type IdentityCertificate = { status: string; expires_at: number | null; renew_after: number | null; error: string | null; next_retry_at: number | null };
 export type TransportIdentity = { server: IdentityCertificate; ca_expires_at: number | null; ca_needs_attention: boolean };
 export type Device = { id: string; name: string; status: string; os?: string | null; architecture?: string | null; agent_version?: string | null; tunnel_count: number; enrolled_at?: number | null; last_seen_at?: number | null; certificate?: IdentityCertificate };
-export type Enrollment = { id: string; kind?: string; device_id?: string | null; status: string; expires_at: number; token?: string | null; device_name?: string | null; os?: string | null; architecture?: string | null; agent_version?: string | null };
+export type Enrollment = { id: string; kind: "recovery"; device_id?: string | null; status: string; expires_at: number; token?: string | null; device_name?: string | null; os?: string | null; architecture?: string | null; agent_version?: string | null };
 export type DomainCertificate = { hostname: string; status: string; not_before: number | null; expires_at: number | null; error: string | null; next_retry_at: number | null };
 export type DomainRuntime = { config_status: string; config_error: string | null; service_warning: string | null; checked_at: number | null; certificates: DomainCertificate[] };
 export type DomainAccessStatus = { expected_addresses: string[]; checked_at: number | null; next_retry_at?: number | null; retries_remaining?: number; public_access: string; records: { hostname: string; addresses: string[]; status: string; matches_server: boolean | null; error: string | null }[] };
@@ -94,11 +94,12 @@ export function RowLink({ href, title, detail, icon }: { href: string; title: st
 export function DetailField({ label, children, className = "" }: { label: string; children: ReactNode; className?: string }) { return <div className={`detail-field ${className}`}><dt>{label}</dt><dd>{children}</dd></div>; }
 
 /** HTTP 页面可能没有 Clipboard API；在点击回调内用同步选择复制，并恢复原焦点和选区。 */
-export async function copyText(value: string): Promise<void> {
-  if (navigator.clipboard?.writeText) {
+export async function copyText(value: string, synchronous = false, trigger?: HTMLElement): Promise<void> {
+  if (!synchronous && navigator.clipboard?.writeText) {
     try { await navigator.clipboard.writeText(value); return; } catch { /* 尝试浏览器的同步复制能力。 */ }
   }
   const focused = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+  const textSelection = focused instanceof HTMLInputElement || focused instanceof HTMLTextAreaElement ? { start: focused.selectionStart, end: focused.selectionEnd, direction: focused.selectionDirection } : null;
   const selection = window.getSelection();
   const ranges = Array.from({ length: selection?.rangeCount ?? 0 }, (_, index) => selection!.getRangeAt(index).cloneRange());
   const input = document.createElement("textarea");
@@ -107,24 +108,34 @@ export async function copyText(value: string): Promise<void> {
   input.tabIndex = -1;
   input.setAttribute("aria-hidden", "true");
   input.style.cssText = "position:fixed;top:0;left:0;width:1px;height:1px;opacity:0";
-  (Array.from(document.querySelectorAll("dialog[open]")).at(-1) ?? document.body).append(input);
+  (trigger?.closest("dialog[open]") ?? focused?.closest("dialog[open]") ?? Array.from(document.querySelectorAll("dialog[open]")).at(-1) ?? document.body).append(input);
   try {
     input.focus({ preventScroll: true });
     input.select();
     if (!document.execCommand("copy")) throw new Error("浏览器不允许复制");
   } finally {
     input.remove();
+    focused?.focus({ preventScroll: true });
     selection?.removeAllRanges();
     ranges.forEach(range => selection?.addRange(range));
-    focused?.focus({ preventScroll: true });
+    if (textSelection?.start != null && textSelection.end != null) (focused as HTMLInputElement | HTMLTextAreaElement).setSelectionRange(textSelection.start, textSelection.end, textSelection.direction ?? undefined);
   }
 }
 
+/** 异步权限失败后允许用新的点击直接同步复制；凭据仅保留在当前组件内存。 */
 export function CopyButton({ value, label = "复制地址", compact = false, iconOnly = false }: { value: string; label?: string; compact?: boolean; iconOnly?: boolean }) {
   const [state, setState] = useState<"idle" | "copied" | "failed">("idle");
+  const manual = useRef<HTMLTextAreaElement>(null);
   useEffect(() => { setState("idle"); }, [value]);
   useEffect(() => { if (state !== "copied") return; const timer = window.setTimeout(() => setState("idle"), 2500); return () => clearTimeout(timer); }, [state]);
-  return <div className={`copy-control ${compact ? "compact-copy" : ""}${iconOnly ? " icon-copy" : ""}`}><button className={iconOnly ? "icon-button" : compact ? "address-button" : "secondary-button"} aria-label={label} title={iconOnly ? label : undefined} onClick={async () => { try { await copyText(value); setState("copied"); } catch { setState("failed"); } }}>{compact && <code>{value}</code>}{state === "copied" ? <Check size={17} /> : <Copy size={17} />}{!compact && !iconOnly && (state === "copied" ? "已复制" : "复制")}</button>{state !== "idle" && <span className={state === "failed" ? "form-error" : "sr-only"} role={state === "failed" ? "alert" : "status"}>{state === "copied" ? "已复制" : "无法复制，请选择下方文本手动复制"}</span>}{state === "failed" && <textarea className="copy-fallback" aria-label="手动复制内容" readOnly value={value} onFocus={e => e.currentTarget.select()} />}</div>;
+  useEffect(() => { if (state === "failed") manual.current?.scrollIntoView({ block: "nearest" }); }, [state]);
+  return <div className={`copy-control ${compact ? "compact-copy" : ""}${iconOnly ? " icon-copy" : ""}`}>
+    <button type="button" className={iconOnly ? "icon-button" : compact ? "address-button" : "secondary-button"} aria-label={state === "failed" ? "再次复制" : label} title={iconOnly ? label : undefined} onClick={async e => {
+      try { await copyText(value, state === "failed", e.currentTarget); setState("copied"); } catch { setState("failed"); }
+    }}>{compact && <code>{value}</code>}{state === "copied" ? <Check size={17} /> : <Copy size={17} />}{!compact && !iconOnly && (state === "copied" ? "已复制" : state === "failed" ? "再次复制" : label)}</button>
+    {state !== "idle" && <span className={state === "failed" ? "form-error" : "sr-only"} role={state === "failed" ? "alert" : "status"}>{state === "copied" ? "已复制" : "无法复制，可再次复制，或选择下方完整文本手动复制"}</span>}
+    {state === "failed" && <><textarea ref={manual} className="copy-fallback" aria-label="手动复制内容" readOnly value={value} onFocus={e => e.currentTarget.select()} /><button type="button" className="text-button" onClick={() => { manual.current?.focus(); manual.current?.select(); }}>选择全部</button></>}
+  </div>;
 }
 
 /** 原生 dialog 提供焦点约束和背景隔离；长表单与短操作共享关闭和未保存保护。 */

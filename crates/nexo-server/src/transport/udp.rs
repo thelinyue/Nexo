@@ -5,9 +5,7 @@ use std::net::SocketAddr;
 use tokio::{io::AsyncReadExt, net::UdpSocket};
 
 pub async fn serve(state: AppState) -> Result<()> {
-    let address = std::env::var("NEXO_UDP_ADDR")
-        .unwrap_or_else(|_| "0.0.0.0:9891".into())
-        .parse()?;
+    let address = state.config.udp_addr;
     let endpoint = quinn::Endpoint::server(
         udp::server_config(&state.authority.server_config())?,
         address,
@@ -33,7 +31,7 @@ pub async fn serve(state: AppState) -> Result<()> {
                         let device={
                             let mut connections=state.tunnel_runtime.connections.lock().await;
                             let (device,_)=authenticated_certificate(&state,certificate.as_ref())?;
-                            anyhow::ensure!(connections.control.get(&device).is_some_and(|s|s.udp_capable && !s.cancel.is_cancelled()),"UDP 连接缺少有效控制会话");
+                            anyhow::ensure!(connections.control.get(&device).is_some_and(|s|!s.cancel.is_cancelled()),"UDP 连接缺少有效控制会话");
                             if let Some(previous)=connections.udp.insert(device.clone(),peer.clone()){previous.connection.close(0u32.into(),b"replaced");}
                             device
                         };
@@ -248,8 +246,6 @@ pub(super) async fn refresh_status(
             Some(crate::traffic::quota::EXHAUSTED.to_owned())
         } else if control.is_none() {
             Some("Agent 未连接控制通道".into())
-        } else if !control.is_some_and(|session| session.udp_capable) {
-            Some("需升级 Agent 以支持 UDP".into())
         } else if let Some(error) = failures.get(&id) {
             Some(error.clone())
         } else if !connections.udp_listeners.contains_key(&id) {

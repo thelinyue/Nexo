@@ -1,15 +1,13 @@
 name: nexo-agent
 
-# 每个需要公网 Tunnel 的站点运行一个 Agent。Agent 可连接任意 Nexo Server。
+# 全新安装；先将管理页面生成的 agent.toml 保存到 ./data/nexo-agent/。
 services:
   nexo-agent:
     image: ghcr.io/thelinyue/nexo-agent:latest
     container_name: nexo-agent
     network_mode: host
     environment:
-      TZ: ${TZ:-Asia/Shanghai}
-      NEXO_SERVER_URL: ${NEXO_SERVER_URL:?请在 .env 中填写 NEXO_SERVER_URL}
-      NEXO_ENROLLMENT_TOKEN: ${NEXO_ENROLLMENT_TOKEN:-}
+      TZ: Asia/Shanghai
     volumes:
       - ./data/nexo-agent:/data/nexo-agent
     restart: unless-stopped

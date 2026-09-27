@@ -135,17 +135,6 @@ impl AuthorityRuntime {
     }
 }
 
-pub fn initialize_schema(db: &Connection) -> Result<()> {
-    db.execute_batch("CREATE TABLE IF NOT EXISTS device_certificates (
-        device_id TEXT PRIMARY KEY REFERENCES devices(id) ON DELETE CASCADE,
-        certificate_pem TEXT, pending_csr_pem TEXT, pending_certificate_pem TEXT,
-        retry_failures INTEGER NOT NULL DEFAULT 0, renewal_error TEXT, next_retry_at INTEGER
-    );
-    INSERT OR IGNORE INTO device_certificates (device_id,certificate_pem)
-        SELECT p.device_id,r.certificate_pem FROM pending_enrollments p JOIN enrollment_requests r ON r.enrollment_id=p.id
-        WHERE p.device_id IS NOT NULL AND r.certificate_pem IS NOT NULL;")?;
-    Ok(())
-}
 pub fn fingerprint(pem: &str) -> Result<String> {
     Ok(hex::encode(Sha256::digest(
         identity::certificates(pem)?[0].as_ref(),

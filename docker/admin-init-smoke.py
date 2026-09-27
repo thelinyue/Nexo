@@ -30,13 +30,15 @@ class Server:
         self.url = f"http://127.0.0.1:{port}/api/v1/"
         self.opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
         self.env = {key: value for key, value in os.environ.items() if not key.startswith("NEXO_")}
-        self.env.update({
-            "NEXO_DATA_DIR": str(directory), "NEXO_HTTP_ADDR": f"127.0.0.1:{port}",
-            "NEXO_CONTROL_ADDR": "127.0.0.1:0", "NEXO_TUNNEL_ADDR": "127.0.0.1:0",
-            "NEXO_UDP_ADDR": "127.0.0.1:0", "NEXO_CADDY_ENABLED": "false",
-            "NEXO_PUBLIC_BIND": "127.0.0.1", **credentials,
-        })
-        self.process = subprocess.Popen([binary], env=self.env, stdout=self.log, stderr=subprocess.STDOUT,
+        config = {
+            "data_dir": str(directory), "http_addr": f"127.0.0.1:{port}",
+            "control_addr": "127.0.0.1:0", "tunnel_addr": "127.0.0.1:0",
+            "udp_addr": "127.0.0.1:0", "caddy.enabled": False,
+            "public_bind": "127.0.0.1", **credentials,
+        }
+        config.pop("data_dir")
+        (directory / "server.toml").write_text("\n".join(f"{key} = {json.dumps(value)}" for key, value in config.items()), encoding="utf-8")
+        self.process = subprocess.Popen([binary, "--data-dir", str(directory)], env=self.env, stdout=self.log, stderr=subprocess.STDOUT,
                                         creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0)
 
     def api(self, route, body=None):
@@ -83,14 +85,14 @@ def main():
     generated_passwords = []
     for name, credentials, username, explicit_password in [
         ("defaults", {}, "admin", None),
-        ("empty", {"NEXO_ADMIN_USERNAME": " \t", "NEXO_ADMIN_PASSWORD": ""}, "admin", None),
-        ("username", {"NEXO_ADMIN_USERNAME": " owner "}, "owner", None),
-        ("password", {"NEXO_ADMIN_PASSWORD": " explicit-password-4821 "}, "admin", " explicit-password-4821 "),
-        ("explicit", {"NEXO_ADMIN_USERNAME": " owner ", "NEXO_ADMIN_PASSWORD": "explicit-password-4821"}, "owner", "explicit-password-4821"),
+        ("empty", {"admin.username": " \t", "admin.password": ""}, "admin", None),
+        ("username", {"admin.username": " owner "}, "owner", None),
+        ("password", {"admin.password": " explicit-password-4821 "}, "admin", " explicit-password-4821 "),
+        ("six", {"admin.password": "123456"}, "admin", "123456"),
+        ("explicit", {"admin.username": " owner ", "admin.password": "explicit-password-4821"}, "owner", "explicit-password-4821"),
     ]:
         directory = root / name
         directory.mkdir()
-        (directory / "bootstrap.code").write_text("obsolete-bootstrap", encoding="utf-8")
         server = Server(binary, directory, "first", credentials)
         try:
             server.ready()
@@ -110,7 +112,7 @@ def main():
                 assert len(before) == 1 and before[0][2].startswith("$argon2")
         finally:
             server.close()
-        server = Server(binary, directory, "restart", {"NEXO_ADMIN_USERNAME": "x", "NEXO_ADMIN_PASSWORD": "invalid"})
+        server = Server(binary, directory, "restart", {"admin.username": "x", "admin.password": "invalid"})
         try:
             server.ready()
             assert "自动生成的密码：" not in server.output() and password not in server.output()
@@ -122,14 +124,14 @@ def main():
         print(f"PASS {name}: 首次登录、输出策略、旧接口拒绝、重启凭据不变", flush=True)
     assert len(set(generated_passwords)) == len(generated_passwords)
     for name, credentials, variable in [
-        ("bad-name", {"NEXO_ADMIN_USERNAME": "x", "NEXO_ADMIN_PASSWORD": "explicit-secret-4821"}, "NEXO_ADMIN_USERNAME"),
-        ("bad-password", {"NEXO_ADMIN_PASSWORD": "short-4821"}, "NEXO_ADMIN_PASSWORD"),
+        ("bad-name", {"admin.username": "x", "admin.password": "explicit-secret-4821"}, "admin.username"),
+        ("bad-password", {"admin.password": "12345"}, "admin.password"),
     ]:
         server = Server(binary, root / name, "invalid", credentials)
         try:
             assert server.process.wait(timeout=30) != 0
             output = server.output()
-            assert variable in output and credentials["NEXO_ADMIN_PASSWORD"] not in output
+            assert variable in output and credentials["admin.password"] not in output
             with sqlite3.connect(root / name / "nexo.db") as db:
                 assert db.execute("SELECT COUNT(*) FROM users").fetchone()[0] == 0
         finally:

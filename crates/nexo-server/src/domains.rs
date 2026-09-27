@@ -88,8 +88,6 @@ pub struct Settings {
     pub dns: DnsSettings,
     #[serde(skip)]
     pub credential_file: Option<String>,
-    #[serde(skip)]
-    pub legacy: bool,
 }
 #[derive(Deserialize)]
 pub struct SettingsInput {
@@ -102,34 +100,10 @@ pub struct CredentialInput {
     pub token: String,
 }
 
-pub fn initialize_schema(db: &Connection) -> Result<()> {
-    db.execute_batch("CREATE TABLE IF NOT EXISTS domain_settings (
-        domain_id TEXT PRIMARY KEY REFERENCES public_domains(id) ON DELETE CASCADE,
-        certificate_mode TEXT NOT NULL CHECK(certificate_mode IN ('http01','cloudflare_dns')),
-        verified INTEGER NOT NULL DEFAULT 0, verification_token TEXT NOT NULL,
-        credential_file TEXT, dns_resolvers TEXT NOT NULL DEFAULT '[]',
-        propagation_delay INTEGER, propagation_timeout INTEGER, legacy INTEGER NOT NULL DEFAULT 0
-    );
-    INSERT OR IGNORE INTO domain_settings(domain_id,certificate_mode,verified,verification_token,legacy)
-        SELECT id,'cloudflare_dns',1,'',1 FROM public_domains;")?;
-    Ok(())
-}
-
 pub fn load(db: &Connection, id: &str, domain: &str) -> Result<Settings, ApiError> {
-    let row=db.query_row("SELECT certificate_mode,verified,verification_token,credential_file,dns_resolvers,propagation_delay,propagation_timeout,legacy FROM domain_settings WHERE domain_id=?1",[id],|r|Ok((r.get::<_,String>(0)?,r.get::<_,bool>(1)?,r.get::<_,String>(2)?,r.get::<_,Option<String>>(3)?,r.get::<_,String>(4)?,r.get::<_,Option<u32>>(5)?,r.get::<_,Option<u32>>(6)?,r.get::<_,bool>(7)?))).optional().map_err(db_error)?;
-    let (mode, verified, token, file, resolvers, delay, timeout, legacy) =
-        row.unwrap_or_else(|| {
-            (
-                "cloudflare_dns".into(),
-                true,
-                String::new(),
-                None,
-                "[]".into(),
-                None,
-                None,
-                true,
-            )
-        });
+    let row=db.query_row("SELECT certificate_mode,verified,verification_token,credential_file,dns_resolvers,propagation_delay,propagation_timeout FROM domain_settings WHERE domain_id=?1",[id],|r|Ok((r.get::<_,String>(0)?,r.get::<_,bool>(1)?,r.get::<_,String>(2)?,r.get::<_,Option<String>>(3)?,r.get::<_,String>(4)?,r.get::<_,Option<u32>>(5)?,r.get::<_,Option<u32>>(6)?))).optional().map_err(db_error)?;
+    let (mode, verified, token, file, resolvers, delay, timeout) =
+        row.ok_or_else(|| db_error("域名设置缺失，请核对数据库"))?;
     let mut dns_resolvers: Vec<String> = serde_json::from_str(&resolvers).map_err(db_error)?;
     // 新域名和已有空配置统一使用阿里云公共 DNS，仅用于证书验证，不改变归属验证的信任来源。
     if dns_resolvers.is_empty() {
@@ -147,7 +121,6 @@ pub fn load(db: &Connection, id: &str, domain: &str) -> Result<Settings, ApiErro
             dns_propagation_delay_seconds: delay,
             dns_propagation_timeout_seconds: timeout,
         },
-        legacy,
     })
 }
 
@@ -218,10 +191,7 @@ pub async fn update(
     let db = state.db.lock().map_err(|_| db_error("数据库锁不可用"))?;
     let domain = owned(&db, &session.tenant_id, &id)?;
     let current = load(&db, &id, &domain)?;
-    if input.certificate_mode == "cloudflare_dns"
-        && !current.credential_configured
-        && !current.legacy
-    {
+    if input.certificate_mode == "cloudflare_dns" && !current.credential_configured {
         return Err(ApiError::new(
             StatusCode::BAD_REQUEST,
             "请先验证并保存 Cloudflare Token，再保存 DNS 证书配置",

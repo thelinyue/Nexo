@@ -4,7 +4,6 @@
 .tmp-headscale.swagger.json
 .env
 .env.*
-!.env.example
 target
 web/node_modules
 web/dist

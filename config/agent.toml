@@ -1,0 +1,8 @@
+# Nexo Agent 启动配置。首次接入填写地址和空间接入密钥；后续重启复用身份。
+server_url = "" # 必填，例如 https://nexo.example.com
+enrollment_token = "" # 首次接入使用；身份保存成功后请清空
+# 设备名称只在首次接入时使用。
+device_name = "Nexo Agent"
+control_endpoint = "" # 留空使用 Server 主机的 9890 端口
+tunnel_endpoint = "" # Server 未下发数据地址时使用；留空使用 Server 主机的 9891 端口
+udp_endpoint = "" # Server 未下发 QUIC 地址时使用；留空沿用 TCP 数据地址

@@ -83,7 +83,7 @@ async fn real_caddy_direct_proxy_lifecycle_tls_websocket_and_quota_isolation() {
             .unwrap()
             .port()
     };
-    let mut cfg = CaddyRuntimeConfig::from_env(root.clone());
+    let mut cfg = CaddyRuntimeConfig::new(root.clone(), &crate::config::Caddy::default());
     cfg.enabled = true;
     cfg.binary = std::env::var_os("NEXO_TEST_CADDY_BIN")
         .expect("请设置测试 Caddy 路径")
@@ -97,6 +97,7 @@ async fn real_caddy_direct_proxy_lifecycle_tls_websocket_and_quota_isolation() {
     state.domain_runtime = Arc::new(DomainRuntimeManager::new(cfg.clone()));
     // localhost 由 Caddy 内部 CA 管理，无公网 DNS 或 ACME 副作用。
     state.db.lock().unwrap().execute("INSERT INTO public_domains(id,tenant_id,domain,https_enabled,created_at,updated_at) VALUES('domain','default','reverse.localhost',1,0,0)", []).unwrap();
+    state.db.lock().unwrap().execute("INSERT INTO domain_settings(domain_id,certificate_mode,verified,verification_token) VALUES('domain','http01',1,'test-proof')", []).unwrap();
     let supervisor = state.domain_runtime.supervisor.clone();
     supervisor
         .write_startup_config(&build_config(&cfg, &[]).unwrap())
@@ -106,6 +107,28 @@ async fn real_caddy_direct_proxy_lifecycle_tls_websocket_and_quota_isolation() {
     while supervisor.current_config().await.is_err() {
         assert!(tokio::time::Instant::now() < deadline);
         tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    // 独立测试预置内部 CA 证书；生产仍使用正常 HTTP-01 设置，不依赖缺失凭据的回退。
+    let mut local_ca = build_config(&cfg, &[]).unwrap();
+    local_ca["apps"]["tls"] = json!({"certificates":{"automate":["reverse.localhost","app.reverse.localhost"]},"automation":{"policies":[{"issuers":[{"module":"internal"}]}]}});
+    supervisor.apply_json(&local_ca).await.unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    while read_certificates(&cfg.storage_root).len() < 2 {
+        assert!(tokio::time::Instant::now() < deadline);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    // HTTP-01 从 ACME 的存储命名空间加载已有证书；夹具复制内部 CA 证书，避免访问公共 CA。
+    for host in ["reverse.localhost", "app.reverse.localhost"] {
+        let source = cfg.storage_root.join("certificates/local").join(host);
+        let target = cfg
+            .storage_root
+            .join("certificates/acme-v02.api.letsencrypt.org-directory")
+            .join(host);
+        fs::create_dir_all(&target).unwrap();
+        for entry in fs::read_dir(source).unwrap() {
+            let entry = entry.unwrap();
+            fs::copy(entry.path(), target.join(entry.file_name())).unwrap();
+        }
     }
     let origin = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let origin_port = origin.local_addr().unwrap().port();
@@ -146,6 +169,7 @@ async fn real_caddy_direct_proxy_lifecycle_tls_websocket_and_quota_isolation() {
     let client = reqwest::Client::builder()
         .no_proxy()
         .http1_only()
+        .pool_max_idle_per_host(0)
         .timeout(Duration::from_secs(5))
         .add_root_certificate(reqwest::Certificate::from_pem(&pem).unwrap())
         .resolve("app.reverse.localhost", https_address)
@@ -281,7 +305,17 @@ async fn real_caddy_direct_proxy_lifecycle_tls_websocket_and_quota_isolation() {
     )
     .await
     .unwrap();
-    assert_eq!(client.get(&url).send().await.unwrap().status(), 404);
+    // HTTP-01 的停用服务不会继续自动管理该主机证书；通过 HTTP 入口验证路由已撤销。
+    let removed = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .unwrap()
+        .get(format!("http://{http_address}/"))
+        .header("Host", "app.reverse.localhost")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(removed.status(), 404);
     let _ = enable_tunnel(
         State(state.clone()),
         headers.clone(),
@@ -313,7 +347,17 @@ async fn real_caddy_direct_proxy_lifecycle_tls_websocket_and_quota_isolation() {
     let _ = delete_tunnel(State(state.clone()), headers, Path(proxy.id))
         .await
         .unwrap();
-    assert_eq!(client.get(&url).send().await.unwrap().status(), 404);
+    // HTTP-01 的停用服务不会继续自动管理该主机证书；通过 HTTP 入口验证路由已撤销。
+    let removed = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .unwrap()
+        .get(format!("http://{http_address}/"))
+        .header("Host", "app.reverse.localhost")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(removed.status(), 404);
     restarted.shutdown().await.unwrap();
     tls_task.abort();
     tls_task.await.ok();

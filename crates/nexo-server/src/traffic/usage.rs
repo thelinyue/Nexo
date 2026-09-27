@@ -8,31 +8,6 @@ pub(super) fn day_start(at: i64) -> i64 {
     (at + OFFSET).div_euclid(86400) * 86400 - OFFSET
 }
 
-pub(super) fn initialize_schema(db: &Connection) -> Result<()> {
-    let tx = db.unchecked_transaction()?;
-    tx.execute_batch("CREATE TABLE IF NOT EXISTS traffic_daily (
-        tenant_id TEXT NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
-        day INTEGER NOT NULL, to_origin INTEGER NOT NULL, to_public INTEGER NOT NULL,
-        PRIMARY KEY(tenant_id,day));
-        CREATE TABLE IF NOT EXISTS traffic_daily_coverage (day INTEGER PRIMARY KEY, seconds REAL NOT NULL);
-        CREATE TABLE IF NOT EXISTS traffic_usage_state (id INTEGER PRIMARY KEY CHECK(id=1), started_at INTEGER NOT NULL);
-        CREATE TABLE IF NOT EXISTS traffic_usage_resets (
-        tenant_id TEXT PRIMARY KEY REFERENCES tenants(id) ON DELETE CASCADE, reset_at INTEGER NOT NULL);")?;
-    // 标记和回填同一事务提交。重启只建表，不会把重置前的分钟趋势再次计入用量。
-    let initialized: bool = tx.query_row(
-        "SELECT EXISTS(SELECT 1 FROM traffic_usage_state)",
-        [],
-        |r| r.get(0),
-    )?;
-    if !initialized {
-        tx.execute("INSERT INTO traffic_daily SELECT tenant_id,(minute+?1)/86400*86400-?1,SUM(to_origin),SUM(to_public) FROM traffic_minutes GROUP BY tenant_id,(minute+?1)/86400", [OFFSET])?;
-        tx.execute("INSERT INTO traffic_daily_coverage SELECT (minute+?1)/86400*86400-?1,SUM(seconds) FROM traffic_coverage GROUP BY (minute+?1)/86400", [OFFSET])?;
-        tx.execute("INSERT INTO traffic_usage_state SELECT 1,COALESCE(MIN(minute),?1) FROM traffic_coverage", [unix_now()])?;
-    }
-    tx.commit()?;
-    Ok(())
-}
-
 pub(super) fn flush(db: &Connection, snapshot: &Snapshot, now: i64) -> Result<()> {
     for ((tenant, day), bytes) in &snapshot.usage_pending {
         db.execute("INSERT INTO traffic_daily VALUES (?1,?2,?3,?4) ON CONFLICT(tenant_id,day) DO UPDATE SET to_origin=to_origin+excluded.to_origin,to_public=to_public+excluded.to_public", params![tenant,day,bytes.to_origin,bytes.to_public])?;

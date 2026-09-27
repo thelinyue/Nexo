@@ -47,7 +47,7 @@ struct Service {
 struct Listener {
     service: Service,
     upstream: Option<String>,
-    path: Option<PathBuf>,
+    path: Option<(PathBuf, std::fs::Metadata)>,
     cancel: CancellationToken,
     task: JoinHandle<()>,
 }
@@ -64,7 +64,6 @@ struct DataSession {
     permits: Arc<Semaphore>,
 }
 struct ControlSession {
-    udp_capable: bool,
     sender: mpsc::Sender<ServerControlMessage>,
     cancel: CancellationToken,
     // 仅在 mTLS、设备身份和 Hello 全部通过后记录；连接替换或撤销时随会话清理。
@@ -121,7 +120,7 @@ impl Runtime {
         for (device, session) in &connections.control {
             let message = ServerControlMessage::HeartbeatAck {
                 server_time: unix_now(),
-                tunnels: desired_for(state, device, session.udp_capable)?,
+                tunnels: desired_tunnels(state, device)?,
                 tunnel_endpoint: state.tunnel_endpoint.clone(),
                 udp_endpoint: state.udp_endpoint.clone(),
             };
@@ -367,9 +366,20 @@ impl Runtime {
         #[cfg(unix)]
         {
             use std::os::unix::fs::{FileTypeExt, PermissionsExt};
-            let directory = state.data_dir.join("tunnel-sockets");
-            std::fs::create_dir_all(&directory)?;
-            std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700))?;
+            let directory = state.config.runtime_dir.join("tunnel-sockets");
+            // 每个实例使用独占运行目录；拒绝目录符号链接，避免把临时入口写入其他位置。
+            use std::os::unix::fs::DirBuilderExt;
+            for dir in [&state.config.runtime_dir, &directory] {
+                std::fs::DirBuilder::new()
+                    .recursive(true)
+                    .mode(0o700)
+                    .create(dir)?;
+                anyhow::ensure!(
+                    std::fs::symlink_metadata(dir)?.file_type().is_dir(),
+                    "运行目录必须是普通目录，不能是符号链接"
+                );
+                std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+            }
             let path = directory.join(format!("{}.sock", service.id));
             if let Ok(metadata) = std::fs::symlink_metadata(&path) {
                 anyhow::ensure!(
@@ -397,7 +407,7 @@ impl Runtime {
             Ok(Listener {
                 service,
                 upstream: Some(format!("unix/{}", path.display())),
-                path: Some(path),
+                path: Some((path.clone(), std::fs::symlink_metadata(&path)?)),
                 cancel,
                 task,
             })
@@ -423,9 +433,18 @@ async fn stop_listener(listener: Listener) {
     listener.cancel.cancel();
     listener.task.abort();
     let _ = listener.task.await;
-    if let Some(path) = listener.path {
-        let _ = std::fs::remove_file(path);
+    #[cfg(unix)]
+    if let Some((path, created)) = listener.path {
+        use std::os::unix::fs::MetadataExt;
+        // 只删除本监听器创建的节点；路径若被替换，不接管也不删除替代文件。
+        if std::fs::symlink_metadata(&path)
+            .is_ok_and(|current| current.dev() == created.dev() && current.ino() == created.ino())
+        {
+            let _ = std::fs::remove_file(path);
+        }
     }
+    #[cfg(not(unix))]
+    let _ = listener.path;
 }
 fn tcp_listener(
     state: AppState,
@@ -570,7 +589,6 @@ async fn control_session(
     let AgentControlMessage::Hello {
         device_id,
         agent_version,
-        capabilities,
     } = serde_json::from_str(&first)?
     else {
         anyhow::bail!("Agent 首帧必须是 Hello");
@@ -593,7 +611,6 @@ async fn control_session(
         if let Some(previous) = connections.control.insert(
             device.clone(),
             ControlSession {
-                udp_capable: capabilities.iter().any(|c| c == "udp-v1"),
                 sender: sender.clone(),
                 cancel: cancel.clone(),
                 public_ipv4: public_ipv4(peer),
@@ -604,7 +621,7 @@ async fn control_session(
         }
     }
     let result: Result<()> = async {
-        write_message(&mut write, &ServerControlMessage::HelloAccepted { server_time: unix_now(), tunnels: desired_for(&state, &device, capabilities.iter().any(|c| c == "udp-v1"))?, tunnel_endpoint: state.tunnel_endpoint.clone(), udp_endpoint: state.udp_endpoint.clone() }).await?;
+        write_message(&mut write, &ServerControlMessage::HelloAccepted { server_time: unix_now(), tunnels: desired_tunnels(&state, &device)?, tunnel_endpoint: state.tunnel_endpoint.clone(), udp_endpoint: state.udp_endpoint.clone() }).await?;
         let deadline = tokio::time::sleep(Duration::from_secs(45)); tokio::pin!(deadline);
         loop { tokio::select! {
             _ = cancel.cancelled() => break,
@@ -617,7 +634,7 @@ async fn control_session(
                     AgentControlMessage::Heartbeat { device_id, agent_version } => {
                         anyhow::ensure!(device_id == device, "心跳设备 ID 与证书不一致");
                         state.db.lock().map_err(|_| anyhow::anyhow!("数据库锁不可用"))?.execute("UPDATE devices SET last_seen_at=?1,agent_version=?2 WHERE id=?3", params![unix_now(),agent_version,device])?;
-                        write_message(&mut write, &ServerControlMessage::HeartbeatAck { server_time: unix_now(), tunnels: desired_for(&state, &device, capabilities.iter().any(|c| c == "udp-v1"))?, tunnel_endpoint: state.tunnel_endpoint.clone(), udp_endpoint: state.udp_endpoint.clone() }).await?;
+                        write_message(&mut write, &ServerControlMessage::HeartbeatAck { server_time: unix_now(), tunnels: desired_tunnels(&state, &device)?, tunnel_endpoint: state.tunnel_endpoint.clone(), udp_endpoint: state.udp_endpoint.clone() }).await?;
                     }
                     AgentControlMessage::TunnelApplyReport { results } => {
                         let ids = apply_results(&state, &device, results)?;
@@ -667,23 +684,6 @@ async fn control_session(
             .execute("UPDATE devices SET status='offline' WHERE id=?1", [&device])?;
     }
     result
-}
-
-fn desired_for(
-    state: &AppState,
-    device: &str,
-    udp_capable: bool,
-) -> Result<Vec<nexo_protocol::TunnelDesiredState>> {
-    let mut tunnels = desired_tunnels(state, device)?;
-    if !udp_capable {
-        tunnels.retain(|t| t.protocol != "udp");
-        for tunnel in &mut tunnels {
-            if tunnel.protocol == "tcp_udp" {
-                tunnel.protocol = "tcp".into();
-            }
-        }
-    }
-    Ok(tunnels)
 }
 
 fn apply_results(
@@ -947,6 +947,57 @@ fn refresh_status(
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn socket_cleanup_preserves_replaced_files_and_rejects_links() {
+        use std::os::unix::fs::symlink;
+        let (state, _) = crate::tests::domain_fixture();
+        let service = Service {
+            id: "test".into(),
+            tenant: "default".into(),
+            device: "device".into(),
+            revision: 1,
+            protocol: "http".into(),
+            port: None,
+        };
+        let directory = state.config.runtime_dir.join("tunnel-sockets");
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("test.sock");
+        std::fs::write(&path, "keep").unwrap();
+        assert!(state
+            .tunnel_runtime
+            .listen(&state, service.clone())
+            .await
+            .is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), b"keep");
+        std::fs::remove_file(&path).unwrap();
+        let target = directory.join("target");
+        std::fs::write(&target, "keep").unwrap();
+        symlink(&target, &path).unwrap();
+        assert!(state
+            .tunnel_runtime
+            .listen(&state, service.clone())
+            .await
+            .is_err());
+        assert!(std::fs::symlink_metadata(&path).unwrap().is_symlink());
+        std::fs::remove_file(&path).unwrap();
+        let listener = state
+            .tunnel_runtime
+            .listen(&state, service.clone())
+            .await
+            .unwrap();
+        std::fs::remove_file(&path).unwrap();
+        std::fs::write(&path, "replacement").unwrap();
+        stop_listener(listener).await;
+        assert_eq!(std::fs::read(&path).unwrap(), b"replacement");
+        std::fs::remove_file(&path).unwrap();
+        let listener = state.tunnel_runtime.listen(&state, service).await.unwrap();
+        stop_listener(listener).await;
+        assert!(!path.exists());
+        std::fs::remove_file(target).unwrap();
+        std::fs::remove_dir(directory).unwrap();
+        std::fs::remove_dir(&state.config.runtime_dir).unwrap();
+    }
     use super::*;
     use crate::{create_tunnel, TunnelInput};
     use axum::{extract::State, Json};
@@ -1011,7 +1062,6 @@ mod tests {
         write_message(
             client,
             &AgentControlMessage::Hello {
-                capabilities: vec![],
                 device_id: device.into(),
                 agent_version: "test".into(),
             },
@@ -1107,7 +1157,6 @@ mod tests {
         write_message(
             &mut client,
             &AgentControlMessage::Hello {
-                capabilities: vec![],
                 device_id: "foreign".into(),
                 agent_version: "test".into(),
             },
@@ -1175,7 +1224,6 @@ mod tests {
         write_message(
             &mut new,
             &AgentControlMessage::Hello {
-                capabilities: vec![],
                 device_id: "mine".into(),
                 agent_version: "test".into(),
             },
@@ -1229,15 +1277,11 @@ mod tests {
     }
 
     #[test]
-    fn old_agent_receives_tcp_part_without_udp_and_keeps_revision() {
+    fn current_agent_receives_all_protocols() {
         let (state, _) = crate::tests::domain_fixture();
         populate(&state);
         state.db.lock().unwrap().execute_batch("UPDATE tunnels SET protocol='tcp_udp' WHERE id='own'; INSERT INTO tunnels(id,tenant_id,device_id,name,protocol,local_address,local_port,created_at,updated_at) VALUES('udp','default','mine','udp','udp','localhost',1234,0,0)").unwrap();
-        let old = desired_for(&state, "mine", false).unwrap();
-        assert_eq!(old.len(), 1);
-        assert_eq!(old[0].protocol, "tcp");
-        assert_eq!(old[0].revision, 2);
-        let new = desired_for(&state, "mine", true).unwrap();
+        let new = desired_tunnels(&state, "mine").unwrap();
         assert_eq!(new.len(), 2);
         assert!(new.iter().any(|t| t.protocol == "tcp_udp"));
     }

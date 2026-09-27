@@ -3,14 +3,14 @@
 use crate::{unix_now, ApiError, AppState};
 use axum::{
     extract::{ConnectInfo, State},
-    http::{header, HeaderMap, HeaderValue, Request, StatusCode},
+    http::{header, HeaderValue, Request, StatusCode},
     middleware::Next,
     response::{IntoResponse, Response},
 };
 use std::{
     collections::HashMap,
-    net::{IpAddr, SocketAddr},
-    sync::Mutex,
+    net::SocketAddr,
+    sync::{Mutex, RwLock},
 };
 
 #[derive(Clone, Copy, Default)]
@@ -22,51 +22,24 @@ pub struct RequestSecurity {
 #[derive(Default)]
 /// 公网地址、可信代理和有界尝试计数共用一份进程状态；不同 API 使用独立的配额键。
 pub struct Security {
-    pub public_origin: Option<String>,
-    trusted_proxies: Vec<IpAddr>,
+    pub(crate) configuration: RwLock<crate::server_settings::Settings>,
     attempts: Mutex<HashMap<String, (u32, i64)>>,
 }
 
 impl Security {
-    pub fn from_env() -> anyhow::Result<Self> {
-        let origin = std::env::var("NEXO_PUBLIC_URL")
-            .ok()
-            .filter(|v| !v.is_empty());
-        let public_origin = origin
-            .map(|value| -> anyhow::Result<String> {
-                let url = reqwest::Url::parse(&value)?;
-                anyhow::ensure!(
-                    matches!(url.scheme(), "http" | "https")
-                        && url.host_str().is_some()
-                        && url.username().is_empty()
-                        && url.password().is_none()
-                        && url.path() == "/"
-                        && url.query().is_none()
-                        && url.fragment().is_none(),
-                    "NEXO_PUBLIC_URL 必须是管理入口地址，不含账号、路径或参数"
-                );
-                Ok(url.origin().ascii_serialization())
-            })
-            .transpose()?;
-        let trusted_proxies = std::env::var("NEXO_TRUSTED_PROXIES")
-            .unwrap_or_default()
-            .split(',')
-            .filter(|v| !v.trim().is_empty())
-            .map(|v| v.trim().parse())
-            .collect::<Result<Vec<IpAddr>, _>>()?;
-        Ok(Self {
-            public_origin,
-            trusted_proxies,
+    pub fn new(settings: crate::server_settings::Settings) -> Self {
+        Self {
+            configuration: RwLock::new(settings),
             ..Default::default()
-        })
+        }
     }
 
-    fn secure(&self, peer: Option<IpAddr>, headers: &HeaderMap) -> bool {
-        peer.is_some_and(|ip| self.trusted_proxies.contains(&ip))
-            && headers.get_all("x-forwarded-proto").iter().count() == 1
-            && headers
-                .get("x-forwarded-proto")
-                .is_some_and(|v| v == "https")
+    /// 每次请求只读取一份完整快照；保存设置不重置认证限流计数。
+    pub fn settings(&self) -> Result<crate::server_settings::Settings, ApiError> {
+        self.configuration
+            .read()
+            .map(|value| value.clone())
+            .map_err(|_| crate::db_error("服务器设置锁不可用"))
     }
 
     /// 配额在校验前占用，防止并发失败请求穿透；过期条目清理且容量有界。
@@ -96,16 +69,14 @@ pub async fn protect(
         .extensions()
         .get::<ConnectInfo<SocketAddr>>()
         .map(|v| v.0.ip());
-    let secure = state.security.secure(peer, request.headers());
+    let settings = match state.security.settings() {
+        Ok(value) => value,
+        Err(error) => return error.into_response(),
+    };
+    let secure = settings.secure(peer, request.headers());
     let path = request.uri().path();
     if path.starts_with("/api/") {
-        if state
-            .security
-            .public_origin
-            .as_ref()
-            .is_some_and(|v| v.starts_with("https://"))
-            && !secure
-        {
+        if settings.public_url.starts_with("https://") && !secure {
             return ApiError::new(
                 StatusCode::FORBIDDEN,
                 "管理入口要求 HTTPS，请检查可信反向代理配置",
@@ -118,7 +89,9 @@ pub async fn protect(
         ) {
             // 浏览器跨站写入在认证前拒绝；无 Origin 的本机 CLI 仍由 Token/CSRF 验证。
             if let Some(origin) = request.headers().get(header::ORIGIN) {
-                let expected = state.security.public_origin.clone().unwrap_or_else(|| {
+                let expected = if !settings.public_url.is_empty() {
+                    settings.public_url.clone()
+                } else {
                     format!(
                         "{}://{}",
                         if secure { "https" } else { "http" },
@@ -128,7 +101,7 @@ pub async fn protect(
                             .and_then(|v| v.to_str().ok())
                             .unwrap_or_default()
                     )
-                });
+                };
                 if origin.to_str().ok() != Some(expected.as_str()) {
                     return ApiError::new(
                         StatusCode::FORBIDDEN,
@@ -179,9 +152,10 @@ pub fn limited() -> ApiError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::http::HeaderMap;
     #[test]
     fn forwarded_https_requires_trusted_peer_and_single_value() {
-        let security = Security {
+        let security = crate::server_settings::Settings {
             trusted_proxies: vec!["127.0.0.1".parse().unwrap()],
             ..Default::default()
         };

@@ -28,14 +28,14 @@ function AuthForm({ initial, message, onAuth, reauth = false, recoveryCode }: { 
     {!reauth && <><Brand /><h1>{mode === "recover" ? "找回账号" : "欢迎回来"}</h1></>}
     {(mode !== "login" || reauth) && <p className="auth-copy">{mode === "recover" ? recoveryCode ? "设置新密码，恢复账号访问。" : "请联系管理员获取恢复链接。" : "重新登录后继续操作，当前填写的内容会保留。"}</p>}
     {(notice || message) && <p className="action-status" role="status">{notice || message}</p>}
-    {mode === "recover" && <details className="recovery-help"><summary>管理员如何恢复账号</summary><p>在 Server 所在主机运行：</p><code>docker compose exec nexo-server nexo admin recover</code><p>直接运行二进制时使用 <code>nexo-server admin recover</code>，并设置原来的 NEXO_DATA_DIR。恢复码有效期 15 分钟，重新生成后旧码失效。</p></details>}
+    {mode === "recover" && <details className="recovery-help"><summary>管理员如何恢复账号</summary><p>在 Server 所在主机运行：</p><code>docker compose exec nexo-server nexo --data-dir /data/nexo admin recover</code><p>直接运行二进制时使用 <code>nexo-server admin recover</code>，并用 --data-dir 指定原数据目录。恢复码有效期 15 分钟，重新生成后旧码失效。</p></details>}
     <form className="auth-form" onSubmit={submit}>
       <fieldset disabled={busy}>
         {mode === "recover" && <label>一次性恢复码<input value={code} onChange={e => setCode(e.target.value)} type="password" autoComplete="one-time-code" autoCapitalize="none" spellCheck={false} required /></label>}
         {mode !== "recover" && <label>用户名<input value={username} onChange={e => setUsername(e.target.value)} autoComplete="username" autoCapitalize="none" spellCheck={false} required /></label>}
-        <label>{mode === "recover" ? "新密码" : "密码"}<PasswordInput aria-label={mode === "recover" ? "新密码" : "密码"} value={password} onChange={e => setPassword(e.target.value)} type="password" autoComplete={mode === "login" ? "current-password" : "new-password"} minLength={mode === "login" ? undefined : 12} required /></label>
-        {mode === "recover" && <label>确认新密码<PasswordInput aria-label="确认新密码" value={confirm} onChange={e => setConfirm(e.target.value)} type="password" autoComplete="new-password" minLength={12} required /></label>}
-        {mode !== "login" && <p className="helper">密码至少 12 个字符。{mode === "recover" && "重设后，此账号的所有登录会话都会失效。"}</p>}
+        <label>{mode === "recover" ? "新密码" : "密码"}<PasswordInput aria-label={mode === "recover" ? "新密码" : "密码"} value={password} onChange={e => setPassword(e.target.value)} type="password" autoComplete={mode === "login" ? "current-password" : "new-password"} minLength={mode === "login" ? undefined : 6} required /></label>
+        {mode === "recover" && <label>确认新密码<PasswordInput aria-label="确认新密码" value={confirm} onChange={e => setConfirm(e.target.value)} type="password" autoComplete="new-password" minLength={6} required /></label>}
+        {mode !== "login" && <p className="helper">密码至少 6 个字符。{mode === "recover" && "重设后，此账号的所有登录会话都会失效。"}</p>}
       </fieldset>
       <Notice error={error} /><button className="primary-button" disabled={busy}>{busy ? "处理中…" : mode === "recover" ? "重设密码" : "登录"}</button>
     </form>

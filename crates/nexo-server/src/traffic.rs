@@ -15,19 +15,6 @@ pub mod quota;
 mod usage;
 pub use usage::{admin_reset, admin_usage, own_usage};
 
-pub fn initialize_schema(db: &Connection) -> Result<()> {
-    db.execute_batch("CREATE TABLE IF NOT EXISTS traffic_minutes (
-        tenant_id TEXT NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
-        tunnel_id TEXT NOT NULL, minute INTEGER NOT NULL,
-        to_origin INTEGER NOT NULL, to_public INTEGER NOT NULL,
-        PRIMARY KEY(tenant_id,tunnel_id,minute));
-        CREATE INDEX IF NOT EXISTS traffic_minutes_time ON traffic_minutes(minute);
-        CREATE TABLE IF NOT EXISTS traffic_coverage (minute INTEGER PRIMARY KEY, seconds REAL NOT NULL);")?;
-    usage::initialize_schema(db)?;
-    quota::initialize_schema(db)?;
-    Ok(())
-}
-
 #[derive(Clone, Copy, Default, Serialize)]
 pub struct Bytes {
     pub to_origin: u64,

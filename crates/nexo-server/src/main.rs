@@ -1,9 +1,9 @@
 //! Nexo v0.2.0 Server：只负责账号、Agent、域名和内网穿透服务。
 //!
-//! Agent 通过空间共享密钥或兼容的一次性入网凭证加入，之后使用独立的控制连接接收 Tunnel Desired State。
+//! Agent 通过空间共享密钥加入，之后使用独立的控制连接接收 Tunnel Desired State。
 
 use std::{
-    env, fs,
+    fs,
     net::SocketAddr,
     path::PathBuf,
     sync::{Arc, Mutex},
@@ -34,6 +34,7 @@ mod access_keys;
 mod accounts;
 mod auth;
 mod caddy;
+mod config;
 mod domain_access;
 mod domain_runtime;
 mod domains;
@@ -42,15 +43,21 @@ mod identity_runtime;
 mod lan_redirect;
 mod reverse_proxy;
 mod security;
+mod server_settings;
 mod service_access;
 mod traffic;
 mod transport;
-mod udp_schema;
 use enrollment::{agent_enroll, agent_poll, approve_enrollment};
 
 #[derive(Debug, Parser)]
 #[command(name = "nexo", version, about = "Nexo 联巢内网穿透服务")]
 struct Cli {
+    /// 数据目录；配置、数据库和身份持久化于此。
+    #[arg(long, default_value = "./data/nexo", global = true)]
+    data_dir: PathBuf,
+    /// 默认读取数据目录中的 server.toml。
+    #[arg(long, global = true)]
+    config: Option<PathBuf>,
     #[command(subcommand)]
     command: Option<CliCommand>,
 }
@@ -72,9 +79,9 @@ enum AdminCommand {
 
 #[derive(Clone)]
 pub(crate) struct AppState {
+    pub(crate) config: Arc<config::Config>,
     pub(crate) db: Arc<Mutex<Connection>>,
     pub(crate) security: Arc<security::Security>,
-    pub(crate) public_ips: Vec<std::net::IpAddr>,
     pub(crate) data_dir: PathBuf,
     pub(crate) domain_runtime: Arc<domain_runtime::DomainRuntimeManager>,
     pub(crate) domain_access: Arc<domain_access::Runtime>,
@@ -160,13 +167,8 @@ struct Enrollment {
     agent_version: Option<String>,
 }
 #[derive(Debug, Deserialize)]
-struct CreateEnrollment {
-    ttl_seconds: Option<i64>,
-}
-#[derive(Debug, Deserialize)]
-struct ApproveEnrollment {
-    device_name: Option<String>,
-}
+#[serde(deny_unknown_fields)]
+struct ApproveEnrollment {}
 #[derive(Debug, Serialize, Deserialize)]
 struct Tunnel {
     #[serde(default)]
@@ -179,7 +181,7 @@ struct Tunnel {
     device_name: Option<String>,
     name: String,
     protocol: String,
-    /// 内网回源协议独立于公网协议；TCP 不使用，旧网页服务默认 HTTP。
+    /// 内网回源协议独立于公网协议；TCP 不使用，网页服务默认 HTTP。
     origin_protocol: Option<String>,
     local_address: String,
     local_port: u16,
@@ -202,7 +204,7 @@ struct TunnelInput {
     device_id: Option<String>,
     name: String,
     protocol: String,
-    /// 内网回源协议独立于公网协议；TCP 不使用，旧网页服务默认 HTTP。
+    /// 内网回源协议独立于公网协议；TCP 不使用，网页服务默认 HTTP。
     origin_protocol: Option<String>,
     local_address: String,
     local_port: u16,
@@ -245,8 +247,7 @@ async fn main() -> Result<()> {
         .compact()
         .init();
     let cli = Cli::parse();
-    let data_dir =
-        PathBuf::from(env::var("NEXO_DATA_DIR").unwrap_or_else(|_| "./data/nexo".to_owned()));
+    let data_dir = nexo_core::config::absolute(&cli.data_dir)?;
     if let Some(CliCommand::Admin {
         command: AdminCommand::Recover { username },
     }) = cli.command
@@ -255,19 +256,25 @@ async fn main() -> Result<()> {
         println!("账号：{username}\n一次性恢复码：{code}\n有效期：15 分钟（到期时间戳 {expires}）\n在登录页选择“忘记密码”，输入恢复码和新密码。重新生成会使旧恢复码失效。");
         return Ok(());
     }
+    let config_path =
+        nexo_core::config::absolute(&cli.config.unwrap_or_else(|| data_dir.join("server.toml")))?;
+    let config = Arc::new(config::Config::load(&config_path)?);
     let db_path = data_dir.join("nexo.db");
     fs::create_dir_all(&data_dir)?;
-    let is_new = !db_path.exists();
+    let is_new = !db_path.try_exists().context("无法检查数据库文件")?;
     let mut connection = Connection::open(&db_path)?;
-    initialize_database(&connection, is_new)?;
+    initialize_database(&connection, is_new).context("无法读取当前数据库，原文件已保留")?;
     if let Some((username, password)) = auth::ensure_admin(
         &mut connection,
-        env::var("NEXO_ADMIN_USERNAME").ok().as_deref(),
-        env::var("NEXO_ADMIN_PASSWORD").ok().as_deref(),
+        Some(&config.admin.username),
+        Some(&config.admin.password),
     )
     .context("无法初始化管理员账号")?
     {
         println!("管理员账号已创建\n用户名：{username}\n自动生成的密码：{password}\n密码仅在首次创建时显示，请妥善保存；遗失后可使用 nexo admin recover 恢复账号。");
+    }
+    if !config.admin.password.is_empty() {
+        tracing::info!("管理员已初始化，请清除 server.toml 中的初始密码");
     }
     let identity_path = data_dir.join("transport/identity.json");
     let authority = Arc::new(identity_runtime::AuthorityRuntime::new(
@@ -276,38 +283,25 @@ async fn main() -> Result<()> {
     )?);
     connection.execute("UPDATE devices SET status='offline'", [])?;
     let state = AppState {
-        security: Arc::new(security::Security::from_env()?),
+        security: Arc::new(security::Security::new(server_settings::load(&connection)?)),
         domain_access: Arc::new(domain_access::Runtime::default()),
-        public_ips: env::var("NEXO_PUBLIC_IPS")
-            .unwrap_or_default()
-            .split(',')
-            .filter(|v| !v.trim().is_empty())
-            .map(|v| v.trim().parse())
-            .collect::<std::result::Result<_, _>>()
-            .context("NEXO_PUBLIC_IPS 必须是逗号分隔的公网 IP 地址")?,
         authority,
-        tunnel_runtime: Arc::new(transport::Runtime::new(
-            env::var("NEXO_PUBLIC_BIND")
-                .unwrap_or_else(|_| "0.0.0.0".into())
-                .parse()
-                .context("NEXO_PUBLIC_BIND 必须是 IP 地址")?,
-        )),
+        tunnel_runtime: Arc::new(transport::Runtime::new(config.public_bind)),
         db: Arc::new(Mutex::new(connection)),
         domain_runtime: Arc::new(domain_runtime::DomainRuntimeManager::new(
-            caddy::CaddyRuntimeConfig::from_env(&data_dir),
+            caddy::CaddyRuntimeConfig::new(&data_dir, &config.caddy),
         )),
         data_dir,
-        control_addr: env::var("NEXO_CONTROL_ADDR").unwrap_or_else(|_| "0.0.0.0:9890".to_owned()),
+        control_addr: config.control_addr.to_string(),
         udp_endpoint: Some(TunnelDataEndpoint {
-            address: env::var("NEXO_UDP_ENDPOINT").unwrap_or_default(),
+            address: config.udp_endpoint.clone(),
             server_name: nexo_tunnel::identity::SERVER_NAME.into(),
         }),
-        tunnel_endpoint: env::var("NEXO_TUNNEL_ENDPOINT")
-            .ok()
-            .map(|address| TunnelDataEndpoint {
-                address,
-                server_name: nexo_tunnel::identity::SERVER_NAME.into(),
-            }),
+        tunnel_endpoint: (!config.tunnel_endpoint.is_empty()).then(|| TunnelDataEndpoint {
+            address: config.tunnel_endpoint.clone(),
+            server_name: nexo_tunnel::identity::SERVER_NAME.into(),
+        }),
+        config: config.clone(),
     };
     state
         .tunnel_runtime
@@ -317,10 +311,9 @@ async fn main() -> Result<()> {
     let control_listener = TcpListener::bind(&state.control_addr)
         .await
         .context("无法监听 Agent mTLS 控制端口")?;
-    let data_listener =
-        TcpListener::bind(env::var("NEXO_TUNNEL_ADDR").unwrap_or_else(|_| "0.0.0.0:9891".into()))
-            .await
-            .context("无法监听 Tunnel mTLS 数据端口")?;
+    let data_listener = TcpListener::bind(config.tunnel_addr)
+        .await
+        .context("无法监听 Tunnel mTLS 数据端口")?;
     let udp_state = state.clone();
     let udp_task = tokio::spawn(async move {
         if let Err(error) = transport::udp::serve(udp_state).await {
@@ -332,10 +325,7 @@ async fn main() -> Result<()> {
     let transport_task = tokio::spawn(transport::Runtime::run(state.clone()));
     let identity_task = tokio::spawn(identity_runtime::AuthorityRuntime::run(state.clone()));
     let tunnel_runtime = state.tunnel_runtime.clone();
-    let http_addr: SocketAddr = env::var("NEXO_HTTP_ADDR")
-        .unwrap_or_else(|_| "0.0.0.0:8280".to_owned())
-        .parse()
-        .context("NEXO_HTTP_ADDR 不是有效地址")?;
+    let http_addr = config.http_addr;
     let caddy_task = tokio::spawn(domain_runtime::DomainRuntimeManager::run(state.clone()));
     let dns_task = tokio::spawn(domain_access::Runtime::run(state.clone()));
     let traffic_task = tokio::spawn(traffic::Collector::run(state.clone()));
@@ -386,6 +376,9 @@ async fn shutdown_signal() {
 }
 
 fn router(state: AppState) -> Router {
+    // 网页目录来自启动配置；缺失资源保持 404。
+    // 前端使用 hash 路由，缺失文件保持 404，不能用首页掩盖未知 API 或资源错误。
+    let web_dir = state.config.web_dir.clone();
     let routes = Router::new()
         .route("/health", get(health))
         .route("/api/v1/traffic/realtime", get(traffic::own_realtime))
@@ -403,6 +396,10 @@ fn router(state: AppState) -> Router {
             get(traffic::admin_realtime),
         )
         .route("/api/v1/admin/traffic/history", get(traffic::admin_history))
+        .route(
+            "/api/v1/admin/server-settings",
+            get(server_settings::get).put(server_settings::update),
+        )
         .route("/api/v1/admin/users", get(accounts::list_users))
         .route(
             "/api/v1/admin/users/{id}",
@@ -443,10 +440,7 @@ fn router(state: AppState) -> Router {
             "/api/v1/devices/{id}/recovery",
             post(enrollment::create_recovery),
         )
-        .route(
-            "/api/v1/enrollments",
-            get(list_enrollments).post(create_enrollment),
-        )
+        .route("/api/v1/enrollments", get(list_enrollments))
         .route(
             "/api/v1/enrollments/{id}",
             get(get_enrollment).delete(enrollment::cancel_enrollment),
@@ -491,6 +485,7 @@ fn router(state: AppState) -> Router {
             get(domain_access::instructions).post(domain_access::check),
         )
         .route("/api/v1/public-domain-runtime-events", get(domain_events))
+        .fallback_service(tower_http::services::ServeDir::new(web_dir))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             auth::session_middleware,
@@ -513,42 +508,18 @@ async fn health() -> Json<Health> {
 }
 
 fn initialize_database(connection: &Connection, is_new: bool) -> Result<()> {
-    // SQLite 的外键开关属于连接；恢复已有目录时也必须启用，确保删除设备能撤销恢复邀请的绑定。
     connection.pragma_update(None, "foreign_keys", "ON")?;
-    if !is_new {
-        let generation: Option<String> = connection
-            .query_row(
-                "SELECT value FROM product_metadata WHERE key='generation'",
-                [],
-                |row| row.get(0),
-            )
-            .optional()
-            .context("无法读取数据目录版本")?;
-        if generation.as_deref() != Some("tunnel-only-v1") {
-            anyhow::bail!(
-                "检测到旧版 Nexo 数据目录；v0.2.0 仅支持全新安装，请备份后使用空数据目录启动"
-            );
-        }
-        enrollment::initialize_schema(connection)?;
-        access_keys::initialize_schema(connection)?;
-        accounts::initialize_schema(connection)?;
-        reverse_proxy::initialize_schema(connection)?;
-        lan_redirect::initialize_schema(connection)?;
-        service_access::initialize_schema(connection)?;
-        udp_schema::initialize(connection)?;
-        traffic::initialize_schema(connection)?;
-        return domains::initialize_schema(connection);
+    if is_new {
+        let tx = connection.unchecked_transaction()?;
+        tx.execute_batch(include_str!("../../../migrations/schema.sql"))
+            .context("无法初始化数据库，已回滚")?;
+        tx.commit()?;
     }
-    connection.execute_batch(include_str!("../../../migrations/v0.2.0_baseline.sql"))?;
-    enrollment::initialize_schema(connection)?;
-    access_keys::initialize_schema(connection)?;
-    accounts::initialize_schema(connection)?;
-    reverse_proxy::initialize_schema(connection)?;
-    lan_redirect::initialize_schema(connection)?;
-    service_access::initialize_schema(connection)?;
-    udp_schema::initialize(connection)?;
-    traffic::initialize_schema(connection)?;
-    domains::initialize_schema(connection)
+    // 正常读取当前业务必需的字段，错误直接返回；不探测或转换历史结构。
+    server_settings::load(connection).context("无法读取服务器设置")?;
+    connection.prepare("SELECT enabled FROM tenants")?;
+    connection.prepare("SELECT service_mode,protocol_statuses,access_mode FROM tunnels")?;
+    Ok(())
 }
 
 fn require_session(state: &AppState, headers: &HeaderMap) -> Result<auth::Session, ApiError> {
@@ -664,38 +635,7 @@ async fn list_enrollments(
         .map_err(db_error)?;
     Ok(Json(rows))
 }
-async fn create_enrollment(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Json(input): Json<CreateEnrollment>,
-) -> Result<Json<Enrollment>, ApiError> {
-    let session = require_write(&state, &headers)?;
-    let token = EnrollmentToken::generate(unix_now(), input.ttl_seconds.unwrap_or(3600))
-        .map_err(db_error)?;
-    let id = Uuid::new_v4().to_string();
-    let connection = state.db.lock().map_err(|_| db_error("数据库锁不可用"))?;
-    accounts::ensure_workspace_enabled(&connection, &session.tenant_id)?;
-    let connection = connection.unchecked_transaction().map_err(db_error)?;
-    connection.execute("INSERT INTO pending_enrollments (id,tenant_id,token_digest,status,expires_at,created_at) VALUES (?1,?2,?3,'awaiting_agent',?4,?5)",params![id,session.tenant_id,token.digest,token.expires_at,unix_now()]).map_err(db_error)?;
-    accounts::audit(
-        &connection,
-        &session,
-        "enrollment_created",
-        "enrollment",
-        &id,
-    )?;
-    connection.commit().map_err(db_error)?;
-    Ok(Json(Enrollment {
-        id,
-        kind: "enroll".into(),
-        tenant_id: session.tenant_id,
-        status: "awaiting_agent".to_owned(),
-        expires_at: token.expires_at,
-        device_id: None,
-        token: Some(token.secret),
-        ..Enrollment::default()
-    }))
-}
+
 async fn get_enrollment(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1194,7 +1134,7 @@ fn prepare_tunnel(
 ) -> Result<(), ApiError> {
     validate_tunnel(input)?;
     // 先确定本次有效回源协议，随后重定向验证、持久化与 Agent 下发使用同一份值。
-    // 旧客户端更新时省略字段必须保留已有 HTTPS，不能意外降级。
+    // 局部更新省略回源字段时保留已有 HTTPS，避免意外降级。
     input.origin_protocol = if nexo_tunnel::udp::is_port(&input.protocol) {
         None
     } else {
@@ -1271,7 +1211,6 @@ fn prepare_tunnel(
         if input.protocol == "https"
             && settings.certificate_mode == "cloudflare_dns"
             && !settings.credential_configured
-            && !settings.legacy
         {
             return Err(ApiError::new(
                 StatusCode::BAD_REQUEST,
@@ -1394,37 +1333,51 @@ mod tests {
     }
 
     #[test]
-    fn fresh_database_uses_tunnel_only_baseline() {
-        let connection = Connection::open_in_memory().expect("应创建内存数据库");
-        initialize_database(&connection, true).expect("新数据库应初始化");
-        let generation: String = connection
-            .query_row(
-                "SELECT value FROM product_metadata WHERE key='generation'",
-                [],
-                |row| row.get(0),
-            )
-            .expect("应写入产品代际标记");
-        assert_eq!(generation, "tunnel-only-v1");
-        let old_tables: i64 = connection
-            .query_row(
-                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN ('legacy_devices','legacy_routes','legacy_policies')",
-                [],
-                |row| row.get(0),
-            )
-            .expect("应能检查旧表");
-        assert_eq!(old_tables, 0);
+    fn current_database_reopens_without_rewriting_and_invalid_data_is_preserved() {
+        let db = Connection::open_in_memory().unwrap();
+        initialize_database(&db, true).unwrap();
+        db.execute("UPDATE tenants SET name='保留设置'", [])
+            .unwrap();
+        initialize_database(&db, false).unwrap();
+        assert_eq!(
+            db.query_row("SELECT name FROM tenants", [], |r| r.get::<_, String>(0))
+                .unwrap(),
+            "保留设置"
+        );
+        db.execute("DROP TABLE server_settings", []).unwrap();
+        assert!(initialize_database(&db, false).is_err());
+        assert_eq!(
+            db.query_row("SELECT name FROM tenants", [], |r| r.get::<_, String>(0))
+                .unwrap(),
+            "保留设置"
+        );
     }
 
     #[test]
-    fn old_generation_is_rejected_with_chinese_message() {
-        let connection = Connection::open_in_memory().expect("应创建内存数据库");
-        connection
-            .execute_batch(
-                "CREATE TABLE product_metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL); INSERT INTO product_metadata VALUES ('generation','legacy-v1');",
+    fn initialization_failure_rolls_back_all_created_tables() {
+        let db = Connection::open_in_memory().unwrap();
+        db.execute("CREATE TABLE tunnels(marker TEXT)", []).unwrap();
+        assert!(initialize_database(&db, true).is_err());
+        assert_eq!(
+            db.query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table'",
+                [],
+                |r| r.get::<_, i64>(0)
             )
-            .expect("应创建旧代际标记");
-        let error = initialize_database(&connection, false).expect_err("旧代际必须拒绝");
-        assert!(error.to_string().contains("仅支持全新安装"));
+            .unwrap(),
+            1
+        );
+    }
+
+    /// 测试恢复审批时预置当前设备；不保留旧的新增设备审批入口。
+    pub(super) async fn recovery_fixture(state: &AppState, headers: &HeaderMap) -> Enrollment {
+        let tenant = auth::require_session(state, headers).unwrap().tenant_id;
+        let device = Uuid::new_v4().to_string();
+        state.db.lock().unwrap().execute("INSERT INTO devices(id,tenant_id,name,created_at,updated_at) VALUES(?1,?2,'原设备',0,0)", params![device,tenant]).unwrap();
+        enrollment::create_recovery(State(state.clone()), headers.clone(), Path(device))
+            .await
+            .unwrap()
+            .0
     }
 
     // 使用真实 SQLite、会话和 CSRF 校验调用处理函数，不以浏览器模拟接口代替删除保护测试。
@@ -1453,9 +1406,12 @@ mod tests {
         let digest = |value: &str| hex::encode(Sha256::digest(value.as_bytes()));
         db.execute("INSERT INTO auth_sessions (id,user_id,tenant_id,session_digest,csrf_digest,created_at,last_seen_at,expires_at) VALUES ('s','u','default',?1,?2,0,0,?3)", params![digest("domain-test"), digest("csrf-test"), unix_now() + 3600]).unwrap();
         let state = AppState {
+            config: Arc::new(config::Config {
+                runtime_dir: std::env::temp_dir().join(format!("nexo-test-{}", Uuid::new_v4())),
+                ..Default::default()
+            }),
             security: Arc::new(security::Security::default()),
             domain_access: Arc::new(domain_access::Runtime::default()),
-            public_ips: vec![],
             authority: Arc::new(
                 identity_runtime::AuthorityRuntime::new(
                     nexo_tunnel::identity::Authority::generate().unwrap(),
@@ -1469,7 +1425,7 @@ mod tests {
             domain_runtime: Arc::new(domain_runtime::DomainRuntimeManager::new(
                 caddy::CaddyRuntimeConfig {
                     enabled: false,
-                    ..caddy::CaddyRuntimeConfig::from_env(PathBuf::new())
+                    ..caddy::CaddyRuntimeConfig::new(PathBuf::new(), &config::Caddy::default())
                 },
             )),
             control_addr: String::new(),

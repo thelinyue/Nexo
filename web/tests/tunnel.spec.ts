@@ -255,8 +255,8 @@ test("公网 HTTP 页面可复制服务地址和弹窗内的 Compose 配置", as
   await page.goto("http://copy.example.test:4173/#/agents");
   await page.getByRole("button", { name: "添加 Agent", exact: true }).click();
   const dialog = page.getByRole("dialog", { name: "添加 Agent" });
-  await dialog.getByRole("button", { name: "复制 Compose 配置文件", exact: true }).click();
-  await expect(dialog.getByRole("status")).toHaveText("Compose 配置文件已复制");
+  await dialog.getByRole("button", { name: "复制 Agent TOML", exact: true }).click();
+  await expect(dialog.getByRole("status")).toHaveText("已复制");
   expect(await page.evaluate(() => (window as any).copiedFallback)).toContain("nexo_join_shared-test-key");
 });
 
@@ -265,11 +265,10 @@ test("Agent 离线可见，批准表单和删除错误可重试", async ({ page 
   await page.goto("/#/agents");
   await expect(page.getByText("离线", { exact: true })).toBeVisible();
   await page.getByRole("button", { name: "批准", exact: true }).click();
-  const approve = page.getByRole("dialog", { name: "批准 Agent 入网" });
-  await approve.getByLabel("Agent 名称").fill("办公室 Agent");
-  await approve.getByRole("button", { name: "批准入网" }).click();
+  const approve = page.getByRole("dialog", { name: "批准恢复 家庭 Agent 的身份？" });
+  await approve.getByRole("button", { name: "批准恢复" }).click();
   await expect(approve).not.toBeVisible();
-  expect(state.calls.find(item => item.path.endsWith("/approve"))?.body.device_name).toBe("办公室 Agent");
+  expect(state.calls.find(item => item.path.endsWith("/approve"))?.body).toEqual({});
   await page.locator(".agent-row").filter({ hasText: "家庭 Agent" }).click();
   await page.getByRole("button", { name: "删除 Agent", exact: true }).click();
   state.failures.set("DELETE /api/v1/devices/a-1", "删除节点失败");

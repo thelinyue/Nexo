@@ -3,19 +3,6 @@ use crate::*;
 
 pub const MODE: &str = "reverse_proxy";
 
-/// 在当前产品数据目录中增量扩展，旧记录始终保留穿透语义。
-pub fn initialize_schema(db: &Connection) -> Result<()> {
-    let exists: bool = db.query_row(
-        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('tunnels') WHERE name='service_mode')",
-        [],
-        |r| r.get(0),
-    )?;
-    if !exists {
-        db.execute_batch("ALTER TABLE tunnels ADD COLUMN service_mode TEXT NOT NULL DEFAULT 'tunnel' CHECK(service_mode IN ('tunnel','reverse_proxy'))")?;
-    }
-    Ok(())
-}
-
 /// 使用同一事务中的真实登录用户校验权限，不能把被管理工作空间当作操作者。
 fn authorize(db: &Connection, session: &auth::Session, mode: &str) -> Result<(), ApiError> {
     if mode == MODE {
@@ -47,7 +34,7 @@ pub fn existing(db: &Connection, session: &auth::Session, id: &str) -> Result<bo
     Ok(mode == MODE)
 }
 
-/// 省略字段的旧客户端只能保留原模式；绝不能通过删除 Agent 绑定隐式创建反代。
+/// 局部更新省略字段时保留原模式；绝不能通过删除 Agent 绑定隐式创建反代。
 pub fn prepare(
     db: &Connection,
     session: &auth::Session,

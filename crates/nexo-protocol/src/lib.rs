@@ -48,7 +48,6 @@ pub struct ProtocolStatus {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TunnelApplyResult {
-    #[serde(default)]
     pub protocol_statuses: std::collections::BTreeMap<String, ProtocolStatus>,
     pub tunnel_id: String,
     pub revision: i64,
@@ -68,8 +67,6 @@ pub struct TunnelDataEndpoint {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AgentControlMessage {
     Hello {
-        #[serde(default)]
-        capabilities: Vec<String>,
         device_id: String,
         agent_version: String,
     },
@@ -97,7 +94,6 @@ pub enum AgentControlMessage {
 pub enum ServerControlMessage {
     HelloAccepted {
         server_time: i64,
-        #[serde(default)]
         tunnels: Vec<TunnelDesiredState>,
         #[serde(default)]
         tunnel_endpoint: Option<TunnelDataEndpoint>,
@@ -106,7 +102,6 @@ pub enum ServerControlMessage {
     },
     HeartbeatAck {
         server_time: i64,
-        #[serde(default)]
         tunnels: Vec<TunnelDesiredState>,
         #[serde(default)]
         tunnel_endpoint: Option<TunnelDataEndpoint>,
@@ -114,7 +109,6 @@ pub enum ServerControlMessage {
         udp_endpoint: Option<TunnelDataEndpoint>,
     },
     TunnelApplyAccepted {
-        #[serde(default)]
         tunnel_ids: Vec<String>,
     },
     CertificateRenewed {
@@ -136,7 +130,7 @@ pub struct AgentEnrollmentRequest {
     pub os: Option<String>,
     pub architecture: Option<String>,
     pub agent_version: String,
-    pub csr_pem: Option<String>,
+    pub csr_pem: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -144,7 +138,6 @@ pub struct AgentEnrollmentResponse {
     pub enrollment_id: String,
     pub status: EnrollmentStatus,
     pub device_id: Option<String>,
-    pub server_endpoint: Option<String>,
     pub certificate_pem: Option<String>,
     pub ca_certificate_pem: Option<String>,
     pub message: String,

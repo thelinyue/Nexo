@@ -183,6 +183,7 @@ pub fn snapshot(state: &AppState, tenant: &str, id: &str) -> Result<Access, ApiE
 }
 
 fn load(state: &AppState, tenant: &str, id: &str) -> Result<Access, ApiError> {
+    let expected_addresses = state.security.settings()?.public_ips;
     let db = state.db.lock().map_err(|_| db_error("数据库锁不可用"))?;
     let domain: String = db
         .query_row(
@@ -206,7 +207,7 @@ fn load(state: &AppState, tenant: &str, id: &str) -> Result<Access, ApiError> {
     }
     Ok(Access {
         domain,
-        expected_addresses: state.public_ips.clone(),
+        expected_addresses,
         records: hosts
             .into_iter()
             .map(|hostname| Record {
@@ -450,8 +451,9 @@ mod tests {
 
     #[tokio::test]
     async fn resolved_cdn_addresses_do_not_schedule_retries() {
-        let (mut state, headers) = crate::tests::domain_fixture();
-        state.public_ips = vec!["203.0.113.10".parse().unwrap()];
+        let (state, headers) = crate::tests::domain_fixture();
+        state.security.configuration.write().unwrap().public_ips =
+            vec!["203.0.113.10".parse().unwrap()];
         let domain = crate::tests::add_test_domain(&state, &headers, "test.localhost")
             .await
             .unwrap();

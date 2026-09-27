@@ -2,7 +2,7 @@
 // Node 22+，真实进程验收。数据、密钥和日志只写入独立测试目录，不访问公网 CA。
 import assert from "node:assert/strict";
 import fs from "node:fs/promises";
-import { createWriteStream } from "node:fs";
+import { createWriteStream, mkdirSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import net from "node:net";
 import tls from "node:tls";
@@ -27,11 +27,16 @@ async function wait(check, label, timeout = 30000) {
 async function port() { const listener = net.createServer(); listener.listen(0, "127.0.0.1"); await once(listener, "listening"); const value = listener.address().port; await new Promise(resolve => listener.close(resolve)); return value; }
 const ports = { api: await port(), control: await port(), data: await port(), public: await port() };
 const url = `http://127.0.0.1:${ports.api}`;
-const serverEnv = { NEXO_ADMIN_USERNAME: "admin", NEXO_ADMIN_PASSWORD: "old-test-password-1234", NEXO_DATA_DIR: path.join(root, "server"), NEXO_HTTP_ADDR: `127.0.0.1:${ports.api}`, NEXO_CONTROL_ADDR: `127.0.0.1:${ports.control}`, NEXO_TUNNEL_ADDR: `127.0.0.1:${ports.data}`, NEXO_TUNNEL_ENDPOINT: `127.0.0.1:${ports.data}`, NEXO_PUBLIC_BIND: "127.0.0.1", NEXO_CADDY_ENABLED: "false", NEXO_PUBLIC_URL: "", NEXO_TRUSTED_PROXIES: "", NEXO_PUBLIC_IPS: "127.0.0.1" };
-const agentEnv = { NEXO_STATE_DIR: path.join(root, "agent"), NEXO_SERVER_URL: url, NEXO_ENROLLMENT_TOKEN: "", NEXO_CONTROL_ENDPOINT: `127.0.0.1:${ports.control}`, NEXO_TUNNEL_ENDPOINT: `127.0.0.1:${ports.data}` };
-function launch(name, binary, environment, parameters = []) {
+const serverConfig = { "admin.username": "admin", "admin.password": "old-test-password-1234", data_dir: path.join(root, "server"), http_addr: `127.0.0.1:${ports.api}`, control_addr: `127.0.0.1:${ports.control}`, tunnel_addr: `127.0.0.1:${ports.data}`, tunnel_endpoint: `127.0.0.1:${ports.data}`, public_bind: "127.0.0.1", "caddy.enabled": false };
+const agentConfig = { data_dir: path.join(root, "agent"), server_url: url, enrollment_token: "", control_endpoint: `127.0.0.1:${ports.control}`, tunnel_endpoint: `127.0.0.1:${ports.data}` };
+function launch(name, binary, configuration, parameters = []) {
+  const { data_dir: directory, ...config } = configuration;
+  mkdirSync(directory, { recursive: true });
+  const component = binary === serverBin ? "server" : "agent";
+  if (component === "server") config.runtime_dir = path.join(root, "runtime");
+  writeFileSync(path.join(directory, `${component}.toml`), Object.entries(config).map(([key, value]) => `${key} = ${JSON.stringify(value)}`).join("\n"));
   const log = createWriteStream(path.join(root, `${name}-${processes.length}.log`)); logs.push(log);
-  const child = spawn(binary, parameters, { env: { ...process.env, ...environment }, windowsHide: true, stdio: ["ignore", "pipe", "pipe"] });
+  const child = spawn(binary, ["--data-dir", directory, ...parameters], { env: process.env, windowsHide: true, stdio: ["ignore", "pipe", "pipe"] });
   child.stdout.pipe(log, { end: false }); child.stderr.pipe(log, { end: false }); processes.push(child);
   return child;
 }
@@ -65,34 +70,34 @@ const echo = net.createServer(socket => { socket.on("error", () => {}); socket.p
 echo.listen(0, "127.0.0.1"); await once(echo, "listening");
 console.log("测试目录：", root);
 try {
-  server = launch("server", serverBin, serverEnv);
+  server = launch("server", serverBin, serverConfig);
   await wait(async () => (await call("auth/status")).status === 200, "Server 启动");
   await api("auth/login", "POST", { username: "admin", password: "old-test-password-1234" });
   assert.equal((await api("auth/status", "GET", undefined, { "x-forwarded-proto": "https" })).channel, "local_http");
   assert.equal((await call("auth/logout", "POST", {}, { Origin: "https://attacker.invalid" })).status, 403);
   assert.equal((await call("auth/logout", "POST", {}, { "x-nexo-csrf": "wrong" })).status, 403);
   check("未信任的 HTTPS 请求头无效，跨站和缺少 CSRF 的写入被拒绝");
+  await api("admin/server-settings", "PUT", { public_url: "", trusted_proxies: [], public_ips: ["127.0.0.1"] });
 
-  const invite = await api("enrollments", "POST", { ttl_seconds: 3600 });
-  agent = launch("agent", agentBin, { ...agentEnv, NEXO_ENROLLMENT_TOKEN: invite.token });
-  await wait(async () => (await api("enrollments")).some(item => item.id === invite.id && item.status === "awaiting_approval"), "首次 CSR");
-  const device = (await api(`enrollments/${invite.id}/approve`, "POST", { device_name: "恢复验收 Agent" })).device_id;
+  const invite = await api("agent-access-key", "POST", {});
+  agent = launch("agent", agentBin, { ...agentConfig, enrollment_token: invite.token });
+  const device = await wait(async () => (await api("devices")).find(item => item.status === "online")?.id, "共享密钥注册");
   await wait(async () => (await api("devices")).some(item => item.id === device && item.status === "online"), "Agent 在线");
   const tunnel = await api("tunnels", "POST", { name: "恢复测试", protocol: "tcp", device_id: device, local_address: "127.0.0.1", local_port: echo.address().port, public_port: ports.public, enabled: true });
   await wait(() => ready(tunnel.id), "TCP 就绪"); await echoThroughTunnel();
-  check("真实入网审批、mTLS 控制与 TCP 数据转发");
+  check("共享密钥注册、mTLS 控制与 TCP 数据转发");
 
   const identityFile = path.join(root, "agent/identity.json");
   const oldBytes = await fs.readFile(identityFile), oldIdentity = JSON.parse(oldBytes);
   const previous = await api(`devices/${device}/recovery`, "POST");
   const recovery = await api(`devices/${device}/recovery`, "POST");
   assert.equal((await api(`enrollments/${previous.id}`)).status, "revoked");
-  let recoveryProcess = launch("recover", agentBin, { ...agentEnv, NEXO_ENROLLMENT_TOKEN: recovery.token }, ["--recover-identity"]);
+  let recoveryProcess = launch("recover", agentBin, { ...agentConfig, enrollment_token: recovery.token }, ["--recover-identity"]);
   await wait(async () => (await api(`enrollments/${recovery.id}`)).status === "awaiting_approval", "恢复 CSR");
   assert((await fs.readFile(identityFile)).equals(oldBytes));
   const key = await fs.readFile(path.join(root, "agent/recovery-key.json"));
   await stop(recoveryProcess);
-  recoveryProcess = launch("recover-retry", agentBin, { ...agentEnv, NEXO_ENROLLMENT_TOKEN: recovery.token }, ["--recover-identity"]);
+  recoveryProcess = launch("recover-retry", agentBin, { ...agentConfig, enrollment_token: recovery.token }, ["--recover-identity"]);
   await delay(500); assert((await fs.readFile(path.join(root, "agent/recovery-key.json"))).equals(key));
   const live = net.connect(ports.public, "127.0.0.1"); await once(live, "connect"); live.write("before"); await once(live, "data");
   const disconnected = new Promise(resolve => { live.on("error", () => {}); live.once("close", () => resolve(true)); });
@@ -103,7 +108,7 @@ try {
   assert.equal(recovered.device_id, device); assert.notEqual(recovered.key_pem, oldIdentity.key_pem);
   await oldIdentityRejected(oldIdentity, false); await oldIdentityRejected(oldIdentity, true);
   check("恢复申请可重试，批准前保留旧身份；批准后撤销旧证书与既有连接");
-  await stop(agent); agent = launch("agent-recovered", agentBin, agentEnv);
+  await stop(agent); agent = launch("agent-recovered", agentBin, agentConfig);
   await wait(() => ready(tunnel.id), "恢复后重新转发"); await echoThroughTunnel();
   assert.equal((await api("devices")).length, 1);
   const bound = (await api("tunnels")).find(item => item.id === tunnel.id);
@@ -112,11 +117,11 @@ try {
 
   await stop(agent); await fs.rename(identityFile, identityFile + ".test-backup");
   const lost = await api(`devices/${device}/recovery`, "POST");
-  const lostProcess = launch("recover-lost", agentBin, { ...agentEnv, NEXO_ENROLLMENT_TOKEN: lost.token }, ["--recover-identity"]);
+  const lostProcess = launch("recover-lost", agentBin, { ...agentConfig, enrollment_token: lost.token }, ["--recover-identity"]);
   await wait(async () => (await api(`enrollments/${lost.id}`)).status === "awaiting_approval", "丢失私钥后的恢复申请");
   await api(`enrollments/${lost.id}/approve`, "POST", {});
   await wait(() => lostProcess.exitCode !== null, "丢失身份恢复完成"); assert.equal(lostProcess.exitCode, 0);
-  agent = launch("agent-after-loss", agentBin, agentEnv); await wait(() => ready(tunnel.id), "丢失身份后重新转发"); await echoThroughTunnel();
+  agent = launch("agent-after-loss", agentBin, agentConfig); await wait(() => ready(tunnel.id), "丢失身份后重新转发"); await echoThroughTunnel();
   assert.equal(JSON.parse(await fs.readFile(identityFile)).device_id, device);
   check("身份文件和私钥丢失后可重新授权，原服务仍可用");
 
@@ -135,7 +140,7 @@ try {
   assert(rechecked.retries_remaining <= dns.retries_remaining, "手动检查重置了自动重试次数");
   check("域名解析在后台自动检查，列表读取结果，手动重试不冒充公网可达验证");
 
-  const command = await promisify(execFile)(serverBin, ["admin", "recover", "--username", "admin"], { env: { ...process.env, ...serverEnv }, windowsHide: true });
+  const command = await promisify(execFile)(serverBin, ["--data-dir", path.join(root, "server"), "admin", "recover", "--username", "admin"], { env: process.env, windowsHide: true });
   const code = command.stdout.match(/[a-f0-9]{64}/)?.[0]; assert(code, "CLI 未生成恢复码");
   await api("auth/recover", "POST", { recovery_code: code, new_password: "recovered-test-password-1234" });
   assert.equal((await call("devices")).value.code, "session_expired");
@@ -145,10 +150,12 @@ try {
   assert.equal((await api("devices"))[0].id, device);
   check("本机 CLI 生成一次性恢复码，重设密码撤销旧会话和旧密码，业务数据保留");
 
+  await api("admin/server-settings", "PUT", { public_url: "", trusted_proxies: ["127.0.0.1"], public_ips: ["127.0.0.1"] });
+  await api("admin/server-settings", "PUT", { public_url: `https://${new URL(url).host}`, trusted_proxies: ["127.0.0.1"], public_ips: ["127.0.0.1"] }, { "x-forwarded-proto": "https", Origin: `https://${new URL(url).host}` });
   await stop(server);
-  server = launch("server-proxy", serverBin, { ...serverEnv, NEXO_PUBLIC_URL: "https://manage.example.test", NEXO_TRUSTED_PROXIES: "127.0.0.1" });
+  server = launch("server-proxy", serverBin, serverConfig);
   await wait(async () => (await call("auth/status")).status === 403, "HTTPS 强制保护");
-  const proxyHeaders = { "x-forwarded-proto": "https", Origin: "https://manage.example.test" };
+  const proxyHeaders = { "x-forwarded-proto": "https", Origin: `https://${new URL(url).host}` };
   const secured = await call("auth/login", "POST", { username: "admin", password: "recovered-test-password-1234" }, proxyHeaders);
   assert.equal(secured.status, 200); assert(secured.cookies.every(value => value.includes("; Secure")));
   assert.equal((await api("auth/status", "GET", undefined, proxyHeaders)).local_http_warning, false);

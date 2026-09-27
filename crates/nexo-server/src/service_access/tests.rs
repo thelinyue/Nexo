@@ -5,6 +5,7 @@ use axum::extract::Path;
 fn fixture() -> (AppState, HeaderMap) {
     let (state, headers) = crate::tests::domain_fixture();
     state.db.lock().unwrap().execute("INSERT INTO public_domains(id,tenant_id,domain,https_enabled,created_at,updated_at) VALUES('domain','default','example.com',1,0,0)", []).unwrap();
+    state.db.lock().unwrap().execute("INSERT INTO domain_settings(domain_id,verification_token,certificate_mode,verified) VALUES('domain','test-proof','http01',1)", []).unwrap();
     (state, headers)
 }
 fn input(mode: Option<&str>, password: Option<&str>) -> TunnelInput {
@@ -58,7 +59,7 @@ fn password_and_return_validation() {
 }
 
 #[tokio::test]
-async fn api_default_compatibility_password_changes_and_tcp_rejection() {
+async fn api_default_password_changes_and_tcp_rejection() {
     let _guard = auth::PASSWORD_TEST_LOCK.lock().await;
     let (state, headers) = fixture();
     let created = create_tunnel(
@@ -329,15 +330,13 @@ async fn rate_limit_and_host_checks() {
 }
 
 #[tokio::test]
-async fn schema_is_idempotent_and_revokes_all_service_mutations() {
+async fn schema_revokes_sessions_on_all_service_mutations() {
     let (state, admin) = fixture();
     let created = create_tunnel(State(state.clone()), admin, Json(input(None, None)))
         .await
         .unwrap()
         .0;
     let db = state.db.lock().unwrap();
-    initialize_schema(&db).unwrap();
-    initialize_schema(&db).unwrap();
     for mutation in [
         "hostname='new'",
         "protocol='https'",

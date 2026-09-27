@@ -38,7 +38,7 @@ async fn real_caddy_access_password_cookie_proxy_and_lan_priority() {
             .unwrap()
             .port()
     };
-    let mut cfg = CaddyRuntimeConfig::from_env(&root);
+    let mut cfg = CaddyRuntimeConfig::new(&root, &crate::config::Caddy::default());
     cfg.binary = std::env::var_os("NEXO_TEST_CADDY_BIN").unwrap().into();
     cfg.enabled = true;
     cfg.admin_url = format!("http://127.0.0.1:{}", port());
@@ -92,6 +92,7 @@ async fn real_caddy_access_password_cookie_proxy_and_lan_priority() {
     let client = reqwest::Client::builder()
         .no_proxy()
         .http1_only()
+        .pool_max_idle_per_host(0)
         .redirect(reqwest::redirect::Policy::none())
         .timeout(Duration::from_secs(5))
         .add_root_certificate(reqwest::Certificate::from_pem(&cert).unwrap())

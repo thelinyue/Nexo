@@ -100,7 +100,7 @@ pub fn ensure_admin(
         .filter(|value| !value.is_empty())
         .unwrap_or("admin");
     validate_username(username)
-        .map_err(|error| anyhow::anyhow!("NEXO_ADMIN_USERNAME 配置无效：{}", error.message))?;
+        .map_err(|error| anyhow::anyhow!("admin.username 配置无效：{}", error.message))?;
     let generated = password.is_none_or(str::is_empty);
     let password = if generated {
         let mut bytes = [0_u8; 24];
@@ -112,7 +112,7 @@ pub fn ensure_admin(
         password.unwrap().to_owned()
     };
     validate_password(&password)
-        .map_err(|error| anyhow::anyhow!("NEXO_ADMIN_PASSWORD 配置无效：{}", error.message))?;
+        .map_err(|error| anyhow::anyhow!("admin.password 配置无效：{}", error.message))?;
     let hash = hash_password(&password)?;
     transaction.execute(
         "INSERT INTO users (id, tenant_id, username, role, password_hash, enabled, created_at) VALUES (?1,'default',?2,'system_admin',?3,1,?4)",
@@ -434,15 +434,6 @@ pub fn create_recovery_code(
         rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE,
     )?;
     connection.busy_timeout(std::time::Duration::from_secs(5))?;
-    let generation: String = connection.query_row(
-        "SELECT value FROM product_metadata WHERE key='generation'",
-        [],
-        |r| r.get(0),
-    )?;
-    anyhow::ensure!(
-        generation == "tunnel-only-v1",
-        "此数据目录不是当前 Tunnel 版本，请使用与数据目录匹配的 Server 恢复账号"
-    );
     let mut query = connection.prepare("SELECT id,username FROM users WHERE role='system_admin' AND enabled=1 AND (?1 IS NULL OR username=?1)")?;
     let users = query
         .query_map([username], |r| {
@@ -533,23 +524,6 @@ fn load_session(state: &AppState, headers: &HeaderMap) -> Option<Session> {
     let raw = cookie(headers, "nexo_session")?;
     let connection = state.db.lock().ok()?;
     connection.query_row("SELECT s.user_id, s.tenant_id, s.csrf_digest FROM auth_sessions s JOIN users u ON u.id=s.user_id AND u.enabled=1 WHERE s.session_digest = ?1 AND s.expires_at > ?2", params![digest(&raw), unix_now()], |row| Ok(Session { user_id: row.get(0)?, tenant_id: row.get(1)?, csrf: row.get(2)? })).optional().ok().flatten()
-}
-
-/// 兼容已有 Tunnel 数据目录；旧会话没有设备标签，界面显示未知设备。
-pub(crate) fn initialize_session_labels(db: &rusqlite::Connection) -> anyhow::Result<()> {
-    for column in ["browser", "os"] {
-        let exists: bool = db.query_row(
-            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('auth_sessions') WHERE name=?1)",
-            [column],
-            |row| row.get(0),
-        )?;
-        if !exists {
-            db.execute_batch(&format!(
-                "ALTER TABLE auth_sessions ADD COLUMN {column} TEXT;"
-            ))?;
-        }
-    }
-    Ok(())
 }
 
 /// User-Agent 仅映射到固定展示标签，不保存原始内容，不用于认证、授权或设备身份判断。
@@ -679,10 +653,10 @@ pub(crate) fn validate_username(value: &str) -> Result<(), ApiError> {
     }
 }
 pub(crate) fn validate_password(value: &str) -> Result<(), ApiError> {
-    if value.chars().count() < 12 || value.len() > 1024 {
+    if value.chars().count() < 6 || value.len() > 1024 {
         Err(ApiError::new(
             StatusCode::BAD_REQUEST,
-            "密码至少需要 12 个字符，且不超过 1024 字节",
+            "密码至少需要 6 个字符，且不超过 1024 字节",
         ))
     } else {
         Ok(())
@@ -693,6 +667,15 @@ fn internal(error: impl std::fmt::Display) -> ApiError {
 }
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn passwords_use_character_minimum_and_byte_maximum() {
+        assert!(super::validate_password("12345").is_err());
+        assert!(super::validate_password("123456").is_ok());
+        assert!(super::validate_password("中文密码六个").is_ok());
+        assert!(super::validate_password(&"a".repeat(1024)).is_ok());
+        assert!(super::validate_password(&"a".repeat(1025)).is_err());
+        assert!(super::validate_password(&"中".repeat(342)).is_err());
+    }
     use super::*;
     use std::{
         fs,
@@ -754,19 +737,15 @@ mod tests {
             (
                 "a".to_owned(),
                 "valid-password-1234".to_owned(),
-                "NEXO_ADMIN_USERNAME",
+                "admin.username",
             ),
             (
                 "a".repeat(65),
                 "valid-password-1234".to_owned(),
-                "NEXO_ADMIN_USERNAME",
+                "admin.username",
             ),
-            (
-                "admin".to_owned(),
-                "short-123".to_owned(),
-                "NEXO_ADMIN_PASSWORD",
-            ),
-            ("admin".to_owned(), "a".repeat(1025), "NEXO_ADMIN_PASSWORD"),
+            ("admin".to_owned(), "12345".to_owned(), "admin.password"),
+            ("admin".to_owned(), "a".repeat(1025), "admin.password"),
         ] {
             let mut db = rusqlite::Connection::open_in_memory().unwrap();
             crate::initialize_database(&db, true).unwrap();
@@ -827,15 +806,6 @@ mod tests {
 
     #[tokio::test]
     async fn session_labels_preserve_existing_sessions_and_only_store_known_labels() {
-        let old = rusqlite::Connection::open_in_memory().unwrap();
-        old.execute_batch("CREATE TABLE auth_sessions(id TEXT PRIMARY KEY); INSERT INTO auth_sessions VALUES('old-session');").unwrap();
-        initialize_session_labels(&old).unwrap();
-        let migrated: (String, Option<String>, Option<String>) = old
-            .query_row("SELECT id,browser,os FROM auth_sessions", [], |row| {
-                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
-            })
-            .unwrap();
-        assert_eq!(migrated, ("old-session".into(), None, None));
         let (state, headers) = crate::tests::domain_fixture();
         let original = current_session_info(State(state.clone()), headers.clone())
             .await
@@ -844,8 +814,6 @@ mod tests {
         assert!(original.browser.is_none());
         {
             let db = state.db.lock().unwrap();
-            initialize_session_labels(&db).unwrap();
-            initialize_session_labels(&db).unwrap();
             let mut client = HeaderMap::new();
             client.insert(
                 header::USER_AGENT,

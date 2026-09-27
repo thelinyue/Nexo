@@ -6,21 +6,6 @@ use reqwest::Url;
 use rusqlite::{params, Connection, OptionalExtension};
 use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 
-/// 旧服务一律关闭；仅增量添加开关，不改变本地目标和既有访问路径。
-pub fn initialize_schema(db: &Connection) -> anyhow::Result<()> {
-    let exists: bool = db.query_row(
-        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('tunnels') WHERE name='lan_redirect_enabled')",
-        [],
-        |row| row.get(0),
-    )?;
-    if !exists {
-        db.execute_batch(
-            "ALTER TABLE tunnels ADD COLUMN lan_redirect_enabled INTEGER NOT NULL DEFAULT 0",
-        )?;
-    }
-    Ok(())
-}
-
 /// 每次由真实回源协议、IP 和端口生成地址，公网 HTTPS 不代表本地应用也提供 HTTPS。
 pub fn target_url(
     local_address: &str,
@@ -187,10 +172,10 @@ mod tests {
                 assert_eq!(desired[0].origin_protocol.as_deref(), Some(next));
                 assert!(desired[0].revision > created.apply_revision);
 
-                // 旧客户端只改名称，不得把 HTTPS 回源意外降为 HTTP。
+                // 局部更新只改名称，不得把 HTTPS 回源意外降为 HTTP。
                 body.as_object_mut().unwrap().remove("origin_protocol");
                 body["name"] = json!("renamed");
-                let Json(legacy_update) = crate::update_tunnel(
+                let Json(partial_update) = crate::update_tunnel(
                     State(state.clone()),
                     headers.clone(),
                     Path(created.id.clone()),
@@ -198,7 +183,7 @@ mod tests {
                 )
                 .await
                 .unwrap();
-                assert_eq!(legacy_update.origin_protocol.as_deref(), Some(next));
+                assert_eq!(partial_update.origin_protocol.as_deref(), Some(next));
                 body["protocol"] = json!("tcp");
                 body["lan_redirect_enabled"] = json!(false);
                 let Json(tcp) = crate::update_tunnel(
@@ -332,9 +317,9 @@ mod tests {
     }
 
     #[test]
-    fn existing_database_gets_a_disabled_switch_and_preserves_it_on_reopen() {
+    fn current_database_defaults_to_disabled_switch_and_preserves_it_on_reopen() {
         let db = Connection::open_in_memory().unwrap();
-        db.execute_batch(include_str!("../../../migrations/v0.2.0_baseline.sql"))
+        db.execute_batch(include_str!("../../../migrations/schema.sql"))
             .unwrap();
         db.execute("INSERT INTO tunnels (id,tenant_id,name,protocol,local_address,local_port,created_at,updated_at) VALUES ('existing','default','nas','http','127.0.0.1',8080,0,0)", []).unwrap();
         crate::initialize_database(&db, false).unwrap();

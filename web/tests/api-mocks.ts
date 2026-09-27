@@ -12,7 +12,7 @@ export async function installApiMocks(page: Page, options: { empty?: boolean; an
     transportIdentity: { server: { status: "valid", expires_at: Math.floor(Date.now()/1000) + 825*86400, renew_after: Math.floor(Date.now()/1000) + 795*86400, error: null, next_retry_at: null }, ca_expires_at: Math.floor(Date.now()/1000) + 3650*86400, ca_needs_attention: false } as TransportIdentity,
     domains: [{ id: "d-1", domain: "example.com", is_primary: true, https_enabled: true, apply_status: "applied", runtime: { config_status: "applied", config_error: null, service_warning: null, checked_at: Math.floor(Date.now() / 1000), certificates: [{ hostname: "example.com", status: "issued", not_before: Math.floor(Date.now() / 1000) - 3600, expires_at: Math.floor(Date.now() / 1000) + 90 * 86400, error: null, next_retry_at: null }] } }] as Domain[],
     domainEvents: [{ id: 1, domain_id: "d-1", summary: "配置已加载", occurred_at: Math.floor(Date.now() / 1000) }] as DomainEvent[],
-    enrollments: [{ id: "e-1", kind: "enroll", status: "awaiting_approval", expires_at: 1791000000 }] as Enrollment[],
+    enrollments: [{ id: "e-1", kind: "recovery", device_id: "a-1", status: "awaiting_approval", expires_at: 1791000000 }] as Enrollment[],
     failureStatuses: new Map<string, number>(),
     trafficResets: new Map<string, number>(),
     quotas: new Map<string, { monthly_limit_bytes: number | null; used_bytes: number }>(),
@@ -78,7 +78,6 @@ export async function installApiMocks(page: Page, options: { empty?: boolean; an
     if (path === "/api/v1/transport-identity") return respond(state.transportIdentity);
     if (path.startsWith("/api/v1/devices/") && method === "DELETE") { state.devices = state.devices.filter(item => item.id !== path.split("/").pop()); return respond({}); }
     if (path === "/api/v1/enrollments" && method === "GET") return respond(state.enrollments);
-    if (path === "/api/v1/enrollments" && method === "POST") { const invite = { id: "e-new", status: "awaiting_agent", token: "one-time-secret-enrollment-token", expires_at: Math.floor(Date.now()/1000) + 3600 }; state.enrollments.push(invite); return respond(invite); }
     if (path.startsWith("/api/v1/enrollments/") && method === "GET") return respond(state.enrollments.find(item => item.id === path.split("/").pop()) ?? { id: path.split("/").pop(), status: "awaiting_agent", expires_at: Math.floor(Date.now()/1000) + 3600 });
     if (path.startsWith("/api/v1/enrollments/") && method === "DELETE") { state.enrollments = state.enrollments.filter(item => item.id !== path.split("/").pop()); return respond({ revoked: true }); }
     if (path.endsWith("/approve")) { const invite = state.enrollments.find(item => item.id === path.split("/").at(-2)); if (invite) Object.assign(invite, { status: "approved", device_id: invite.device_id ?? "a-1" }); return respond(invite ?? {}); }
