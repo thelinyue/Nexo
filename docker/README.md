@@ -54,7 +54,9 @@ Agent 的 `server_url` 是 HTTP/HTTPS API 地址；控制与数据始终使用�
 | 公网证书、ACME 账号和私钥 | Server `caddy-storage/` |
 | 临时 Web Tunnel Socket | `/run/nexo/tunnel-sockets/<服务ID>.sock` |
 
-Linux 保留 Unix Socket，运行目录权限 `0700`、Socket `0600`，拒绝覆盖普通文件或符号链接。非 root 或多实例部署必须设置各自独占、可写的 `runtime_dir`。Compose 把 `/run/nexo` 挂为 tmpfs，停用、删除及正常退出清理本实例 Socket，容器重建后根据数据库重新监听。Caddy 沿用启动恢复流程，在当前监听器准备好后应用路由。Windows 继续用本机随机 TCP 端口。目录调整不承诺吞吐提升。
+Linux 保留 Unix Socket，程序自动创建运行目录，目录权限 `0700`、Socket `0600`，拒绝覆盖普通文件或符号链接。非 root 或多实例部署必须设置各自独占、可写的 `runtime_dir`。默认使用容器内部的 `/run/nexo`，无需额外挂载；停用、删除及正常退出清理本实例 Socket，重新监听时处理遗留节点，容器重建后根据数据库重新监听。Caddy 沿用启动恢复流程，在当前监听器准备好后应用路由。Windows 继续用本机随机 TCP 端口。
+
+tmpfs 是可选部署项，并非运行依赖。只读容器根文件系统需要为 `runtime_dir` 提供可写位置，例如在 Server 服务中设置 `tmpfs: ["/run/nexo:mode=0700"]`。Unix Socket 的传输数据由内核处理，不会作为 Socket 文件内容写入磁盘；使用 tmpfs 不代表转发吞吐提升。
 
 备份前停止对应组件，完整复制 `./data/nexo` 或 `./data/nexo-agent`；不要只复制 SQLite。恢复时把完整备份放入空目录，使用同一版本和对应挂载启动。Socket 运行目录不备份；证书、凭据、身份和 Caddy Applied 文件必须保留。不要将同一 Agent 身份同时恢复到多台设备。
 

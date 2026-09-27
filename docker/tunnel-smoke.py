@@ -490,7 +490,7 @@ class Harness:
             limit_to(saved_quota + 1024 * 1024 * 1024)
             self.stop_server()
             if os.name != "nt":
-                # 仅删除本测试的两个空目录，模拟 tmpfs 随容器重建后为空。
+                # 仅删除本测试的两个空目录，模拟容器重建后运行目录为空。
                 (self.root / "runtime/tunnel-sockets").rmdir()
                 (self.root / "runtime").rmdir()
             self.agent.terminate()

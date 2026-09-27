@@ -101,7 +101,7 @@ npx playwright test tests/clipboard.spec.ts tests/invitation-copy.spec.ts tests/
 
 Clipboard 用例覆盖普通非安全 HTTP、回环安全上下文及本机 HTTPS（固定测试证书，不安装系统信任），从安全读回页面核对完整邀请、密码恢复链接、Agent TOML、Compose、命令和密钥。权限拒绝与手动选择另在移动 WebKit 覆盖；模拟移动浏览器不等同于实机系统剪贴板。
 
-Linux 运行时验收需为 `runtime_dir` 提供独占 tmpfs，检查 Socket 权限、停用/删除/退出清理及清空运行目录后的恢复。公网 ACME、DNS-01、真实外网吞吐和手机实机应单独记录，不能以本机通过代替。
+Linux 运行时验收为 `runtime_dir` 提供独占、可写的普通目录即可，检查 Socket 权限、停用/删除/退出清理及清空运行目录后的恢复；tmpfs 不作为验收前提。公网 ACME、DNS-01、真实外网吞吐和手机实机应单独记录，不能以本机通过代替。
 
 本地镜像的默认布局可单独验证；此脚本只创建并删除自己的测试容器，持久化测试目录用于诊断，需运行用户能读取容器生成的 0600 文件：
 
@@ -111,4 +111,4 @@ docker build -f docker/Dockerfile.agent -t nexo-agent-next-local:validation .
 python3 docker/image-config-smoke.py --server-image nexo-next-local:validation --agent-image nexo-agent-next-local:validation
 ```
 
-检查默认 TOML、网页资源、8280 登录、Caddy、运行目录 tmpfs、Server 重启以及 Agent 缺少配置时的明确退出。测试仅在回环发布管理端口；正式模板仍保留 host 网络和端口清单。
+检查未额外挂载运行目录时的默认 TOML、网页资源、8280 登录、Caddy、Server 重启以及 Agent 缺少配置时的明确退出。测试仅在回环发布管理端口；正式模板仍保留 host 网络和端口清单。

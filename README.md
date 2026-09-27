@@ -85,8 +85,6 @@ services:
       TZ: Asia/Shanghai
     volumes:
       - ./data/nexo:/data/nexo
-    tmpfs:
-      - /run/nexo:mode=0700
     restart: unless-stopped
     healthcheck:
       test: ["CMD-SHELL", "curl --fail --silent http://127.0.0.1:8280/health >/dev/null"]
@@ -179,7 +177,7 @@ Agent 身份保存在 `data/nexo-agent`。接入成功后可手动清空 `agent.
 
 管理地址、可信代理 IP、公网 IP 在“账号设置 → 管理员功能 → 服务器设置”保存到 SQLite，立即生效。首次 Agent 接入先将页面生成的 `agent.toml` 保存到 `./data/nexo-agent/`，再保存 Compose 或执行 Docker 命令；Linux 对 TOML 设置 `chmod 600`。接入后可清空凭据，重启复用身份。
 
-本次不提供原地升级。备份当前新版实例时先停止对应组件，复制整个持久化目录；恢复到空目录并使用同一版本。Server 的 `/run/nexo` 使用 tmpfs，不备份 Socket。详见 [配置、备份与恢复](docker/README.md)。
+本次不提供原地升级。备份当前新版实例时先停止对应组件，复制整个持久化目录；恢复到空目录并使用同一版本。Server 自动管理容器内部的 `/run/nexo`，无需额外挂载，也不备份其中的 Socket。详见 [配置、备份与恢复](docker/README.md)。
 
 | 需要帮助 | 文档 |
 | --- | --- |

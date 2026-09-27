@@ -22,8 +22,6 @@ services:
       TZ: Asia/Shanghai
     volumes:
       - ./data/nexo:/data/nexo
-    tmpfs:
-      - /run/nexo:mode=0700
     restart: unless-stopped
     healthcheck:
       test: ["CMD-SHELL", "curl --fail --silent http://127.0.0.1:8280/health >/dev/null"]

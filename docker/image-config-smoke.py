@@ -29,7 +29,7 @@ def main():
     print("测试目录:", root, flush=True)
     try:
         (root / "server").mkdir()
-        docker("run", "-d", "--name", server, "--tmpfs", "/run/nexo:mode=0700", "-p", "127.0.0.1::8280",
+        docker("run", "-d", "--name", server, "-p", "127.0.0.1::8280",
                "-v", f"{root / 'server'}:/data/nexo", args.server_image)
 
         def check_web():
@@ -58,7 +58,6 @@ def main():
         original = config.read_bytes()
         caddy = json.loads(docker("exec", server, "curl", "-fsS", "http://127.0.0.1:8290/config/"))
         assert caddy["storage"]["root"].startswith("/data/nexo/")
-        assert "tmpfs /run/nexo tmpfs" in docker("exec", server, "cat", "/proc/mounts")
         # 仅在内存中提取随机密码，不输出日志或凭据。
         password = re.search(r"自动生成的密码：([^\r\n]+)", docker("logs", server)).group(1)
 
@@ -71,7 +70,7 @@ def main():
         docker("restart", server)
         login(check_web())
         assert config.read_bytes() == original
-        print("PASS Server 默认配置 0600、8280 静态/PWA/登录、Caddy、tmpfs、同一账号重启", flush=True)
+        print("PASS Server 无额外运行目录挂载、默认配置 0600、8280 静态/PWA/登录、Caddy、同一账号重启", flush=True)
 
         (root / "agent").mkdir()
         docker("create", "--name", agent, "-v", f"{root / 'agent'}:/data/nexo-agent", args.agent_image)
