@@ -199,6 +199,6 @@ test("账号菜单键盘关闭与退出清理标签", async ({ page }, info) => 
   await page.locator(".account-popover").getByRole("link", { name: "账号设置" }).click();
   await expect(page.getByRole("tab", { name: "账号设置" })).toHaveAttribute("aria-selected", "true");
   await current(page).getByRole("button", { name: "退出登录", exact: true }).click();
-  await expect(page.getByRole("heading", { name: "欢迎回来" })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "登录", exact: true })).toBeVisible();
   expect(await page.evaluate(() => Object.keys(sessionStorage).filter(key => key.startsWith("nexo:tabs:")))).toEqual([]);
 });

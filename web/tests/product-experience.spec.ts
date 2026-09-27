@@ -207,7 +207,7 @@ test("用户搜索与状态筛选组合，启用操作使用普通确认", async
   await expect(page.getByText("没有匹配的用户", { exact: true })).toBeVisible();
   await page.getByRole("button", { name: "清除筛选" }).click();
   await expect(page.locator(".user-card")).toHaveCount(1);
-  await page.getByRole("button", { name: "账号设置", exact: true }).click();
+  await page.getByRole("button", { name: "更多", exact: true }).click();
   await page.getByRole("button", { name: "启用用户", exact: true }).click();
   await expect(page.getByRole("dialog").getByRole("button", { name: "启用用户", exact: true })).toHaveClass("primary-button");
   await page.getByRole("dialog").getByRole("button", { name: "取消" }).click();

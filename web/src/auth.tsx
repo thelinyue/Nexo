@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useRef, useState } from "react";
 import type { FormEvent } from "react";
 import { Brand, PasswordInput, Confirm, Modal, Notice, errorText, request } from "./ui";
 import type { Auth } from "./ui";
@@ -9,11 +9,12 @@ function AuthForm({ initial, message, onAuth, reauth = false, recoveryCode }: { 
   const [username, setUsername] = useState(initial.username ?? "");
   const [password, setPassword] = useState(""); const [confirm, setConfirm] = useState(""); const [code, setCode] = useState(recoveryCode ?? "");
   const [busy, setBusy] = useState(false); const [error, setError] = useState<string | null>(null); const [notice, setNotice] = useState<string | null>(null);
+  const submitting = useRef(false);
   function switchMode(next: typeof mode) { setMode(next); setError(null); setNotice(null); setPassword(""); setConfirm(""); setCode(""); }
   async function submit(event: FormEvent) {
-    event.preventDefault(); setError(null);
+    event.preventDefault(); if (submitting.current) return; setError(null);
     if (mode === "recover" && password !== confirm) { setError("两次输入的密码不一致"); return; }
-    setBusy(true);
+    submitting.current = true; setBusy(true);
     try {
       if (mode === "recover") {
         const result = await request<{ username: string }>("/api/v1/auth/recover", { method: "POST", body: JSON.stringify({ recovery_code: code.trim(), new_password: password }) });
@@ -22,10 +23,10 @@ function AuthForm({ initial, message, onAuth, reauth = false, recoveryCode }: { 
         await request("/api/v1/auth/login", { method: "POST", body: JSON.stringify({ username, password }) });
         onAuth(await request<Auth>("/api/v1/auth/status"));
       }
-    } catch (e) { setError(errorText(e)); } finally { setBusy(false); }
+    } catch (e) { setError(errorText(e)); } finally { submitting.current = false; setBusy(false); }
   }
   return <>
-    {!reauth && <><Brand /><h1>{mode === "recover" ? "找回账号" : "欢迎回来"}</h1></>}
+    {!reauth && <><Brand /><h1>{mode === "recover" ? "找回账号" : "登录"}</h1></>}
     {(mode !== "login" || reauth) && <p className="auth-copy">{mode === "recover" ? recoveryCode ? "设置新密码，恢复账号访问。" : "请联系管理员获取恢复链接。" : "重新登录后继续操作，当前填写的内容会保留。"}</p>}
     {(notice || message) && <p className="action-status" role="status">{notice || message}</p>}
     {mode === "recover" && <details className="recovery-help"><summary>管理员如何恢复账号</summary><p>在 Server 所在主机运行：</p><code>docker compose exec nexo-server nexo --data-dir /data/nexo admin recover</code><p>直接运行二进制时使用 <code>nexo-server admin recover</code>，并用 --data-dir 指定原数据目录。恢复码有效期 15 分钟，重新生成后旧码失效。</p></details>}
@@ -44,7 +45,7 @@ function AuthForm({ initial, message, onAuth, reauth = false, recoveryCode }: { 
 }
 
 export function AuthScreen(props: { initial: Auth; message?: string | null; recoveryCode?: string; onAuth: (auth: Auth) => void }) {
-  return <main className="auth-shell"><div className="auth-stage"><div className="auth-visual"><img src="/illustrations/empty-public.webp" alt="" /><p>把你的服务，带到身边。</p></div><section className="auth-panel"><AuthForm {...props} /></section></div></main>;
+  return <main className="auth-shell"><section className="auth-panel"><AuthForm {...props} /></section></main>;
 }
 export function Reauthenticate({ auth, onAuth, onAbandon }: { auth: Auth; onAuth: (auth: Auth) => void; onAbandon: () => void }) {
   const [abandon, setAbandon] = useState(false);

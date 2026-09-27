@@ -5,7 +5,7 @@ test("管理员配置额度，停流确认、失败重试与取消限制", async
   const state = await installApiMocks(page);
   await page.goto("/#/users");
   const user = page.locator(".user-card").filter({ has: page.getByRole("heading", { name: "alice", exact: true }) });
-  await user.getByRole("button", { name: "账号设置" }).click();
+  await user.getByRole("button", { name: "更多" }).click();
   await user.getByRole("button", { name: "流量限制", exact: true }).click();
   const dialog = page.getByRole("dialog", { name: "流量限制 · alice", exact: true });
   await expect(dialog).toContainText("80 GiB");
@@ -14,6 +14,7 @@ test("管理员配置额度，停流确认、失败重试与取消限制", async
   await dialog.getByRole("button", { name: "保存", exact: true }).click();
   await expect(dialog).toHaveCount(0);
   expect(state.quotas.get("alice")?.monthly_limit_bytes).toBe(100 * 1024 ** 3);
+  await user.getByRole("button", { name: "更多" }).click();
   await user.getByRole("button", { name: "流量限制", exact: true }).click();
   await dialog.getByLabel("月额度（GiB）").fill("50");
   await expect(dialog).toContainText("保存后将停止该用户全部隧道转发");
@@ -31,6 +32,7 @@ test("管理员配置额度，停流确认、失败重试与取消限制", async
   expect(request.headers()["x-nexo-csrf"]).toBeTruthy();
   expect(new URL(request.url()).searchParams.get("user_id")).toBe("alice");
   await expect(dialog).toHaveCount(0);
+  await user.getByRole("button", { name: "更多" }).click();
   await user.getByRole("button", { name: "流量限制", exact: true }).click();
   await dialog.getByLabel("限制方式").selectOption("unlimited");
   await dialog.getByRole("button", { name: "保存", exact: true }).click();

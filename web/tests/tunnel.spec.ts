@@ -306,7 +306,7 @@ test("密码错误保留输入，成功后返回登录；会话列表失败可�
   await expect(dialog.getByLabel("新密码")).toHaveValue("a-new-password-123");
   state.failures.clear();
   await dialog.getByRole("button", { name: "更新密码" }).click();
-  await expect(page.getByRole("heading", { name: "欢迎回来" })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "登录", exact: true })).toBeVisible();
 });
 
 test("会话读取失败不显示空列表，吊销当前会话返回登录", async ({ page }) => {
@@ -319,7 +319,7 @@ test("会话读取失败不显示空列表，吊销当前会话返回登录", as
   await page.getByRole("button", { name: "重试", exact: true }).click();
   await page.locator(".session-row").filter({ hasText: "当前会话" }).getByRole("button", { name: "结束会话" }).click();
   await page.getByRole("dialog").getByRole("button", { name: "结束会话" }).click();
-  await expect(page.getByRole("heading", { name: "欢迎回来" })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "登录", exact: true })).toBeVisible();
 });
 
 test("首次读取失败、重试、无结果与空列表互相区分", async ({ page }) => {
@@ -347,7 +347,7 @@ test("登录使用可自动填充的单栏表单且不再提供网页初始化",
   await expect(page.getByRole("button", { name: "首次安装 Nexo" })).toHaveCount(0);
   await page.getByLabel("用户名", { exact: true }).fill("admin");
   await page.getByLabel("密码", { exact: true }).fill("a-secure-password");
-  if ((page.viewportSize()?.width ?? 0) <= 900) await expect(page.locator(".auth-visual")).toBeHidden();
+  await expect(page.locator(".auth-panel")).toBeVisible();
   await page.getByRole("button", { name: "登录", exact: true }).click();
   expect(state.calls.some(call => call.path === "/api/v1/auth/initialize")).toBeFalsy();
   expect(state.calls.some(call => call.path === "/api/v1/auth/login")).toBeTruthy();

@@ -124,10 +124,12 @@ test("管理员邀请和停用有明确反馈，失败不伪报成功", async ({
   await page.goto("/#/users");await page.getByRole("button",{name:"邀请用户"}).click();
   const link=page.getByRole("dialog",{name:"邀请链接"});await expect(link.locator("code")).toContainText("#/invite?token=secret-invitation");
   await link.getByRole("button",{name:"关闭",exact:true}).click();
-  await page.getByRole("button",{name:"账号设置",exact:true}).click();
+  await page.getByRole("button",{name:"更多",exact:true}).click();
   await page.getByRole("button",{name:"停用用户",exact:true}).click();const confirm=page.getByRole("dialog",{name:"停用 alice？"});
   await expect(confirm).toContainText("断开全部转发");await confirm.getByRole("button",{name:"停用用户",exact:true}).click();
   await expect(confirm.getByRole("alert")).toContainText("暂时无法停用");fail=false;await confirm.getByRole("button",{name:"停用用户",exact:true}).click();
+  await expect(confirm).toBeHidden();
+  await page.getByRole("button", { name: "更多", exact: true }).click();
   await expect(page.getByRole("button",{name:"启用用户",exact:true})).toBeVisible();
   expect(await page.evaluate(() => document.documentElement.scrollWidth<=innerWidth)).toBeTruthy();
   await page.screenshot({path:info.outputPath("users.png"),fullPage:true});
@@ -190,12 +192,14 @@ test("唯一管理员可改名及管理自身安全，改名失败保留输入�
   await expect(page.getByText("管理员 · 本人", { exact: true })).toBeVisible();
   await expect(page.getByRole("button", { name: "删除用户", exact: true })).toHaveCount(0);
   await expect(page.getByRole("button", { name: "停用用户", exact: true })).toHaveCount(0);
-  await page.getByRole("button", { name: "账号设置", exact: true }).click();
+  await page.getByRole("button", { name: "更多", exact: true }).click();
   await expect(page.getByRole("button", { name: "删除用户", exact: true })).toHaveCount(0);
   await expect(page.getByRole("button", { name: "停用用户", exact: true })).toHaveCount(0);
   await page.locator(".user-card").getByRole("button", { name: "修改密码", exact: true }).click();
   await expect(page.getByRole("dialog", { name: "修改密码" }).getByLabel("当前密码", { exact: true })).toBeVisible();
   await page.getByRole("dialog").getByRole("button", { name: "取消", exact: true }).click();
+  await expect(page.getByRole("button", { name: "更多", exact: true })).toBeFocused();
+  await page.getByRole("button", { name: "更多", exact: true }).click();
   await expect(page.locator(".user-card").getByRole("link", { name: "登录会话" })).toHaveAttribute("href", "#/settings/sessions");
   await page.getByRole("button", { name: "修改用户名", exact: true }).click();
   const dialog = page.getByRole("dialog", { name: "修改用户名" });
@@ -228,7 +232,7 @@ test("普通用户改名和整空间删除提供确认、失败重试与清理�
     return route.fulfill({ json: [] });
   });
   await page.goto("/#/users");
-  await page.getByRole("button", { name: "账号设置", exact: true }).click();
+  await page.getByRole("button", { name: "更多", exact: true }).click();
   await page.getByRole("button", { name: "修改用户名", exact: true }).click();
   const edit = page.getByRole("dialog", { name: "修改用户名" });
   await edit.getByLabel("新用户名").fill("alice-new");
@@ -237,6 +241,7 @@ test("普通用户改名和整空间删除提供确认、失败重试与清理�
   await expect(edit.getByLabel("新用户名")).toHaveValue("alice-new");
   fail = false; await edit.getByRole("button", { name: "保存用户名" }).click();
   await expect(page.getByRole("heading", { name: "alice-new", exact: true })).toBeVisible();
+  await page.getByRole("button", { name: "更多", exact: true }).click();
   await page.getByRole("button", { name: "删除用户", exact: true }).click();
   const deletion = page.getByRole("dialog", { name: "删除用户", exact: true });
   await expect(deletion.locator(".user-resources dd")).toHaveText(["2", "3", "1"]);
@@ -270,7 +275,7 @@ test("删除正在代管的用户后回到本人空间", async ({ page }) => {
   await page.evaluate(() => { location.hash = "#/services"; });
   await expect(page.locator(".workspace-banner")).toBeVisible();
   await page.evaluate(() => { location.hash = "#/users"; });
-  await page.getByRole("button", { name: "账号设置", exact: true }).click();
+  await page.getByRole("button", { name: "更多", exact: true }).click();
   await page.getByRole("button", { name: "删除用户", exact: true }).click();
   await page.getByLabel("输入用户名确认").fill("alice");
   await page.getByRole("button", { name: "永久删除" }).click();
@@ -308,7 +313,7 @@ test("重新认证可输入新用户名，切换账号清除代管和旧草稿",
   await expect(page.getByLabel("服务名称")).toHaveValue("");
 });
 
-test("用户卡片精简字段，长用户名可展开查看且小屏不横向溢出", async ({ page }, info) => {
+test("用户始终单行，更多菜单显示完整名称且小屏不横向溢出", async ({ page }, info) => {
   await installApiMocks(page);
   const longName = "member_" + "a".repeat(57);
   const users = [
@@ -321,15 +326,16 @@ test("用户卡片精简字段，长用户名可展开查看且小屏不横向�
   const cards = page.locator(".user-card");
   await expect(cards).toHaveCount(3);
   await expect(cards.getByRole("button")).toHaveCount(6);
-  await expect(page.locator(".user-profile")).toHaveCount(0);
+  await expect(page.locator(".user-menu:popover-open")).toHaveCount(0);
   await expect(cards.nth(1).getByRole("heading")).toHaveAttribute("title", longName);
   await expect(cards.first().locator(".user-resource-summary")).toHaveText("Agent 2 · 服务 12 · 域名 3");
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBeTruthy();
   await page.screenshot({ path: info.outputPath("users-overview.png"), fullPage: true });
-  await cards.nth(1).getByRole("button", { name: "账号设置" }).click();
+  await cards.nth(1).getByRole("button", { name: "更多" }).click();
   await expect(cards.nth(1).getByRole("heading")).toHaveText(longName);
-  await expect(cards.nth(1).getByRole("heading")).toHaveCSS("white-space", "normal");
-  await expect(cards.nth(1).getByRole("button", { name: "账号设置" })).toHaveAttribute("aria-expanded", "true");
+  await expect(cards.nth(1).getByRole("heading")).toHaveCSS("white-space", "nowrap");
+  await expect(cards.nth(1).locator(".user-menu-summary>strong")).toHaveText(longName);
+  await expect(cards.nth(1).getByRole("button", { name: "更多" })).toHaveAttribute("aria-expanded", "true");
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBeTruthy();
   await page.screenshot({ path: info.outputPath("user-account-fields.png"), fullPage: true });
 });

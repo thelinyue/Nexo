@@ -68,7 +68,7 @@ test("登录与恢复在各尺寸可用", async ({ page }, testInfo) => {
   for (const [name, width, height] of cases) {
     await page.setViewportSize({ width, height });
     await page.goto("/");
-    await expect(page.getByRole("heading", { name: "欢迎回来" })).toBeVisible();
+    await expect(page.getByRole("heading", { name: "登录", exact: true })).toBeVisible();
     expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBeTruthy();
     await page.screenshot({ path: testInfo.outputPath(`${name}-login.png`), fullPage: true });
     await page.getByRole("button", { name: "忘记密码" }).click();

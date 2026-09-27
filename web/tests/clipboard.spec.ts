@@ -72,7 +72,7 @@ for (const transport of ["loopback", "http", "https"]) test(`${transport} 真实
   expect(await readClipboard()).toBe(await invitation.locator("code.token").textContent());
   expect(linksCreated).toBe(1);
   await invitation.getByRole("button", { name: "关闭", exact: true }).click();
-  await page.locator('[aria-controls="user-settings-alice"]').click();
+  await page.locator(".user-card").filter({ has: page.getByRole("heading", { name: "alice", exact: true }) }).getByRole("button", { name: "更多", exact: true }).click();
   await page.getByRole("button", { name: "重设密码", exact: true }).click();
   const recovery = page.getByRole("dialog", { name: "重设 alice 的密码", exact: true });
   await recovery.getByRole("button", { name: "复制链接" }).click();
