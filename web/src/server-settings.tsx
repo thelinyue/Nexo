@@ -25,30 +25,30 @@ export function ServerSettings({ csrf, onClose }: { csrf?: string | null; onClos
   function update(key: keyof Fields, text: string) {
     setValue(previous => previous && ({ ...previous, [key]: text })); setError(null); setMessage(null);
   }
-  return <Modal title="服务器设置" full dirty={dirty} busy={busy} onClose={onClose}>
+  return <Modal title="服务器设置" full dirty={dirty} busy={busy} onClose={onClose}>{close =>
     <form className="modal-form" onSubmit={async event => {
       event.preventDefault(); if (!value || busy) return;
       setBusy(true); setError(null); setMessage(null);
       try {
         const result = await request<Settings>("/api/v1/admin/server-settings", { method: "PUT", body: JSON.stringify({ public_url: value.public_url.trim(), trusted_proxies: addresses(value.trusted_proxies), public_ips: addresses(value.public_ips) }) }, csrf);
-        setSaved(fields(result)); setValue(fields(result)); setMessage("已保存并立即生效，重启后保留。公网 IP 更新后，可在域名页面重新检查解析。");
+        setSaved(fields(result)); setValue(fields(result)); setMessage("已保存并生效。公网 IP 变更后，请重新检查域名解析。");
       } catch (e) { setError(errorText(e)); } finally { setBusy(false); }
     }}>
       <div className="modal-body">
         {loading && <Loading />}
         {value && <fieldset disabled={busy}>
           <label htmlFor="server-public-url">管理地址<input id="server-public-url" type="url" value={value.public_url} onChange={e => update("public_url", e.target.value)} placeholder="https://nexo.example.com" autoCapitalize="none" spellCheck={false} aria-describedby="server-public-url-help" /></label>
-          <p className="helper" id="server-public-url-help">可选，固定管理入口的来源；填写 HTTPS 地址后，API 只接受经可信代理转发的 HTTPS 请求。留空按当前访问地址校验。不自动创建反向代理或申请证书。</p>
+          <p className="helper" id="server-public-url-help">留空按当前地址校验。填写 HTTPS 地址后，仅接受可信代理转发的 HTTPS 请求；需自行配置反向代理和证书。</p>
           <label htmlFor="server-trusted-proxies">可信代理 IP<input id="server-trusted-proxies" value={value.trusted_proxies} onChange={e => update("trusted_proxies", e.target.value)} placeholder="127.0.0.1, ::1" autoCapitalize="none" spellCheck={false} aria-describedby="server-trusted-proxies-help" /></label>
-          <p className="helper" id="server-trusted-proxies-help">填写直接连接 Server 的反向代理 IP，多个用逗号分隔，不支持 CIDR。留空不信任代理协议头；只填写由你控制的代理。</p>
+          <p className="helper" id="server-trusted-proxies-help">仅填写你控制且直接连接 Server 的代理 IP，逗号分隔，不支持 CIDR。留空不信任代理协议头。</p>
           <label htmlFor="server-public-ips">公网 IP<input id="server-public-ips" value={value.public_ips} onChange={e => update("public_ips", e.target.value)} placeholder="203.0.113.10, 2001:db8::10" autoCapitalize="none" spellCheck={false} aria-describedby="server-public-ips-help" /></label>
-          <p className="helper" id="server-public-ips-help">可选，用于核对域名 A/AAAA 解析结果，多个用逗号分隔。留空仅显示解析结果，不判断是否指向 Server；不会修改 DNS 或监听地址。</p>
+          <p className="helper" id="server-public-ips-help">用于核对 A/AAAA 解析，逗号分隔。留空不核对指向；不会修改 DNS 或监听地址。</p>
           <details className="recovery-help"><summary>首次配置 HTTPS 或更换管理地址</summary><p>先配置 HTTPS 反向代理，保留原始 Host，并覆盖 X-Forwarded-Proto 为 https。在当前 HTTP 入口先保存可信代理 IP，管理地址留空；随后从 HTTPS 地址重新登录，再填写该管理地址并保存。</p><p>更换已有管理地址时，先从原入口清空管理地址并保存，再从新入口登录设置。保存时会检查当前连接，避免填写错误后无法继续管理。</p></details>
         </fieldset>}
         <Notice error={error} onRetry={!value && !loading ? () => setRetry(previous => previous + 1) : undefined} />
         {message && <p role="status" className="action-status">{message}</p>}
       </div>
-      <footer className="modal-actions"><button className="primary-button" disabled={loading || busy || !value || !dirty}>{busy ? "保存中…" : "保存设置"}</button></footer>
-    </form>
+      <footer className="modal-actions"><button type="button" className="secondary-button desktop-modal-cancel" onClick={close} disabled={busy}>取消</button><button className="primary-button" disabled={loading || busy || !value || !dirty}>{busy ? "保存中…" : "保存设置"}</button></footer>
+    </form>}
   </Modal>;
 }

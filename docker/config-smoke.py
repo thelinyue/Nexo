@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""独立目录验证 TOML、网页资源、环境变量失效与完整目录恢复，不访问公网。"""
+"""独立目录验证 TOML、网页资源、管理员环境变量与完整目录恢复，不访问公网。"""
 import argparse
 import json
 import os
@@ -52,7 +52,7 @@ def main():
     def run(directory):
         log = open(root / f"{directory.name}.log", "wb")
         process = subprocess.Popen([server, "--data-dir", str(directory), "--config", str(config)], stdout=log, stderr=subprocess.STDOUT,
-            env={**os.environ, "NEXO_HTTP_ADDR": "invalid-ignored", "NEXO_ADMIN_PASSWORD": "wrong", "NEXO_DATA_DIR": str(root / "unused")},
+            env={**os.environ, "NEXO_HTTP_ADDR": "invalid-ignored", "NEXO_ADMIN_USERNAME": "env-owner", "NEXO_ADMIN_PASSWORD": "env-secret-4821", "NEXO_DATA_DIR": str(root / "unused")},
             creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0)
         try:
             end = time.monotonic() + 20
@@ -71,7 +71,7 @@ def main():
             for path in paths:
                 with opener.open(f"http://127.0.0.1:{port}/{path.lstrip('/')}") as response:
                     assert response.status == 200 and response.read()
-            request = urllib.request.Request(f"http://127.0.0.1:{port}/api/v1/auth/login", data=json.dumps({"username": "admin", "password": "123456"}).encode(), headers={"Content-Type": "application/json"})
+            request = urllib.request.Request(f"http://127.0.0.1:{port}/api/v1/auth/login", data=json.dumps({"username": "env-owner", "password": "env-secret-4821"}).encode(), headers={"Content-Type": "application/json"})
             with opener.open(request) as response:
                 assert response.status == 200
             assert not (root / "unused").exists()
@@ -88,7 +88,7 @@ def main():
     identity = (root / "server/transport/identity.json").read_bytes()
     run(root / "restored")
     assert (root / "restored/transport/identity.json").read_bytes() == identity
-    print(f"PASS {port} 网页、JS/CSS、PWA、登录；旧环境变量无效；相对路径及清除初始密码后的完整备份恢复", flush=True)
+    print(f"PASS {port} 网页、JS/CSS、PWA、登录；管理员环境变量优先，其他旧环境变量无效；相对路径及完整备份恢复", flush=True)
     for text in ['unknown = true', 'http_addr = "invalid"', 'admin.password = ["do-not-log-secret"]']:
         config.write_text(text, encoding="utf-8")
         result = subprocess.run([server, "--config", str(config), "--data-dir", str(root / "invalid")], capture_output=True)

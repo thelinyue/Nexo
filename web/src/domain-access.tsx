@@ -23,7 +23,7 @@ export function DomainAccess({ domain, active, csrf }: { domain: Domain; active:
   return <><button className={`text-button domain-access-button${status.attention ? " danger-text" : ""}`} aria-label={`域名解析 ${domain.domain}：${status.label}`} aria-haspopup="dialog" onClick={() => setOpen(true)}>{status.label}</button>
     {open && active && <Modal title="域名解析" onClose={() => setOpen(false)} busy={busy}><div className="modal-form dns-check-form"><div className="modal-body domain-access">
       <strong>{domain.domain}</strong>
-      {(resource.error || error) && result && <p className="helper">本次检查未完成，以下保留上次读取的结果。</p>}
+      {(resource.error || error) && result && <p className="helper">检查未完成，显示上次结果。</p>}
       <Notice error={resource.error} onRetry={() => void resource.reload()} />{resource.busy && !resource.data && <Loading />}
       {result?.records.map(record => <section className="domain-certificate" key={record.hostname} aria-label={`DNS ${record.hostname}`}>
         <strong>{record.hostname}</strong><p>{record.status === "resolved" ? "DNS 已解析" : record.status === "unresolved" ? "DNS 未解析" : "DNS 待检查"}</p>
@@ -33,10 +33,10 @@ export function DomainAccess({ domain, active, csrf }: { domain: Domain; active:
         {record.error && <p className="form-error">{record.error}</p>}
       </section>)}
       {result?.checked_at && <p className="helper">最近检查：{dateText(result.checked_at)}</p>}
-      {result?.next_retry_at ? <p className="helper">下次自动重试：{dateText(result.next_retry_at)}。剩余 {result.retries_remaining} 次。</p> : result?.checked_at && result.retries_remaining === 0 && result.records.some(record => record.status === "unresolved") ? <p className="helper">自动重试已结束。请核对 DNS 配置，修改后可点“重新检查”。</p> : null}
+      {result?.next_retry_at ? <p className="helper">下次自动重试：{dateText(result.next_retry_at)}。剩余 {result.retries_remaining} 次。</p> : result?.checked_at && result.retries_remaining === 0 && result.records.some(record => record.status === "unresolved") ? <p className="helper">重试已结束，请修正 DNS 后重新检查。</p> : null}
       <details className="recovery-help"><summary>检查说明</summary>
         <p>新增域名或服务域名变化时自动检查，解析成功后停止自动查询。未解析时每 5 分钟重试，最多 3 次。</p>
-        <p>检查使用 Server 的 DNS 解析器。DNS 服务商侧的修改不会自动触发检查，修改后可点“重新检查”。检查结果不影响服务转发。</p>
+        <p>使用 Server 的 DNS 解析器，结果不影响转发。修改 DNS 后需手动重新检查。</p>
       </details>
       <section className="dns-expected"><h3>期望的访问记录</h3>{result?.expected_addresses.length ? result.expected_addresses.map(address => <div className="service-detail-address" key={address}><span>{address.includes(":") ? "AAAA" : "A"}</span><code>{address}</code><CopyButton value={address} label={`复制 ${address}`} iconOnly /></div>) : <p className="helper">Server 尚未提供公网 IP，请向管理员核对。</p>}</section>
       <details className="recovery-help"><summary>如何配置解析</summary>

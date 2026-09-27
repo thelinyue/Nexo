@@ -63,13 +63,14 @@ test("协议、状态和 Agent 筛选组合可清空，空状态按资源给出�
   await expect(page.locator(".service-row")).toHaveCount(2);
   state.tunnels = []; state.devices = []; state.domains = [];
   await page.clock.fastForward(5000);
-  await expect(page.getByRole("button", { name: "创建第一个服务", exact: true })).toBeVisible();
+  await expect(page.getByRole("button", { name: "创建服务", exact: true })).toBeVisible();
   await expect(page.getByLabel("搜索服务")).toBeHidden();
-  await expect(page.getByRole("button", { name: "创建服务", exact: true })).toBeHidden();
+  await expect(page.locator(".page-header").getByRole("button", { name: "创建服务", exact: true })).toBeHidden();
+  await expect(page.getByRole("button", { name: "创建服务", exact: true })).toHaveCount(1);
   await expect(page.locator(".batch-actions")).toBeHidden();
 });
 
-test("共享配置保持展开，弹窗显示多台独立设备", async ({ page }, info) => {
+test("部署命令可直接复制，弹窗显示多台独立设备", async ({ page }, info) => {
   const state = await installApiMocks(page); state.devices = []; state.enrollments = [];
   await page.goto("/#/agents");
   await page.getByRole("button", { name: "添加 Agent", exact: true }).click();
@@ -79,7 +80,7 @@ test("共享配置保持展开，弹窗显示多台独立设备", async ({ page 
   state.devices.push({ id: "nas-one-uuid", name: "家庭 NAS", status: "online", tunnel_count: 0, enrolled_at: 1790000001 }, { id: "nas-two-uuid", name: "家庭 NAS", status: "offline", tunnel_count: 0, enrolled_at: 1790000002 });
   await page.evaluate(() => window.dispatchEvent(new Event("focus")));
   await expect(progress.locator("li")).toHaveCount(2);
-  await expect(dialog.getByLabel("Compose 配置文件", { exact: true })).toBeVisible();
+  await expect(dialog.getByRole("button", { name: "复制 Compose 部署命令", exact: true })).toBeVisible();
   await expect(dialog.getByRole("button", { name: "批准入网" })).toHaveCount(0);
   expect(state.calls.some(call => call.path.endsWith("/approve"))).toBeFalsy();
   await page.screenshot({ path: info.outputPath("shared-agent-devices.png") });
@@ -112,9 +113,10 @@ test("空服务页只有一个创建入口，删除最后一项后退出批量�
   await page.getByRole("dialog").getByRole("button", { name: "删除服务", exact: true }).click();
   await expect(page.locator(".batch-actions")).toBeHidden();
   await expect(page.getByLabel("搜索服务")).toBeHidden();
-  await expect(page.getByRole("button", { name: "创建服务", exact: true })).toBeHidden();
+  await expect(page.locator(".page-header").getByRole("button", { name: "创建服务", exact: true })).toBeHidden();
+  await expect(page.getByRole("button", { name: "创建服务", exact: true })).toHaveCount(1);
   await page.screenshot({ path: info.outputPath("services-empty.png") });
-  await page.getByRole("button", { name: "创建第一个服务", exact: true }).click();
+  await page.getByRole("button", { name: "创建服务", exact: true }).click();
   await expect(page.getByRole("dialog", { name: "创建服务", exact: true })).toBeVisible();
 });
 
@@ -167,7 +169,7 @@ test("普通用户首次接入的空状态只有一个添加入口，手机可�
   await page.screenshot({ path: info.outputPath("empty-agents.png") });
   await addAgent.click();
   await expect(page.getByRole("dialog", { name: "添加 Agent", exact: true })).toBeVisible();
-  await page.getByRole("dialog").getByRole("button", { name: "取消", exact: true }).click();
+  await page.getByRole("dialog").getByRole("button", { name: /^(取消|关闭)$/ }).click();
   await page.goto("/#/domains");
   const addDomain = page.getByRole("button", { name: "添加 域名", exact: true });
   await expect(addDomain).toHaveCount(1);

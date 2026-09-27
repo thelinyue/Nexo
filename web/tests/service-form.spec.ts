@@ -292,10 +292,10 @@ test("无 Agent 或域名时指引先取消表单，选择框和保存禁用", a
   await openServiceEditor(page);
   const dialog = page.getByRole("dialog", { name: "创建服务" });
   await expect(dialog.getByRole("combobox", { name: "Agent", exact: true })).toBeDisabled();
-  await expect(dialog.getByText("请先取消表单，再到设备页添加。", { exact: true })).toBeVisible();
+  await expect(dialog.getByText("请关闭表单，到设备页添加 Agent。", { exact: true })).toBeVisible();
   await dialog.getByRole("radio", { name: "网页服务", exact: true }).check();
   await expect(dialog.getByRole("combobox", { name: "根域名", exact: true })).toBeDisabled();
-  await expect(dialog.getByText("请先取消表单，再到域名页添加。", { exact: true })).toBeVisible();
+  await expect(dialog.getByText("网页服务需要域名，请关闭表单后到域名页添加。", { exact: true })).toBeVisible();
   await expect(dialog.getByRole("button", { name: "保存服务" })).toBeDisabled();
 });
 

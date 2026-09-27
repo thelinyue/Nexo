@@ -26,7 +26,7 @@ test("服务器设置保存失败保留输入，重试成功后重新打开读�
   await expect(dialog.getByRole("status")).toHaveCount(0);
   fail = false;
   await dialog.getByRole("button", { name: "保存设置" }).click();
-  await expect(dialog.getByRole("status")).toContainText("已保存并立即生效");
+  await expect(dialog.getByRole("status")).toContainText("已保存并生效");
   expect(saved.trusted_proxies).toEqual(["127.0.0.1", "::1"]);
   await dialog.getByRole("button", { name: "取消", exact: true }).click();
   await page.getByRole("button", { name: "服务器设置", exact: true }).click();

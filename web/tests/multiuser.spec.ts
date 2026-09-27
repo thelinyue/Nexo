@@ -91,10 +91,10 @@ test("域名自助配置保留失败输入，兼容长 Token 并按域名保存 
   await expect(dialog.getByText("proof-for-this-workspace",{exact:true})).toBeVisible();
   await dialog.getByLabel("证书验证方式").selectOption("cloudflare_dns");
   const token="cfat_"+"a".repeat(220);await dialog.getByLabel("Cloudflare API Token").fill(token);
-  await dialog.getByRole("button",{name:"验证并启用 Cloudflare DNS"}).click();
+  await dialog.getByRole("button",{name:"验证并启用"}).click();
   await expect(dialog.getByRole("alert")).toContainText("检查 Token 权限");
   await expect(dialog.getByLabel("Cloudflare API Token")).toHaveValue(token);
-  fail=false;await dialog.getByRole("button",{name:"验证并启用 Cloudflare DNS"}).click();
+  fail=false;await dialog.getByRole("button",{name:"验证并启用"}).click();
   await expect(dialog.getByLabel("Cloudflare API Token")).toHaveCount(0);
   await dialog.getByRole("button", { name: "更新 Token", exact: true }).click();
   await expect(dialog.getByLabel("Cloudflare API Token")).toHaveValue("");
@@ -102,7 +102,7 @@ test("域名自助配置保留失败输入，兼容长 Token 并按域名保存 
   await expect(dialog.getByLabel("DNS 解析器")).toHaveValue("223.5.5.5:53, 223.6.6.6:53");
   await dialog.getByLabel("DNS 解析器").fill("1.1.1.1:53, [2606:4700:4700::1111]:53");
   await dialog.getByLabel("传播等待（秒）").fill("10");await dialog.getByLabel("传播超时（秒）").fill("90");
-  await dialog.getByRole("button",{name:"保存 DNS 高级设置"}).click();
+  await dialog.getByRole("button",{name:"保存 DNS 设置"}).click();
   await expect(dialog.getByRole("status").filter({ hasText: "DNS 高级设置已保存" })).toBeVisible();
   expect(writes.at(-1)).toEqual({certificate_mode:"cloudflare_dns",dns_resolvers:["1.1.1.1:53","[2606:4700:4700::1111]:53"],dns_propagation_delay_seconds:10,dns_propagation_timeout_seconds:90});
   expect(writes.at(-1)).not.toHaveProperty("token");
@@ -298,7 +298,7 @@ test("重新认证可输入新用户名，切换账号清除代管和旧草稿",
   await page.goto("/#/users"); await page.getByRole("button", { name: "管理 alice 的空间" }).click();
   await expect(page).toHaveURL(/#\/home$/);
   await page.evaluate(() => { location.hash = "#/services"; });
-  await page.getByRole("button", { name: "创建第一个服务", exact: true }).click();
+  await page.getByRole("button", { name: "创建服务", exact: true }).click();
   const editor = page.getByRole("dialog", { name: "创建服务" });
   await editor.getByLabel("服务名称").fill("旧账号未保存草稿"); await editor.getByLabel("内网端口").fill("8080");
   await editor.getByLabel("主机名").fill("reauth");

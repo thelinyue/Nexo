@@ -83,19 +83,16 @@ for (const transport of ["loopback", "http", "https"]) test(`${transport} 真实
   await page.getByRole("button", { name: "添加 Agent", exact: true }).click();
   const dialog = page.getByRole("dialog", { name: "添加 Agent", exact: true });
   await dialog.getByLabel("设备名称（可选）", { exact: true }).fill("家庭 NAS ' $HOME");
-  const compose = dialog.getByLabel("Compose 配置文件", { exact: true });
-  const toml = dialog.getByLabel("Agent TOML", { exact: true });
-  await expect(toml).toContainText(state.accessKey);
-  await dialog.getByRole("button", { name: "复制 Agent TOML", exact: true }).click();
-  await expect(dialog.getByRole("button", { name: "复制 Agent TOML", exact: true }).locator("..").getByRole("status")).toHaveText("已复制");
-  expect(await readClipboard()).toBe(await toml.textContent());
-  await dialog.getByRole("button", { name: "复制 Compose 配置文件", exact: true }).click();
-  await expect(dialog.getByRole("button", { name: "复制 Compose 配置文件", exact: true }).locator("..").getByRole("status")).toHaveText("已复制");
+  await dialog.getByText("查看部署命令", { exact: true }).click();
+  const compose = dialog.getByLabel("Compose 部署命令", { exact: true });
+  await expect(compose).toContainText(state.accessKey);
+  await dialog.getByRole("button", { name: "复制 Compose 部署命令", exact: true }).click();
+  await expect(dialog.getByRole("button", { name: "复制 Compose 部署命令", exact: true }).locator("..").getByRole("status")).toHaveText("已复制");
   expect(await readClipboard()).toBe(await compose.textContent());
   await dialog.getByRole("button", { name: "docker run", exact: true }).click();
-  const command = dialog.getByLabel("Docker run 命令", { exact: true });
-  await dialog.getByRole("button", { name: "复制 Docker run 命令", exact: true }).click();
-  await expect(dialog.getByRole("button", { name: "复制 Docker run 命令", exact: true }).locator("..").getByRole("status")).toHaveText("已复制");
+  const command = dialog.getByLabel("Docker run 部署命令", { exact: true });
+  await dialog.getByRole("button", { name: "复制 Docker run 部署命令", exact: true }).click();
+  await expect(dialog.getByRole("button", { name: "复制 Docker run 部署命令", exact: true }).locator("..").getByRole("status")).toHaveText("已复制");
   expect(await readClipboard()).toBe(await command.textContent());
   await dialog.getByText("高级：接入密钥", { exact: true }).click();
   await dialog.getByRole("button", { name: "复制接入密钥", exact: true }).click();
@@ -104,10 +101,10 @@ for (const transport of ["loopback", "http", "https"]) test(`${transport} 真实
 
   await dialog.getByRole("button", { name: "重置接入密钥", exact: true }).click();
   await page.getByRole("dialog", { name: "重置接入密钥？", exact: true }).getByRole("button", { name: "重置密钥", exact: true }).click();
-  await expect(toml).toContainText("nexo_join_reset-test-key");
-  await dialog.getByRole("button", { name: "复制 Agent TOML", exact: true }).click();
-  await expect(dialog.getByRole("button", { name: "复制 Agent TOML", exact: true }).locator("..").getByRole("status")).toHaveText("已复制");
-  expect(await readClipboard()).toBe(await toml.textContent());
+  await expect(command).toContainText("nexo_join_reset-test-key");
+  await dialog.getByRole("button", { name: "复制 Docker run 部署命令", exact: true }).click();
+  await expect(dialog.getByRole("button", { name: "复制 Docker run 部署命令", exact: true }).locator("..").getByRole("status")).toHaveText("已复制");
+  expect(await readClipboard()).toBe(await command.textContent());
   await dialog.getByRole("button", { name: "完成", exact: true }).click();
 
   await page.goto(`${base}/#/agents/a-1`);

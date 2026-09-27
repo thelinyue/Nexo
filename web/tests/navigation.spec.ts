@@ -179,7 +179,7 @@ test("空白与已修改表单锁住历史导航，跨断点保持实例", async
   await page.screenshot({ animations: "disabled", scale: "css", path: info.outputPath("mobile-full-form.png") });
   await page.setViewportSize({ width: 1440, height: 900 });
   await expect(editor.getByLabel("服务名称")).toHaveValue("跨断点草稿");
-  await editor.getByRole("button", { name: "取消", exact: true }).click();
+  await editor.locator(".modal-actions").getByRole("button", { name: "取消", exact: true }).click();
   await page.getByRole("button", { name: "放弃修改", exact: true }).click();
   await page.locator(".sidebar").getByRole("link", { name: "域名", exact: true }).click();
   await expect(page).toHaveURL(/#\/domains$/);

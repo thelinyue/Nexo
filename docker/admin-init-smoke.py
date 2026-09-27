@@ -22,7 +22,7 @@ def free_port():
 
 class Server:
     """每次启动独立日志，显式复用测试数据目录以检查重启不会覆盖账号。"""
-    def __init__(self, binary, directory, run, credentials):
+    def __init__(self, binary, directory, run, credentials, environment=None):
         directory.mkdir(parents=True, exist_ok=True)
         self.log_path = directory / f"{run}.log"
         self.log = self.log_path.open("wb")
@@ -30,6 +30,7 @@ class Server:
         self.url = f"http://127.0.0.1:{port}/api/v1/"
         self.opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
         self.env = {key: value for key, value in os.environ.items() if not key.startswith("NEXO_")}
+        self.env.update(environment or {})
         config = {
             "data_dir": str(directory), "http_addr": f"127.0.0.1:{port}",
             "control_addr": "127.0.0.1:0", "tunnel_addr": "127.0.0.1:0",
@@ -83,17 +84,23 @@ def main():
     root = Path(tempfile.mkdtemp(prefix="nexo-admin-init-"))
     print("Test directory:", root, flush=True)
     generated_passwords = []
-    for name, credentials, username, explicit_password in [
-        ("defaults", {}, "admin", None),
-        ("empty", {"admin.username": " \t", "admin.password": ""}, "admin", None),
-        ("username", {"admin.username": " owner "}, "owner", None),
-        ("password", {"admin.password": " explicit-password-4821 "}, "admin", " explicit-password-4821 "),
-        ("six", {"admin.password": "123456"}, "admin", "123456"),
-        ("explicit", {"admin.username": " owner ", "admin.password": "explicit-password-4821"}, "owner", "explicit-password-4821"),
+    for name, credentials, environment, username, explicit_password in [
+        ("env-priority", {"admin.username": "toml-owner", "admin.password": "toml-secret-4821"}, {"NEXO_ADMIN_USERNAME": " env-owner ", "NEXO_ADMIN_PASSWORD": " env-secret-4821 "}, "env-owner", " env-secret-4821 "),
+        ("env-only", {}, {"NEXO_ADMIN_USERNAME": "env-owner", "NEXO_ADMIN_PASSWORD": "env-secret-4821"}, "env-owner", "env-secret-4821"),
+        ("env-username", {"admin.password": "toml-secret-4821"}, {"NEXO_ADMIN_USERNAME": "env-owner"}, "env-owner", "toml-secret-4821"),
+        ("env-password", {"admin.username": "toml-owner"}, {"NEXO_ADMIN_PASSWORD": "env-secret-4821"}, "toml-owner", "env-secret-4821"),
+        ("env-empty", {"admin.username": "toml-owner", "admin.password": "toml-secret-4821"}, {"NEXO_ADMIN_USERNAME": "", "NEXO_ADMIN_PASSWORD": ""}, "toml-owner", "toml-secret-4821"),
+        ("env-empty-defaults", {}, {"NEXO_ADMIN_USERNAME": "", "NEXO_ADMIN_PASSWORD": ""}, "admin", None),
+        ("defaults", {}, {}, "admin", None),
+        ("empty", {"admin.username": " \t", "admin.password": ""}, {}, "admin", None),
+        ("username", {"admin.username": " owner "}, {}, "owner", None),
+        ("password", {"admin.password": " explicit-password-4821 "}, {}, "admin", " explicit-password-4821 "),
+        ("six", {"admin.password": "123456"}, {}, "admin", "123456"),
+        ("explicit", {"admin.username": " owner ", "admin.password": "explicit-password-4821"}, {}, "owner", "explicit-password-4821"),
     ]:
         directory = root / name
         directory.mkdir()
-        server = Server(binary, directory, "first", credentials)
+        server = Server(binary, directory, "first", credentials, environment)
         try:
             server.ready()
             output = server.output()
@@ -104,18 +111,30 @@ def main():
                 generated_passwords.append(password)
             else:
                 assert not matches and explicit_password not in output
+                assert f"用户名：{username}" in output and "使用指定密码" in output
                 password = explicit_password
+            assert "已有账号，跳过管理员初始化" not in output
             assert server.api("auth/login", {"username": username, "password": password})[0] == 200
+            if name == "env-priority":
+                assert server.api("auth/login", {"username": username, "password": credentials["admin.password"]})[0] == 401
+                assert server.api("auth/login", {"username": credentials["admin.username"], "password": credentials["admin.password"]})[0] == 401
+                assert credentials["admin.password"] not in output
+            assert password not in (directory / "server.toml").read_text(encoding="utf-8") or password == credentials.get("admin.password")
             assert server.api("auth/initialize", {"bootstrap_code": "obsolete-bootstrap", "username": "attacker", "password": "attacker-password-1234"})[0] in (404, 405)
             with sqlite3.connect(directory / "nexo.db") as db:
                 before = db.execute("SELECT id,username,password_hash FROM users").fetchall()
                 assert len(before) == 1 and before[0][2].startswith("$argon2")
         finally:
             server.close()
-        server = Server(binary, directory, "restart", {"admin.username": "x", "admin.password": "invalid"})
+        restart_env = {"NEXO_ADMIN_USERNAME": "", "NEXO_ADMIN_PASSWORD": ""} if name == "env-empty-defaults" else {"NEXO_ADMIN_USERNAME": "x", "NEXO_ADMIN_PASSWORD": "12345"}
+        restart_config = {} if name == "env-empty-defaults" else {"admin.username": "x", "admin.password": "invalid"}
+        server = Server(binary, directory, "restart", restart_config, restart_env)
         try:
             server.ready()
             assert "自动生成的密码：" not in server.output() and password not in server.output()
+            assert "已有账号，跳过管理员初始化" in server.output()
+            assert "nexo admin recover" in server.output()
+            assert "管理员账号已创建" not in server.output()
             assert server.api("auth/login", {"username": username, "password": password})[0] == 200
             with sqlite3.connect(directory / "nexo.db") as db:
                 assert db.execute("SELECT id,username,password_hash FROM users").fetchall() == before
@@ -123,15 +142,17 @@ def main():
             server.close()
         print(f"PASS {name}: 首次登录、输出策略、旧接口拒绝、重启凭据不变", flush=True)
     assert len(set(generated_passwords)) == len(generated_passwords)
-    for name, credentials, variable in [
-        ("bad-name", {"admin.username": "x", "admin.password": "explicit-secret-4821"}, "admin.username"),
-        ("bad-password", {"admin.password": "12345"}, "admin.password"),
+    for name, credentials, environment, variable, password in [
+        ("bad-name", {"admin.username": "x", "admin.password": "explicit-secret-4821"}, {}, "admin.username", "explicit-secret-4821"),
+        ("bad-password", {"admin.password": "12345"}, {}, "admin.password", "12345"),
+        ("bad-env-name", {}, {"NEXO_ADMIN_USERNAME": "x", "NEXO_ADMIN_PASSWORD": "explicit-secret-4821"}, "NEXO_ADMIN_USERNAME", "explicit-secret-4821"),
+        ("bad-env-password", {"admin.password": "valid-toml-secret"}, {"NEXO_ADMIN_PASSWORD": "12345"}, "NEXO_ADMIN_PASSWORD", "12345"),
     ]:
-        server = Server(binary, root / name, "invalid", credentials)
+        server = Server(binary, root / name, "invalid", credentials, environment)
         try:
             assert server.process.wait(timeout=30) != 0
             output = server.output()
-            assert variable in output and credentials["admin.password"] not in output
+            assert variable in output and password not in output
             with sqlite3.connect(root / name / "nexo.db") as db:
                 assert db.execute("SELECT COUNT(*) FROM users").fetchone()[0] == 0
         finally:

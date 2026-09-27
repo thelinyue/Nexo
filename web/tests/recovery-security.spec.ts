@@ -83,7 +83,7 @@ test("设备恢复凭证绑定原设备，批准前说明撤销旧身份", async
   await expect(recovery).toContainText("--recover-identity");
   await page.screenshot({ path: testInfo.outputPath("device-recovery.png") });
   state.enrollments = state.enrollments.filter(item => item.kind === "recovery"); state.enrollments[0].status = "awaiting_approval";
-  await recovery.getByRole("button", { name: "取消", exact: true }).click();
+  await recovery.getByRole("button", { name: /^(取消|关闭)$/ }).click();
   await page.getByRole("link", { name: "返回", exact: true }).click();
   await page.clock.fastForward(5000);
   await page.getByRole("button", { name: "批准", exact: true }).click();
@@ -154,7 +154,7 @@ test("DNS 详情显示有限重试计划，耗尽后提示人工核对，手动�
   await expect(dialog.getByText(/下次自动重试/)).toContainText("剩余 3 次");
   state.dnsRetriesRemaining = 0; state.dnsNextRetryAt = null;
   await page.clock.fastForward(5000);
-  await expect(dialog.getByText(/自动重试已结束/)).toBeVisible();
+  await expect(dialog.getByText(/重试已结束/)).toBeVisible();
   await expect(dialog.getByText(/下次自动重试/)).toHaveCount(0);
   expect(state.calls.every(call => call.method === "GET")).toBeTruthy();
   expect(await dialog.evaluate(element => element.scrollWidth <= element.clientWidth)).toBeTruthy();
@@ -162,6 +162,6 @@ test("DNS 详情显示有限重试计划，耗尽后提示人工核对，手动�
   state.dnsResolved = true;
   await dialog.getByRole("button", { name: "重新检查", exact: true }).click();
   await expect(dialog.getByText("DNS 已解析", { exact: true })).toBeVisible();
-  await expect(dialog.getByText(/自动重试已结束/)).toHaveCount(0);
+  await expect(dialog.getByText(/重试已结束/)).toHaveCount(0);
   expect(state.calls.filter(call => call.method === "POST" && call.path.endsWith("/access"))).toHaveLength(1);
 });

@@ -1,21 +1,25 @@
 # 容器、配置与维护
 
-v0.2.5 Server、Agent 都要求全新安装，不能原地升级或混用旧组件。不导入环境配置、旧数据库或旧身份，不扫描旧材料，也不添加版本标记。当前格式的数据读取失败时停止启动并保留文件。新版正常重启、身份恢复、续签和备份恢复继续支持。
+本次发布 Server v0.2.6，Agent 保持 v0.2.5。已有 v0.2.5 数据可继续使用，只更新 Server；从 v0.2.4 及更早版本安装仍要求两端使用全新目录，不导入旧数据库或旧身份。当前格式的数据读取失败时停止启动并保留文件。正常重启、身份恢复、续签和备份恢复继续支持。
 
-本仓库模板配合 v0.2.5 镜像使用；本次同时发布 Server 和 Agent，不自动部署 VPS。组件仍按实际代码变化独立发布。
+本仓库模板配合 Server v0.2.6、Agent v0.2.5 使用；本次只发布 Server，不自动部署 VPS。更新步骤见 [v0.2.6 发布说明](../docs/releases/v0.2.6.md)。
 
 ## 部署与首次启动
 
 Server 使用仓库根目录的 [compose.yml](../compose.yml)，Agent 使用 [compose.agent.yml](../compose.agent.yml)。保留 host 网络、端口清单及原挂载路径；host 下 `ports` 不提供映射，实际端口由应用和宿主机防火墙控制。
 
-Server 首次启动自动生成 `./data/nexo/server.toml`（容器内 `/data/nexo/server.toml`），默认 `0.0.0.0:8280` 提供首页、静态资源和 API，Caddy 默认启用。默认用户名 `admin`，密码留空生成随机密码，首次日志显示一次。指定密码时先预置 TOML，至少 6 个字符、不超过 1024 字节；初始化后手动清空 `admin.password`。数据库仅保存密码哈希。
+Server 首次启动自动生成 `./data/nexo/server.toml`（容器内 `/data/nexo/server.toml`），默认 `0.0.0.0:8280` 提供首页、静态资源和 API，Caddy 默认启用。默认用户名 `admin`，密码留空生成随机密码，首次日志显示一次。指定密码可预置 TOML，或向容器传入 `NEXO_ADMIN_USERNAME` / `NEXO_ADMIN_PASSWORD`；密码至少 6 个字符、不超过 1024 字节。非空环境变量逐项优先于 TOML，未设置或为空时回退到 TOML，密码中的空格保留。环境变量不会回写配置文件；初始化后清除 TOML、Compose 或 `.env` 中的初始密码。数据库仅保存密码哈希。
+
+仓库 Compose 已映射这两个可选变量，可通过宿主机环境或同目录 `.env` 传入；自定义 Compose 也须在 `environment` 中传入容器，仅创建 `.env` 不会自动注入。此支持从 Server v0.2.6 开始提供。已有账号不会因更改环境变量、TOML 或重启而重设密码；需要重设时使用下方的账号恢复流程。
+
+账号初始化信息写入容器日志，执行 `docker compose logs nexo-server` 查看；`docker compose up -d` 只负责后台启动，不显示应用日志。首次创建且环境变量、TOML 密码均为空时，日志显示用户名与随机密码。指定密码时只显示用户名和“使用指定密码”；已有账号时明确显示“已有账号，跳过管理员初始化”及恢复入口，不再打印密码。
 
 Agent 操作顺序：
 
-1. 在页面“添加 Agent”填写 Server 地址及设备名称，复制 TOML。
-2. 在 Agent 主机创建 `./data/nexo-agent/agent.toml`，保存内容；Linux 执行 `chmod 600 ./data/nexo-agent/agent.toml`。
-3. 在同一工作目录保存页面的 Compose 为 `compose.yml`，执行 `docker compose up -d`；或执行页面提供的 Docker 命令。
-4. 接入后可清空 TOML 中的 `enrollment_token`；正常重启复用身份，无需重新接入。每台主机独立数据目录。
+1. 在页面“添加 Agent”填写 Server 地址及设备名称，选择 Compose 或 docker run，复制部署命令。
+2. 在已安装 Docker 的 Linux / NAS 主机终端执行。命令自动创建 `./data/nexo-agent/agent.toml`（权限 0600）并启动；Compose 方式还会保存 `./compose.agent.yml`，后续通过 `docker compose -f compose.agent.yml` 管理。
+3. 回到页面查看“最近接入”。命令含接入密钥，请勿分享；每台主机使用独立数据目录。已有配置时命令停止，不覆盖；已有 Agent 使用原配置管理。
+4. 接入后可清空 TOML 中的 `enrollment_token`；正常重启复用身份，无需重新接入。
 
 新 Agent 没有配置时会生成模板并退出，指出缺少的字段及文件位置。共享接入密钥可用于多台设备；重置密钥不撤销已接入设备。缺少或损坏身份不能通过复制其他设备目录解决。
 
@@ -23,7 +27,7 @@ Agent 操作顺序：
 
 两端统一支持 `--config`、`--data-dir`。默认读取数据目录中的对应 TOML。相对文件路径按 TOML 所在目录解析；配置只在启动读取，修改后重启。未知字段、类型错误和非法地址报错，程序不覆盖已有配置或修改排版。自动创建的 Linux TOML 权限为 `0600`。
 
-完整中文模板：[server.toml](../config/server.toml)、[agent.toml](../config/agent.toml)。不再读取任何 `NEXO_*` 启动环境变量；`TZ` 等通用系统变量保留。
+完整中文模板：[server.toml](../config/server.toml)、[agent.toml](../config/agent.toml)。仅 Server 首次创建管理员读取 `NEXO_ADMIN_USERNAME` / `NEXO_ADMIN_PASSWORD`；其他 `NEXO_*` 启动环境变量不生效，`TZ` 等通用系统变量保留。
 
 | Server 字段 | 默认值 / 用途 |
 | --- | --- |

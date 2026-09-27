@@ -1,6 +1,6 @@
 name: nexo-agent
 
-# 全新安装；先将管理页面生成的 agent.toml 保存到 ./data/nexo-agent/。
+# 手动部署时先准备 ./data/nexo-agent/agent.toml；页面部署命令会自动保存。
 services:
   nexo-agent:
     image: ghcr.io/thelinyue/nexo-agent:latest

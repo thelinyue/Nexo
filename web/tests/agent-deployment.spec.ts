@@ -10,14 +10,29 @@ test("Server 地址规范化保留 IPv6、端口及路径，拒绝危险或歧�
   for (const token of ["", "   ", "one-time-token", "nexo_join_bad\nvalue"]) expect(() => agentToml("https://example.com", token)).toThrow();
 });
 
-test("部署模板不含凭据和 Nexo 环境变量，目录与 TOML 操作说明一致", () => {
+test("部署命令自动保存 TOML 并启动，凭据不作为容器环境变量", () => {
   for (const method of ["compose", "docker"] as const) {
     const result = agentDeploymentContent(template, "https://nexo.example.com", "nexo_join_secret", method);
     expect(result).toContain("./data/nexo-agent:/data/nexo-agent");
     expect(result).toContain("host");
-    expect(result).not.toContain("nexo_join_secret");
-    expect(result).not.toContain("NEXO_");
+    expect(result).toContain('enrollment_token = "nexo_join_secret"');
+    expect(result).toContain("cat > ./data/nexo-agent/agent.toml <<'NEXO_AGENT_TOML'");
+    expect(result).toContain("umask 077");
+    expect(result).not.toContain("NEXO_ENROLLMENT_TOKEN");
   }
+});
+
+test("Linux Shell 执行部署命令，检查权限、转义、启动参数与已有配置保护", ({}, info) => {
+  test.skip(info.project.name !== "desktop-dark", "Shell 验证与浏览器无关");
+  const token = "nexo_join_quote'\"\\ $HOME $(touch injected) `touch injected`";
+  const name = "家庭 NAS '\"\nNEXO_AGENT_TOML\n$(touch injected)\\设备";
+  const url = "https://example.com/path/$HOME";
+  const checker = readFileSync(new URL("./agent-install-check.py", import.meta.url), "utf8");
+  const cases = ["compose", "docker"].map(method => ({ method, command: agentDeploymentContent(template, url, token, method as "compose" | "docker", name) }));
+  const result = spawnSync(process.platform === "win32" ? "wsl.exe" : "python3", [...(process.platform === "win32" ? ["--exec", "python3"] : []), "-c", checker], {
+    input: JSON.stringify({ cases, expected: { server_url: url, device_name: name, enrollment_token: token } }), encoding: "utf8", timeout: 30_000,
+  });
+  expect(result.status, result.stderr || result.error?.message).toBe(0);
 });
 
 test("镜像标签取自 Compose，支持 latest 与数字版本", () => {

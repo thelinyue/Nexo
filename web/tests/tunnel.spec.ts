@@ -175,7 +175,7 @@ test("无域名时先关闭表单再配置，不允许跨页保留编辑窗口",
   const editor = page.getByRole("dialog", { name: "创建服务" });
   await editor.getByLabel("服务名称").fill("草稿服务");
   await editor.getByRole("radio", { name: "网页服务", exact: true }).check();
-  await expect(editor.getByText("请先取消表单，再到域名页添加。", { exact: true })).toBeVisible();
+  await expect(editor.getByText("网页服务需要域名，请关闭表单后到域名页添加。", { exact: true })).toBeVisible();
   await page.evaluate(() => { window.location.hash = "#/domains"; });
   await expect(page).toHaveURL(/#\/services$/);
   await expect(editor.getByLabel("服务名称")).toHaveValue("草稿服务");
@@ -255,7 +255,7 @@ test("公网 HTTP 页面可复制服务地址和弹窗内的 Compose 配置", as
   await page.goto("http://copy.example.test:4173/#/agents");
   await page.getByRole("button", { name: "添加 Agent", exact: true }).click();
   const dialog = page.getByRole("dialog", { name: "添加 Agent" });
-  await dialog.getByRole("button", { name: "复制 Agent TOML", exact: true }).click();
+  await dialog.getByRole("button", { name: "复制 Compose 部署命令", exact: true }).click();
   await expect(dialog.getByRole("status")).toHaveText("已复制");
   expect(await page.evaluate(() => (window as any).copiedFallback)).toContain("nexo_join_shared-test-key");
 });
@@ -378,7 +378,7 @@ test("尚无 Agent 时禁止保存并说明如何接入设备", async ({ page })
   const editor = page.getByRole("dialog", { name: "创建服务" });
   await editor.getByLabel("服务名称").fill("等待 Agent 的服务");
   await expect(editor.getByRole("button", { name: "保存服务" })).toBeDisabled();
-  await expect(editor.getByText("请先取消表单，再到设备页添加。", { exact: true })).toBeVisible();
+  await expect(editor.getByText("请关闭表单，到设备页添加 Agent。", { exact: true })).toBeVisible();
   await page.evaluate(() => { window.location.hash = "#/agents"; });
   await expect(page).toHaveURL(/#\/services$/);
   await expect(editor.getByLabel("服务名称")).toHaveValue("等待 Agent 的服务");

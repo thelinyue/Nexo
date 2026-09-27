@@ -93,14 +93,20 @@ pub fn ensure_admin(
     let exists: bool =
         transaction.query_row("SELECT EXISTS(SELECT 1 FROM users)", [], |row| row.get(0))?;
     if exists {
+        // 数据库只有密码哈希，重启不能再次显示明文；在容器日志中说明跳过原因及恢复入口。
+        tracing::info!("已有账号，跳过管理员初始化；初始账号密码配置不会覆盖已有账号，密码不会再次打印。遗失密码可使用 nexo admin recover 恢复账号。");
         return Ok(None);
     }
     let username = username
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .unwrap_or("admin");
-    validate_username(username)
-        .map_err(|error| anyhow::anyhow!("admin.username 配置无效：{}", error.message))?;
+    validate_username(username).map_err(|error| {
+        anyhow::anyhow!(
+            "admin.username / NEXO_ADMIN_USERNAME 配置无效：{}",
+            error.message
+        )
+    })?;
     let generated = password.is_none_or(str::is_empty);
     let password = if generated {
         let mut bytes = [0_u8; 24];
@@ -111,14 +117,21 @@ pub fn ensure_admin(
     } else {
         password.unwrap().to_owned()
     };
-    validate_password(&password)
-        .map_err(|error| anyhow::anyhow!("admin.password 配置无效：{}", error.message))?;
+    validate_password(&password).map_err(|error| {
+        anyhow::anyhow!(
+            "admin.password / NEXO_ADMIN_PASSWORD 配置无效：{}",
+            error.message
+        )
+    })?;
     let hash = hash_password(&password)?;
     transaction.execute(
         "INSERT INTO users (id, tenant_id, username, role, password_hash, enabled, created_at) VALUES (?1,'default',?2,'system_admin',?3,1,?4)",
         params![Uuid::new_v4().to_string(), username, hash, unix_now()],
     )?;
     transaction.commit()?;
+    if !generated {
+        tracing::info!("管理员账号已创建，用户名：{username}；使用指定密码，不输出密码明文。请清除 server.toml 或 NEXO_ADMIN_PASSWORD 中的初始密码。");
+    }
     Ok(generated.then(|| (username.to_owned(), password)))
 }
 

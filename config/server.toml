@@ -10,6 +10,8 @@ runtime_dir = "/run/nexo" # Linux 临时运行目录，不备份；非 root 或�
 web_dir = "" # 留空使用程序旁 web 目录，开发环境使用工作目录 web/dist
 
 [admin]
+# 首次创建账号时，非空 NEXO_ADMIN_USERNAME / NEXO_ADMIN_PASSWORD 分别优先于下方配置。
+# 环境变量未设置或为空时使用 TOML；已有账号不会被初始化配置覆盖。
 username = "admin"
 password = "" # 仅初始化使用；留空生成随机密码，指定密码至少 6 个字符。成功后请清空。
 

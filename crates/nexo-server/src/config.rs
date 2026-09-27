@@ -1,4 +1,4 @@
-//! Server 启动配置与页面设置分开：此对象在启动时完成解析，运行模块不读取环境变量。
+//! Server 启动配置与页面设置分开：在此读取 TOML 和管理员初始化环境变量，运行模块只使用解析结果。
 use anyhow::{Context, Result};
 use serde::Deserialize;
 use std::{
@@ -76,6 +76,18 @@ impl Config {
     pub fn load(path: &Path) -> Result<Self> {
         let mut value: Self =
             nexo_core::config::load(path, include_str!("../../../config/server.toml"))?;
+        // 仅管理员首次初始化兼容环境变量；非空值逐项覆盖 TOML，不回写配置文件。
+        // 已有账号仍由 ensure_admin 保留，重启时不会用初始凭据重置密码。
+        if let Ok(username) = std::env::var("NEXO_ADMIN_USERNAME") {
+            if !username.is_empty() {
+                value.admin.username = username;
+            }
+        }
+        if let Ok(password) = std::env::var("NEXO_ADMIN_PASSWORD") {
+            if !password.is_empty() {
+                value.admin.password = password;
+            }
+        }
         for (name, address) in [
             ("tunnel_endpoint", &value.tunnel_endpoint),
             ("udp_endpoint", &value.udp_endpoint),

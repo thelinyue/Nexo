@@ -114,9 +114,20 @@ jobs:
         run: |
           set -euo pipefail
           bundle="nexo-v${VERSION}-docker"
-          mkdir -p "dist/${bundle}"
-          cp compose.yml compose.agent.yml README.md LICENSE THIRD_PARTY_NOTICES.md "dist/${bundle}/"
-          cp -R config "dist/${bundle}/config"
+          mkdir -p "dist/${bundle}/config"
+          cp LICENSE THIRD_PARTY_NOTICES.md release-manifest.json "dist/${bundle}/"
+          cp "docs/releases/v${VERSION}.md" "dist/${bundle}/README.md"
+          # 仅打包本次实际发布组件，避免无代码变化的组件被误升级。
+          if [[ "$PUBLISH_SERVER" == "true" ]]; then
+            cp compose.yml "dist/${bundle}/"
+            cp config/server.toml "dist/${bundle}/config/"
+            sed -i "s|nexo-server:latest|nexo-server:${VERSION}|" "dist/${bundle}/compose.yml"
+          fi
+          if [[ "$PUBLISH_AGENT" == "true" ]]; then
+            cp compose.agent.yml "dist/${bundle}/"
+            cp config/agent.toml "dist/${bundle}/config/"
+            sed -i "s|nexo-agent:latest|nexo-agent:${VERSION}|" "dist/${bundle}/compose.agent.yml"
+          fi
           cp -R licenses "dist/${bundle}/licenses"
           tar -C dist -czf "dist/${bundle}.tar.gz" "${bundle}"
           (cd dist && sha256sum "${bundle}.tar.gz" > SHA256SUMS)

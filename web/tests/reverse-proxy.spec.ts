@@ -9,7 +9,7 @@ test("独立反代入口无需 Agent，创建服务入口保持内网穿透", as
   const state = await installApiMocks(page);
   state.tunnels = []; state.devices = [];
   await page.goto("/#/services");
-  await expect(page.getByRole("button", { name: "创建第一个服务", exact: true })).toBeVisible();
+  await expect(page.getByRole("button", { name: "创建服务", exact: true })).toBeVisible();
   await page.getByRole("button", { name: "添加反向代理", exact: true }).click();
   const dialog = page.getByRole("dialog", { name: "添加反向代理" });
   await dialog.getByLabel("服务名称").fill("VPS 应用");

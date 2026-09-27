@@ -271,10 +271,8 @@ async fn main() -> Result<()> {
     )
     .context("无法初始化管理员账号")?
     {
+        // 标准输出由 Docker 收集到容器日志；随机凭据仅在账号创建成功后输出一次。
         println!("管理员账号已创建\n用户名：{username}\n自动生成的密码：{password}\n密码仅在首次创建时显示，请妥善保存；遗失后可使用 nexo admin recover 恢复账号。");
-    }
-    if !config.admin.password.is_empty() {
-        tracing::info!("管理员已初始化，请清除 server.toml 中的初始密码");
     }
     let identity_path = data_dir.join("transport/identity.json");
     let authority = Arc::new(identity_runtime::AuthorityRuntime::new(

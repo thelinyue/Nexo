@@ -1,6 +1,6 @@
 name: nexo
 
-# Nexo 最新稳定版 Server。本版本要求全新安装，配置保存在 data/nexo/server.toml。
+# Nexo 最新稳定版 Server，配置保存在 data/nexo/server.toml；更新前查阅对应发布说明。
 services:
   nexo-server:
     image: ghcr.io/thelinyue/nexo-server:latest
@@ -20,6 +20,9 @@ services:
       - "20000-29999:20000-29999/udp"  # 自动分配的公网 UDP 服务端口
     environment:
       TZ: Asia/Shanghai
+      # 可选：仅首次创建管理员，非空值优先于 server.toml；已有账号不会被重设。
+      NEXO_ADMIN_USERNAME: ${NEXO_ADMIN_USERNAME:-}
+      NEXO_ADMIN_PASSWORD: ${NEXO_ADMIN_PASSWORD:-}
     volumes:
       - ./data/nexo:/data/nexo
     restart: unless-stopped

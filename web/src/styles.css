@@ -242,6 +242,7 @@ dd>code { display:block; margin-bottom:10px; user-select:text; font-size:.9375re
 .modal-body>p { margin-bottom:16px; }
 .modal-actions { padding:12px 18px; display:flex; gap:10px; justify-content:flex-end; border-top:1px solid var(--border); flex-shrink:0; background:var(--surface); }
 .modal-actions button { flex:1; }
+.desktop-modal-close,.desktop-modal-cancel { display:none; }
 .form-section { display:grid; gap:16px; }
 .form-section+ .form-section { padding-top:24px; border-top:1px solid var(--border); }
 .form-section h3 { color:var(--secondary); }
@@ -425,7 +426,6 @@ dd>code { display:block; margin-bottom:10px; user-select:text; font-size:.9375re
   .danger-zone { width:auto; }
   .batch-actions { left:244px; right:24px; }
   .short-modal { inset:0; transform:none; margin:auto; width:460px; max-height:min(85dvh,var(--visible-height,85dvh)); border-radius:28px; }
-  .full-form { inset:0 0 0 auto; margin:0; width:560px; height:100dvh; max-height:100dvh; border-left:1px solid var(--border); }
   .form-grid { grid-template-columns:minmax(0,1fr) minmax(0,1fr); }
   .modal-actions button { flex:0 1 auto; min-width:120px; }
   .auth-panel { padding:24px; }
@@ -567,7 +567,6 @@ dd>code { display:block; margin-bottom:10px; user-select:text; font-size:.9375re
 /* 域名短表单让输入和错误共用滚动区域，提交按钮固定在可见视口内。 */
 .modal:has(>.domain-form) { background:var(--bg); max-height:min(560px,calc(var(--visible-height,100dvh) - max(12px,env(safe-area-inset-top)))); }
 .domain-form .modal-body { padding:16px; scroll-padding-block:16px; }
-.domain-form .domain-input-label { margin:0 2px 8px; color:var(--secondary); font-size:.875rem; }
 .domain-input-control { display:flex; align-items:center; min-width:0; border:1px solid var(--border); border-radius:18px; background:var(--surface); }
 .domain-input-control:focus-within { border-color:var(--primary); box-shadow:0 0 0 2px var(--primary); }
 .domain-input-control[data-invalid=true] { border-color:var(--danger); box-shadow:0 0 0 2px var(--danger); }
@@ -577,7 +576,6 @@ dd>code { display:block; margin-bottom:10px; user-select:text; font-size:.9375re
 .domain-form .modal-body>.helper { margin:8px 2px 0; }
 .domain-form .domain-input-error { margin:10px 2px 0; overflow-wrap:anywhere; }
 .domain-url-suggestion { margin-top:12px; border-radius:16px; background:var(--surface-raised); padding:10px 12px; }
-.domain-url-suggestion p { margin:0; }
 .domain-url-suggestion button { justify-content:flex-start; flex-wrap:wrap; gap:4px 8px; width:100%; padding:8px 0; text-align:left; }
 .domain-url-suggestion code,.domain-normalized code { overflow-wrap:anywhere; user-select:text; }
 .domain-url-suggestion code { font-size:.9375rem; }
@@ -789,6 +787,36 @@ dd>code { display:block; margin-bottom:10px; user-select:text; font-size:.9375re
   .page-header { min-height:0; margin-bottom:16px; }
   .page-header h1 { position:absolute; width:1px; height:1px; overflow:hidden; clip-path:inset(50%); white-space:nowrap; }
   .page-header:not([data-has-action=true]):not([data-has-back=true]) { margin:0; }
+  /* 桌面表单统一居中；覆盖移动表单的高度上限，长内容内部滚动并保留操作区。 */
+  .modal.full-form { inset:0; margin:auto; width:min(560px,calc(100vw - 48px)); height:fit-content; max-height:calc(var(--visible-height,100dvh) - 48px); border:1px solid var(--border); border-radius:24px; }
+  .modal-heading>.mobile-form-cancel { display:none; }
+  .desktop-modal-close,.desktop-modal-cancel { display:inline-flex; }
+  /* 桌面操作靠右并排，次要操作在前；错误提示独占一行，避免挤压按钮。 */
+  .modal .modal-actions { flex-wrap:wrap; }
+  .modal .modal-actions>button { min-width:88px; min-height:44px; border-radius:10px; font-size:.875rem; }
+  .modal .management-form .modal-actions { flex-direction:row; }
+  .modal .modal-actions>.notice { flex-basis:100%; }
+  /* 域名页有独立容器：让空状态填满内容区，避免面板内再嵌套一张空卡片。 */
+  .page-slot:has(>.domains-page) { display:flex; flex-direction:column; }
+  .domains-page { display:flex; flex-direction:column; flex:1; min-width:0; }
+  .page-slot>.domains-page>.page-header { flex-shrink:0; min-height:44px; margin:0 0 16px; }
+  .domains-page>.page-header h1 { position:static; width:auto; height:auto; overflow:visible; clip-path:none; white-space:normal; font-size:1.25rem; }
+  .domains-page>.empty { flex:1; max-width:none; min-height:320px; margin:0; border:0; border-radius:0; background:transparent; box-shadow:none; }
+  .domains-page>.empty .empty-symbol { width:64px; height:64px; margin-bottom:20px; border-radius:20px; }
+  .domains-page>.empty p { max-width:40ch; font-size:.9375rem; text-wrap:balance; }
+  .domains-page>.empty .empty-actions { width:auto; margin-top:24px; }
+  .domains-page>.empty .primary-button { width:auto; min-width:120px; min-height:44px; border-radius:12px; }
+  /* 单字段表单按内容撑高并居中；错误与网址修正仍在原滚动区域内。 */
+  .modal.full-form:has(>.domain-form) { width:min(440px,calc(100vw - 48px)); border-radius:20px; background:var(--surface); }
+  .modal:has(>.domain-form)>.modal-heading { padding:12px 20px 4px; border-bottom:0; }
+  .modal:has(>.domain-form)>.modal-heading h2 { font-size:1.125rem; letter-spacing:-.02em; }
+  .domain-form>.modal-body { padding:8px 20px 20px; }
+  .domain-form .domain-input-control { border-radius:10px; background:var(--surface-soft); }
+  .domain-form .domain-input-control input { min-height:44px; padding:10px 12px; font-size:.9375rem; }
+  .domain-form .modal-body>.helper { margin:8px 0 0; font-size:.8125rem; line-height:1.6; }
+  .domain-form .modal-actions { flex-direction:row; padding:0 20px 20px; border-top:0; }
+  .domain-form .modal-actions>button { width:auto; min-width:88px; min-height:44px; border-radius:10px; font-size:.875rem; }
+  .domain-form .modal-actions>.primary-button { width:auto; min-width:104px; min-height:44px; }
   /* 用户工具栏与列表共用横向空间，桌面通过侧栏返回，无需额外占一行。 */
   .page-slot:has(>.users-filter) { display:grid; grid-template-columns:minmax(0,1fr) auto; column-gap:12px; align-content:start; align-items:start; }
   .page-slot:has(>.users-filter)>* { grid-column:1 / -1; }
@@ -823,12 +851,13 @@ dd>code { display:block; margin-bottom:10px; user-select:text; font-size:.9375re
   .service-form .service-field-group,.service-form .service-advanced { border-radius:14px; }
   .service-form .service-field:not(.service-toggle-field)>input { text-align:left; }
   .service-form .service-select-field:not(.service-select-compact) .service-select-value { justify-content:flex-start; }
-  .service-form .modal-actions { grid-template-columns:minmax(0,1fr) auto; align-items:center; column-gap:24px; padding:16px 24px; background:var(--surface); }
+  .service-form .modal-actions { grid-template-columns:minmax(0,1fr) auto auto; align-items:center; column-gap:10px; padding:16px 24px; background:var(--surface); }
   .service-form .modal-actions>.service-submit-preview { grid-column:1; grid-row:1; display:grid; gap:4px; }
   .service-form .service-submit-preview code { text-align:left; }
-  .service-form .modal-actions>.primary-button { grid-column:2; grid-row:1; width:auto; min-width:112px; min-height:44px; border-radius:12px; padding-inline:20px; }
+  .service-form .modal-actions>.desktop-modal-cancel { grid-column:2; grid-row:1; }
+  .service-form .modal-actions>.primary-button { grid-column:3; grid-row:1; width:auto; min-width:112px; min-height:44px; border-radius:10px; padding-inline:20px; }
   .service-form .modal-actions>.form-error { grid-column:1 / -1; grid-row:1; }
-  .service-form .modal-actions:has(>.form-error)>.service-submit-preview,.service-form .modal-actions:has(>.form-error)>.primary-button { grid-row:2; }
+  .service-form .modal-actions:has(>.form-error)>:not(.form-error) { grid-row:2; }
   /* 桌面详情操作保持同一行，删除靠右留出间隔，避免危险操作独占整行。 */
   .service-detail-actions { align-items:center; gap:10px; }
   .service-detail-actions button { min-width:112px; min-height:44px; padding-inline:18px; border-radius:12px; box-shadow:none; }
@@ -913,6 +942,10 @@ dd>code { display:block; margin-bottom:10px; user-select:text; font-size:.9375re
 .dns-check-form .modal-actions { flex-direction:column; }
 .dns-check-form .modal-actions .notice { margin:0; }
 .dns-check-form .modal-actions>.primary-button,.link-actions>.copy-control,.link-actions .secondary-button { width:100%; }
+@media (min-width:901px) {
+  .dns-check-form .modal-actions { flex-direction:row; }
+  .dns-check-form .modal-actions>.primary-button,.link-actions>.copy-control,.link-actions .secondary-button { width:auto; }
+}
 
 .recent-agents { list-style:none; padding:0; margin:0; }
 .recent-agents li { display:flex; align-items:center; justify-content:space-between; gap:12px; padding:10px 0; border-bottom:1px solid var(--border); }
