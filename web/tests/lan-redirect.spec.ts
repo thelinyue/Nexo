@@ -1,3 +1,4 @@
+import { openServiceEditor } from "./service-actions";
 import { expect, test } from "@playwright/test";
 import type { Page } from "@playwright/test";
 import { isLanRedirectAddress } from "../src/lan-redirect";
@@ -5,12 +6,13 @@ import { installApiMocks } from "./api-mocks";
 
 async function createWebService(page: Page) {
   await page.goto("/#/services");
-  await page.getByRole("button", { name: "创建服务", exact: true }).click();
+  await openServiceEditor(page);
   const dialog = page.getByRole("dialog", { name: "创建服务" });
   await dialog.getByRole("radio", { name: "网页服务", exact: true }).check();
   await dialog.getByLabel("服务名称").fill("内网相册");
   await dialog.getByLabel("内网端口").fill("8080");
   await dialog.getByLabel("主机名").fill("photos");
+  await dialog.locator("summary", { hasText: "高级设置" }).click();
   return dialog;
 }
 
@@ -79,6 +81,7 @@ test("重定向仅使用本地目标，修改内网地址和端口后继续启�
   await expect(page.getByRole("button", { name: "复制内网地址" })).toHaveCount(1);
   await page.getByRole("button", { name: "编辑服务" }).click();
   const editor = page.getByRole("dialog", { name: "编辑服务" });
+  await editor.locator("summary", { hasText: "高级设置" }).click();
   await expect(editor.getByRole("switch", { name: "内网重定向" })).toBeChecked();
   await expect(editor.getByLabel("内网地址")).toHaveValue("192.168.1.10");
   await expect(editor.getByLabel("内网地址", { exact: true })).toHaveCount(1);
@@ -121,6 +124,7 @@ test("关闭重定向后可继续使用回环本地目标", async ({ page }) => 
   await page.goto("/#/services/t-1");
   await page.getByRole("button", { name: "编辑服务" }).click();
   const dialog = page.getByRole("dialog", { name: "编辑服务" });
+  await dialog.locator("summary", { hasText: "高级设置" }).click();
   const toggle = dialog.getByRole("switch", { name: "内网重定向" });
   await expect(toggle).toBeChecked();
   await dialog.getByLabel("内网地址").fill("127.0.0.1");
@@ -134,6 +138,7 @@ test("关闭重定向后可继续使用回环本地目标", async ({ page }) => 
   expect(state.tunnels[0].local_address).toBe("127.0.0.1");
   await expect(page.getByRole("button", { name: "复制内网地址" })).toHaveCount(1);
   await page.getByRole("button", { name: "编辑服务" }).click();
+  await dialog.locator("summary", { hasText: "高级设置" }).click();
   await expect(toggle).not.toBeChecked();
   await expect(dialog.getByLabel("内网地址")).toHaveValue("127.0.0.1");
   expect(state.calls.find(item => item.method === "PUT")!.body).not.toHaveProperty("lan_redirect_url");
@@ -145,9 +150,11 @@ test("切换 TCP 清除内网重定向，重新切回 Web 保持关闭", async (
   await page.goto("/#/services/t-1");
   await page.getByRole("button", { name: "编辑服务" }).click();
   const dialog = page.getByRole("dialog", { name: "编辑服务" });
+  await dialog.locator("summary", { hasText: "高级设置" }).click();
   await dialog.getByRole("radio", { name: "TCP 服务", exact: true }).check();
   await expect(dialog.getByRole("switch", { name: "内网重定向" })).toHaveCount(0);
   await dialog.getByRole("radio", { name: "网页服务", exact: true }).check();
+  await dialog.locator("summary", { hasText: "高级设置" }).click();
   await expect(dialog.getByRole("switch", { name: "内网重定向" })).not.toBeChecked();
   await dialog.getByRole("switch", { name: "内网重定向" }).check();
   await expect(dialog.getByLabel("内网地址", { exact: true })).toHaveCount(1);
@@ -171,6 +178,7 @@ test("地址修改受未保存保护，保存中禁用控件且请求失败保�
   await page.goto("/#/services/t-1");
   await page.getByRole("button", { name: "编辑服务" }).click();
   const dialog = page.getByRole("dialog", { name: "编辑服务" });
+  await dialog.locator("summary", { hasText: "高级设置" }).click();
   const toggle = dialog.getByRole("switch", { name: "内网重定向" });
   await toggle.check();
   await dialog.getByLabel("内网地址").fill("10.0.0.4");
@@ -200,6 +208,7 @@ test("仅显示重定向开关，长 IPv6 本地目标在当前视口内可操�
   await page.screenshot({ path: testInfo.outputPath("lan-redirect-detail.png"), fullPage: true });
   await page.getByRole("button", { name: "编辑服务" }).click();
   const dialog = page.getByRole("dialog", { name: "编辑服务" });
+  await dialog.locator("summary", { hasText: "高级设置" }).click();
   await expect(dialog.getByLabel("内网地址", { exact: true })).toHaveCount(1);
   await expect(dialog.getByRole("switch", { name: "内网重定向" })).toBeChecked();
   const input = dialog.getByLabel("内网地址");

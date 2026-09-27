@@ -691,7 +691,7 @@ fn cookie(headers: &HeaderMap, name: &str) -> Option<String> {
         .map(str::trim)
         .find_map(|item| item.strip_prefix(&format!("{name}=")).map(str::to_owned))
 }
-fn digest(value: &str) -> String {
+pub(crate) fn digest(value: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(value.as_bytes());
     hex::encode(hasher.finalize())
@@ -702,7 +702,7 @@ pub(crate) fn hash_password(value: &str) -> anyhow::Result<String> {
         .map(|hash| hash.to_string())
         .map_err(|error| anyhow::anyhow!(error.to_string()))
 }
-fn verify_password(value: &str, hash: &str) -> bool {
+pub(crate) fn verify_password(value: &str, hash: &str) -> bool {
     PasswordHash::new(hash).ok().is_some_and(|parsed| {
         Argon2::default()
             .verify_password(value.as_bytes(), &parsed)

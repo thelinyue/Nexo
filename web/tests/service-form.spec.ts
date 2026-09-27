@@ -1,3 +1,4 @@
+import { openServiceEditor } from "./service-actions";
 import { expect, test } from "@playwright/test";
 import { installApiMocks } from "./api-mocks";
 
@@ -5,7 +6,7 @@ for (const protocol of ["http", "https"]) for (const origin of ["http", "https"]
   test(`公网 ${protocol} 与内网 ${origin} 独立保存、回填且切换不改端口`, async ({ page }) => {
     const state = await installApiMocks(page);
     await page.goto("/#/services");
-    await page.getByRole("button", { name: "创建服务", exact: true }).click();
+    await openServiceEditor(page);
     const dialog = page.getByRole("dialog", { name: "创建服务" });
     await dialog.getByLabel("服务名称").fill("独立协议");
     await dialog.getByLabel("内网地址", { exact: true }).fill("192.168.1.10");
@@ -38,7 +39,7 @@ for (const protocol of ["http", "https"]) for (const origin of ["http", "https"]
 test("窄屏两个地址组保持同行，长地址仍可编辑且保存按钮可见", async ({ page }, info) => {
   await installApiMocks(page);
   await page.goto("/#/services");
-  await page.getByRole("button", { name: "创建服务", exact: true }).click();
+  await openServiceEditor(page);
   const dialog = page.getByRole("dialog", { name: "创建服务" });
   await dialog.getByLabel("服务名称").fill("家庭 NAS");
   await dialog.getByLabel("内网地址", { exact: true }).fill("192.168.1.10");
@@ -72,7 +73,7 @@ test("窄屏两个地址组保持同行，长地址仍可编辑且保存按钮�
 test("协议直接点选且单域名自动填入，打开表单不抢占输入焦点", async ({ page }, testInfo) => {
   await installApiMocks(page);
   await page.goto("/#/services");
-  await page.getByRole("button", { name: "创建服务", exact: true }).click();
+  await openServiceEditor(page);
   const dialog = page.getByRole("dialog", { name: "创建服务" });
   await expect(dialog).toBeVisible();
   expect(await page.evaluate(() => document.activeElement instanceof HTMLInputElement)).toBeFalsy();
@@ -91,7 +92,7 @@ test("协议直接点选且单域名自动填入，打开表单不抢占输入�
 test("错误定位到具体字段，折叠的无效端口自动展开，未通过校验不请求接口", async ({ page }) => {
   const state = await installApiMocks(page);
   await page.goto("/#/services");
-  await page.getByRole("button", { name: "创建服务", exact: true }).click();
+  await openServiceEditor(page);
   const dialog = page.getByRole("dialog", { name: "创建服务" });
   await dialog.getByRole("radio", { name: "TCP 服务", exact: true }).check();
   const save = dialog.getByRole("button", { name: "保存服务" });
@@ -121,7 +122,7 @@ test("键盘下一项不误提交，可视区域缩小后字段和保存按钮�
   const state = await installApiMocks(page);
   await page.setViewportSize({ width: 390, height: 844 });
   await page.goto("/#/services");
-  await page.getByRole("button", { name: "创建服务", exact: true }).click();
+  await openServiceEditor(page);
   const dialog = page.getByRole("dialog", { name: "创建服务" });
   await dialog.getByLabel("服务名称").fill("键盘测试");
   await dialog.getByLabel("服务名称").press("Enter");
@@ -148,7 +149,7 @@ test("协议切换保留输入，但不提交其他协议的端口；多域名�
   const state = await installApiMocks(page);
   state.domains.push({ ...state.domains[0], id: "d-2", domain: "second.example.com", is_primary: false });
   await page.goto("/#/services");
-  await page.getByRole("button", { name: "创建服务", exact: true }).click();
+  await openServiceEditor(page);
   const dialog = page.getByRole("dialog", { name: "创建服务" });
   await dialog.getByRole("radio", { name: "TCP 服务", exact: true }).check();
   await dialog.getByLabel("服务名称").fill("Web 服务");
@@ -174,7 +175,7 @@ test("协议切换保留输入，但不提交其他协议的端口；多域名�
 test("Agent 浮层显示当前选择，离线 Agent 可选择并提交", async ({ page }, testInfo) => {
   const state = await installApiMocks(page);
   await page.goto("/#/services");
-  await page.getByRole("button", { name: "创建服务", exact: true }).click();
+  await openServiceEditor(page);
   const dialog = page.getByRole("dialog", { name: "创建服务" });
   const agent = dialog.getByRole("combobox", { name: "Agent", exact: true });
   await expect(agent).toContainText("家庭 Agent");
@@ -201,7 +202,7 @@ test("两个选择框互斥，键盘确认和取消不误提交或关闭表单",
   const state = await installApiMocks(page);
   state.domains.push({ ...state.domains[0], id: "d-2", domain: "second.example.com" });
   await page.goto("/#/services");
-  await page.getByRole("button", { name: "创建服务", exact: true }).click();
+  await openServiceEditor(page);
   const dialog = page.getByRole("dialog", { name: "创建服务" });
   const agent = dialog.getByRole("combobox", { name: "Agent", exact: true });
   await dialog.getByRole("radio", { name: "网页服务", exact: true }).check();
@@ -259,7 +260,7 @@ test("长名称和长域名浮层在窄屏、横屏及低高度视口内可滚�
   state.devices = Array.from({ length: 14 }, (_, index) => ({ ...state.devices[0], id: `long-agent-${index}`, name: `家庭存储服务器长名称用于检查窄屏展示${index}` }));
   state.domains = Array.from({ length: 14 }, (_, index) => ({ ...state.domains[0], id: `long-domain-${index}`, domain: `very-long-home-network-domain-for-small-screens-${index}.example.com` }));
   await page.goto("/#/services");
-  await page.getByRole("button", { name: "创建服务", exact: true }).click();
+  await openServiceEditor(page);
   const dialog = page.getByRole("dialog", { name: "创建服务" });
   await dialog.getByRole("radio", { name: "网页服务", exact: true }).check();
   for (const viewport of [{ width: 320, height: 568 }, { width: 390, height: 420 }, { width: 812, height: 375 }]) {
@@ -288,7 +289,7 @@ test("长名称和长域名浮层在窄屏、横屏及低高度视口内可滚�
 test("无 Agent 或域名时指引先取消表单，选择框和保存禁用", async ({ page }) => {
   const state = await installApiMocks(page); state.devices = []; state.domains = [];
   await page.goto("/#/services");
-  await page.getByRole("button", { name: "创建服务", exact: true }).click();
+  await openServiceEditor(page);
   const dialog = page.getByRole("dialog", { name: "创建服务" });
   await expect(dialog.getByRole("combobox", { name: "Agent", exact: true })).toBeDisabled();
   await expect(dialog.getByText("请先取消表单，再到设备页添加。", { exact: true })).toBeVisible();
@@ -303,7 +304,7 @@ test("展开中的浮层跟随表单滚动和视口变化", async ({ page }) => 
   state.devices = Array.from({ length: 10 }, (_, index) => ({ ...state.devices[0], id: `agent-${index}`, name: `设备 ${index}` }));
   await page.setViewportSize({ width: 375, height: 568 });
   await page.goto("/#/services");
-  await page.getByRole("button", { name: "创建服务", exact: true }).click();
+  await openServiceEditor(page);
   const dialog = page.getByRole("dialog", { name: "创建服务" });
   await dialog.getByRole("radio", { name: "网页服务", exact: true }).check();
   const agent = dialog.getByRole("combobox", { name: "Agent", exact: true });
@@ -324,7 +325,7 @@ test("展开中的浮层跟随表单滚动和视口变化", async ({ page }) => 
 test("保存期间禁用两个选择框，失败后恢复选择和草稿", async ({ page }) => {
   await installApiMocks(page);
   await page.goto("/#/services");
-  await page.getByRole("button", { name: "创建服务", exact: true }).click();
+  await openServiceEditor(page);
   const dialog = page.getByRole("dialog", { name: "创建服务" });
   await dialog.getByRole("radio", { name: "网页服务", exact: true }).check();
   await dialog.getByLabel("服务名称").fill("保存期间");

@@ -34,6 +34,8 @@ pub(crate) const LAN_REDIRECT_ROUTE_PREFIX: &str = "nexo-lan-redirect-";
 
 #[derive(Debug, Clone)]
 pub struct CaddyRuntimeConfig {
+    /// 由本进程绑定的认证监听地址；未初始化时使用不可连接的端口，禁止绕过认证。
+    pub access_address: String,
     pub binary: PathBuf,
     pub config_path: PathBuf,
     pub applied_path: PathBuf,
@@ -287,6 +289,7 @@ impl CaddyRuntimeConfig {
             })
             .unwrap_or(true);
         Self {
+            access_address: "127.0.0.1:0".into(),
             binary,
             config_path: data_dir.join("caddy").join("config.json"),
             applied_path: data_dir.join("caddy").join("applied.json"),
@@ -484,12 +487,13 @@ impl CaddySupervisor {
     /// 如果上一份 Applied 配置存在，优先用它启动 Caddy，再由协调器把
     /// SQLite 中的 Desired State 通过 Admin API 应用。这样 Server 重启时
     /// 不会因为一次尚未验证的新配置覆盖掉上一份可用边缘配置。
-    /// 内网重定向规则例外：上次认证会话已失效，必须等待 Agent 重新连接后重建。
+    /// 内网重定向等待 Agent 重新连接；代理暂时关闭，等待本次认证监听和数据库规则重建。
     pub fn write_startup_config(&self, config: &Value) -> Result<()> {
         let body = match fs::read(&self.config.applied_path) {
             Ok(applied) => match serde_json::from_slice::<Value>(&applied) {
                 Ok(mut config) => {
                     strip_lan_redirect_routes(&mut config);
+                    close_restored_proxies(&mut config);
                     serde_json::to_vec(&config)?
                 }
                 Err(_) => {
@@ -623,6 +627,20 @@ impl CaddySupervisor {
         }
         *child = None;
         Ok(())
+    }
+}
+
+/// Server 重启后旧随机端口不再可信；旧版路由也可能完全没有认证处理器。
+/// 保留证书配置，但先关闭恢复的代理，等待协调器以当前数据库和本次监听地址重建。
+fn close_restored_proxies(value: &mut Value) {
+    if value.get("handler").and_then(Value::as_str) == Some("reverse_proxy") {
+        *value = serde_json::json!({"handler":"static_response","status_code":503,"body":"服务正在恢复，请稍后重试"});
+        return;
+    }
+    match value {
+        Value::Object(map) => map.values_mut().for_each(close_restored_proxies),
+        Value::Array(values) => values.iter_mut().for_each(close_restored_proxies),
+        _ => {}
     }
 }
 

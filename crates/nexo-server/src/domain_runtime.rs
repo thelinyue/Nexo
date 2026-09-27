@@ -22,6 +22,9 @@ use x509_parser::{extensions::GeneralName, pem::parse_x509_pem};
 #[cfg(test)]
 #[path = "domain_runtime_reverse_proxy_tests.rs"]
 mod reverse_proxy_tests;
+#[cfg(test)]
+#[path = "service_access/caddy_tests.rs"]
+mod service_access_tests;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct CertificateStatus {
@@ -57,6 +60,7 @@ impl DomainRuntime {
 
 /// 仅保存本次进程观测到的运行状态；重启后重新从 Caddy 查询，不沿用数据库中的旧成功标记。
 pub struct DomainRuntimeManager {
+    access_runtime: tokio::sync::OnceCell<crate::service_access::Runtime>,
     pub supervisor: Arc<CaddySupervisor>,
     statuses: Mutex<HashMap<String, DomainRuntime>>,
     /// 配置快照、删除和凭据回收共用协调锁，禁止把删除前的快照重新加载。
@@ -66,6 +70,7 @@ impl DomainRuntimeManager {
     pub fn new(config: CaddyRuntimeConfig) -> Self {
         Self {
             supervisor: Arc::new(CaddySupervisor::new(config)),
+            access_runtime: tokio::sync::OnceCell::new(),
             statuses: Mutex::new(HashMap::new()),
             reconcile_lock: tokio::sync::Mutex::new(()),
         }
@@ -350,7 +355,10 @@ fn build_config(settings: &CaddyRuntimeConfig, domains: &[DomainSpec]) -> Result
             } else {
                 json!({"handler":"static_response","status_code":503,"body":"服务转发通道尚未就绪"})
             };
-            let route = json!({"match":[{"host":[service.hostname]}],"handle":[handler]});
+            let (access_endpoint, access_check) =
+                crate::service_access::handlers(&settings.access_address, &service.id);
+            let route =
+                json!({"match":[{"host":[service.hostname]}],"handle":[access_check,handler]});
             let routes = if service.protocol == "https" {
                 &mut https
             } else {
@@ -377,6 +385,7 @@ fn build_config(settings: &CaddyRuntimeConfig, domains: &[DomainSpec]) -> Result
                     "terminal": true
                 }));
             }
+            routes.push(json!({"match":[{"host":[service.hostname],"path":["/.nexo-access/*"]}],"handle":[access_endpoint],"terminal":true}));
             routes.push(route);
         }
         let domain_subjects = domain.subjects();
@@ -444,7 +453,13 @@ pub(crate) async fn reconcile_locked(state: &AppState) -> Result<bool> {
         cleanup_deleted_credentials(state, &Value::Null)?;
         return Ok(true);
     }
-    let desired = build_config(settings, &specs);
+    let access = manager
+        .access_runtime
+        .get_or_try_init(|| crate::service_access::Runtime::start(state))
+        .await?;
+    let mut settings_with_access = settings.clone();
+    settings_with_access.access_address = access.address.clone();
+    let desired = build_config(&settings_with_access, &specs);
     let config_result = match desired {
         Ok(config) => match supervisor.current_config().await {
             Ok(current)
@@ -802,6 +817,7 @@ mod tests {
 
     fn settings(root: &Path) -> CaddyRuntimeConfig {
         CaddyRuntimeConfig {
+            access_address: "127.0.0.1:0".into(),
             binary: PathBuf::from("caddy"),
             config_path: root.join("config.json"),
             applied_path: root.join("applied.json"),
@@ -844,7 +860,7 @@ mod tests {
             true
         );
         assert_eq!(
-            cfg["apps"]["http"]["servers"]["https"]["routes"][1]["handle"][0]["status_code"],
+            cfg["apps"]["http"]["servers"]["https"]["routes"][2]["handle"][1]["status_code"],
             503
         );
         assert!(!cfg.to_string().contains("mesh."));
@@ -962,7 +978,7 @@ mod tests {
     }
 
     #[test]
-    fn startup_removes_dynamic_redirects_and_preserves_last_good_routes() {
+    fn startup_removes_redirects_and_blocks_restored_proxies_until_reconciled() {
         let root = std::env::temp_dir().join(format!(
             "nexo-caddy-redirect-startup-{}",
             uuid::Uuid::new_v4()
@@ -983,7 +999,12 @@ mod tests {
             .unwrap();
         d.services[0].lan_redirect = None;
         let startup: Value = serde_json::from_slice(&fs::read(&cfg.config_path).unwrap()).unwrap();
-        assert_eq!(startup, build_config(&cfg, &[d]).unwrap());
+        assert_eq!(startup["apps"]["tls"], applied["apps"]["tls"]);
+        assert!(!startup.to_string().contains("reverse_proxy"));
+        assert!(!startup
+            .to_string()
+            .contains(caddy::LAN_REDIRECT_ROUTE_PREFIX));
+        assert!(startup.to_string().contains("503"));
         assert_eq!(
             serde_json::from_slice::<Value>(&fs::read(&cfg.applied_path).unwrap()).unwrap(),
             applied
@@ -1321,6 +1342,22 @@ mod tests {
         other_service.hostname = "other.lan-redirect.localhost".into();
         other_service.lan_redirect.as_mut().unwrap().public_ipv4 = "8.8.8.8".parse().unwrap();
         d.services.push(other_service);
+        let (access_state, _) = crate::tests::domain_fixture();
+        {
+            let db = access_state.db.lock().unwrap();
+            db.execute("INSERT INTO public_domains(id,tenant_id,domain,https_enabled,created_at,updated_at) VALUES('access-domain','default','lan-redirect.localhost',1,0,0)", []).unwrap();
+            for service in &d.services {
+                let hostname = service
+                    .hostname
+                    .strip_suffix(".lan-redirect.localhost")
+                    .unwrap();
+                db.execute("INSERT INTO tunnels(id,tenant_id,name,protocol,local_address,local_port,hostname,public_domain_id,created_at,updated_at) VALUES(?1,'default',?1,?2,'127.0.0.1',8080,?3,'access-domain',0,0)", params![service.id,service.protocol,hostname]).unwrap();
+            }
+        }
+        let access_runtime = crate::service_access::Runtime::start(&access_state)
+            .await
+            .unwrap();
+        cfg.access_address = access_runtime.address.clone();
         let make_config = |d: DomainSpec| {
             let mut config = build_config(&cfg, &[d]).unwrap();
             config["apps"]["tls"]["automation"]["policies"] =
@@ -1458,13 +1495,25 @@ mod tests {
             assert!(tokio::time::Instant::now() < deadline, "Caddy 未重新启动");
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
-        assert_eq!(restarted.current_config().await.unwrap(), disabled);
+        let restored = restarted.current_config().await.unwrap();
+        assert!(!restored.to_string().contains("reverse_proxy"));
+        assert!(!restored
+            .to_string()
+            .contains(caddy::LAN_REDIRECT_ROUTE_PREFIX));
         let response = navigation(Method::GET, &https_url).send().await.unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(response.text().await.unwrap(), format!("GET {uri}"));
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        restarted.apply_json(&disabled).await.unwrap();
+        assert_eq!(
+            navigation(Method::GET, &https_url)
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
         assert_eq!(
             serde_json::from_slice::<Value>(&fs::read(&cfg.applied_path).unwrap()).unwrap(),
-            enabled
+            disabled
         );
         restarted.shutdown().await.unwrap();
         upstream_task.abort();
@@ -1701,7 +1750,7 @@ mod tests {
         );
         assert!(policies[1]["issuers"][0]["challenges"]["dns"].is_null());
         assert_eq!(
-            config["apps"]["http"]["servers"]["https"]["routes"][1]["handle"][0]
+            config["apps"]["http"]["servers"]["https"]["routes"][2]["handle"][1]
                 ["stream_close_delay"],
             300_000_000_000_u64
         );

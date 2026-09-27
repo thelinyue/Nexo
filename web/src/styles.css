@@ -96,6 +96,7 @@ button,a { transition:background-color 160ms ease,color 160ms ease,box-shadow 16
 .address-button code { min-width:0; flex:1; overflow:hidden; white-space:nowrap; text-overflow:ellipsis; }
 .address-button svg { width:44px; padding:12px; height:44px; margin-right:-10px; }
 .service-origin code { min-width:0; flex:1; display:block; overflow:hidden; white-space:nowrap; text-overflow:ellipsis; }
+.service-access-mode { color:var(--muted); font-size:.75rem; white-space:nowrap; flex-shrink:0; }
 .service-origin .icon-button { margin-right:-10px; }
 .row-error { display:flex; min-height:44px; align-items:center; gap:6px; color:var(--danger); font-size:.875rem; border-top:1px solid var(--border); }
 .row-error span { flex:1; min-width:0; overflow:hidden; white-space:nowrap; text-overflow:ellipsis; }
@@ -306,6 +307,9 @@ dd>code { display:block; margin-bottom:10px; user-select:text; font-size:.9375re
 .service-address-input>input,.service-address-input>select,.service-public-input>input,.service-public-input>select { width:100%; min-width:0; min-height:48px; padding:8px 4px; border:0; border-radius:8px; background:transparent; font-size:1rem; }
 .service-address-input [aria-invalid=true],.service-public-input [aria-invalid=true] { box-shadow:inset 0 0 0 2px var(--danger); }
 .service-fixed-protocol { display:flex; align-items:center; min-height:48px; padding:8px 4px; font-size:1rem; color:var(--secondary); }
+/* 协议仍使用原生选择菜单，仅移除浏览器自带的灰色按钮外观。 */
+.service-address-input>select,.service-public-input>select { appearance:none; -webkit-appearance:none; box-shadow:none; padding-right:18px; cursor:pointer; background-image:linear-gradient(45deg,transparent 50%,var(--secondary) 50%),linear-gradient(135deg,var(--secondary) 50%,transparent 50%); background-position:calc(100% - 9px) center,calc(100% - 5px) center; background-size:4px 4px; background-repeat:no-repeat; }
+.service-address-input>select:focus-visible,.service-public-input>select:focus-visible { outline:2px solid var(--primary); outline-offset:-2px; }
 .service-address-separator { color:var(--secondary); }
 .service-select-compact { min-width:0; }
 .service-select-compact .service-select-trigger { min-height:48px; padding:8px 4px; gap:4px; }
@@ -324,6 +328,7 @@ dd>code { display:block; margin-bottom:10px; user-select:text; font-size:.9375re
 .service-advanced summary>span:nth-child(2) { color:var(--secondary); overflow-wrap:anywhere; }
 .service-advanced[open] summary svg { transform:rotate(90deg); }
 .service-advanced[open] summary { border-bottom:1px solid var(--border); }
+.service-advanced-content { display:grid; gap:16px; padding:14px; }
 .service-advanced>.helper { padding:0 14px 12px; font-size:.875rem; }
 .service-form .modal-actions { display:grid; grid-template-columns:minmax(0,1fr); gap:10px; padding:12px 16px; }
 .service-form .modal-actions>.primary-button { width:100%; min-height:48px; }
@@ -661,6 +666,13 @@ dd>code { display:block; margin-bottom:10px; user-select:text; font-size:.9375re
 .page-header .page-create { position:static; min-height:44px; padding:8px 12px; width:auto; height:auto; border-radius:10px; box-shadow:none; }
 .page-header .page-create span { display:inline; }
 .page-actions { display:flex; gap:8px; align-items:center; }
+.service-add-proxy { white-space:nowrap; font-size:.875rem; }
+.service-create-options { display:grid; gap:8px; }
+.service-create-options button { display:flex; align-items:center; gap:14px; width:100%; min-height:72px; padding:12px 16px; border:1px solid var(--border); border-radius:16px; color:var(--text); background:var(--surface); text-align:left; }
+.service-create-options button>svg { flex-shrink:0; color:var(--secondary); }
+.service-create-options button>span { flex:1; min-width:0; font-weight:600; }
+.service-create-options small { display:block; margin-top:4px; color:var(--secondary); font-size:.8125rem; font-weight:400; }
+.service-create-options button:active { background:var(--surface-raised); }
 .toolbar-row { flex-wrap:wrap; gap:8px; }
 .toolbar-row select { width:auto; max-width:100%; min-width:0; flex:1 1 120px; }
 .service-search-row { display:contents; }

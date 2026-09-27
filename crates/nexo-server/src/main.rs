@@ -42,6 +42,7 @@ mod identity_runtime;
 mod lan_redirect;
 mod reverse_proxy;
 mod security;
+mod service_access;
 mod traffic;
 mod transport;
 use enrollment::{agent_enroll, agent_poll, approve_enrollment};
@@ -167,6 +168,7 @@ struct ApproveEnrollment {
 }
 #[derive(Debug, Serialize, Deserialize)]
 struct Tunnel {
+    access_mode: String,
     service_mode: String,
     id: String,
     tenant_id: String,
@@ -189,8 +191,10 @@ struct Tunnel {
     public_domain: Option<String>,
     deletion_pending: bool,
 }
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 struct TunnelInput {
+    access_mode: Option<String>,
+    access_password: Option<String>,
     service_mode: Option<String>,
     device_id: Option<String>,
     name: String,
@@ -513,6 +517,7 @@ fn initialize_database(connection: &Connection, is_new: bool) -> Result<()> {
         accounts::initialize_schema(connection)?;
         reverse_proxy::initialize_schema(connection)?;
         lan_redirect::initialize_schema(connection)?;
+        service_access::initialize_schema(connection)?;
         traffic::initialize_schema(connection)?;
         return domains::initialize_schema(connection);
     }
@@ -522,6 +527,7 @@ fn initialize_database(connection: &Connection, is_new: bool) -> Result<()> {
     accounts::initialize_schema(connection)?;
     reverse_proxy::initialize_schema(connection)?;
     lan_redirect::initialize_schema(connection)?;
+    service_access::initialize_schema(connection)?;
     traffic::initialize_schema(connection)?;
     domains::initialize_schema(connection)
 }
@@ -697,13 +703,22 @@ async fn create_tunnel(
     Json(mut input): Json<TunnelInput>,
 ) -> Result<Json<Tunnel>, ApiError> {
     let session = require_write(&state, &headers)?;
+    let access_hash = service_access::password_hash(&mut input).await?;
     let id = Uuid::new_v4().to_string();
     {
         let db = state.db.lock().map_err(|_| db_error("数据库锁不可用"))?;
         let db = db.unchecked_transaction().map_err(db_error)?;
         reverse_proxy::prepare(&db, &session, &id, &mut input)?;
         prepare_tunnel(&db, &session.tenant_id, &id, &mut input)?;
+        service_access::prepare(
+            &db,
+            &session.tenant_id,
+            &id,
+            &mut input,
+            access_hash.as_deref(),
+        )?;
         db.execute("INSERT INTO tunnels (id,tenant_id,device_id,name,protocol,local_address,local_port,public_port,hostname,enabled,apply_status,apply_revision,public_domain_id,created_at,updated_at,lan_redirect_enabled,origin_protocol,service_mode) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,'checking',1,?11,?12,?12,?13,?14,?15)",params![id,session.tenant_id,input.device_id,input.name.trim(),input.protocol,input.local_address.trim(),input.local_port,input.public_port,input.hostname,input.enabled.unwrap_or(true),input.public_domain_id,unix_now(),input.lan_redirect_enabled.unwrap_or(false),input.origin_protocol,input.service_mode]).map_err(db_error)?;
+        service_access::save(&db, &id, &input, access_hash.as_deref())?;
         accounts::audit(&db, &session, "service_created", "service", &id)?;
         db.commit().map_err(db_error)?;
     }
@@ -721,13 +736,22 @@ async fn update_tunnel(
     Json(mut input): Json<TunnelInput>,
 ) -> Result<Json<Tunnel>, ApiError> {
     let session = require_write(&state, &headers)?;
+    let access_hash = service_access::password_hash(&mut input).await?;
     {
         let db = state.db.lock().map_err(|_| db_error("数据库锁不可用"))?;
         let db = db.unchecked_transaction().map_err(db_error)?;
         if !db.query_row("SELECT EXISTS(SELECT 1 FROM tunnels WHERE id=?1 AND tenant_id=?2 AND deleted_at IS NULL)",params![id,session.tenant_id], |r| r.get::<_,bool>(0)).map_err(db_error)? { return Err(ApiError::new(StatusCode::NOT_FOUND,"服务不存在")); }
         reverse_proxy::prepare(&db, &session, &id, &mut input)?;
         prepare_tunnel(&db, &session.tenant_id, &id, &mut input)?;
+        service_access::prepare(
+            &db,
+            &session.tenant_id,
+            &id,
+            &mut input,
+            access_hash.as_deref(),
+        )?;
         db.execute("UPDATE tunnels SET device_id=?1,name=?2,protocol=?3,local_address=?4,local_port=?5,public_port=?6,hostname=?7,enabled=?8,apply_revision=apply_revision+1,apply_status='checking',updated_at=?9,public_domain_id=?12,lan_redirect_enabled=?13,origin_protocol=?14,service_mode=?15 WHERE id=?10 AND tenant_id=?11 AND deleted_at IS NULL",params![input.device_id,input.name.trim(),input.protocol,input.local_address.trim(),input.local_port,input.public_port,input.hostname,input.enabled.unwrap_or(true),unix_now(),id,session.tenant_id,input.public_domain_id,input.lan_redirect_enabled.unwrap_or(false),input.origin_protocol,input.service_mode]).map_err(db_error)?;
+        service_access::save(&db, &id, &input, access_hash.as_deref())?;
         accounts::audit(&db, &session, "service_updated", "service", &id)?;
         db.commit().map_err(db_error)?;
     }
@@ -1096,7 +1120,7 @@ fn query_tunnels(
         .get(axum::http::header::HOST)
         .and_then(|value| value.to_str().ok())
         .and_then(|host| host.parse::<axum::http::uri::Authority>().ok());
-    let sql="SELECT t.id,t.tenant_id,t.device_id,d.name,t.name,t.protocol,t.local_address,t.local_port,t.public_port,t.hostname,t.enabled,t.apply_status,t.apply_error,t.apply_revision,t.public_domain_id,t.deleted_at,p.domain,t.lan_redirect_enabled,CASE WHEN t.protocol='tcp' THEN NULL ELSE COALESCE(t.origin_protocol,'http') END,t.service_mode FROM tunnels t LEFT JOIN devices d ON d.id=t.device_id LEFT JOIN public_domains p ON p.id=t.public_domain_id WHERE t.tenant_id=?1 AND t.deleted_at IS NULL AND (?2 IS NULL OR t.id=?2) ORDER BY t.created_at DESC";
+    let sql="SELECT t.id,t.tenant_id,t.device_id,d.name,t.name,t.protocol,t.local_address,t.local_port,t.public_port,t.hostname,t.enabled,t.apply_status,t.apply_error,t.apply_revision,t.public_domain_id,t.deleted_at,p.domain,t.lan_redirect_enabled,CASE WHEN t.protocol='tcp' THEN NULL ELSE COALESCE(t.origin_protocol,'http') END,t.service_mode,t.access_mode FROM tunnels t LEFT JOIN devices d ON d.id=t.device_id LEFT JOIN public_domains p ON p.id=t.public_domain_id WHERE t.tenant_id=?1 AND t.deleted_at IS NULL AND (?2 IS NULL OR t.id=?2) ORDER BY t.created_at DESC";
     let mut q = connection.prepare(sql)?;
     let rows = q
         .query_map(params![tenant, only], |row| {
@@ -1114,6 +1138,7 @@ fn query_tunnels(
                     .map(|(host, domain)| format!("{protocol}://{host}.{domain}"))
             };
             Ok(Tunnel {
+                access_mode: row.get(20)?,
                 service_mode: row.get(19)?,
                 id: row.get(0)?,
                 tenant_id: row.get(1)?,

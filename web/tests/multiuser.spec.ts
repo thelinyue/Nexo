@@ -1,3 +1,4 @@
+import { openServiceEditor } from "./service-actions";
 import { expect, test } from "@playwright/test";
 import { installApiMocks } from "./api-mocks";
 
@@ -29,7 +30,7 @@ test("管理员代管空间时请求绑定该空间，账号安全仍访问本�
   await expect(page.getByRole("link", { name: "alice 的服务", exact: true })).toBeVisible();
   expect(scoped).toContain("/api/v1/admin/workspaces/alice-space/tunnels");
   await page.screenshot({ path: info.outputPath("managed-workspace.png"), fullPage: true });
-  await page.getByRole("button", { name: "创建服务", exact: true }).click();
+  await openServiceEditor(page);
   await expect(page.getByRole("dialog").locator(".modal-workspace")).toHaveText("操作空间：alice 的工作空间");
   await page.screenshot({ path: info.outputPath("managed-service-form.png") });
   await page.getByRole("dialog").getByRole("button", { name: "取消", exact: true }).click();
@@ -161,7 +162,7 @@ test("代管空间中重新认证保留原空间及服务草稿", async ({ page 
   await page.goto("/#/users");await page.getByRole("button",{name:"管理 alice 的空间"}).click();
   await expect(page).toHaveURL(/#\/home$/);
   await page.evaluate(() => { location.hash = "#/services"; });
-  await page.getByRole("button",{name:"创建服务"}).click();const editor=page.getByRole("dialog",{name:"创建服务"});
+  await openServiceEditor(page);const editor=page.getByRole("dialog",{name:"创建服务"});
   await editor.getByLabel("服务名称").fill("保留代管草稿");await editor.getByLabel("内网端口").fill("8080");
   await editor.getByLabel("主机名").fill("reauth");
   await editor.getByRole("button",{name:"保存服务"}).click();const login=page.getByRole("dialog",{name:"登录已过期"});
@@ -303,7 +304,7 @@ test("重新认证可输入新用户名，切换账号清除代管和旧草稿",
   await login.getByRole("button", { name: "登录", exact: true }).click();
   await expect(page.getByRole("dialog")).toHaveCount(0);
   await expect(page.locator(".workspace-banner")).toHaveCount(0);
-  await page.getByRole("button", { name: "创建服务" }).click();
+  await openServiceEditor(page);
   await expect(page.getByLabel("服务名称")).toHaveValue("");
 });
 

@@ -1,3 +1,4 @@
+import { openServiceEditor } from "./service-actions";
 import { expect, test } from "@playwright/test";
 import { installApiMocks } from "./api-mocks";
 
@@ -26,7 +27,7 @@ test("账号恢复校验确认密码，失败保留输入，成功返回登录",
 test("保存遇到会话过期后重新登录，保留原服务草稿", async ({ page }, testInfo) => {
   const state = await installApiMocks(page);
   await page.goto("/#/services");
-  await page.getByRole("button", { name: "创建服务" }).click();
+  await openServiceEditor(page);
   const editor = page.getByRole("dialog", { name: "创建服务" });
   await editor.getByLabel("服务名称").fill("保留我的草稿");
   await editor.getByLabel("内网端口").fill("8080");
@@ -65,7 +66,7 @@ test("服务状态自动更新，编辑和后台暂停，返回前台立即刷�
   state.tunnels[0].name = "前台已更新";
   await page.evaluate(() => { Object.defineProperty(document, "visibilityState", { configurable: true, get: () => "visible" }); document.dispatchEvent(new Event("visibilitychange")); });
   await expect(page.getByText("前台已更新", { exact: true })).toBeVisible();
-  await page.getByRole("button", { name: "创建服务" }).click();
+  await openServiceEditor(page);
   const editing = count(); await page.clock.fastForward(10000); expect(count()).toBe(editing);
 });
 

@@ -88,12 +88,12 @@ export async function installApiMocks(page: Page, options: { empty?: boolean; an
     if (path === "/api/v1/public-domain-runtime-events") return respond({ events: state.domainEvents, next_cursor: null });
     if (path.startsWith("/api/v1/public-domains/") && method === "DELETE") { state.domains = state.domains.filter(item => item.id !== path.split("/").pop()); return respond({}); }
     if (path === "/api/v1/tunnels" && method === "GET") return respond(state.tunnels);
-    if (path === "/api/v1/tunnels" && method === "POST") { const item = { lan_redirect_enabled: false, ...body, id: "t-new", public_address: "new.example.com", public_domain: "example.com", apply_status: "checking" }; state.tunnels.push(item); return respond(item, 201); }
+    if (path === "/api/v1/tunnels" && method === "POST") { const item = { access_mode: "public", lan_redirect_enabled: false, ...body, id: "t-new", public_address: "new.example.com", public_domain: "example.com", apply_status: "checking" }; delete item.access_password; state.tunnels.push(item); return respond(item, 201); }
     if (path === "/api/v1/tunnels/batch" && method === "DELETE") { state.tunnels = state.tunnels.filter(item => !body.tunnel_ids.includes(item.id)); return respond({ deleted_ids: body.tunnel_ids }); }
     if (/^\/api\/v1\/tunnels\/batch\/(enable|disable)$/.test(path)) { const items = state.tunnels.filter(item => body.tunnel_ids.includes(item.id)); items.forEach(item => Object.assign(item, { enabled: path.endsWith("/enable"), apply_status: path.endsWith("/enable") ? "checking" : "disabled" })); return respond(items); }
     const toggle = path.match(/^\/api\/v1\/tunnels\/([^/]+)\/(enable|disable)$/);
     if (toggle) { const item = state.tunnels.find(item => item.id === toggle[1]); Object.assign(item, { enabled: toggle[2] === "enable", apply_status: toggle[2] === "enable" ? "checking" : "disabled" }); return respond(item); }
-    if (path.startsWith("/api/v1/tunnels/") && method === "PUT") { const item = state.tunnels.find(item => item.id === path.split("/").pop()); Object.assign(item, body, { lan_redirect_enabled: body.protocol === "tcp" ? false : body.lan_redirect_enabled ?? item.lan_redirect_enabled ?? false }); return respond(item); }
+    if (path.startsWith("/api/v1/tunnels/") && method === "PUT") { const item = state.tunnels.find(item => item.id === path.split("/").pop()); Object.assign(item, body, { lan_redirect_enabled: body.protocol === "tcp" ? false : body.lan_redirect_enabled ?? item.lan_redirect_enabled ?? false }); delete item.access_password; return respond(item); }
     if (path.startsWith("/api/v1/tunnels/") && method === "DELETE") { state.tunnels = state.tunnels.filter(item => item.id !== path.split("/").pop()); return respond({}); }
     return respond({ error: `未模拟的接口 ${method} ${path}` }, 404);
   });

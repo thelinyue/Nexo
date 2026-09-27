@@ -1195,6 +1195,8 @@ mod tests {
         let occupied = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = occupied.local_addr().unwrap().port();
         let input = |device: &str| TunnelInput {
+            access_mode: None,
+            access_password: None,
             service_mode: None,
             device_id: Some(device.into()),
             name: "test".into(),

@@ -1,3 +1,4 @@
+import { openServiceEditor } from "./service-actions";
 import { expect, test } from "@playwright/test";
 import { installApiMocks } from "./api-mocks";
 
@@ -60,7 +61,7 @@ test("首页标签固定，关闭其他页面回到首页，旧空工作区跳�
   await page.getByRole("tab", { name: "首页", exact: true }).press("Delete");
   await expect(page.getByRole("tab")).toHaveText(["首页", "服务"]);
   await page.getByRole("tab", { name: "服务", exact: true }).click();
-  await page.getByRole("button", { name: "创建服务", exact: true }).click();
+  await openServiceEditor(page);
   await page.evaluate(() => document.querySelector<HTMLButtonElement>('.tab-close[aria-label="关闭 服务"]')!.click());
   await expect(page).toHaveURL(/#\/services$/);
   await expect(page.getByRole("dialog", { name: "创建服务" })).toBeVisible();
@@ -162,7 +163,7 @@ test("空白与已修改表单锁住历史导航，跨断点保持实例", async
   await installApiMocks(page);
   await page.goto("/#/agents");
   await page.evaluate(() => { window.location.hash = "#/services"; });
-  await page.getByRole("button", { name: "创建服务", exact: true }).click();
+  await openServiceEditor(page);
   const editor = page.getByRole("dialog", { name: "创建服务" });
   await page.goBack();
   await expect(page).toHaveURL(/#\/services$/);

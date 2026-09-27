@@ -1,3 +1,4 @@
+import { openServiceEditor } from "./service-actions";
 import { expect, test } from "@playwright/test";
 import { installApiMocks } from "./api-mocks";
 
@@ -110,7 +111,7 @@ for (const protocol of ["tcp", "http", "https"]) {
   test(`创建 ${protocol} 服务按协议提交且失败保留输入`, async ({ page }) => {
     const state = await installApiMocks(page);
     await page.goto("/#/services");
-    await page.getByRole("button", { name: "创建服务", exact: true }).click();
+    await openServiceEditor(page);
     const dialog = page.getByRole("dialog", { name: "创建服务" });
     await dialog.getByLabel("服务名称").fill("新服务");
     await dialog.getByRole("radio", { name: protocol === "tcp" ? "TCP 服务" : "网页服务", exact: true }).check();
@@ -149,8 +150,8 @@ test("编辑预填域名，保存不丢失原配置", async ({ page }) => {
 test("未保存保护、弹层焦点约束与关闭后恢复", async ({ page }) => {
   await installApiMocks(page);
   await page.goto("/#/services");
-  const create = page.getByRole("button", { name: "创建服务", exact: true });
-  await create.click();
+  const create = page.getByRole("button", { name: /^(添加|创建服务)$/ });
+  await openServiceEditor(page);
   const editor = page.getByRole("dialog", { name: "创建服务" });
   await editor.getByLabel("服务名称").fill("保留草稿");
   await page.keyboard.press("Escape");
@@ -170,7 +171,7 @@ test("未保存保护、弹层焦点约束与关闭后恢复", async ({ page }) 
 test("无域名时先关闭表单再配置，不允许跨页保留编辑窗口", async ({ page }) => {
   const state = await installApiMocks(page); state.domains = [];
   await page.goto("/#/services");
-  await page.getByRole("button", { name: "创建服务", exact: true }).click();
+  await openServiceEditor(page);
   const editor = page.getByRole("dialog", { name: "创建服务" });
   await editor.getByLabel("服务名称").fill("草稿服务");
   await editor.getByRole("radio", { name: "网页服务", exact: true }).check();
@@ -355,7 +356,7 @@ test("浏览器返回不能切走正在编辑的表单", async ({ page }) => {
   await page.goto("/#/manage");
   const nav = page.locator((page.viewportSize()?.width ?? 0) <= 900 ? ".bottom-nav" : ".sidebar nav");
   await nav.getByRole("link", { name: "服务", exact: true }).click();
-  await page.getByRole("button", { name: "创建服务", exact: true }).click();
+  await openServiceEditor(page);
   const editor = page.getByRole("dialog", { name: "创建服务" });
   await editor.getByLabel("服务名称").fill("未保存内容");
   await page.goBack();
@@ -370,7 +371,7 @@ test("浏览器返回不能切走正在编辑的表单", async ({ page }) => {
 test("尚无 Agent 时禁止保存并说明如何接入设备", async ({ page }) => {
   const state = await installApiMocks(page); state.devices = [];
   await page.goto("/#/services");
-  await page.getByRole("button", { name: "创建服务", exact: true }).click();
+  await openServiceEditor(page);
   const editor = page.getByRole("dialog", { name: "创建服务" });
   await editor.getByLabel("服务名称").fill("等待 Agent 的服务");
   await expect(editor.getByRole("button", { name: "保存服务" })).toBeDisabled();

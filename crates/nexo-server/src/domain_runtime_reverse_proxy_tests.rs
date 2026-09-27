@@ -20,7 +20,7 @@ fn direct_tls_keeps_host_and_verifies_target_while_tunnels_keep_socket_transport
 }
 
 /// 测试上游回显原始 HTTP 请求；WebSocket 握手后解码一帧并返回，验证真实升级后的双向通道。
-async fn echo_origin<S: AsyncRead + AsyncWrite + Unpin>(
+pub(super) async fn echo_origin<S: AsyncRead + AsyncWrite + Unpin>(
     mut stream: S,
     label: &str,
 ) -> anyhow::Result<()> {
@@ -236,8 +236,10 @@ async fn real_caddy_direct_proxy_lifecycle_tls_websocket_and_quota_isolation() {
         .unwrap();
     let handler = &mut routes
         .iter_mut()
-        .find(|r| r["match"][0]["host"][0] == "app.reverse.localhost")
-        .unwrap()["handle"][0];
+        .find(|r| {
+            r["match"][0]["host"][0] == "app.reverse.localhost" && r["match"][0]["path"].is_null()
+        })
+        .unwrap()["handle"][1];
     handler["transport"]["tls"]["root_ca_pem_files"] = json!([cert_path]);
     supervisor.apply_json(&trusted).await.unwrap();
     let response = client.get(&url).send().await.unwrap();

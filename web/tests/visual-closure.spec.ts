@@ -1,3 +1,4 @@
+import { openServiceEditor } from "./service-actions";
 import { expect, test } from "@playwright/test";
 import { installApiMocks } from "./api-mocks";
 
@@ -28,7 +29,7 @@ test("所有页面在移动尺寸和明暗主题中无溢出，输出实际截�
           if (route === "services") {
             await expect(page.locator(".service-address .public-address").first()).toHaveCSS("white-space", "nowrap");
             await expect(page.locator(".service-origin code").first()).toHaveCSS("white-space", "nowrap");
-            const fab = await page.getByRole("button", { name: "创建服务", exact: true }).boundingBox();
+            const fab = await page.getByRole("button", { name: "添加", exact: true }).boundingBox();
             const nav = await page.locator(".bottom-nav").boundingBox();
             expect(fab!.y + fab!.height).toBeLessThanOrEqual(nav!.y);
             expect(fab!.y).toBeGreaterThan(height / 2);
@@ -45,7 +46,7 @@ test("所有页面在移动尺寸和明暗主题中无溢出，输出实际截�
         await page.screenshot({ path: testInfo.outputPath(`${name}-${theme}-${route.replaceAll("/", "-")}.png`) });
       }
       await page.goto("/#/services");
-      await page.getByRole("button", { name: "创建服务", exact: true }).click();
+      await openServiceEditor(page);
       const dialog = page.getByRole("dialog", { name: "创建服务" });
       await expect(dialog).toBeVisible();
       await expect(dialog.getByRole("button", { name: "保存服务" })).toBeInViewport();
