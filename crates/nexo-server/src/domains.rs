@@ -7,25 +7,13 @@ use std::{
     time::Duration,
 };
 
-fn default_dns_resolvers() -> Vec<String> {
-    vec!["223.5.5.5:53".into(), "223.6.6.6:53".into()]
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
+/// 每域名独立的证书验证参数；空解析器列表使用 Caddy 默认，不影响归属验证。
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct DnsSettings {
-    #[serde(default = "default_dns_resolvers")]
+    #[serde(default)]
     pub dns_resolvers: Vec<String>,
     pub dns_propagation_delay_seconds: Option<u32>,
     pub dns_propagation_timeout_seconds: Option<u32>,
-}
-impl Default for DnsSettings {
-    fn default() -> Self {
-        Self {
-            dns_resolvers: default_dns_resolvers(),
-            dns_propagation_delay_seconds: None,
-            dns_propagation_timeout_seconds: None,
-        }
-    }
 }
 impl DnsSettings {
     fn validate(&mut self) -> Result<(), ApiError> {
@@ -69,17 +57,15 @@ impl DnsSettings {
                 "DNS 传播等待应为 0–120 秒，传播超时应为 1–600 秒",
             ));
         }
-        self.dns_resolvers = if normalized.is_empty() {
-            default_dns_resolvers()
-        } else {
-            normalized
-        };
+        // 空列表交由 Caddy 选择默认解析器，不覆盖系统 DNS。
+        self.dns_resolvers = normalized;
         Ok(())
     }
 }
 
 #[derive(Clone, Debug, Serialize)]
 pub struct Settings {
+    pub dns_provider: String,
     pub certificate_mode: String,
     pub verification_status: String,
     pub verification_record: Option<Value>,
@@ -104,12 +90,15 @@ pub fn load(db: &Connection, id: &str, domain: &str) -> Result<Settings, ApiErro
     let row=db.query_row("SELECT certificate_mode,verified,verification_token,credential_file,dns_resolvers,propagation_delay,propagation_timeout FROM domain_settings WHERE domain_id=?1",[id],|r|Ok((r.get::<_,String>(0)?,r.get::<_,bool>(1)?,r.get::<_,String>(2)?,r.get::<_,Option<String>>(3)?,r.get::<_,String>(4)?,r.get::<_,Option<u32>>(5)?,r.get::<_,Option<u32>>(6)?))).optional().map_err(db_error)?;
     let (mode, verified, token, file, resolvers, delay, timeout) =
         row.ok_or_else(|| db_error("域名设置缺失，请核对数据库"))?;
-    let mut dns_resolvers: Vec<String> = serde_json::from_str(&resolvers).map_err(db_error)?;
-    // 新域名和已有空配置统一使用阿里云公共 DNS，仅用于证书验证，不改变归属验证的信任来源。
-    if dns_resolvers.is_empty() {
-        dns_resolvers = default_dns_resolvers();
-    }
+    let dns_resolvers: Vec<String> = serde_json::from_str(&resolvers).map_err(db_error)?;
     Ok(Settings {
+        dns_provider: db
+            .query_row(
+                "SELECT dns_provider FROM domain_settings WHERE domain_id=?1",
+                [id],
+                |r| r.get(0),
+            )
+            .map_err(db_error)?,
         certificate_mode: mode,
         verification_status: if verified { "verified" } else { "pending" }.into(),
         verification_record: (!verified)
@@ -129,7 +118,7 @@ pub fn create_settings(db: &Connection, id: &str) -> Result<(), ApiError> {
     db.execute("INSERT INTO domain_settings(domain_id,certificate_mode,verified,verification_token) VALUES (?1,'http01',0,?2)",params![id,proof.secret]).map_err(db_error)?;
     Ok(())
 }
-fn owned(db: &Connection, tenant: &str, id: &str) -> Result<String, ApiError> {
+pub(crate) fn owned(db: &Connection, tenant: &str, id: &str) -> Result<String, ApiError> {
     db.query_row(
         "SELECT domain FROM public_domains WHERE id=?1 AND tenant_id=?2",
         params![id, tenant],
@@ -141,7 +130,7 @@ fn owned(db: &Connection, tenant: &str, id: &str) -> Result<String, ApiError> {
 }
 
 /// 在写事务内占用域名范围；未验证记录不能抢占其他用户域名，父子域也不能跨空间重叠。
-fn claim(db: &Connection, tenant: &str, id: &str, domain: &str) -> Result<(), ApiError> {
+pub(crate) fn claim(db: &Connection, tenant: &str, id: &str, domain: &str) -> Result<(), ApiError> {
     crate::server_settings::ensure_host_available(db, domain)?;
     let mut query=db.prepare("SELECT p.domain FROM public_domains p LEFT JOIN domain_settings s ON s.domain_id=p.id WHERE p.tenant_id!=?1 AND COALESCE(s.verified,1)=1").map_err(db_error)?;
     for existing in query
@@ -185,17 +174,20 @@ pub async fn update(
     if !matches!(input.certificate_mode.as_str(), "http01" | "cloudflare_dns") {
         return Err(ApiError::new(
             StatusCode::BAD_REQUEST,
-            "请选择 HTTP 验证或 Cloudflare DNS 验证",
+            "请选择 HTTP 验证或 DNS 验证",
         ));
     }
     input.dns.validate()?;
     let db = state.db.lock().map_err(|_| db_error("数据库锁不可用"))?;
     let domain = owned(&db, &session.tenant_id, &id)?;
     let current = load(&db, &id, &domain)?;
+    if input.certificate_mode == "http01" && db.query_row("SELECT EXISTS(SELECT 1 FROM tunnels WHERE public_domain_id=?1 AND ipv6_direct_enabled=1 AND deleted_at IS NULL)",[&id],|r|r.get::<_,bool>(0)).map_err(db_error)? {
+        return Err(ApiError::new(StatusCode::CONFLICT,"请先关闭该域名下服务的 IPv6 直连，再切换 HTTP 验证"));
+    }
     if input.certificate_mode == "cloudflare_dns" && !current.credential_configured {
         return Err(ApiError::new(
             StatusCode::BAD_REQUEST,
-            "请先验证并保存 Cloudflare Token，再保存 DNS 证书配置",
+            "请先验证并保存 DNS 凭据，再保存 DNS 证书配置",
         ));
     }
     let tx = db.unchecked_transaction().map_err(db_error)?;
@@ -399,6 +391,8 @@ pub async fn set_credential(
     owned(&db, &session.tenant_id, &id)?;
     let tx = db.unchecked_transaction().map_err(db_error)?;
     claim(&tx, &session.tenant_id, &id, &domain)?;
+    crate::dns_provider::ensure_switch(&tx, &id, "cloudflare")
+        .map_err(|e| ApiError::new(StatusCode::CONFLICT, e.to_string()))?;
     let file = write_credential(
         &state
             .domain_runtime
@@ -414,7 +408,7 @@ pub async fn set_credential(
             "无法安全保存 Cloudflare 凭据",
         )
     })?;
-    tx.execute("UPDATE domain_settings SET credential_file=?1,certificate_mode='cloudflare_dns' WHERE domain_id=?2",params![file,id]).map_err(db_error)?;
+    tx.execute("UPDATE domain_settings SET credential_file=?1,dns_provider='cloudflare',certificate_mode='cloudflare_dns' WHERE domain_id=?2",params![file,id]).map_err(db_error)?;
     accounts::audit(&tx, &session, "domain_credential_updated", "domain", &id)?;
     tx.commit().map_err(db_error)?;
     Ok(Json(load(&db, &id, &domain)?))
@@ -478,7 +472,7 @@ mod tests {
                 .unwrap()
                 .dns
                 .dns_resolvers,
-            ["223.5.5.5:53", "223.6.6.6:53"]
+            Vec::<String>::new()
         );
         let error = update(
             State(state.clone()),
@@ -499,6 +493,40 @@ mod tests {
             "http01"
         );
     }
+    #[tokio::test]
+    async fn empty_resolvers_round_trip_without_overriding_saved_addresses() {
+        let (state, headers) = crate::tests::domain_fixture();
+        let domain = crate::tests::add_test_domain(&state, &headers, "defaults.test")
+            .await
+            .unwrap();
+        for resolvers in [vec!["223.5.5.5:53", "223.6.6.6:53"], vec![]] {
+            let input: SettingsInput = serde_json::from_value(
+                json!({"certificate_mode":"http01", "dns_resolvers":resolvers}),
+            )
+            .unwrap();
+            let saved = update(
+                State(state.clone()),
+                headers.clone(),
+                Path(domain.id.clone()),
+                Json(input),
+            )
+            .await
+            .unwrap()
+            .0;
+            assert_eq!(saved.dns.dns_resolvers, resolvers);
+            assert_eq!(
+                load(&state.db.lock().unwrap(), &domain.id, &domain.domain)
+                    .unwrap()
+                    .dns
+                    .dns_resolvers,
+                resolvers
+            );
+        }
+        let input: SettingsInput =
+            serde_json::from_value(json!({"certificate_mode":"http01"})).unwrap();
+        assert!(input.dns.dns_resolvers.is_empty());
+    }
+
     #[test]
     fn tokens_match_cloudflare_module_and_cannot_inject_placeholders() {
         for token in [
@@ -538,7 +566,7 @@ mod tests {
         }
         value.dns_resolvers.clear();
         value.validate().unwrap();
-        assert_eq!(value.dns_resolvers, ["223.5.5.5:53", "223.6.6.6:53"]);
+        assert_eq!(value.dns_resolvers, Vec::<String>::new());
         value.dns_propagation_timeout_seconds = Some(0);
         assert!(value.validate().is_err());
     }

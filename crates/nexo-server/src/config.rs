@@ -20,6 +20,24 @@ pub struct Config {
     pub web_dir: PathBuf,
     pub admin: Admin,
     pub caddy: Caddy,
+    pub direct: Direct,
+}
+/// IPv6 直连签证与可选诊断；Server 可以完全没有 IPv6 出口。
+#[derive(Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Direct {
+    pub relay_ipv4: Option<std::net::Ipv4Addr>,
+    pub acme_directory: String,
+    pub probe_enabled: bool,
+}
+impl Default for Direct {
+    fn default() -> Self {
+        Self {
+            relay_ipv4: None,
+            acme_directory: "https://acme-v02.api.letsencrypt.org/directory".into(),
+            probe_enabled: false,
+        }
+    }
 }
 #[derive(Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -69,6 +87,7 @@ impl Default for Config {
             web_dir: PathBuf::new(),
             admin: Admin::default(),
             caddy: Caddy::default(),
+            direct: Direct::default(),
         }
     }
 }
@@ -88,6 +107,15 @@ impl Config {
                 value.admin.password = password;
             }
         }
+        let acme = reqwest::Url::parse(&value.direct.acme_directory)
+            .context("direct.acme_directory 格式错误")?;
+        anyhow::ensure!(
+            acme.scheme() == "https"
+                && acme.host_str().is_some()
+                && acme.username().is_empty()
+                && acme.password().is_none(),
+            "ACME 目录必须是 HTTPS 地址"
+        );
         for (name, address) in [
             ("tunnel_endpoint", &value.tunnel_endpoint),
             ("udp_endpoint", &value.udp_endpoint),

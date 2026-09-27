@@ -126,19 +126,9 @@ try {
   check("身份文件和私钥丢失后可重新授权，原服务仍可用");
 
   const domain = await api("public-domains", "POST", { domain: "example.localhost", https_enabled: false });
-  const instructions = await api(`public-domains/${domain.id}/access`);
-  assert.equal(instructions.public_access, "unverified");
-  assert.deepEqual(instructions.expected_addresses, ["127.0.0.1"]);
-  const dns = await wait(async () => { const result = await api(`public-domains/${domain.id}/access`); return result.checked_at ? result : null; }, "DNS 未自动检查");
-  assert.equal(dns.public_access, "unverified"); assert(dns.checked_at);
-  const unresolved = dns.records.some(record => record.status === "unresolved");
-  assert.equal(dns.retries_remaining, unresolved ? 3 : 0);
-  assert.equal(dns.next_retry_at, unresolved ? dns.checked_at + 300 : null);
-  assert((await api("public-domains")).find(item => item.id === domain.id)?.access.checked_at);
-  const rechecked = await api(`public-domains/${domain.id}/access`, "POST");
-  assert.equal(rechecked.public_access, "unverified"); assert(rechecked.checked_at);
-  assert(rechecked.retries_remaining <= dns.retries_remaining, "手动检查重置了自动重试次数");
-  check("域名解析在后台自动检查，列表读取结果，手动重试不冒充公网可达验证");
+  const savedDomain = (await api("public-domains")).find(item => item.id === domain.id);
+  assert(savedDomain); assert.equal(Object.hasOwn(savedDomain, "access"), false);
+  check("域名保存后不附带访问解析检查结果");
 
   const command = await promisify(execFile)(serverBin, ["--data-dir", path.join(root, "server"), "admin", "recover", "--username", "admin"], { env: process.env, windowsHide: true });
   const code = command.stdout.match(/[a-f0-9]{64}/)?.[0]; assert(code, "CLI 未生成恢复码");

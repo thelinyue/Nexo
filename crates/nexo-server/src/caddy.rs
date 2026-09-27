@@ -712,7 +712,14 @@ fn credential_signature(config: &Value) -> Result<Option<String>> {
         match value {
             Value::Object(map) => {
                 for (key, value) in map {
-                    if key == "api_token" {
+                    if matches!(
+                        key.as_str(),
+                        "api_token"
+                            | "access_key_id"
+                            | "access_key_secret"
+                            | "SecretId"
+                            | "SecretKey"
+                    ) {
                         if let Some(path) = value
                             .as_str()
                             .and_then(|s| s.strip_prefix("{file."))

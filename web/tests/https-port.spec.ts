@@ -1,0 +1,33 @@
+import { expect, test } from "@playwright/test";
+import { installApiMocks } from "./api-mocks";
+import { openServiceEditor } from "./service-actions";
+
+test("HTTPS 公网端口预览、验证、保存与切换保留", async ({ page }) => {
+  const state = await installApiMocks(page);
+  await page.goto("/#/services");
+  await openServiceEditor(page);
+  const dialog = page.getByRole("dialog", { name: "创建服务" });
+  await dialog.getByLabel("服务名称").fill("媒体端口");
+  await dialog.getByLabel("内网地址", { exact: true }).fill("192.168.1.10");
+  await dialog.getByLabel("内网端口").fill("8096");
+  await dialog.getByLabel("主机名").fill("emby");
+  const port = dialog.getByLabel("HTTPS 端口");
+  await expect(port).toHaveValue("443");
+  await port.fill("9443");
+  await expect(dialog.locator(".service-submit-preview")).toContainText(":9443");
+  await dialog.getByLabel("公网协议").selectOption("http");
+  await expect(port).toHaveCount(0);
+  await expect(dialog.locator(".service-submit-preview")).not.toContainText(":9443");
+  await dialog.getByLabel("公网协议").selectOption("https");
+  await expect(port).toHaveValue("9443");
+  await port.fill("0");
+  await dialog.getByRole("button", { name: "保存服务" }).click();
+  await expect(dialog.getByText("请输入 1–65535 的整数端口")).toBeVisible();
+  await port.fill("9443");
+  await dialog.getByRole("button", { name: "保存服务" }).click();
+  await expect(dialog).toBeHidden();
+  expect(state.calls.find(call => call.method === "POST")?.body).toMatchObject({ https_port: 9443, local_port: 8096, protocol: "https" });
+  await page.getByRole("link", { name: "媒体端口", exact: true }).click();
+  await page.getByRole("button", { name: "编辑服务" }).click();
+  await expect(page.getByRole("dialog").getByLabel("HTTPS 端口")).toHaveValue("9443");
+});

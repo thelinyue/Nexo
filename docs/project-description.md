@@ -14,4 +14,4 @@ Nexo 联巢：自托管 TCP / HTTP / HTTPS 内网穿透平台，提供可视化�
 
 Nexo 是一个自托管内网穿透平台，通过轻量 Agent 将内网 TCP、HTTP、HTTPS 服务发布到公网。用户可以在 Web 页面管理 Agent、服务、域名与证书，并通过独立工作空间与其他用户共用部署。Server 和 Agent 的官方镜像支持 Linux/amd64，默认部署使用各组件的 latest 稳定版。
 
-域名能力包括归属验证、访问解析检查和 Cloudflare DNS-01 证书验证；不会自动创建服务访问所需的 A/AAAA 记录。
+域名能力包括归属验证和自动证书申请、续期；用户自行配置根域名和泛域名的 A/AAAA 记录，Nexo 不检查访问解析。

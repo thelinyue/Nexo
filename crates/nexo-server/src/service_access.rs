@@ -83,6 +83,7 @@ pub fn save(
 
 #[derive(Clone)]
 struct AccessState {
+    default_https_port: u16,
     db: Arc<Mutex<Connection>>,
     security: Arc<crate::security::Security>,
 }
@@ -112,6 +113,15 @@ impl Runtime {
                 protected(response)
             }))
             .with_state(AccessState {
+                default_https_port: state
+                    .domain_runtime
+                    .supervisor
+                    .config()
+                    .https_listen
+                    .rsplit(':')
+                    .next()
+                    .and_then(|p| p.parse().ok())
+                    .unwrap_or(443),
                 db: state.db.clone(),
                 security: state.security.clone(),
             });
@@ -139,10 +149,10 @@ fn value<'a>(headers: &'a HeaderMap, name: &str) -> &'a str {
         .and_then(|v| v.to_str().ok())
         .unwrap_or("")
 }
-fn service(db: &Connection, headers: &HeaderMap) -> Result<Service, ApiError> {
+fn service(state: &AccessState, db: &Connection, headers: &HeaderMap) -> Result<Service, ApiError> {
     let id = value(headers, "x-nexo-access-service");
-    let result = db.query_row("SELECT t.id,t.name,t.access_mode,t.access_password_hash,t.protocol,t.hostname || '.' || p.domain,t.apply_revision FROM tunnels t JOIN public_domains p ON p.id=t.public_domain_id JOIN tenants w ON w.id=t.tenant_id WHERE t.id=?1 AND t.enabled=1 AND t.deleted_at IS NULL AND w.enabled=1 AND t.protocol IN ('http','https')", [id], |r| Ok((Service { id:r.get(0)?,name:r.get(1)?,mode:r.get(2)?,hash:r.get(3)?,origin:String::new(),revision:r.get(6)? },r.get::<_,String>(4)?,r.get::<_,String>(5)?))).optional().map_err(db_error)?;
-    let Some((mut service, protocol, host)) = result else {
+    let result = db.query_row("SELECT t.id,t.name,t.access_mode,t.access_password_hash,t.protocol,t.hostname || '.' || p.domain,t.apply_revision,t.https_port FROM tunnels t JOIN public_domains p ON p.id=t.public_domain_id JOIN tenants w ON w.id=t.tenant_id WHERE t.id=?1 AND t.enabled=1 AND t.deleted_at IS NULL AND w.enabled=1 AND t.protocol IN ('http','https')", [id], |r| Ok((Service { id:r.get(0)?,name:r.get(1)?,mode:r.get(2)?,hash:r.get(3)?,origin:String::new(),revision:r.get(6)? },r.get::<_,String>(4)?,r.get::<_,String>(5)?,r.get::<_,u16>(7)?))).optional().map_err(db_error)?;
+    let Some((mut service, protocol, host, https_port)) = result else {
         return Err(ApiError::new(StatusCode::NOT_FOUND, "服务不可用"));
     };
     // 检查当前域名，防止配置加载失败时旧 Caddy 路由继续使用新服务的认证。
@@ -155,7 +165,11 @@ fn service(db: &Connection, headers: &HeaderMap) -> Result<Service, ApiError> {
     let parsed = authority
         .parse::<axum::http::uri::Authority>()
         .map_err(db_error)?;
-    if parsed.host() != host {
+    if parsed.host() != host
+        || (protocol == "https"
+            && parsed.port_u16().unwrap_or(443) != https_port
+            && !(https_port == 443 && parsed.port_u16() == Some(state.default_https_port)))
+    {
         return Err(ApiError::new(StatusCode::BAD_REQUEST, "访问地址无效"));
     }
     service.origin = format!("{protocol}://{authority}");
@@ -201,7 +215,7 @@ async fn check(State(state): State<AccessState>, headers: HeaderMap) -> Response
 }
 fn check_inner(state: &AccessState, headers: &HeaderMap) -> Result<Response, ApiError> {
     let db = state.db.lock().map_err(|_| db_error("数据库锁不可用"))?;
-    let service = service(&db, headers)?;
+    let service = service(state, &db, headers)?;
     if service.mode == "public" || authenticated(&db, headers, &service)? {
         let clean = headers
             .get_all(header::COOKIE)
@@ -277,7 +291,7 @@ async fn page(
 ) -> Response {
     let result = (|| {
         let db = state.db.lock().map_err(|_| db_error("数据库锁不可用"))?;
-        let service = service(&db, &headers)?;
+        let service = service(&state, &db, &headers)?;
         if service.mode == "public" || authenticated(&db, &headers, &service)? {
             return Ok(redirect(&safe_return(&target.path)));
         }
@@ -311,7 +325,7 @@ async fn login_inner(
 ) -> Result<Response, ApiError> {
     let initial = {
         let db = state.db.lock().map_err(|_| db_error("数据库锁不可用"))?;
-        service(&db, headers)?
+        service(state, &db, headers)?
     };
     if value(headers, "origin") != initial.origin {
         return Err(ApiError::new(StatusCode::FORBIDDEN, "请求来源不匹配"));
@@ -340,7 +354,7 @@ async fn login_inner(
     rand::rngs::OsRng.fill_bytes(&mut bytes);
     let raw = hex::encode(bytes);
     let db = state.db.lock().map_err(|_| db_error("数据库锁不可用"))?;
-    let current = service(&db, headers)?;
+    let current = service(state, &db, headers)?;
     if current.hash != initial.hash
         || current.mode != initial.mode
         || current.origin != initial.origin
@@ -394,6 +408,102 @@ pub fn handlers(address: &str, id: &str) -> (Value, Value) {
     check["rewrite"] = json!({"method":"GET","uri":"/check"});
     check["handle_response"] = json!([{"match":{"status_code":[2]},"routes":[{"handle":[{"handler":"headers","request":{"set":{"Cookie":["{http.reverse_proxy.header.X-Nexo-Upstream-Cookie}"]},"delete":["X-Nexo-Access-*","X-Nexo-Upstream-Cookie"]}}]}]}]);
     (endpoint, check)
+}
+
+/// 管理连接已验证设备和服务版本；仅桥接原认证流程，禁止转发任意 URL 或应用请求体。
+pub async fn direct_request(
+    state: &AppState,
+    service: &nexo_protocol::direct::Service,
+    path: String,
+    incoming: Vec<(String, String)>,
+    body: Vec<u8>,
+) -> anyhow::Result<nexo_protocol::direct::Response> {
+    anyhow::ensure!(
+        incoming.len() <= 64
+            && incoming
+                .iter()
+                .map(|(k, v)| k.len() + v.len())
+                .sum::<usize>()
+                <= 32768
+            && body.len() <= 2048,
+        "认证请求过大"
+    );
+    let mut headers = HeaderMap::new();
+    for (key, value) in incoming {
+        // Agent 只能提供认证流程消费的元数据，不能注入管理账号的转发身份。
+        if matches!(
+            key.as_str(),
+            "cookie"
+                | "origin"
+                | "accept"
+                | "upgrade"
+                | "sec-fetch-mode"
+                | "sec-fetch-dest"
+                | "x-nexo-access-authority"
+                | "x-nexo-access-ip"
+                | "x-nexo-access-method"
+                | "x-nexo-access-uri"
+        ) {
+            headers.append(
+                axum::http::HeaderName::from_bytes(key.as_bytes())?,
+                HeaderValue::from_str(&value)?,
+            );
+        }
+    }
+    headers.insert(
+        "x-nexo-access-service",
+        HeaderValue::from_str(&service.tunnel.tunnel_id)?,
+    );
+    headers.insert(
+        "x-nexo-access-host",
+        HeaderValue::from_str(&service.hostname)?,
+    );
+    headers.insert("x-nexo-access-proto", HeaderValue::from_static("https"));
+    let access = AccessState {
+        db: state.db.clone(),
+        security: state.security.clone(),
+        default_https_port: 443,
+    };
+    let response = if path == "/check" {
+        check(State(access), headers).await
+    } else if path == "/.nexo-access/login" {
+        if headers
+            .get("x-nexo-access-method")
+            .is_none_or(|v| v != "POST")
+        {
+            StatusCode::METHOD_NOT_ALLOWED.into_response()
+        } else {
+            login(State(access), headers, Json(serde_json::from_slice(&body)?)).await
+        }
+    } else {
+        let url = reqwest::Url::parse(&format!("http://local{path}"))?;
+        anyhow::ensure!(
+            url.host_str() == Some("local") && url.path() == PREFIX,
+            "认证路径无效"
+        );
+        let target = url
+            .query_pairs()
+            .find(|(k, _)| k == "return")
+            .map(|(_, v)| v.into_owned())
+            .unwrap_or_default();
+        page(State(access), Query(ReturnPath { path: target }), headers).await
+    };
+    let (parts, body) = response.into_parts();
+    let headers = parts
+        .headers
+        .iter()
+        .filter_map(|(k, v)| {
+            v.to_str()
+                .ok()
+                .map(|v| (k.as_str().to_owned(), v.to_owned()))
+        })
+        .collect();
+    let body = axum::body::to_bytes(body, 64 * 1024).await?.to_vec();
+    Ok(nexo_protocol::direct::Response::Access {
+        status: parts.status.as_u16(),
+        headers,
+        body,
+    })
 }
 
 #[cfg(test)]

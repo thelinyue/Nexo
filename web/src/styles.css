@@ -544,9 +544,6 @@ dd>code { display:block; margin-bottom:10px; user-select:text; font-size:.9375re
 .domain-list .panel { margin:0; }
 .domain-heading { display:flex; align-items:center; gap:12px; }
 .domain-heading h2 { min-width:0; flex:1; margin:0; font-size:1rem; overflow-wrap:anywhere; -webkit-user-select:text; user-select:text; }
-.domain-access-button { flex-shrink:0; padding-inline:8px; font-size:.875rem; }
-.domain-config { display:flex; flex-wrap:wrap; align-items:center; gap:8px 12px; margin:0; color:var(--secondary); font-size:.875rem; }
-.domain-config .status { max-width:100%; }
 .domain-diagnostics>summary,.domain-events>summary { min-height:44px; display:flex; align-items:center; justify-content:space-between; gap:8px; cursor:pointer; list-style:none; color:var(--secondary); font-size:.875rem; }
 .domain-diagnostics>summary::-webkit-details-marker,.domain-events>summary::-webkit-details-marker { display:none; }
 .domain-diagnostics>summary>svg,.domain-events>summary>svg { flex-shrink:0; }
@@ -561,10 +558,9 @@ dd>code { display:block; margin-bottom:10px; user-select:text; font-size:.9375re
 .domain-certificate .detail-field dd { overflow-wrap:anywhere; }
 .domain-error { margin:8px 0; padding:10px 12px; background:var(--danger-soft); border-radius:12px; color:var(--danger); font-size:.875rem; white-space:pre-wrap; user-select:text; }
 .domain-error strong { display:block; margin-bottom:4px; }
-.domain-alert { margin:2px 0 0; color:var(--danger); font-size:.875rem; }
 .domain-events { margin-top:16px; padding:4px 16px; }
 .domain-events>summary { font-weight:600; color:var(--text); }
-.domain-events-body .list-caption { margin-top:0; }
+.domain-events li:first-child { border-top:0; }
 .domain-events ol { padding:0; margin:0; list-style:none; }
 .domain-events li { padding:12px 0; border-top:1px solid var(--border); font-size:.875rem; }
 .domain-events time { display:block; margin-top:3px; color:var(--secondary); }
@@ -593,9 +589,6 @@ dd>code { display:block; margin-bottom:10px; user-select:text; font-size:.9375re
 .recovery-help { margin-block: .75rem; }
 .recovery-help summary { cursor: pointer; min-height: 44px; display: flex; align-items: center; gap: .5rem; }
 .recovery-help code, .command-block { display: block; white-space: pre-wrap; overflow-wrap: anywhere; user-select: text; font-size:.875rem; }
-.domain-access { overflow-wrap: anywhere; font-size: 1rem; color: var(--text); }
-.domain-access .domain-certificate { overflow-wrap: anywhere; }
-.domain-access .domain-certificate p { margin-block: .5rem; }
 .pending-actions { display: flex; flex-wrap: wrap; gap: .5rem; align-items: center; }
 /* 多用户仍沿用管理列表和原生弹层；小屏允许操作换行，凭据不撑开页面。 */
 .workspace-banner { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 16px; margin-bottom: 20px; border: 1px solid var(--border); border-radius: 16px; background: var(--surface); }
@@ -685,8 +678,6 @@ dd>code { display:block; margin-bottom:10px; user-select:text; font-size:.9375re
 @media (max-width:380px) { .users-filter { grid-template-columns:minmax(0,1fr) 104px; } .users-filter .search { padding-inline:10px; gap:6px; } }
 .credential-summary { display:flex; flex-wrap:wrap; align-items:center; justify-content:space-between; gap:8px; font-size:.875rem; }
 .domain-settings>.helper { margin:0; }
-.domain-config .domain-access-button { padding-left:0; }
-.domain-heading>.text-button { flex-shrink:0; padding-inline:8px; }
 
 /* 统一任务布局：创建操作属于标题区，正文不再为各页面的悬浮按钮单独让位。 */
 .page-header .page-create { position:static; min-height:44px; padding:8px 12px; width:auto; height:auto; border-radius:10px; box-shadow:none; }
@@ -730,9 +721,7 @@ dd>code { display:block; margin-bottom:10px; user-select:text; font-size:.9375re
 .domain-settings section { min-width:0; }
 .domain-settings h3 { margin-bottom:12px; }
 .domain-settings .management-fields .helper { padding:0 14px 12px; }
-.dns-expected { margin-block:16px; }
-.dns-expected .service-detail-address { margin-block:8px; }
-.helper,.panel-note,.service-device,.status,.session-row small,.pending-row small,.domain-config,.domain-error,.domain-alert,.domain-diagnostics>summary,.domain-events>summary,.domain-certificate .detail-field,.domain-events li,.user-resources dt,.row-link small { font-size:max(14px,.875rem); }
+.helper,.panel-note,.service-device,.status,.session-row small,.pending-row small,.domain-error,.domain-diagnostics>summary,.domain-events>summary,.domain-certificate .detail-field,.domain-events li,.user-resources dt,.row-link small { font-size:max(14px,.875rem); }
 @media (max-width:900px) {
   .content { padding-bottom:calc(112px + env(safe-area-inset-bottom)); }
   .page-header { position:relative; background:none; backdrop-filter:none; -webkit-backdrop-filter:none; padding-block:16px; gap:8px; }
@@ -749,8 +738,6 @@ dd>code { display:block; margin-bottom:10px; user-select:text; font-size:.9375re
   .management-form { width:100%; max-width:640px; margin-inline:auto; }
 }
 
-.domain-row>.row-link { padding:6px 0; min-height:44px; font-size:14px; color:var(--secondary); }
-.domain-row>.row-link>span { min-width:0; }
 
 .service-detail>.notice,.detail-panel>.notice { display:block; }
 .service-detail>.notice p,.detail-panel>.notice p { margin:6px 0; }
@@ -947,12 +934,9 @@ dd>code { display:block; margin-bottom:10px; user-select:text; font-size:.9375re
 .service-public-link { min-width:0; min-height:44px; display:flex; align-items:center; color:var(--primary); text-decoration:underline; text-underline-offset:3px; }
 .service-detail-note { display:flex; flex-wrap:wrap; align-items:center; gap:4px 12px; }
 .service-detail-note .text-link { margin-left:0; }
-.dns-check-form .modal-actions { flex-direction:column; }
-.dns-check-form .modal-actions .notice { margin:0; }
-.dns-check-form .modal-actions>.primary-button,.link-actions>.copy-control,.link-actions .secondary-button { width:100%; }
+.link-actions>.copy-control,.link-actions .secondary-button { width:100%; }
 @media (min-width:901px) {
-  .dns-check-form .modal-actions { flex-direction:row; }
-  .dns-check-form .modal-actions>.primary-button,.link-actions>.copy-control,.link-actions .secondary-button { width:auto; }
+  .link-actions>.copy-control,.link-actions .secondary-button { width:auto; }
 }
 
 .recent-agents { list-style:none; padding:0; margin:0; }
@@ -964,3 +948,16 @@ dd>code { display:block; margin-bottom:10px; user-select:text; font-size:.9375re
 
 .service-protocol-state { display:flex; flex-wrap:wrap; align-items:center; gap:6px; }
 .service-protocol-state .helper { flex-basis:100%; margin:0; overflow-wrap:anywhere; }
+
+/* 域名列表只保留一行；名称让出空间，操作保持完整触控区域。 */
+.domain-compact { padding:4px 8px 4px 12px; }
+.domain-compact .domain-heading { gap:8px; }
+.domain-compact h2 { overflow:hidden; white-space:nowrap; }
+.domain-compact h2 a { display:block; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; line-height:44px; }
+.domain-actions { display:flex; flex-shrink:0; gap:0; }
+.domain-actions .icon-button { min-width:44px; min-height:44px; flex-shrink:0; }
+.domain-state { flex-shrink:0; white-space:nowrap; font-size:.8125rem; color:var(--secondary); }
+.domain-state.danger { color:var(--danger); }
+.domain-detail .domain-heading { align-items:flex-start; }
+.domain-detail .domain-heading h2 { align-self:center; }
+.domain-dns-reminder { overflow-wrap:anywhere; }

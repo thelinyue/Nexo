@@ -5,7 +5,7 @@ const initial = () => ({ management_entry: null as { domain_id: string; hostname
 
 test("从 HTTP 保存管理域名，失败保留草稿，状态更新不覆盖输入", async ({ page }, info) => {
   await installApiMocks(page);
-  let saved = initial(); let fail = true;
+  let saved = { ...initial(), public_ips: ["203.0.113.7"] }; let fail = true;
   await page.route("**/api/v1/admin/server-settings", route => {
     if (route.request().method() === "PUT") {
       expect(route.request().headers()["x-nexo-csrf"]).toBe("test-csrf");
@@ -24,8 +24,7 @@ test("从 HTTP 保存管理域名，失败保留草稿，状态更新不覆盖�
   await dialog.getByRole("switch", { name: "HTTPS 管理入口" }).check();
   await expect(dialog.getByRole("combobox", { name: "域名", exact: true })).toHaveValue("domain");
   await dialog.getByLabel("子域名", { exact: true }).fill("manage");
-  await dialog.getByText("公网 IP 校验（可选）", { exact: true }).click();
-  await dialog.getByLabel("公网 IP", { exact: true }).fill("203.0.113.7");
+  await expect(dialog.getByLabel("公网 IP", { exact: true })).toHaveCount(0);
   await dialog.getByRole("button", { name: "保存设置" }).click();
   await expect(dialog.getByRole("alert")).toContainText("保存失败");
   await expect(dialog.getByLabel("子域名", { exact: true })).toHaveValue("manage");
@@ -35,6 +34,7 @@ test("从 HTTP 保存管理域名，失败保留草稿，状态更新不覆盖�
   await expect(dialog.getByText("设置已保存。", { exact: true })).toBeVisible();
   await expect(dialog.getByText("等待证书", { exact: true })).toBeVisible();
   expect(saved.management_entry).toEqual({ domain_id: "domain", hostname: "manage" });
+  expect(saved.public_ips).toEqual(["203.0.113.7"]);
   await dialog.getByLabel("子域名", { exact: true }).fill("draft");
   saved.status = "ready";
   await expect(dialog.getByRole("link", { name: "打开管理入口" })).toHaveAttribute("href", "https://manage.example.test", { timeout: 10000 });

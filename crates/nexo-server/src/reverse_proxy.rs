@@ -166,7 +166,7 @@ pub fn refresh_status(state: &AppState) -> Result<()> {
         .db
         .lock()
         .map_err(|_| anyhow::anyhow!("数据库锁不可用"))?;
-    let mut query = db.prepare("SELECT t.id,t.enabled AND w.enabled,t.protocol,t.hostname,p.domain,t.public_domain_id,t.origin_protocol,t.local_address,t.local_port FROM tunnels t JOIN tenants w ON w.id=t.tenant_id LEFT JOIN public_domains p ON p.id=t.public_domain_id AND p.tenant_id=t.tenant_id WHERE t.service_mode='reverse_proxy' AND t.deleted_at IS NULL")?;
+    let mut query = db.prepare("SELECT t.id,t.enabled AND w.enabled,t.protocol,t.hostname,p.domain,t.public_domain_id,t.origin_protocol,t.local_address,t.local_port,t.https_port FROM tunnels t JOIN tenants w ON w.id=t.tenant_id LEFT JOIN public_domains p ON p.id=t.public_domain_id AND p.tenant_id=t.tenant_id WHERE t.service_mode='reverse_proxy' AND t.deleted_at IS NULL")?;
     let rows = query
         .query_map([], |r| {
             Ok((
@@ -179,10 +179,13 @@ pub fn refresh_status(state: &AppState) -> Result<()> {
                 r.get::<_, Option<String>>(6)?,
                 r.get::<_, String>(7)?,
                 r.get::<_, u16>(8)?,
+                r.get::<_, u16>(9)?,
             ))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
-    for (id, enabled, protocol, hostname, domain, domain_id, origin, address, port) in rows {
+    for (id, enabled, protocol, hostname, domain, domain_id, origin, address, port, https_port) in
+        rows
+    {
         let runtime = state
             .domain_runtime
             .status(domain_id.as_deref().unwrap_or_default());
@@ -194,10 +197,15 @@ pub fn refresh_status(state: &AppState) -> Result<()> {
         let expected = target(origin.as_deref().unwrap_or("http"), &address, port);
         let (status, error) = if !enabled {
             ("disabled", None)
+        } else if let Some(error) = runtime.service_errors.get(&id) {
+            ("failed", Some(error.clone()))
         } else if let Some(error) = runtime.config_error {
             ("failed", Some(error))
         } else if runtime.config_status != "applied"
-            || runtime.loaded_routes.get(&format!("{protocol}://{host}")) != Some(&expected)
+            || runtime
+                .loaded_routes
+                .get(&crate::https_ports::url(&protocol, &host, https_port))
+                != Some(&expected)
         {
             ("checking", Some("等待 Caddy 加载当前反向代理配置".into()))
         } else if protocol == "https"

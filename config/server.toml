@@ -21,3 +21,9 @@ binary = "caddy" # 程序名从 PATH 查找；带目录的相对路径按本文�
 admin_url = "http://127.0.0.1:8290" # 仅允许本机回环 IP
 http_listen = ":80"
 https_listen = ":443"
+
+[direct]
+# relay_ipv4 = "203.0.113.10" # 开启直连前填写 Server 实际公网 IPv4，用于明确的 A 记录
+# IPv6 直连证书由 Server 使用 DNS-01 申请，Server 不需要 IPv6。
+acme_directory = "https://acme-v02.api.letsencrypt.org/directory"
+probe_enabled = false # 可选公网 IPv6 探测，仅诊断，不因超时撤销 DNS

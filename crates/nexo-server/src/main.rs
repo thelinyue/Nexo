@@ -12,7 +12,7 @@ use std::{
 
 use anyhow::{Context, Result};
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::{HeaderMap, StatusCode},
     middleware,
     response::{IntoResponse, Response},
@@ -35,10 +35,12 @@ mod accounts;
 mod auth;
 mod caddy;
 mod config;
-mod domain_access;
+mod direct;
+mod dns_provider;
 mod domain_runtime;
 mod domains;
 mod enrollment;
+mod https_ports;
 mod identity_runtime;
 mod lan_redirect;
 mod reverse_proxy;
@@ -84,7 +86,6 @@ pub(crate) struct AppState {
     pub(crate) security: Arc<security::Security>,
     pub(crate) data_dir: PathBuf,
     pub(crate) domain_runtime: Arc<domain_runtime::DomainRuntimeManager>,
-    pub(crate) domain_access: Arc<domain_access::Runtime>,
     pub(crate) control_addr: String,
     pub(crate) udp_endpoint: Option<TunnelDataEndpoint>,
     pub(crate) tunnel_endpoint: Option<TunnelDataEndpoint>,
@@ -186,6 +187,9 @@ struct Tunnel {
     local_address: String,
     local_port: u16,
     public_port: Option<u16>,
+    https_port: u16,
+    ipv6_direct_enabled: bool,
+    direct_status: serde_json::Value,
     hostname: Option<String>,
     enabled: bool,
     lan_redirect_enabled: bool,
@@ -210,6 +214,8 @@ struct TunnelInput {
     local_address: String,
     local_port: u16,
     public_port: Option<u16>,
+    https_port: Option<u16>,
+    ipv6_direct_enabled: Option<bool>,
     hostname: Option<String>,
     enabled: Option<bool>,
     public_domain_id: Option<String>,
@@ -225,7 +231,6 @@ struct PublicDomain {
     https_enabled: bool,
     apply_status: String,
     runtime: domain_runtime::DomainRuntime,
-    access: Option<domain_access::Access>,
     #[serde(flatten)]
     settings: domains::Settings,
 }
@@ -287,7 +292,6 @@ async fn main() -> Result<()> {
             &connection,
             config.http_addr,
         )?)),
-        domain_access: Arc::new(domain_access::Runtime::default()),
         authority,
         tunnel_runtime: Arc::new(transport::Runtime::new(config.public_bind)),
         db: Arc::new(Mutex::new(connection)),
@@ -330,7 +334,6 @@ async fn main() -> Result<()> {
     let tunnel_runtime = state.tunnel_runtime.clone();
     let http_addr = config.http_addr;
     let caddy_task = tokio::spawn(domain_runtime::DomainRuntimeManager::run(state.clone()));
-    let dns_task = tokio::spawn(domain_access::Runtime::run(state.clone()));
     let traffic_task = tokio::spawn(traffic::Collector::run(state.clone()));
     let traffic_state = state.clone();
     let runtime = state.domain_runtime.clone();
@@ -344,7 +347,6 @@ async fn main() -> Result<()> {
     .with_graceful_shutdown(shutdown_signal())
     .await;
     caddy_task.abort();
-    dns_task.abort();
     tunnel_runtime.shutdown().await;
     transport_task.abort();
     identity_task.abort();
@@ -480,12 +482,16 @@ fn router(state: AppState) -> Router {
             post(domains::verify),
         )
         .route(
-            "/api/v1/public-domains/{id}/cloudflare-credential",
-            put(domains::set_credential),
+            "/api/v1/devices/{id}/ipv6",
+            get(direct::addresses).put(direct::select),
         )
         .route(
-            "/api/v1/public-domains/{id}/access",
-            get(domain_access::instructions).post(domain_access::check),
+            "/api/v1/public-domains/{id}/dns-credential",
+            put(dns_provider::set_credential),
+        )
+        .route(
+            "/api/v1/public-domains/{id}/cloudflare-credential",
+            put(domains::set_credential),
         )
         .route("/api/v1/public-domain-runtime-events", get(domain_events))
         .fallback_service(tower_http::services::ServeDir::new(web_dir))
@@ -519,6 +525,9 @@ fn initialize_database(connection: &Connection, is_new: bool) -> Result<()> {
         tx.commit()?;
     }
     // 先验证当前业务结构，再为现有版本添加强制 HTTPS 字段；不转换旧版 mesh 数据。
+    https_ports::migrate(connection)?;
+    dns_provider::migrate(connection)?;
+    direct::migrate(connection)?;
     server_settings::load(connection).context("无法读取服务器设置")?;
     connection.prepare("SELECT enabled FROM tenants")?;
     connection.prepare("SELECT service_mode,protocol_statuses,access_mode FROM tunnels")?;
@@ -675,6 +684,8 @@ async fn create_tunnel(
         let db = db.unchecked_transaction().map_err(db_error)?;
         reverse_proxy::prepare(&db, &session, &id, &mut input)?;
         prepare_tunnel(&db, &session.tenant_id, &id, &mut input)?;
+        https_ports::prepare(&state, &db, &session.tenant_id, &id, &mut input)?;
+        direct::prepare(&db, &session.tenant_id, &id, &mut input)?;
         service_access::prepare(
             &db,
             &session.tenant_id,
@@ -683,6 +694,12 @@ async fn create_tunnel(
             access_hash.as_deref(),
         )?;
         db.execute("INSERT INTO tunnels (id,tenant_id,device_id,name,protocol,local_address,local_port,public_port,hostname,enabled,apply_status,apply_revision,public_domain_id,created_at,updated_at,lan_redirect_enabled,origin_protocol,service_mode,http_redirect_enabled) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,'checking',1,?11,?12,?12,?13,?14,?15,?16)",params![id,session.tenant_id,input.device_id,input.name.trim(),input.protocol,input.local_address.trim(),input.local_port,input.public_port,input.hostname,input.enabled.unwrap_or(true),input.public_domain_id,unix_now(),input.lan_redirect_enabled.unwrap_or(false),input.origin_protocol,input.service_mode,input.http_redirect_enabled.unwrap_or(false)]).map_err(db_error)?;
+        https_ports::save(&db, &id, &input)?;
+        db.execute(
+            "UPDATE tunnels SET ipv6_direct_enabled=?2 WHERE id=?1",
+            params![id, input.ipv6_direct_enabled.unwrap_or(false)],
+        )
+        .map_err(db_error)?;
         service_access::save(&db, &id, &input, access_hash.as_deref())?;
         accounts::audit(&db, &session, "service_created", "service", &id)?;
         db.commit().map_err(db_error)?;
@@ -708,6 +725,8 @@ async fn update_tunnel(
         if !db.query_row("SELECT EXISTS(SELECT 1 FROM tunnels WHERE id=?1 AND tenant_id=?2 AND deleted_at IS NULL)",params![id,session.tenant_id], |r| r.get::<_,bool>(0)).map_err(db_error)? { return Err(ApiError::new(StatusCode::NOT_FOUND,"服务不存在")); }
         reverse_proxy::prepare(&db, &session, &id, &mut input)?;
         prepare_tunnel(&db, &session.tenant_id, &id, &mut input)?;
+        https_ports::prepare(&state, &db, &session.tenant_id, &id, &mut input)?;
+        direct::prepare(&db, &session.tenant_id, &id, &mut input)?;
         service_access::prepare(
             &db,
             &session.tenant_id,
@@ -716,6 +735,12 @@ async fn update_tunnel(
             access_hash.as_deref(),
         )?;
         db.execute("UPDATE tunnels SET device_id=?1,name=?2,protocol=?3,local_address=?4,local_port=?5,public_port=?6,hostname=?7,enabled=?8,apply_revision=apply_revision+1,apply_status='checking',updated_at=?9,public_domain_id=?12,lan_redirect_enabled=?13,origin_protocol=?14,service_mode=?15,http_redirect_enabled=?16 WHERE id=?10 AND tenant_id=?11 AND deleted_at IS NULL",params![input.device_id,input.name.trim(),input.protocol,input.local_address.trim(),input.local_port,input.public_port,input.hostname,input.enabled.unwrap_or(true),unix_now(),id,session.tenant_id,input.public_domain_id,input.lan_redirect_enabled.unwrap_or(false),input.origin_protocol,input.service_mode,input.http_redirect_enabled.unwrap_or(false)]).map_err(db_error)?;
+        https_ports::save(&db, &id, &input)?;
+        db.execute(
+            "UPDATE tunnels SET ipv6_direct_enabled=?2 WHERE id=?1",
+            params![id, input.ipv6_direct_enabled.unwrap_or(false)],
+        )
+        .map_err(db_error)?;
         service_access::save(&db, &id, &input, access_hash.as_deref())?;
         accounts::audit(&db, &session, "service_updated", "service", &id)?;
         db.commit().map_err(db_error)?;
@@ -890,7 +915,6 @@ async fn list_domains(
                     https_enabled: row.get::<_, i64>(4)? != 0,
                     apply_status: "pending".into(),
                     runtime: domain_runtime::DomainRuntime::pending(true),
-                    access: None,
                     settings: domains::load(
                         &connection,
                         &row.get::<_, String>(0)?,
@@ -910,11 +934,6 @@ async fn list_domains(
     for domain in &mut domains {
         domain.runtime = state.domain_runtime.status(&domain.id);
         domain.apply_status = domain.runtime.config_status.clone();
-        domain.access = Some(domain_access::snapshot(
-            &state,
-            &session.tenant_id,
-            &domain.id,
-        )?);
     }
     Ok(Json(domains))
 }
@@ -967,7 +986,6 @@ async fn create_domain(
         is_primary: primary == 0,
         https_enabled: input.https_enabled.unwrap_or(true),
         apply_status: "pending".to_owned(),
-        access: None,
         settings,
         runtime: domain_runtime::DomainRuntime::pending(
             state.domain_runtime.supervisor.config().enabled,
@@ -1032,6 +1050,19 @@ async fn delete_domain(
         return Err(ApiError::new(StatusCode::NOT_FOUND, "域名不存在或已被删除"));
     }
     server_settings::ensure_domain_unused(&tx, &id)?;
+    if tx
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM direct_dns_records WHERE domain_id=?1 AND kind!='A')",
+            [&id],
+            |r| r.get::<_, bool>(0),
+        )
+        .map_err(db_error)?
+    {
+        return Err(ApiError::new(
+            StatusCode::CONFLICT,
+            "直连 DNS 记录尚未清理，请完成清理后删除域名",
+        ));
+    }
     let related = {
         let mut query = tx.prepare("SELECT CASE WHEN tenant_id=?2 THEN name ELSE '其他工作空间服务' END FROM tunnels WHERE public_domain_id=?1 AND deleted_at IS NULL ORDER BY name LIMIT 4").map_err(db_error)?;
         let rows = query
@@ -1063,14 +1094,21 @@ async fn delete_domain(
     tx.commit().map_err(db_error)?;
     Ok(Json(serde_json::json!({"deleted":true,"id":id})))
 }
+/// 先按租户和域名筛选日志，再截取最近记录，避免繁忙域名挤掉其他域名的事件。
+#[derive(Default, Deserialize)]
+struct DomainEventsQuery {
+    domain_id: Option<String>,
+}
+
 async fn domain_events(
     State(state): State<AppState>,
     headers: HeaderMap,
+    Query(filter): Query<DomainEventsQuery>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let session = require_session(&state, &headers)?;
     let connection = state.db.lock().map_err(|_| db_error("数据库锁不可用"))?;
-    let mut query = connection.prepare("SELECT id,public_domain_id,summary,occurred_at FROM public_domain_runtime_events WHERE tenant_id=?1 ORDER BY id DESC LIMIT 100").map_err(db_error)?;
-    let events = query.query_map(params![session.tenant_id], |row| Ok(serde_json::json!({"id":row.get::<_,i64>(0)?, "domain_id":row.get::<_,Option<String>>(1)?, "summary":row.get::<_,String>(2)?, "occurred_at":row.get::<_,i64>(3)?}))).map_err(db_error)?.collect::<Result<Vec<_>, _>>().map_err(db_error)?;
+    let mut query = connection.prepare("SELECT id,public_domain_id,summary,occurred_at FROM public_domain_runtime_events WHERE tenant_id=?1 AND (?2 IS NULL OR public_domain_id=?2) ORDER BY id DESC LIMIT 100").map_err(db_error)?;
+    let events = query.query_map(params![session.tenant_id, filter.domain_id], |row| Ok(serde_json::json!({"id":row.get::<_,i64>(0)?, "domain_id":row.get::<_,Option<String>>(1)?, "summary":row.get::<_,String>(2)?, "occurred_at":row.get::<_,i64>(3)?}))).map_err(db_error)?.collect::<Result<Vec<_>, _>>().map_err(db_error)?;
     Ok(Json(
         serde_json::json!({"events":events,"next_cursor":null}),
     ))
@@ -1087,7 +1125,7 @@ fn query_tunnels(
         .get(axum::http::header::HOST)
         .and_then(|value| value.to_str().ok())
         .and_then(|host| host.parse::<axum::http::uri::Authority>().ok());
-    let sql="SELECT t.id,t.tenant_id,t.device_id,d.name,t.name,t.protocol,t.local_address,t.local_port,t.public_port,t.hostname,t.enabled,t.apply_status,t.apply_error,t.apply_revision,t.public_domain_id,t.deleted_at,p.domain,t.lan_redirect_enabled,CASE WHEN t.protocol IN ('tcp','udp','tcp_udp') THEN NULL ELSE COALESCE(t.origin_protocol,'http') END,t.service_mode,t.access_mode,t.protocol_statuses,t.http_redirect_enabled FROM tunnels t LEFT JOIN devices d ON d.id=t.device_id LEFT JOIN public_domains p ON p.id=t.public_domain_id WHERE t.tenant_id=?1 AND t.deleted_at IS NULL AND (?2 IS NULL OR t.id=?2) ORDER BY t.created_at DESC";
+    let sql="SELECT t.id,t.tenant_id,t.device_id,d.name,t.name,t.protocol,t.local_address,t.local_port,t.public_port,t.hostname,t.enabled,t.apply_status,t.apply_error,t.apply_revision,t.public_domain_id,t.deleted_at,p.domain,t.lan_redirect_enabled,CASE WHEN t.protocol IN ('tcp','udp','tcp_udp') THEN NULL ELSE COALESCE(t.origin_protocol,'http') END,t.service_mode,t.access_mode,t.protocol_statuses,t.http_redirect_enabled,t.https_port,t.ipv6_direct_enabled FROM tunnels t LEFT JOIN devices d ON d.id=t.device_id LEFT JOIN public_domains p ON p.id=t.public_domain_id WHERE t.tenant_id=?1 AND t.deleted_at IS NULL AND (?2 IS NULL OR t.id=?2) ORDER BY t.created_at DESC";
     let mut q = connection.prepare(sql)?;
     let rows = q
         .query_map(params![tenant, only], |row| {
@@ -1095,6 +1133,7 @@ fn query_tunnels(
             let hostname: Option<String> = row.get(9)?;
             let protocol: String = row.get(5)?;
             let public_domain: Option<String> = row.get(16)?;
+            let https_port: u16 = row.get(23)?;
             let public_address = if nexo_tunnel::udp::is_port(&protocol) {
                 port.zip(authority.as_ref())
                     .map(|(port, authority)| format!("{}:{port}", authority.host()))
@@ -1102,7 +1141,9 @@ fn query_tunnels(
                 hostname
                     .as_ref()
                     .zip(public_domain.as_ref())
-                    .map(|(host, domain)| format!("{protocol}://{host}.{domain}"))
+                    .map(|(host, domain)| {
+                        https_ports::url(&protocol, &format!("{host}.{domain}"), https_port)
+                    })
             };
             Ok(Tunnel {
                 protocol_statuses: serde_json::from_str(&row.get::<_, String>(21)?)
@@ -1119,6 +1160,9 @@ fn query_tunnels(
                 local_address: row.get(6)?,
                 local_port: row.get(7)?,
                 public_port: port,
+                https_port,
+                ipv6_direct_enabled: row.get(24)?,
+                direct_status: direct::status(connection, &row.get::<_, String>(0)?),
                 hostname: hostname.clone(),
                 enabled: row.get::<_, i64>(10)? != 0,
                 lan_redirect_enabled: row.get(17)?,
@@ -1179,7 +1223,10 @@ fn prepare_tunnel(
             input.public_port = db.query_row("SELECT public_port FROM tunnels WHERE id=?1 AND tenant_id=?2 AND protocol IN ('tcp','udp','tcp_udp')",params![id,tenant],|r|r.get::<_,Option<u16>>(0)).optional().map_err(db_error)?.flatten();
         }
         if input.public_port.is_none() {
-            let used = db.prepare("SELECT public_port FROM tunnels WHERE public_port IS NOT NULL AND deleted_at IS NULL AND id!=?2 AND (protocol=?1 OR protocol='tcp_udp' OR ?1='tcp_udp')").map_err(db_error)?.query_map(params![input.protocol,id], |r|r.get::<_,u16>(0)).map_err(db_error)?.collect::<rusqlite::Result<std::collections::HashSet<_>>>().map_err(db_error)?;
+            let mut used = db.prepare("SELECT public_port FROM tunnels WHERE public_port IS NOT NULL AND deleted_at IS NULL AND id!=?2 AND (protocol=?1 OR protocol='tcp_udp' OR ?1='tcp_udp')").map_err(db_error)?.query_map(params![input.protocol,id], |r|r.get::<_,u16>(0)).map_err(db_error)?.collect::<rusqlite::Result<std::collections::HashSet<_>>>().map_err(db_error)?;
+            if input.protocol != "udp" {
+                used.extend(db.prepare("SELECT https_port FROM tunnels WHERE protocol='https' AND deleted_at IS NULL AND id!=?1").map_err(db_error)?.query_map([id],|r|r.get::<_,u16>(0)).map_err(db_error)?.collect::<rusqlite::Result<Vec<_>>>().map_err(db_error)?);
+            }
             input.public_port = (20000..=29999).find(|port| !used.contains(port));
         }
         if input.public_port.is_none_or(|port| port == 0) {
@@ -1421,7 +1468,6 @@ mod tests {
                 ..Default::default()
             }),
             security: Arc::new(security::Security::default()),
-            domain_access: Arc::new(domain_access::Runtime::default()),
             authority: Arc::new(
                 identity_runtime::AuthorityRuntime::new(
                     nexo_tunnel::identity::Authority::generate().unwrap(),
@@ -1435,7 +1481,10 @@ mod tests {
             domain_runtime: Arc::new(domain_runtime::DomainRuntimeManager::new(
                 caddy::CaddyRuntimeConfig {
                     enabled: false,
-                    ..caddy::CaddyRuntimeConfig::new(PathBuf::new(), &config::Caddy::default())
+                    ..caddy::CaddyRuntimeConfig::new(
+                        std::env::temp_dir().join(format!("nexo-domain-test-{}", Uuid::new_v4())),
+                        &config::Caddy::default(),
+                    )
                 },
             )),
             control_addr: String::new(),
@@ -1661,14 +1710,69 @@ mod tests {
         let (state, headers) = domain_fixture();
         state.db.lock().unwrap().execute_batch("INSERT INTO tenants(id,name,created_at) VALUES ('other','其他空间',0); INSERT INTO public_domain_runtime_events (tenant_id,summary,occurred_at) VALUES ('default','配置已加载',1),('other','其他空间的证书错误',2);").unwrap();
         assert_eq!(
-            domain_events(State(state.clone()), HeaderMap::new())
-                .await
-                .unwrap_err()
-                .status,
+            domain_events(
+                State(state.clone()),
+                HeaderMap::new(),
+                Query(DomainEventsQuery::default())
+            )
+            .await
+            .unwrap_err()
+            .status,
             StatusCode::UNAUTHORIZED
         );
-        let events = domain_events(State(state), headers).await.unwrap().0;
+        let events = domain_events(State(state), headers, Query(DomainEventsQuery::default()))
+            .await
+            .unwrap()
+            .0;
         assert_eq!(events["events"].as_array().unwrap().len(), 1);
         assert_eq!(events["events"][0]["summary"], "配置已加载");
+    }
+    #[tokio::test]
+    async fn domain_event_filter_precedes_limit_and_never_crosses_tenants() {
+        let (state, headers) = domain_fixture();
+        {
+            let db = state.db.lock().unwrap();
+            db.execute_batch(
+                "INSERT INTO tenants(id,name,created_at) VALUES ('other','其他空间',0);",
+            )
+            .unwrap();
+            db.execute("INSERT INTO public_domain_runtime_events(tenant_id,public_domain_id,summary,occurred_at) VALUES ('default','target','目标事件',1)", []).unwrap();
+            for index in 0..105 {
+                db.execute("INSERT INTO public_domain_runtime_events(tenant_id,public_domain_id,summary,occurred_at) VALUES ('default','busy','其他域名',?1)", [index]).unwrap();
+            }
+            db.execute("INSERT INTO public_domain_runtime_events(tenant_id,public_domain_id,summary,occurred_at) VALUES ('other','target','其他空间',2)", []).unwrap();
+        }
+        let events = domain_events(
+            State(state.clone()),
+            headers.clone(),
+            Query(DomainEventsQuery {
+                domain_id: Some("target".into()),
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(events["events"].as_array().unwrap().len(), 1);
+        assert_eq!(events["events"][0]["summary"], "目标事件");
+        let all = domain_events(
+            State(state.clone()),
+            headers.clone(),
+            Query(DomainEventsQuery::default()),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(all["events"].as_array().unwrap().len(), 100);
+        let unknown = domain_events(
+            State(state),
+            headers,
+            Query(DomainEventsQuery {
+                domain_id: Some("missing".into()),
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert!(unknown["events"].as_array().unwrap().is_empty());
     }
 }

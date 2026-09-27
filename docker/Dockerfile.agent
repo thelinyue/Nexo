@@ -1,4 +1,4 @@
-# Nexo Agent 镜像：仅包含控制通道与 Tunnel 数据通道运行时。
+# Nexo Agent 镜像：包含 Tunnel 运行时与按需启动的 IPv6 直连 Caddy。
 FROM rust:1.89-bookworm@sha256:948f9b08a66e7fe01b03a98ef1c7568292e07ec2e4fe90d88c07bb14563c84ff AS rust-build
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
@@ -7,13 +7,18 @@ COPY config ./config
 COPY migrations ./migrations
 RUN cargo build --release -p nexo-agent
 
+FROM golang:1.27.1-bookworm@sha256:69a7b9788769bec032d238959b61854e9ae87f57be9029ec04e9885fabf99195 AS caddy-build
+RUN go install github.com/caddyserver/xcaddy/cmd/xcaddy@v0.4.7 \
+    && /go/bin/xcaddy build v2.11.4 --output /usr/local/bin/caddy
+
 FROM debian:bookworm-slim@sha256:88200866dfff7ea7f5cbcb6ec7c8a701889efe6fe859fe64d6990e4b07ea4171
-ARG NEXO_VERSION=0.2.8
+ARG NEXO_VERSION=0.2.9
 ARG NEXO_REVISION=unknown
 RUN apt-get update \
     && apt-get install --no-install-recommends -y ca-certificates tzdata \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=rust-build /src/target/release/nexo-agent /usr/local/bin/nexo-agent
+COPY --from=caddy-build /usr/local/bin/caddy /usr/local/bin/caddy
 COPY LICENSE THIRD_PARTY_NOTICES.md /usr/share/doc/nexo/
 COPY licenses /usr/share/doc/nexo/licenses
 LABEL org.opencontainers.image.title="Nexo Agent" \

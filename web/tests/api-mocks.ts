@@ -16,15 +16,9 @@ export async function installApiMocks(page: Page, options: { empty?: boolean; an
     failureStatuses: new Map<string, number>(),
     trafficResets: new Map<string, number>(),
     quotas: new Map<string, { monthly_limit_bytes: number | null; used_bytes: number }>(),
-    dnsMatches: true,
-    dnsChecked: true,
-    dnsResolved: true,
-    dnsRetriesRemaining: 0,
-    dnsNextRetryAt: null as number | null,
     sessions: [{ id: "s-current", last_seen_at: 1790000000, expires_at: 1791000000 }, { id: "s-other", last_seen_at: 1790000000, expires_at: 1791000000 }],
     failures: new Map<string, string>(), calls: [] as { method: string; path: string; body: any }[], delay: 0,
   };
-  const access = (domain: string) => ({ expected_addresses: ["203.0.113.10"], checked_at: state.dnsChecked ? Math.floor(Date.now()/1000) : null, next_retry_at: state.dnsNextRetryAt, retries_remaining: state.dnsRetriesRemaining, public_access: "unverified", records: [{ hostname: `media.${domain}`, addresses: state.dnsChecked && state.dnsResolved ? ["203.0.113.10"] : [], status: state.dnsChecked ? state.dnsResolved ? "resolved" : "unresolved" : "unchecked", matches_server: state.dnsChecked && state.dnsResolved ? state.dnsMatches : null, error: state.dnsChecked && !state.dnsResolved ? "未找到 A 或 AAAA 记录" : null }] });
   await page.route("**/api/v1/**", async route => {
     const req = route.request(); const path = new URL(req.url()).pathname; const method = req.method(); const body = req.postData() ? req.postDataJSON() : null;
     state.calls.push({ method, path, body });
@@ -81,10 +75,9 @@ export async function installApiMocks(page: Page, options: { empty?: boolean; an
     if (path.startsWith("/api/v1/enrollments/") && method === "GET") return respond(state.enrollments.find(item => item.id === path.split("/").pop()) ?? { id: path.split("/").pop(), status: "awaiting_agent", expires_at: Math.floor(Date.now()/1000) + 3600 });
     if (path.startsWith("/api/v1/enrollments/") && method === "DELETE") { state.enrollments = state.enrollments.filter(item => item.id !== path.split("/").pop()); return respond({ revoked: true }); }
     if (path.endsWith("/approve")) { const invite = state.enrollments.find(item => item.id === path.split("/").at(-2)); if (invite) Object.assign(invite, { status: "approved", device_id: invite.device_id ?? "a-1" }); return respond(invite ?? {}); }
-    if (path.endsWith("/access")) { if (method === "POST") state.dnsChecked = true; return respond(access(state.domains.find(domain => domain.id === path.split("/")[4])?.domain ?? "example.com")); }
-    if (path === "/api/v1/public-domains" && method === "GET") return respond(state.domains.map(domain => ({ ...domain, access: access(domain.domain) })));
-    if (path === "/api/v1/public-domains" && method === "POST") { const item = { ...body, id: "d-2", is_primary: false, apply_status: "pending", runtime: { config_status: "pending", config_error: null, service_warning: null, checked_at: null, certificates: [] } }; state.domains.push(item); return respond(item, 201); }
-    if (path === "/api/v1/public-domain-runtime-events") return respond({ events: state.domainEvents, next_cursor: null });
+    if (path === "/api/v1/public-domains" && method === "GET") return respond(state.domains);
+    if (path === "/api/v1/public-domains" && method === "POST") { const item = { ...body, id: "d-2", is_primary: false, certificate_mode: "http01", verification_status: "pending", credential_configured: false, dns_resolvers: [], verification_record: { name: `_nexo-verification.${body.domain}`, value: "new-domain-proof" }, apply_status: "pending", runtime: { config_status: "pending", config_error: null, service_warning: null, checked_at: null, certificates: [] } }; state.domains.push(item); return respond(item, 201); }
+    if (path === "/api/v1/public-domain-runtime-events") return respond({ events: state.domainEvents.filter(event => !new URL(req.url()).searchParams.has("domain_id") || event.domain_id === new URL(req.url()).searchParams.get("domain_id")), next_cursor: null });
     if (path.startsWith("/api/v1/public-domains/") && method === "DELETE") { state.domains = state.domains.filter(item => item.id !== path.split("/").pop()); return respond({}); }
     if (path === "/api/v1/tunnels" && method === "GET") return respond(state.tunnels);
     if (path === "/api/v1/tunnels" && method === "POST") { const item = { access_mode: "public", lan_redirect_enabled: false, ...body, id: "t-new", public_address: "new.example.com", public_domain: state.domains.find(domain => domain.id === body.public_domain_id)?.domain ?? null, apply_status: "checking" }; delete item.access_password; state.tunnels.push(item); return respond(item, 201); }

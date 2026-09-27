@@ -398,13 +398,13 @@ test("域名操作失败保留表单，删除失败可重试", async ({ page }) 
   await add.getByRole("button", { name: "添加域名", exact: true }).click();
   const row = page.locator(".page-slot:not([hidden]) .domain-row").filter({ has: page.getByText("new.example.com", { exact: true }) });
   await expect(page.getByRole("dialog", { name: /^配置 / })).toBeVisible();
-  await page.getByRole("dialog", { name: /^配置 / }).getByRole("button", { name: "删除域名", exact: true }).click();
+  await page.getByRole("dialog", { name: /^配置 / }).getByRole("button", { name: "删除", exact: true }).click();
   const confirm = page.getByRole("dialog", { name: /^删除 / });
   state.failures.set("DELETE /api/v1/public-domains/d-2", "域名正在使用");
-  await confirm.getByRole("button", { name: "删除域名" }).click();
+  await confirm.getByRole("button", { name: "删除", exact: true }).click();
   await expect(confirm.getByRole("alert")).toContainText("域名正在使用");
   state.failures.clear();
-  await confirm.getByRole("button", { name: "删除域名" }).click();
+  await confirm.getByRole("button", { name: "删除", exact: true }).click();
   await expect(row).toHaveCount(0);
 });
 

@@ -36,5 +36,12 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 uuid.workspace = true
 
-[dev-dependencies]
+instant-acme = { version = "0.8.5", default-features = false, features = ["ring", "hyper-rustls"] }
+hmac = "0.12"
+sha1 = "0.10"
+base64.workspace = true
+
 rcgen.workspace = true
+
+[dev-dependencies]
+hyper-util = { version = "0.1", features = ["client-legacy", "http1", "tokio"] }

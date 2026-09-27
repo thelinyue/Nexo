@@ -4,7 +4,7 @@ import { openServiceEditor } from "./service-actions";
 
 /** 验证真实业务弹窗及其嵌套确认框，短桌面视口下也不能贴边或遮住固定操作区。 */
 async function centered(page: Page, info: TestInfo, name: string) {
-  for (const viewport of [{ width: 901, height: 600 }, { width: 1440, height: 900 }]) {
+  for (const viewport of [{ width: 901, height: 400 }, { width: 1440, height: 900 }]) {
     await page.setViewportSize(viewport);
     const dialogs = page.locator("dialog[open]");
     expect(await dialogs.count()).toBeGreaterThan(0);
@@ -56,9 +56,8 @@ test("账号与服务器设置弹窗居中，长表单内部滚动", async ({ pa
   await page.getByRole("button", { name: "服务器设置", exact: true }).click();
   await expect(page.getByRole("switch", { name: "HTTPS 管理入口" })).toBeVisible();
   await page.getByRole("switch", { name: "HTTPS 管理入口" }).check();
-  await page.getByText("公网 IP 校验（可选）", { exact: true }).click();
   await centered(page, info, "server-settings");
-  await page.setViewportSize({ width: 901, height: 600 });
+  await page.setViewportSize({ width: 901, height: 400 });
   const body = page.getByRole("dialog").locator(".modal-body");
   await expect.poll(() => body.evaluate(element => element.scrollHeight > element.clientHeight)).toBeTruthy();
   await body.evaluate(element => { element.scrollTop = element.scrollHeight; });
@@ -87,15 +86,12 @@ test("设备接入、密钥确认与身份恢复居中", async ({ page }, info) 
   await centered(page, info, "device-recovery");
 });
 
-test("域名证书、解析与删除确认居中", async ({ page }, info) => {
+test("域名配置与删除确认居中", async ({ page }, info) => {
   await installApiMocks(page);
   await page.goto("/#/domains");
-  await page.getByRole("button", { name: /^域名解析 / }).click();
-  await centered(page, info, "domain-dns");
-  await page.keyboard.press("Escape");
-  await page.getByRole("button", { name: "证书配置", exact: true }).click();
+  await page.getByRole("button", { name: /^配置 / }).click();
   await centered(page, info, "domain-settings");
-  await page.getByRole("button", { name: "删除域名", exact: true }).click();
+  await page.getByRole("button", { name: "删除", exact: true }).click();
   await centered(page, info, "domain-delete");
 });
 

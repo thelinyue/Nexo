@@ -89,7 +89,7 @@ CREATE TABLE "tunnels" (
     id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
     device_id TEXT REFERENCES devices(id) ON DELETE SET NULL, name TEXT NOT NULL,
     protocol TEXT NOT NULL CHECK(protocol IN ('tcp','http','https','udp','tcp_udp')), local_address TEXT NOT NULL,
-    local_port INTEGER NOT NULL, public_port INTEGER, hostname TEXT, enabled INTEGER NOT NULL DEFAULT 1,
+    local_port INTEGER NOT NULL, public_port INTEGER, https_port INTEGER NOT NULL DEFAULT 443 CHECK(https_port BETWEEN 1 AND 65535), hostname TEXT, enabled INTEGER NOT NULL DEFAULT 1,
     apply_status TEXT NOT NULL DEFAULT 'checking', apply_error TEXT, apply_revision INTEGER NOT NULL DEFAULT 1,
     origin_protocol TEXT, origin_tls_server_name TEXT, origin_tls_verification TEXT NOT NULL DEFAULT 'system',
     public_domain_id TEXT REFERENCES public_domains(id) ON DELETE SET NULL,

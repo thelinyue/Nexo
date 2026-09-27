@@ -33,7 +33,7 @@ test("内网重定向开关可点击标签及空格切换，减弱动态效果�
   await page.emulateMedia({ reducedMotion: "reduce" });
   await toggle.press("Space");
   await expect(toggle).toBeChecked();
-  await expect(dialog.locator(".service-switch-track")).toHaveCSS("transition-duration", "0s");
+  await expect(toggle.locator("..").locator(".service-switch-track")).toHaveCSS("transition-duration", "0s");
   await page.screenshot({ path: info.outputPath("redirect-switch-on.png"), animations: "disabled" });
 });
 

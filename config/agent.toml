@@ -7,3 +7,5 @@ device_name = "Nexo Agent"
 control_endpoint = "" # 留空使用 Server 主机的 9890 端口
 tunnel_endpoint = "" # Server 未下发数据地址时使用；留空使用 Server 主机的 9891 端口
 udp_endpoint = "" # Server 未下发 QUIC 地址时使用；留空沿用 TCP 数据地址
+
+caddy_binary = "caddy" # IPv6 直连入口，镜像内置；没有直连服务时不启动

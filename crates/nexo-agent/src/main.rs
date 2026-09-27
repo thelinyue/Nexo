@@ -16,6 +16,7 @@ use tokio::{net::TcpStream, sync::watch, task::JoinSet};
 use tokio_rustls::TlsConnector;
 use tokio_util::codec::{FramedRead, LinesCodec};
 mod certificate;
+mod direct;
 #[cfg(test)]
 mod origin_tests;
 mod udp;
@@ -45,6 +46,7 @@ struct Config {
     control_endpoint: String,
     tunnel_endpoint: String,
     udp_endpoint: String,
+    caddy_binary: PathBuf,
     #[serde(skip)]
     recover_identity: bool,
     #[serde(skip)]
@@ -59,6 +61,7 @@ impl Default for Config {
             control_endpoint: String::new(),
             tunnel_endpoint: String::new(),
             udp_endpoint: String::new(),
+            caddy_binary: PathBuf::from("caddy"),
             recover_identity: false,
             agent_version: env!("CARGO_PKG_VERSION").into(),
         }
@@ -100,6 +103,12 @@ async fn main() -> Result<()> {
         nexo_core::config::absolute(&cli.config.unwrap_or_else(|| directory.join("agent.toml")))?;
     let mut config: Config =
         nexo_core::config::load(&path, include_str!("../../../config/agent.toml"))?;
+    if config.caddy_binary.components().count() > 1 && config.caddy_binary.is_relative() {
+        config.caddy_binary = path
+            .parent()
+            .context("配置目录无效")?
+            .join(&config.caddy_binary);
+    }
     // Compose 和 docker run 直接传入连接参数，无需 Shell 预先写文件。
     // 空值沿用 TOML，非空值仅作用于本次启动，不覆盖配置文件或已有设备身份。
     for (name, target) in [
@@ -459,6 +468,7 @@ async fn run_control(
     write_message(
         &mut write,
         &AgentControlMessage::Hello {
+            capabilities: vec![nexo_protocol::direct::CAPABILITY.into()],
             device_id: device.clone(),
             agent_version: config.agent_version.clone(),
         },
@@ -515,10 +525,10 @@ async fn run_control(
                 let line = incoming.context("Server 控制通道已关闭")??;
                 deadline.as_mut().reset(tokio::time::Instant::now()+Duration::from_secs(45));
                 match serde_json::from_str::<ServerControlMessage>(&line)? {
-                    ServerControlMessage::HelloAccepted { tunnels,tunnel_endpoint,udp_endpoint,.. } | ServerControlMessage::HeartbeatAck { tunnels,tunnel_endpoint,udp_endpoint,.. } => {
+                    ServerControlMessage::HelloAccepted { tunnels,tunnel_endpoint,udp_endpoint,capabilities,.. } | ServerControlMessage::HeartbeatAck { tunnels,tunnel_endpoint,udp_endpoint,capabilities,.. } => {
                         let next = Desired { udp_endpoint: udp_endpoint.map(|mut endpoint| { if endpoint.address.is_empty() { endpoint.address = if config.udp_endpoint.is_empty() { fallback.address.clone() } else { config.udp_endpoint.clone() }; } endpoint }), endpoint: tunnel_endpoint.unwrap_or_else(||fallback.clone()),tunnels:tunnels.clone() };
                         if *desired.borrow() != next { desired.send_replace(next); }
-                        if !accepted { accepted=true; data_tasks.spawn(run_data(connector_updates.clone(),receiver.clone())); data_tasks.spawn(udp::run(connector_updates.clone(),receiver.clone())); }
+                        if !accepted { accepted=true; data_tasks.spawn(run_data(connector_updates.clone(),receiver.clone())); data_tasks.spawn(udp::run(connector_updates.clone(),receiver.clone())); if capabilities.iter().any(|c|c==nexo_protocol::direct::CAPABILITY) { data_tasks.spawn(direct::run(config.caddy_binary.clone(),identity_path.parent().context("身份目录无效")?.join("direct"),connector_updates.clone(),receiver.clone())); } }
                         probes.abort_all();
                         probes.spawn(probe_tunnels(tunnels));
                     },

@@ -32,6 +32,7 @@ fn request_headers(id: &str) -> HeaderMap {
 }
 fn access_state(state: &AppState) -> AccessState {
     AccessState {
+        default_https_port: 443,
         db: state.db.clone(),
         security: state.security.clone(),
     }
@@ -361,4 +362,33 @@ async fn schema_revokes_sessions_on_all_service_mutations() {
             0
         );
     }
+}
+
+#[tokio::test]
+async fn https_authority_must_match_service_port() {
+    let (state, headers) = fixture();
+    let mut data = input(None, None);
+    data.protocol = "https".into();
+    data.https_port = Some(9443);
+    let created = create_tunnel(State(state.clone()), headers, Json(data))
+        .await
+        .unwrap()
+        .0;
+    let access = access_state(&state);
+    let mut request = request_headers(&created.id);
+    request.insert("x-nexo-access-proto", "https".parse().unwrap());
+    assert!(check_inner(&access, &request).is_err());
+    request.insert(
+        "x-nexo-access-authority",
+        "app.example.com:9443".parse().unwrap(),
+    );
+    assert_eq!(
+        check_inner(&access, &request).unwrap().status(),
+        StatusCode::NO_CONTENT
+    );
+    request.insert(
+        "x-nexo-access-authority",
+        "app.example.com:443".parse().unwrap(),
+    );
+    assert!(check_inner(&access, &request).is_err());
 }

@@ -83,13 +83,13 @@ test("批量修改 Agent 保留最新配置，部分失败只重试失败项", a
   await expect(page).toHaveURL(/#\/services$/);
   await page.screenshot({ animations: "disabled", scale: "css", path: info.outputPath("batch-agent-editor.png") });
   // 模拟表单打开后服务配置发生变化，提交必须采用最新值。
-  Object.assign(state.tunnels[0], { local_port: 9443, name: "最新媒体中心" });
+  Object.assign(state.tunnels[0], { local_port: 9443, https_port: 8443, name: "最新媒体中心" });
   state.failures.set("PUT /api/v1/tunnels/t-2", "设备暂不可达");
   await dialog.getByRole("button", { name: "保存修改" }).click();
   await expect(dialog.getByRole("alert")).toContainText("TCP 应用：设备暂不可达");
   await expect(dialog.getByRole("status")).toContainText("已完成 1 / 2 项");
   const first = state.calls.find(call => call.method === "PUT" && call.path === "/api/v1/tunnels/t-1")!;
-  expect(first.body).toEqual({ device_id: "a-2", name: "最新媒体中心", protocol: "https", origin_protocol: "https", local_address: "192.168.1.10", local_port: 9443, public_port: null, hostname: "media", public_domain_id: "d-1", enabled: false, lan_redirect_enabled: true });
+  expect(first.body).toEqual({ device_id: "a-2", name: "最新媒体中心", protocol: "https", origin_protocol: "https", local_address: "192.168.1.10", local_port: 9443, public_port: null, https_port: 8443, ipv6_direct_enabled: false, hostname: "media", public_domain_id: "d-1", enabled: false, lan_redirect_enabled: true });
   const tcp = state.calls.find(call => call.method === "PUT" && call.path === "/api/v1/tunnels/t-2")!;
   expect(tcp.body).toMatchObject({ device_id: "a-2", protocol: "tcp", public_port: 23456, origin_protocol: null, hostname: null, public_domain_id: null, enabled: false, lan_redirect_enabled: false });
   state.failures.delete("PUT /api/v1/tunnels/t-2");

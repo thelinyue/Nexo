@@ -120,25 +120,6 @@ test("空服务页只有一个创建入口，删除最后一项后退出批量�
   await expect(page.getByRole("dialog", { name: "创建服务", exact: true })).toBeVisible();
 });
 
-test("DNS 长弹窗检查按钮固定可达，失败保留结果并可重试", async ({ page }, info) => {
-  const state = await installApiMocks(page);
-  await page.setViewportSize({ width: 320, height: 568 });
-  await page.goto("/#/domains/d-1");
-  await page.getByRole("button", { name: /域名解析 example.com/ }).click();
-  const dialog = page.getByRole("dialog", { name: "域名解析", exact: true });
-  const check = dialog.getByRole("button", { name: "重新检查", exact: true });
-  await expect(dialog.getByText("DNS 已解析", { exact: true })).toBeVisible();
-  await expect(check).toBeInViewport({ ratio: 1 });
-  state.failures.set("POST /api/v1/public-domains/d-1/access", "检查失败，请稍后重试");
-  await check.click();
-  await expect(dialog.getByRole("alert")).toContainText("检查失败");
-  await expect(check).toBeInViewport({ ratio: 1 });
-  await expect(dialog.getByText("DNS 已解析", { exact: true })).toHaveCount(1);
-  await page.screenshot({ path: info.outputPath("dns-check-small.png") });
-  state.failures.clear();
-  await check.click();
-  await expect(dialog.getByRole("alert")).toHaveCount(0);
-});
 
 test("用户列表加载失败可就地重试", async ({ page }) => {
   await installApiMocks(page);

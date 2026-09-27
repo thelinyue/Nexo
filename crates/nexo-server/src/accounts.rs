@@ -383,6 +383,9 @@ pub async fn delete_user(
             .map_err(db_error)?;
             tx.execute("DELETE FROM auth_recovery WHERE id=?1", [&id])
                 .map_err(db_error)?;
+            if tx.query_row("SELECT EXISTS(SELECT 1 FROM direct_dns_records r JOIN public_domains p ON p.id=r.domain_id WHERE p.tenant_id=?1 AND r.kind!='A')",[&tenant],|r|r.get::<_,bool>(0)).map_err(db_error)? {
+                return Err(ApiError::new(StatusCode::CONFLICT,"请先关闭该空间的 IPv6 直连并完成 DNS 清理，再删除账号"));
+            }
             tx.execute("DELETE FROM tenants WHERE id=?1", [&tenant])
                 .map_err(db_error)?;
             tx.commit().map_err(db_error)?;

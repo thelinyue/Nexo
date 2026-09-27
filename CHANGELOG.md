@@ -2,6 +2,14 @@
 
 本项目使用 [Semantic Versioning](https://semver.org/) 记录公开版本。
 
+## [0.2.9]
+
+- HTTPS 服务支持自定义公网端口，访问地址、跳转、认证与 Caddy 路由按端口隔离，已有服务保持 443。
+- 新增可选 IPv6 直连：Agent 本地证书与 Caddy 入口、独立 mTLS 管理连接和集中授权；IPv4 继续经 Server 转发。
+- DNS 验证支持 Cloudflare、阿里云 DNS 和腾讯云 DNSPod，按记录所有权维护 A/AAAA/TXT，保留故障重试与撤销保护。
+- 精简域名列表与详情，将转发 IPv4 配置移至 Server TOML；DNS 解析器留空时使用 Caddy 默认值。
+- 本次发布 Server 与 Agent，启用直连需两端更新。兼容性、验证范围与部署步骤见 [v0.2.9 发布说明](docs/releases/v0.2.9.md)。
+
 ## [0.2.8]
 
 - 内置 Caddy 支持 HTTPS 管理入口，复用域名证书，保留原 IP 入口及管理员、来源和 CSRF 校验。

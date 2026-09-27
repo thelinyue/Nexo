@@ -46,19 +46,30 @@ async fn real_caddy_access_password_cookie_proxy_and_lan_priority() {
     cfg.https_listen = format!("127.0.0.1:{}", port());
     cfg.access_address = access.address.clone();
     let http: SocketAddr = cfg.http_listen.parse().unwrap();
-    let https: SocketAddr = cfg.https_listen.parse().unwrap();
+    let https: SocketAddr = format!("127.0.0.1:{}", port()).parse().unwrap();
+    state
+        .db
+        .lock()
+        .unwrap()
+        .execute(
+            "UPDATE tunnels SET https_port=?1 WHERE protocol='https'",
+            [https.port()],
+        )
+        .unwrap();
     let mut domain = DomainSpec {
         id: "domain".into(),
         tenant_id: "default".into(),
         name: "access.localhost".into(),
         https: true,
         token_reference: None,
+        dns_provider: None,
         certificate_mode: "http01".into(),
         dns: Default::default(),
         services: Vec::new(),
     };
     for (id, protocol) in [("web", "https"), ("plain", "http"), ("public", "https")] {
         domain.services.push(WebService {
+            https_port: https.port(),
             management: false,
             http_redirect_enabled: false,
             id: id.into(),

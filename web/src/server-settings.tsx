@@ -3,8 +3,8 @@ import { CopyButton, Loading, Modal, Notice, errorText, request } from "./ui";
 
 type Entry = { domain_id: string; hostname: string };
 type Settings = { management_entry: Entry | null; public_url: string; public_ips: string[]; domains: { id: string; domain: string }[]; caddy_enabled: boolean; status: string; error: string | null };
-type Fields = { enabled: boolean; domain_id: string; hostname: string; public_ips: string };
-const fields = (value: Settings): Fields => ({ enabled: Boolean(value.management_entry), domain_id: value.management_entry?.domain_id ?? (value.domains.length === 1 ? value.domains[0].id : ""), hostname: value.management_entry?.hostname ?? "nexo", public_ips: value.public_ips.join(", ") });
+type Fields = { enabled: boolean; domain_id: string; hostname: string };
+const fields = (value: Settings): Fields => ({ enabled: Boolean(value.management_entry), domain_id: value.management_entry?.domain_id ?? (value.domains.length === 1 ? value.domains[0].id : ""), hostname: value.management_entry?.hostname ?? "nexo" });
 const statusLabel: Record<string, string> = { disabled: "未开启", pending: "正在配置", certificate_pending: "等待证书", ready: "已配置", failed: "配置失败" };
 
 /** 表单只保存期望配置；轮询运行状态不覆盖草稿，证书签发期间仍可关闭或修正入口。 */
@@ -42,7 +42,7 @@ export function ServerSettings({ csrf, onClose }: { csrf?: string | null; onClos
       event.preventDefault(); if (!value || busy) return;
       setBusy(true); setError(null); setMessage(null);
       try {
-        const result = await request<Settings>("/api/v1/admin/server-settings", { method: "PUT", body: JSON.stringify({ management_entry: value.enabled ? { domain_id: value.domain_id, hostname: value.hostname.trim() } : null, public_ips: value.public_ips.split(/[\s,，]+/).filter(Boolean) }) }, csrf);
+        const result = await request<Settings>("/api/v1/admin/server-settings", { method: "PUT", body: JSON.stringify({ management_entry: value.enabled ? { domain_id: value.domain_id, hostname: value.hostname.trim() } : null, public_ips: settings?.public_ips ?? [] }) }, csrf);
         setSettings(result); setSaved(fields(result)); setValue(fields(result)); setMessage("设置已保存。");
       } catch (e) { setError(errorText(e)); } finally { setBusy(false); }
     }}>
@@ -60,7 +60,6 @@ export function ServerSettings({ csrf, onClose }: { csrf?: string | null; onClos
           </>}
           <p className="helper">原 IP 管理入口继续可用。</p>
           {settings.management_entry && <div role="status"><p>{statusLabel[settings.status] ?? "正在检查"}</p>{settings.error && <p className="form-error">{settings.error}</p>}{settings.status === "ready" && <a className="text-button" href={settings.public_url} target="_blank" rel="noopener noreferrer">打开管理入口</a>}</div>}
-          <details className="recovery-help"><summary>公网 IP 校验（可选）</summary><label>公网 IP<input value={value.public_ips} onChange={e => update("public_ips", e.target.value)} placeholder="203.0.113.10, 2001:db8::10" autoCapitalize="none" spellCheck={false} /></label><p className="helper">用于核对域名解析，逗号分隔；留空不核对指向，不会修改 DNS。</p></details>
         </fieldset>}
         <Notice error={error} onRetry={!value && !loading ? () => setRetry(previous => previous + 1) : undefined} />
         {message && <p role="status" className="action-status">{message}</p>}

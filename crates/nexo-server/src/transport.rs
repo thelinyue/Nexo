@@ -68,6 +68,7 @@ struct ControlSession {
     cancel: CancellationToken,
     // 仅在 mTLS、设备身份和 Hello 全部通过后记录；连接替换或撤销时随会话清理。
     public_ipv4: Option<Ipv4Addr>,
+    direct_capable: bool,
 }
 #[derive(Default)]
 struct Connections {
@@ -80,6 +81,7 @@ struct Connections {
 
 /// 监听器与连接的拥有者：协调串行化，连接任务使用取消令牌，不靠数据库标记假装关闭。
 pub struct Runtime {
+    pub direct: crate::direct::Runtime,
     udp_budget: nexo_tunnel::udp::Budget,
     pub traffic: crate::traffic::Collector,
     pub quotas: crate::traffic::quota::Manager,
@@ -93,6 +95,7 @@ impl Runtime {
     pub fn new(bind: IpAddr) -> Self {
         Self {
             udp_budget: Default::default(),
+            direct: Default::default(),
             traffic: crate::traffic::Collector::default(),
             quotas: crate::traffic::quota::Manager::default(),
             transfers: TaskTracker::new(),
@@ -104,6 +107,7 @@ impl Runtime {
     }
 
     pub async fn run(state: AppState) {
+        let _dns = tokio::spawn(crate::direct::dns::run(state.clone()));
         let mut interval = tokio::time::interval(Duration::from_secs(1));
         loop {
             tokio::select! {
@@ -113,12 +117,23 @@ impl Runtime {
         }
     }
 
+    pub async fn direct_session(&self, device: &str) -> Option<CancellationToken> {
+        self.connections
+            .lock()
+            .await
+            .control
+            .get(device)
+            .filter(|s| s.direct_capable && !s.cancel.is_cancelled())
+            .map(|s| s.cancel.clone())
+    }
+
     /// API 修改后立即重建/关闭入口，再推送完整快照；空快照同样会撤销 Agent 上的旧服务。
     pub async fn changed(&self, state: &AppState) -> Result<()> {
         self.reconcile(state).await?;
         let connections = self.connections.lock().await;
         for (device, session) in &connections.control {
             let message = ServerControlMessage::HeartbeatAck {
+                capabilities: vec![nexo_protocol::direct::CAPABILITY.into()],
                 server_time: unix_now(),
                 tunnels: desired_tunnels(state, device)?,
                 tunnel_endpoint: state.tunnel_endpoint.clone(),
@@ -556,13 +571,15 @@ pub async fn serve(state: AppState, listener: TcpListener, data: bool) -> Result
             _ = state.tunnel_runtime.stop.cancelled() => break,
             Some(_) = tasks.join_next(), if !tasks.is_empty() => {},
             incoming = listener.accept() => {
-                let (socket, peer) = incoming?; let acceptor = TlsAcceptor::from(state.authority.server_config()); let state = state.clone();
+                let (socket, peer) = incoming?; let mut tls_config = (*state.authority.server_config()).clone();
+                if data { tls_config.alpn_protocols = vec![nexo_protocol::direct::ALPN.to_vec()]; }
+                let acceptor = TlsAcceptor::from(Arc::new(tls_config)); let state = state.clone();
                 tasks.spawn(async move {
                     let result: Result<()> = async {
                         nexo_tunnel::configure_tunnel_tcp_keepalive(&socket)?;
                         let stream = tokio::time::timeout(Duration::from_secs(10), acceptor.accept(socket)).await.context("Agent TLS 握手超时")??;
                         let (device, fingerprint) = authenticated_device(&state, &stream)?;
-                        if data { data_session(state, stream, device, fingerprint).await } else { control_session(state, stream, device, fingerprint, peer.ip()).await }
+                        if data && stream.get_ref().1.alpn_protocol()==Some(nexo_protocol::direct::ALPN) { crate::direct::session(state,stream,device,fingerprint).await } else if data { data_session(state, stream, device, fingerprint).await } else { control_session(state, stream, device, fingerprint, peer.ip()).await }
                     }.await;
                     if let Err(error) = result { tracing::warn!(%peer, "Agent 连接结束：{error:#}"); }
                 });
@@ -587,6 +604,7 @@ async fn control_session(
         .await?
         .context("Agent 未发送 Hello")??;
     let AgentControlMessage::Hello {
+        capabilities,
         device_id,
         agent_version,
     } = serde_json::from_str(&first)?
@@ -614,6 +632,9 @@ async fn control_session(
                 sender: sender.clone(),
                 cancel: cancel.clone(),
                 public_ipv4: public_ipv4(peer),
+                direct_capable: capabilities
+                    .iter()
+                    .any(|v| v == nexo_protocol::direct::CAPABILITY),
             },
         ) {
             previous.cancel.cancel();
@@ -621,7 +642,7 @@ async fn control_session(
         }
     }
     let result: Result<()> = async {
-        write_message(&mut write, &ServerControlMessage::HelloAccepted { server_time: unix_now(), tunnels: desired_tunnels(&state, &device)?, tunnel_endpoint: state.tunnel_endpoint.clone(), udp_endpoint: state.udp_endpoint.clone() }).await?;
+        write_message(&mut write, &ServerControlMessage::HelloAccepted { capabilities: vec![nexo_protocol::direct::CAPABILITY.into()], server_time: unix_now(), tunnels: desired_tunnels(&state, &device)?, tunnel_endpoint: state.tunnel_endpoint.clone(), udp_endpoint: state.udp_endpoint.clone() }).await?;
         let deadline = tokio::time::sleep(Duration::from_secs(45)); tokio::pin!(deadline);
         loop { tokio::select! {
             _ = cancel.cancelled() => break,
@@ -634,7 +655,7 @@ async fn control_session(
                     AgentControlMessage::Heartbeat { device_id, agent_version } => {
                         anyhow::ensure!(device_id == device, "心跳设备 ID 与证书不一致");
                         state.db.lock().map_err(|_| anyhow::anyhow!("数据库锁不可用"))?.execute("UPDATE devices SET last_seen_at=?1,agent_version=?2 WHERE id=?3", params![unix_now(),agent_version,device])?;
-                        write_message(&mut write, &ServerControlMessage::HeartbeatAck { server_time: unix_now(), tunnels: desired_tunnels(&state, &device)?, tunnel_endpoint: state.tunnel_endpoint.clone(), udp_endpoint: state.udp_endpoint.clone() }).await?;
+                        write_message(&mut write, &ServerControlMessage::HeartbeatAck { capabilities: vec![nexo_protocol::direct::CAPABILITY.into()], server_time: unix_now(), tunnels: desired_tunnels(&state, &device)?, tunnel_endpoint: state.tunnel_endpoint.clone(), udp_endpoint: state.udp_endpoint.clone() }).await?;
                     }
                     AgentControlMessage::TunnelApplyReport { results } => {
                         let ids = apply_results(&state, &device, results)?;
@@ -818,7 +839,7 @@ fn refresh_status(
             .db
             .lock()
             .map_err(|_| anyhow::anyhow!("数据库锁不可用"))?;
-        let mut query = db.prepare("SELECT t.id,t.device_id,(t.enabled AND EXISTS(SELECT 1 FROM tenants w WHERE w.id=t.tenant_id AND w.enabled=1)),t.protocol,t.apply_revision,a.revision,a.status,a.error_message,t.public_domain_id,t.hostname,p.domain,t.tenant_id FROM tunnels t LEFT JOIN tunnel_applied_states a ON a.tunnel_id=t.id LEFT JOIN public_domains p ON p.id=t.public_domain_id AND p.tenant_id=t.tenant_id WHERE t.service_mode='tunnel' AND t.deleted_at IS NULL")?;
+        let mut query = db.prepare("SELECT t.id,t.device_id,(t.enabled AND EXISTS(SELECT 1 FROM tenants w WHERE w.id=t.tenant_id AND w.enabled=1)),t.protocol,t.apply_revision,a.revision,a.status,a.error_message,t.public_domain_id,t.hostname,p.domain,t.tenant_id,t.https_port FROM tunnels t LEFT JOIN tunnel_applied_states a ON a.tunnel_id=t.id LEFT JOIN public_domains p ON p.id=t.public_domain_id AND p.tenant_id=t.tenant_id WHERE t.service_mode='tunnel' AND t.deleted_at IS NULL")?;
         let rows = query
             .query_map([], |r| {
                 Ok((
@@ -834,6 +855,7 @@ fn refresh_status(
                     r.get::<_, Option<String>>(9)?,
                     r.get::<_, Option<String>>(10)?,
                     r.get::<_, String>(11)?,
+                    r.get::<_, u16>(12)?,
                 ))
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -853,6 +875,7 @@ fn refresh_status(
         hostname,
         domain_name,
         tenant,
+        https_port,
     ) in rows
     {
         let (status, error) = if !enabled {
@@ -892,7 +915,9 @@ fn refresh_status(
                 hostname.unwrap_or_default(),
                 domain_name.unwrap_or_default()
             );
-            if runtime.config_status != "applied" {
+            if let Some(error) = runtime.service_errors.get(&id) {
+                ("failed", Some(error.clone()))
+            } else if runtime.config_status != "applied" {
                 (
                     "checking",
                     Some(
@@ -901,7 +926,9 @@ fn refresh_status(
                             .unwrap_or_else(|| "等待 Caddy 加载配置".into()),
                     ),
                 )
-            } else if runtime.loaded_routes.get(&format!("{protocol}://{host}"))
+            } else if runtime
+                .loaded_routes
+                .get(&crate::https_ports::url(&protocol, &host, https_port))
                 != listeners.get(&id).and_then(Option::as_ref)
             {
                 ("checking", Some("等待 Caddy 更新服务入口".into()))
@@ -1062,6 +1089,7 @@ mod tests {
         write_message(
             client,
             &AgentControlMessage::Hello {
+                capabilities: vec![],
                 device_id: device.into(),
                 agent_version: "test".into(),
             },
@@ -1080,6 +1108,113 @@ mod tests {
             serde_json::from_str::<ServerControlMessage>(&response).unwrap(),
             ServerControlMessage::HelloAccepted { .. }
         ));
+    }
+
+    #[tokio::test]
+    async fn direct_alpn_requires_capable_control_and_keeps_data_stream_restrictions() {
+        use nexo_protocol::direct::{
+            Request as DirectRequest, Response as DirectResponse, ALPN, CAPABILITY,
+        };
+        let (state, _) = crate::tests::domain_fixture();
+        populate(&state);
+        let config = test_client_config(&state, "mine");
+        let (mut control, control_task) =
+            test_control_connection(&state, config.clone(), "8.8.8.8").await;
+        write_message(
+            &mut control,
+            &AgentControlMessage::Hello {
+                device_id: "mine".into(),
+                agent_version: "test".into(),
+                capabilities: vec![CAPABILITY.into()],
+            },
+        )
+        .await
+        .unwrap();
+        let mut line = String::new();
+        BufReader::new(&mut control)
+            .read_line(&mut line)
+            .await
+            .unwrap();
+        assert!(state.tunnel_runtime.direct_session("mine").await.is_some());
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(serve(state.clone(), listener, true));
+        for management in [false, true] {
+            let mut tls = (*config).clone();
+            if management {
+                tls.alpn_protocols = vec![ALPN.to_vec()];
+            }
+            let stream = tokio_rustls::TlsConnector::from(Arc::new(tls))
+                .connect(
+                    nexo_tunnel::identity::SERVER_NAME.try_into().unwrap(),
+                    TcpStream::connect(address).await.unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                stream.get_ref().1.alpn_protocol(),
+                if management { Some(ALPN) } else { None }
+            );
+            let mut mux = nexo_tunnel::yamux_connection(stream, yamux::Mode::Client);
+            let outbound = nexo_tunnel::new_outbound(&mut mux).await.unwrap();
+            let driver = tokio::spawn(async move { nexo_tunnel::next_inbound(&mut mux).await });
+            let mut stream = nexo_tunnel::into_tokio_io(outbound);
+            let sent = write_message(
+                &mut stream,
+                &DirectRequest::Sync {
+                    addresses: vec!["2001:4860::1".into()],
+                    reports: vec![],
+                },
+            )
+            .await;
+            let mut reply = String::new();
+            let result = tokio::time::timeout(
+                Duration::from_secs(3),
+                BufReader::new(&mut stream).read_line(&mut reply),
+            )
+            .await
+            .unwrap();
+            if management {
+                sent.unwrap();
+                result.unwrap();
+                assert!(matches!(
+                    serde_json::from_str::<DirectResponse>(&reply).unwrap(),
+                    DirectResponse::Services { .. }
+                ));
+                assert_eq!(
+                    state
+                        .db
+                        .lock()
+                        .unwrap()
+                        .query_row(
+                            "SELECT selected_address FROM direct_agents WHERE device_id='mine'",
+                            [],
+                            |r| r.get::<_, String>(0)
+                        )
+                        .unwrap(),
+                    "2001:4860::1"
+                );
+                state
+                    .tunnel_runtime
+                    .direct_session("mine")
+                    .await
+                    .unwrap()
+                    .cancel();
+                assert!(tokio::time::timeout(Duration::from_secs(3), driver)
+                    .await
+                    .is_ok());
+            } else {
+                assert!(
+                    result.is_err() || reply.is_empty(),
+                    "普通数据通道不得接受 Agent 主动管理流"
+                );
+                driver.abort();
+            }
+        }
+        drop(control);
+        let _ = test_session_finished(control_task).await;
+        state.tunnel_runtime.stop.cancel();
+        server.await.unwrap().unwrap();
     }
 
     async fn test_session_finished(task: JoinHandle<Result<()>>) -> Result<()> {
@@ -1157,6 +1292,7 @@ mod tests {
         write_message(
             &mut client,
             &AgentControlMessage::Hello {
+                capabilities: vec![],
                 device_id: "foreign".into(),
                 agent_version: "test".into(),
             },
@@ -1224,6 +1360,7 @@ mod tests {
         write_message(
             &mut new,
             &AgentControlMessage::Hello {
+                capabilities: vec![],
                 device_id: "mine".into(),
                 agent_version: "test".into(),
             },
@@ -1429,6 +1566,8 @@ mod tests {
         let occupied = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = occupied.local_addr().unwrap().port();
         let input = |device: &str| TunnelInput {
+            https_port: None,
+            ipv6_direct_enabled: None,
             http_redirect_enabled: None,
             access_mode: None,
             access_password: None,

@@ -67,6 +67,8 @@ pub struct TunnelDataEndpoint {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AgentControlMessage {
     Hello {
+        #[serde(default)]
+        capabilities: Vec<String>,
         device_id: String,
         agent_version: String,
     },
@@ -93,6 +95,8 @@ pub enum AgentControlMessage {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ServerControlMessage {
     HelloAccepted {
+        #[serde(default)]
+        capabilities: Vec<String>,
         server_time: i64,
         tunnels: Vec<TunnelDesiredState>,
         #[serde(default)]
@@ -101,6 +105,8 @@ pub enum ServerControlMessage {
         udp_endpoint: Option<TunnelDataEndpoint>,
     },
     HeartbeatAck {
+        #[serde(default)]
+        capabilities: Vec<String>,
         server_time: i64,
         tunnels: Vec<TunnelDesiredState>,
         #[serde(default)]
@@ -174,3 +180,5 @@ pub struct EnrollmentApproval {
     pub ca_certificate_pem: String,
     pub expires_at: i64,
 }
+
+pub mod direct;

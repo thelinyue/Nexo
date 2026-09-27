@@ -5,10 +5,9 @@ import { DeviceRecovery } from "./recovery";
 import { AgentEnrollment } from "./agent-enrollment";
 import { ServerSettings } from "./server-settings";
 import { DomainSettings } from "./domain-settings";
-import { DomainAccess } from "./domain-access";
-import { ChevronRight, Eye, EyeOff, KeyRound, Server, ShieldCheck, Users, X } from "lucide-react";
+import { ChevronRight, Settings, Trash2, Eye, EyeOff, KeyRound, Server, ShieldCheck, Users, X } from "lucide-react";
 import { Confirm, CopyButton, EnrollmentDevice, CreateButton, DetailField, Empty, Loading, Modal, Notice, PageHeader, RowLink, Status, dateText, errorText, request, useApi, useResource } from "./ui";
-import type { Auth, Device, Domain, DomainCertificate, DomainEvent, Enrollment, IdentityCertificate, Session, TransportIdentity, Tunnel } from "./ui";
+import type { Auth, Device, Domain, DomainEvent, Enrollment, IdentityCertificate, Session, TransportIdentity, Tunnel } from "./ui";
 
 function identityCertificateLabel(certificate?: IdentityCertificate) {
   return ({ valid: "证书有效", expiring: "证书即将到期", retry_wait: "证书续签待重试", expired: "证书已过期", unknown: "尚无证书记录" } as Record<string,string>)[certificate?.status ?? "unknown"] ?? "证书状态待确认";
@@ -129,52 +128,53 @@ function DomainForm({ onClose, onSave }: { onClose: () => void; onSave: (domain:
   </Modal>;
 }
 
-/** 证书文件的有效期与申请任务分开呈现：续期失败时，旧证书可能仍然有效。 */
-function certificateSummary(certificates: DomainCertificate[]) {
-  if (!certificates.length) return "等待证书状态";
-  const now = Date.now() / 1000;
-  if (certificates.some(cert => cert.expires_at && cert.expires_at <= now)) return "证书已过期";
-  if (certificates.some(cert => cert.error || ["failed", "retry_wait"].includes(cert.status))) return "证书申请需关注";
-  if (certificates.some(cert => cert.not_before && cert.not_before > now)) return "证书尚未生效";
-  if (certificates.some(cert => cert.status === "renewing")) return "证书续期中";
-  if (certificates.some(cert => !cert.expires_at || !cert.not_before)) return "等待证书签发";
-  const expiry = Math.min(...certificates.map(cert => cert.expires_at!));
-  return `证书有效 · ${new Date(expiry * 1000).toLocaleDateString()} 到期`;
-}
-
-function DomainCard({ item, onConfigure, active, csrf, detail = false }: { item: Domain; onConfigure: () => void; active: boolean; csrf?: string | null; detail?: boolean }) {
+/** 列表只概括证书与配置状态；续期失败不抹去仍然有效的证书日期。 */
+function certificateSummary(item: Domain) {
   const runtime = item.runtime;
   const certificates = runtime?.certificates ?? [];
-  return <article className="panel domain-row">
-    <div className="domain-heading"><h2>{detail ? item.domain : <a className="text-link" href={`#/domains/${encodeURIComponent(item.id)}`}>{item.domain}</a>}</h2><button className="text-button" onClick={onConfigure}>{item.verification_status === "pending" ? "验证与配置" : "证书配置"}</button></div>
-    <div className="domain-config"><DomainAccess domain={item} active={active} csrf={csrf} />{!item.https_enabled && <span>HTTPS 未开启</span>}{item.verification_status === "pending" ? <span className="status neutral">待验证归属</span> : <>{item.verification_status === "verified" && <span className="helper">归属已验证</span>}{runtime?.config_status !== "applied" && <Status kind="domain" value={runtime?.config_status ?? "unverified"} />}</>}</div>
-    {!detail ? <a className="row-link" href={`#/domains/${encodeURIComponent(item.id)}`}><span>{!item.https_enabled ? "未启用自动证书" : certificateSummary(certificates)}</span><ChevronRight size={17} /></a> : <details className="domain-diagnostics" open>
-      <summary><span>{!runtime ? "等待运行状态" : runtime.config_status === "disabled" ? "证书管理已暂停" : !item.https_enabled ? "未启用自动证书" : certificateSummary(certificates)}</span><ChevronRight size={17} /></summary>
-      <div className="domain-diagnostics-body">
-        <div className="domain-config"><span>HTTPS {item.https_enabled ? "已开启" : "未开启"}</span>{runtime?.config_status === "applied" && <Status kind="domain" value="applied" />}</div>
-        {item.https_enabled && <p className="helper">{item.certificate_mode === "http01" ? "HTTP 验证按主机名签发证书，请开放公网 TCP 80、443。" : "子域名共用同级泛域名证书；公网申请与续期需要 Cloudflare DNS 验证凭据。"}</p>}
-        {runtime?.config_error && <p className="domain-error"><strong>配置失败原因</strong>{runtime.config_error}</p>}
-        {runtime?.service_warning && <p className="domain-error">{runtime.service_warning}</p>}
-        {certificates.map(cert => <section className="domain-certificate" key={cert.hostname} aria-label={`证书 ${cert.hostname}`}>
-          <div className="certificate-heading"><strong>{cert.hostname}</strong><Status kind="certificate" value={cert.status} /></div>
-          {cert.expires_at ? <dl><DetailField label="生效时间">{dateText(cert.not_before)}</DetailField><DetailField label="到期时间">{dateText(cert.expires_at)}</DetailField></dl> : <p className="helper">尚未读取到已签发的证书</p>}
-          {cert.error && <p className="domain-error"><strong>{cert.expires_at && cert.expires_at > Date.now() / 1000 ? "现有证书仍有效，续期遇到问题" : "申请失败原因"}</strong>{cert.error}</p>}
-          {(cert.error || cert.status === "retry_wait") && <p className="helper">{cert.next_retry_at ? `Caddy 计划重试：${dateText(cert.next_retry_at)}` : "重试由 Caddy 安排，尚未提供下次时间。"}</p>}
-        </section>)}
-        <p className="helper">{runtime?.checked_at ? `最近检查：${dateText(runtime.checked_at)}` : "尚未完成运行检查"}</p>
-      </div>
-    </details>}
-    {!detail && runtime?.service_warning && <p className="domain-alert">服务转发通道尚未就绪</p>}
+  const now = Date.now() / 1000;
+  if (runtime?.config_status === "failed" || runtime?.config_error) return "配置失败";
+  if (item.verification_status === "pending" || !item.https_enabled || runtime?.config_status === "disabled") return "待配置";
+  if (certificates.some(cert => cert.status === "expired" || (cert.expires_at != null && cert.expires_at <= now))) return "已过期";
+  const failed = certificates.filter(cert => cert.error || ["failed", "retry_wait"].includes(cert.status));
+  if (failed.length) return failed.every(cert => cert.expires_at && cert.expires_at > now && cert.not_before != null && cert.not_before <= now) ? "续期失败" : "签发失败";
+  if (!runtime || runtime.config_status !== "applied") return "待配置";
+  if (!certificates.length || certificates.some(cert => !cert.expires_at || cert.not_before == null || cert.not_before > now)) return "签发中";
+  return "证书有效";
+}
+
+function DomainCard({ item, onConfigure, onDelete, detail = false }: { item: Domain; onConfigure: () => void; onDelete: () => void; detail?: boolean }) {
+  const runtime = item.runtime;
+  const certificates = runtime?.certificates ?? [];
+  const summary = certificateSummary(item);
+  const tone = ["配置失败", "签发失败", "续期失败", "已过期"].includes(summary) ? "danger" : summary === "证书有效" ? "success" : "neutral";
+  return <article className={`panel domain-row${detail ? " domain-detail" : " domain-compact"}`}>
+    <div className="domain-heading"><h2>{detail ? item.domain : <a className="text-link" title={item.domain} href={`#/domains/${encodeURIComponent(item.id)}`}>{item.domain}</a>}</h2>{!detail && <span className={`domain-state ${tone}`}>{summary}</span>}<div className="domain-actions"><button className="icon-button" aria-label={`配置 ${item.domain}`} title="配置" onClick={onConfigure}><Settings size={19} aria-hidden="true" /></button><button className="icon-button danger-text" aria-label={`删除 ${item.domain}`} title="删除" onClick={onDelete}><Trash2 size={19} aria-hidden="true" /></button></div></div>
+    {detail && <>
+      <details className="domain-diagnostics" open>
+        <summary><span className={`domain-state ${tone}`}>{summary}</span><ChevronRight size={17} /></summary>
+        <div className="domain-diagnostics-body">
+          {runtime?.config_error && <p className="domain-error">{runtime.config_error}</p>}
+          {certificates.map(cert => <section className="domain-certificate" key={cert.hostname} aria-label={`证书 ${cert.hostname}`}>
+            <div className="certificate-heading"><strong>{cert.hostname}</strong><Status kind="certificate" value={cert.status} /></div>
+            {cert.expires_at != null && <dl><DetailField label="生效时间">{dateText(cert.not_before)}</DetailField><DetailField label="到期时间">{dateText(cert.expires_at)}</DetailField></dl>}
+            {cert.error && <p className="domain-error">{cert.error}</p>}
+            {cert.next_retry_at && <p className="helper">下次重试：{dateText(cert.next_retry_at)}</p>}
+          </section>)}
+        </div>
+      </details>
+    </>}
   </article>;
 }
 
-function DomainEvents({ active, domains, domainId }: { active: boolean; domains: Domain[]; domainId?: string }) {
+/** 日志仅在当前域名详情展开时读取；服务端先筛选域名，再限制条数。 */
+function DomainEvents({ active, domainId }: { active: boolean; domainId: string }) {
   const request = useApi();
   const [open, setOpen] = useState(false);
-  const events = useResource(() => request<{ events: DomainEvent[] }>("/api/v1/public-domain-runtime-events"), active && open);
+  const events = useResource(() => request<{ events: DomainEvent[] }>(`/api/v1/public-domain-runtime-events?domain_id=${encodeURIComponent(domainId)}`), active && open);
   return <details className="panel domain-events" onToggle={event => setOpen(event.currentTarget.open)}>
-    <summary>最近记录<ChevronRight size={17} /></summary>
-    {open && <div className="domain-events-body"><div className="list-caption"><span>最近 100 条记录</span></div><Notice error={events.error} onRetry={() => void events.reload()} />{events.busy && !events.data && <Loading />}{events.data && (events.data.events.filter(event => !domainId || event.domain_id === domainId).length ? <ol>{events.data.events.filter(event => !domainId || event.domain_id === domainId).map(event => <li key={event.id}><strong>{domains.find(domain => domain.id === event.domain_id)?.domain ?? "已删除的域名"}</strong><time dateTime={new Date(event.occurred_at * 1000).toISOString()}>{dateText(event.occurred_at)}</time><p>{event.summary}</p></li>)}</ol> : <p className="helper">暂无运行记录</p>)}</div>}
+    <summary>运行日志<ChevronRight size={17} /></summary>
+    {open && <div className="domain-events-body"><Notice error={events.error} onRetry={() => void events.reload()} />{events.busy && !events.data && <Loading />}{events.data && (events.data.events.length ? <ol>{events.data.events.map(event => <li key={event.id}><time dateTime={new Date(event.occurred_at * 1000).toISOString()}>{dateText(event.occurred_at)}</time><p>{event.summary}</p></li>)}</ol> : <p className="helper">暂无日志</p>)}</div>}
   </details>;
 }
 
@@ -183,26 +183,26 @@ export function DomainsPage({ active, csrf, route, back, initialConfiguration }:
   const request = useApi();
   const resource = useResource(() => request<Domain[]>("/api/v1/public-domains"), active, true, false, initialConfiguration ? [initialConfiguration] : undefined);
   const [configuring, setConfiguring] = useState<Domain | null>(initialConfiguration ?? null);
-  const [adding, setAdding] = useState(false); const [deleting, setDeleting] = useState<Domain | null>(null); const [saved, setSaved] = useState<string | null>(initialConfiguration ? `已添加 ${initialConfiguration.domain}` : null);
+  const [showDnsReminder, setShowDnsReminder] = useState(Boolean(initialConfiguration));
+  const [adding, setAdding] = useState(false); const [deleting, setDeleting] = useState<Domain | null>(null); const [saved, setSaved] = useState<string | null>(initialConfiguration ? "已添加" : null);
   useResourceDeletions(routes => {
     if (!routes.some(route => route.startsWith("#/domains/"))) return;
     resource.setData(previous => previous?.filter(item => !routes.includes(`#/domains/${encodeURIComponent(item.id)}`)) ?? null);
-    setSaved("域名已删除");
+    setSaved("已删除");
   });
   useEffect(() => { if (!active) setSaved(null); }, [active]);
   const detailId = route.startsWith("#/domains/") ? route.slice("#/domains/".length) : null;
   const detail = resource.data?.find(item => encodeURIComponent(item.id) === detailId);
   return <div className="domains-page">
     <PageHeader title={detailId ? detail?.domain ?? "域名详情" : "域名"} back={detailId ? back : undefined} action={!detailId && Boolean(resource.data?.length) && <CreateButton label="域名" onClick={() => setAdding(true)} />} />
-    <Notice updatedAt={resource.updatedAt} error={resource.error ? `${saved ? "域名变更已保存，但列表刷新失败。可重试刷新，无需重复操作。" : ""}${resource.error}` : null} onRetry={() => void resource.reload()} />{saved && !resource.error && <p className="helper domain-feedback" role="status">{saved}</p>}{!resource.data && resource.busy && <Loading />}
-    {resource.data && (detailId ? detail ? <><DomainCard key={detail.id} item={detail} detail onConfigure={() => setConfiguring(detail)} active={active} csrf={csrf} />{detail.verification_status === "pending" && <p className="notice">请先验证域名归属。</p>}<DomainEvents active={active} domains={resource.data} domainId={detail.id} /></> : <Empty title="域名不存在" detail="域名可能已被删除，或不属于当前空间。"><a href="#/domains" className="secondary-button">返回域名列表</a></Empty> : !resource.data.length ? <Empty kind="domains" title="还没有域名" detail="用于网页访问和 HTTPS 证书。"><button className="primary-button" aria-label="添加 域名" onClick={() => setAdding(true)}>添加域名</button></Empty> : <>
+    <Notice updatedAt={resource.updatedAt} error={resource.error ? `${saved ? "操作已完成，刷新失败：" : ""}${resource.error}` : null} onRetry={() => void resource.reload()} />{saved && !resource.error && <p className="helper domain-feedback" role="status">{saved}</p>}{!resource.data && resource.busy && <Loading />}
+    {resource.data && (detailId ? detail ? <><DomainCard key={detail.id} item={detail} detail onConfigure={() => setConfiguring(detail)} onDelete={() => setDeleting(detail)} /><DomainEvents key={detail.id} active={active} domainId={detail.id} /></> : <Empty title="域名不存在" detail="域名可能已被删除，或不属于当前空间。"><a href="#/domains" className="secondary-button">返回域名列表</a></Empty> : !resource.data.length ? <Empty kind="domains" title="还没有域名" detail="用于网页访问和 HTTPS 证书。"><button className="primary-button" aria-label="添加 域名" onClick={() => setAdding(true)}>添加域名</button></Empty> : <>
       <div className="list-caption"><span>{resource.data.length} 个域名</span></div>
-      <section className="domain-list" aria-label="域名列表">{resource.data.map(item => <DomainCard key={item.id} item={item} onConfigure={() => setConfiguring(item)} active={active} csrf={csrf} />)}</section>
-      <DomainEvents active={active} domains={resource.data} />
+      <section className="domain-list" aria-label="域名列表">{resource.data.map(item => <DomainCard key={item.id} item={item} onConfigure={() => setConfiguring(item)} onDelete={() => setDeleting(item)} />)}</section>
     </>)}
-    {adding && active && <DomainForm onClose={() => setAdding(false)} onSave={async domain => { const created = await request<Domain>("/api/v1/public-domains", { method: "POST", body: JSON.stringify({ domain, https_enabled: true }) }, csrf); resource.setData(previous => [...(previous ?? []).filter(item => item.id !== created.id), created].sort((a, b) => a.domain.localeCompare(b.domain))); setSaved(`已添加 ${created.domain}`); setAdding(false); navigation?.openDomainConfiguration(created); }} />}
-    {configuring && active && <DomainSettings domain={configuring} csrf={csrf} onDelete={() => setDeleting(configuring)} onClose={() => setConfiguring(null)} onSaved={value => { resource.setData(previous => (previous ?? []).map(item => item.id === configuring.id ? { ...item, ...value } : item)); }} />}
-    {deleting && active && <Confirm title={`删除 ${deleting.domain}？`} description="删除后无法再使用此域名配置服务。仍有关联服务时会阻止删除，请先修改或删除关联服务。" label="删除域名" onClose={() => setDeleting(null)} onConfirm={async () => { await request(`/api/v1/public-domains/${encodeURIComponent(deleting.id)}`, { method: "DELETE" }, csrf); resource.setData(previous => (previous ?? []).filter(item => item.id !== deleting.id)); setSaved(`已删除 ${deleting.domain}`); setConfiguring(null); navigation?.removePages([`#/domains/${encodeURIComponent(deleting.id)}`], "#/domains"); void resource.reload(); }} />}
+    {adding && active && <DomainForm onClose={() => setAdding(false)} onSave={async domain => { const created = await request<Domain>("/api/v1/public-domains", { method: "POST", body: JSON.stringify({ domain, https_enabled: true }) }, csrf); resource.setData(previous => [...(previous ?? []).filter(item => item.id !== created.id), created].sort((a, b) => a.domain.localeCompare(b.domain))); setSaved("已添加"); setAdding(false); navigation?.openDomainConfiguration(created); }} />}
+    {configuring && active && <DomainSettings domain={configuring} csrf={csrf} showDnsReminder={showDnsReminder} onDelete={() => setDeleting(configuring)} onClose={() => { setConfiguring(null); setShowDnsReminder(false); }} onSaved={value => { resource.setData(previous => (previous ?? []).map(item => item.id === configuring.id ? { ...item, ...value } : item)); }} />}
+    {deleting && active && <Confirm title={`删除 ${deleting.domain}？`} description="删除后无法恢复。" label="删除" onClose={() => setDeleting(null)} onConfirm={async () => { await request(`/api/v1/public-domains/${encodeURIComponent(deleting.id)}`, { method: "DELETE" }, csrf); resource.setData(previous => (previous ?? []).filter(item => item.id !== deleting.id)); setSaved("已删除"); setConfiguring(null); navigation?.removePages([`#/domains/${encodeURIComponent(deleting.id)}`], "#/domains"); void resource.reload(); }} />}
   </div>;
 }
 

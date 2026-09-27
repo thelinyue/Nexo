@@ -40,6 +40,7 @@ pub struct DomainRuntime {
     pub config_status: String,
     pub config_error: Option<String>,
     pub service_warning: Option<String>,
+    pub service_errors: HashMap<String, String>,
     pub checked_at: Option<i64>,
     pub certificates: Vec<CertificateStatus>,
     #[serde(skip)]
@@ -51,6 +52,7 @@ impl DomainRuntime {
             config_status: if enabled { "pending" } else { "disabled" }.into(),
             config_error: None,
             service_warning: None,
+            service_errors: HashMap::new(),
             checked_at: None,
             certificates: Vec::new(),
             loaded_routes: HashMap::new(),
@@ -113,12 +115,14 @@ struct DomainSpec {
     name: String,
     https: bool,
     token_reference: Option<String>,
+    dns_provider: Option<Value>,
     certificate_mode: String,
     dns: crate::domains::DnsSettings,
     services: Vec<WebService>,
 }
 #[derive(Debug, Clone)]
 struct WebService {
+    https_port: u16,
     management: bool,
     http_redirect_enabled: bool,
     id: String,
@@ -186,6 +190,7 @@ fn specifications(
                 name: row.get(2)?,
                 https: row.get::<_, i64>(3)? != 0,
                 token_reference: None,
+                dns_provider: None,
                 certificate_mode: "cloudflare_dns".into(),
                 dns: crate::domains::DnsSettings::default(),
                 services: Vec::new(),
@@ -195,6 +200,16 @@ fn specifications(
     for domain in &mut domains {
         let options = crate::domains::load(&connection, &domain.id, &domain.name)
             .map_err(|e| anyhow::anyhow!(e.message))?;
+        domain.dns_provider =
+            if options.credential_configured && options.dns_provider != "cloudflare" {
+                Some(crate::dns_provider::caddy_config(
+                    &connection,
+                    &settings.cloudflare_token_root,
+                    &domain.id,
+                )?)
+            } else {
+                None
+            };
         domain.certificate_mode = options.certificate_mode;
         domain.dns = options.dns;
         if domain.certificate_mode == "cloudflare_dns" {
@@ -210,7 +225,7 @@ fn specifications(
                 .transpose()?;
             domain.token_reference = path.map(|path| format!("{{file.{}}}", path.display()));
         }
-        let mut services = connection.prepare("SELECT id,hostname,protocol,device_id,lan_redirect_enabled,local_address,local_port,origin_protocol,service_mode,http_redirect_enabled FROM tunnels WHERE public_domain_id=?1 AND tenant_id=?2 AND enabled=1 AND deleted_at IS NULL AND protocol IN ('http','https')")?;
+        let mut services = connection.prepare("SELECT id,hostname,protocol,device_id,lan_redirect_enabled,local_address,local_port,origin_protocol,service_mode,http_redirect_enabled,https_port FROM tunnels WHERE public_domain_id=?1 AND tenant_id=?2 AND enabled=1 AND deleted_at IS NULL AND protocol IN ('http','https')")?;
         let mut rows = services.query(params![domain.id, domain.tenant_id])?;
         while let Some(row) = rows.next()? {
             let id: String = row.get(0)?;
@@ -242,6 +257,7 @@ fn specifications(
                 None
             };
             domain.services.push(WebService {
+                https_port: row.get(10)?,
                 management: false,
                 http_redirect_enabled: direct && row.get(9)?,
                 hostname: format!("{}.{}", hostname.unwrap_or_default(), domain.name),
@@ -270,6 +286,7 @@ fn specifications(
             .find(|domain| domain.id == entry.domain_id)
         {
             domain.services.push(WebService {
+                https_port: 443,
                 management: true,
                 http_redirect_enabled: true,
                 id: "management".into(),
@@ -327,14 +344,15 @@ fn proxy_handler(upstream: &str) -> Result<Value> {
 }
 
 /// 只跳到配置中的域名，保留原方法与 URI；禁止缓存以便关闭和换域名后立即恢复。
-fn https_redirect(hostname: &str) -> Value {
-    json!({"match":[{"host":[hostname]}],"handle":[{"handler":"static_response","status_code":307,"headers":{"Location":[format!("https://{hostname}{{http.request.uri}}")],"Cache-Control":["no-store"]}}],"terminal":true})
+fn https_redirect(hostname: &str, port: u16) -> Value {
+    let origin = crate::https_ports::url("https", hostname, port);
+    json!({"match":[{"host":[hostname]}],"handle":[{"handler":"static_response","status_code":307,"headers":{"Location":[format!("{origin}{{http.request.uri}}")],"Cache-Control":["no-store"]}}],"terminal":true})
 }
 
 /// 只发布显式域名；未知主机返回 404。没有可信 Tunnel socket 时明确返回 503，不连接 Agent 的私网地址。
 fn build_config(settings: &CaddyRuntimeConfig, domains: &[DomainSpec]) -> Result<Value> {
     let mut http = Vec::new();
-    let mut https = Vec::new();
+    let mut https: std::collections::BTreeMap<u16, Vec<Value>> = std::collections::BTreeMap::new();
     let mut subjects = Vec::new();
     let mut policies = Vec::new();
     let mut claimed = HashSet::new();
@@ -349,7 +367,7 @@ fn build_config(settings: &CaddyRuntimeConfig, domains: &[DomainSpec]) -> Result
         );
         let root_route = json!({"match":[{"host":[domain.name]}],"handle":[{"handler":"static_response","status_code":404}]});
         if domain.https {
-            https.push(root_route);
+            https.entry(443).or_default().push(root_route);
         } else {
             http.push(root_route);
         }
@@ -368,12 +386,12 @@ fn build_config(settings: &CaddyRuntimeConfig, domains: &[DomainSpec]) -> Result
                 json!({"handler":"static_response","status_code":503,"body":"服务转发通道尚未就绪"})
             };
             if service.protocol == "https" && service.http_redirect_enabled {
-                http.push(https_redirect(&service.hostname));
+                http.push(https_redirect(&service.hostname, service.https_port));
             }
             if service.management {
                 // 明确覆盖协议头，不采信访问者自行传入的值。
                 handler["headers"]["request"]["set"]["X-Forwarded-Proto"] = json!(["https"]);
-                https.push(json!({"match":[{"host":[service.hostname]}],"handle":[handler],"terminal":true}));
+                https.entry(443).or_default().push(json!({"match":[{"host":[service.hostname]}],"handle":[handler],"terminal":true}));
                 continue;
             }
             let (access_endpoint, access_check) =
@@ -381,7 +399,7 @@ fn build_config(settings: &CaddyRuntimeConfig, domains: &[DomainSpec]) -> Result
             let route =
                 json!({"match":[{"host":[service.hostname]}],"handle":[access_check,handler]});
             let routes = if service.protocol == "https" {
-                &mut https
+                https.entry(service.https_port).or_default()
             } else {
                 &mut http
             };
@@ -414,7 +432,7 @@ fn build_config(settings: &CaddyRuntimeConfig, domains: &[DomainSpec]) -> Result
             if domain.certificate_mode == "http01" {
                 policies.push(json!({"subjects":domain_subjects,"issuers":[{"module":"acme","challenges":{"tls-alpn":{"disabled":true}}}]}));
             } else if let Some(token) = &domain.token_reference {
-                let mut dns = json!({"provider":{"name":"cloudflare","api_token":token}});
+                let mut dns = json!({"provider":domain.dns_provider.clone().unwrap_or_else(||json!({"name":"cloudflare","api_token":token}))});
                 if !domain.dns.dns_resolvers.is_empty() {
                     dns["resolvers"] = json!(domain.dns.dns_resolvers);
                 }
@@ -432,17 +450,25 @@ fn build_config(settings: &CaddyRuntimeConfig, domains: &[DomainSpec]) -> Result
     // Caddy 无匹配路由时默认返回空的 200；显式兜底，避免未知域名被误认为服务正常。
     let not_found = json!({"handle":[{"handler":"static_response","status_code":404}]});
     http.push(not_found.clone());
-    if !https.is_empty() {
-        https.push(not_found);
+    for routes in https.values_mut() {
+        routes.push(not_found.clone());
     }
     let mut servers = serde_json::Map::new();
     if !domains.is_empty() {
         servers.insert("http".into(),json!({"listen":[settings.http_listen],"automatic_https":{"disable":true},"routes":http}));
     }
-    if !https.is_empty() {
-        // 仅由 tls.certificates.automate 管理根域名和泛域名；关闭从路由发现证书的入口，
-        // 防止新增服务或缺少 DNS 凭据时为具体子域名单独签发。续期和重试仍由 Caddy 执行。
-        servers.insert("https".into(),json!({"listen":[settings.https_listen],"automatic_https":{"disable":true},"routes":https,"tls_connection_policies":[{}]}));
+    // 每个端口只安装属于它的路由，避免同一主机在未选择的端口仍然可访问。
+    for (port, routes) in https {
+        let (name, listen) = if port == 443 {
+            ("https".to_owned(), settings.https_listen.clone())
+        } else {
+            let (address, _) = settings
+                .https_listen
+                .rsplit_once(':')
+                .context("HTTPS 监听地址无效")?;
+            (format!("https_{port}"), format!("{address}:{port}"))
+        };
+        servers.insert(name, json!({"listen":[listen],"automatic_https":{"disable":true},"routes":routes,"tls_connection_policies":[{}]}));
     }
     let mut config = json!({"admin":{"listen":admin_listen(settings)?},"storage":{"module":"file_system","root":settings.storage_root},"apps":{"http":{"servers":servers},"pki":{"certificate_authorities":{"local":{"install_trust":false}}}}});
     if !subjects.is_empty() {
@@ -451,6 +477,61 @@ fn build_config(settings: &CaddyRuntimeConfig, domains: &[DomainSpec]) -> Result
     }
     Ok(config)
 }
+/// 已由当前 Caddy 持有的监听可复用；新监听只做本机占用检查，不发起公网连接。
+fn available_ports(
+    settings: &CaddyRuntimeConfig,
+    specs: &[DomainSpec],
+    current: &Value,
+) -> (Vec<DomainSpec>, HashMap<String, String>) {
+    let mut ports = HashMap::<u16, Option<String>>::new();
+    let mut errors = HashMap::new();
+    let mut available = specs.to_vec();
+    for domain in &mut available {
+        domain.services.retain(|service| {
+            if service.protocol != "https" || service.https_port == 443 {
+                return true;
+            }
+            let port = service.https_port;
+            let error = ports.entry(port).or_insert_with(|| {
+                let prefix = settings
+                    .https_listen
+                    .rsplit_once(':')
+                    .map(|(p, _)| p)
+                    .unwrap_or("");
+                let listen = format!("{prefix}:{port}");
+                let already_listening =
+                    current["apps"]["http"]["servers"]
+                        .as_object()
+                        .is_some_and(|servers| {
+                            servers.values().any(|server| {
+                                server["listen"]
+                                    .as_array()
+                                    .is_some_and(|addresses| addresses.contains(&json!(listen)))
+                            })
+                        });
+                if already_listening {
+                    return None;
+                }
+                let address = if listen.starts_with(':') {
+                    format!("0.0.0.0{listen}")
+                } else {
+                    listen
+                };
+                std::net::TcpListener::bind(address)
+                    .err()
+                    .map(|e| format!("HTTPS 公网端口 {port} 无法监听：{e}"))
+            });
+            if let Some(error) = error {
+                errors.insert(service.id.clone(), error.clone());
+                false
+            } else {
+                true
+            }
+        });
+    }
+    (available, errors)
+}
+
 pub(crate) async fn reconcile(state: &AppState) -> Result<()> {
     let _guard = state.domain_runtime.reconcile_lock.lock().await;
     reconcile_locked(state).await.map(|_| ())
@@ -480,7 +561,11 @@ pub(crate) async fn reconcile_locked(state: &AppState) -> Result<bool> {
         .await?;
     let mut settings_with_access = settings.clone();
     settings_with_access.access_address = access.address.clone();
-    let desired = build_config(&settings_with_access, &specs);
+    // 新端口被其他程序占用时，只撤下该端口的服务；其他入口仍可正常应用配置。
+    let current = supervisor.current_config().await.unwrap_or(Value::Null);
+    let (available_specs, service_errors) =
+        available_ports(&settings_with_access, &specs, &current);
+    let desired = build_config(&settings_with_access, &available_specs);
     let config_result = match desired {
         Ok(config) => match supervisor.current_config().await {
             Ok(current)
@@ -552,7 +637,11 @@ pub(crate) async fn reconcile_locked(state: &AppState) -> Result<bool> {
                 .filter_map(|service| {
                     service.upstream.as_ref().map(|upstream| {
                         (
-                            format!("{}://{}", service.protocol, service.hostname),
+                            crate::https_ports::url(
+                                &service.protocol,
+                                &service.hostname,
+                                service.https_port,
+                            ),
                             upstream.clone(),
                         )
                     })
@@ -561,6 +650,20 @@ pub(crate) async fn reconcile_locked(state: &AppState) -> Result<bool> {
         } else {
             HashMap::new()
         };
+        runtime.service_errors = domain
+            .services
+            .iter()
+            .filter_map(|s| service_errors.get(&s.id).map(|e| (s.id.clone(), e.clone())))
+            .collect();
+        for service in &domain.services {
+            if service_errors.contains_key(&service.id) {
+                runtime.loaded_routes.remove(&crate::https_ports::url(
+                    &service.protocol,
+                    &service.hostname,
+                    service.https_port,
+                ));
+            }
+        }
         runtime.checked_at = Some(now);
         runtime.service_warning = domain
             .services
@@ -852,6 +955,7 @@ mod tests {
     }
     fn domain() -> DomainSpec {
         DomainSpec {
+            dns_provider: None,
             id: "d".into(),
             tenant_id: "default".into(),
             name: "example.com".into(),
@@ -860,6 +964,7 @@ mod tests {
             certificate_mode: "cloudflare_dns".into(),
             dns: crate::domains::DnsSettings::default(),
             services: vec![WebService {
+                https_port: 443,
                 management: false,
                 http_redirect_enabled: false,
                 id: "nas".into(),
@@ -1085,10 +1190,10 @@ mod tests {
                 ["provider"]["api_token"],
             "{file./credential-test.token}"
         );
-        assert_eq!(
+        assert!(
             cfg["apps"]["tls"]["automation"]["policies"][0]["issuers"][0]["challenges"]["dns"]
-                ["resolvers"],
-            json!(["223.5.5.5:53", "223.6.6.6:53"])
+                .get("resolvers")
+                .is_none()
         );
         d.https = false;
         let cfg = build_config(&settings(Path::new("test")), &[d]).unwrap();
@@ -1100,6 +1205,7 @@ mod tests {
         let mut d = domain();
         d.services.extend([
             WebService {
+                https_port: 443,
                 management: false,
                 http_redirect_enabled: false,
                 id: "media".into(),
@@ -1109,6 +1215,7 @@ mod tests {
                 lan_redirect: None,
             },
             WebService {
+                https_port: 443,
                 management: false,
                 http_redirect_enabled: false,
                 id: "a.team".into(),
@@ -1118,6 +1225,7 @@ mod tests {
                 lan_redirect: None,
             },
             WebService {
+                https_port: 443,
                 management: false,
                 http_redirect_enabled: false,
                 id: "b.team".into(),
@@ -1127,6 +1235,7 @@ mod tests {
                 lan_redirect: None,
             },
             WebService {
+                https_port: 443,
                 management: false,
                 http_redirect_enabled: false,
                 id: "http-only".into(),
@@ -1157,6 +1266,7 @@ mod tests {
             }
             let subjects = d.subjects();
             d.services.push(WebService {
+                https_port: 443,
                 management: false,
                 http_redirect_enabled: false,
                 id: "next.team".into(),
@@ -1400,7 +1510,8 @@ mod tests {
         other_service.hostname = "other.lan-redirect.localhost".into();
         other_service.lan_redirect.as_mut().unwrap().public_ipv4 = "8.8.8.8".parse().unwrap();
         d.services.push(other_service);
-        let (access_state, _) = crate::tests::domain_fixture();
+        let (mut access_state, _) = crate::tests::domain_fixture();
+        access_state.domain_runtime = Arc::new(DomainRuntimeManager::new(cfg.clone()));
         {
             let db = access_state.db.lock().unwrap();
             db.execute("INSERT INTO public_domains(id,tenant_id,domain,https_enabled,created_at,updated_at) VALUES('access-domain','default','lan-redirect.localhost',1,0,0)", []).unwrap();
@@ -1765,9 +1876,13 @@ mod tests {
                 .unwrap(),
             event_count
         );
-        let events = crate::domain_events(axum::extract::State(state.clone()), headers)
-            .await
-            .unwrap();
+        let events = crate::domain_events(
+            axum::extract::State(state.clone()),
+            headers,
+            axum::extract::Query(crate::DomainEventsQuery::default()),
+        )
+        .await
+        .unwrap();
         assert!(events.0["events"]
             .as_array()
             .unwrap()
@@ -1924,5 +2039,41 @@ mod tests {
         assert!(!path.exists() && !candidate_path.exists());
         assert!(cfg.cloudflare_token_root.join(&other.id).exists());
         restarted.shutdown().await.unwrap();
+    }
+    #[test]
+    fn custom_https_ports_isolate_routes_and_redirects() {
+        let cfg = settings(Path::new("/tmp/nexo-ports"));
+        let mut domain = domain();
+        domain.services[0].https_port = 9443;
+        domain.services[0].http_redirect_enabled = true;
+        let config = build_config(&cfg, &[domain]).unwrap();
+        let servers = &config["apps"]["http"]["servers"];
+        assert_eq!(servers["https_9443"]["listen"], json!([":9443"]));
+        assert!(!servers["https"]["routes"]
+            .to_string()
+            .contains("nas.example.com"));
+        assert!(servers["https_9443"]["routes"]
+            .to_string()
+            .contains("nas.example.com"));
+        assert!(servers["http"]["routes"]
+            .to_string()
+            .contains("https://nas.example.com:9443"));
+    }
+
+    #[test]
+    fn occupied_custom_port_only_removes_affected_services() {
+        let occupied = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut cfg = settings(Path::new("/tmp/nexo-ports"));
+        cfg.https_listen = "127.0.0.1:443".into();
+        let mut domain = domain();
+        let mut blocked = domain.services[0].clone();
+        blocked.id = "blocked".into();
+        blocked.hostname = "blocked.example.com".into();
+        blocked.https_port = occupied.local_addr().unwrap().port();
+        domain.services.push(blocked);
+        let (available, errors) = available_ports(&cfg, &[domain], &Value::Null);
+        assert_eq!(available[0].services.len(), 1);
+        assert!(errors.contains_key("blocked"));
+        assert!(errors["blocked"].contains("无法监听"));
     }
 }
