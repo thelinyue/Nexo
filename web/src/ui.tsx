@@ -4,7 +4,7 @@ import { ArrowLeft, Check, ChevronRight, Copy, FileQuestion, Globe2, Network, Pl
 import { PageNavigationContext } from "./navigation";
 
 export type Auth = { initialized: boolean; authenticated: boolean; user_id?: string; username?: string; role?: "system_admin" | "tenant"; workspace_id?: string; csrf_token?: string | null; local_http_warning?: boolean };
-export type Tunnel = { id: string; name: string; protocol: string; origin_protocol?: "http" | "https" | null; local_address: string; local_port: number; public_port?: number | null; public_address?: string | null; device_id?: string | null; device_name?: string | null; hostname?: string | null; enabled: boolean; apply_status: string; apply_error?: string | null; public_domain?: string | null; lan_redirect_enabled: boolean };
+export type Tunnel = { service_mode?: "tunnel" | "reverse_proxy"; id: string; name: string; protocol: string; origin_protocol?: "http" | "https" | null; local_address: string; local_port: number; public_port?: number | null; public_address?: string | null; device_id?: string | null; device_name?: string | null; hostname?: string | null; enabled: boolean; apply_status: string; apply_error?: string | null; public_domain?: string | null; lan_redirect_enabled: boolean };
 export type IdentityCertificate = { status: string; expires_at: number | null; renew_after: number | null; error: string | null; next_retry_at: number | null };
 export type TransportIdentity = { server: IdentityCertificate; ca_expires_at: number | null; ca_needs_attention: boolean };
 export type Device = { id: string; name: string; status: string; os?: string | null; architecture?: string | null; agent_version?: string | null; tunnel_count: number; enrolled_at?: number | null; last_seen_at?: number | null; certificate?: IdentityCertificate };
@@ -61,11 +61,12 @@ export function EnrollmentDevice({ item }: { item: Enrollment }) {
 export function Brand() { return <div className="brand"><span className="brand-icon">N</span><span><strong>Nexo</strong><small>联巢 · 内网穿透</small></span></div>; }
 
 /** 各资源分别解释状态，未知状态保留原值，避免把离线或未知情况误报为处理中。 */
-export function Status({ value, kind = "service" }: { value: string; kind?: "service" | "agent" | "domain" | "certificate" }) {
+export function Status({ value, kind = "service" }: { value: string; kind?: "service" | "agent" | "domain" | "certificate" | "reverse_proxy" }) {
   const labels: Record<string, string> = kind === "agent"
     ? { online: "在线", offline: "离线" }
     : kind === "domain" ? { applied: "配置已加载", pending: "等待加载", failed: "配置加载失败", disabled: "Caddy 已停用", unverified: "尚无运行状态" }
     : kind === "certificate" ? { pending: "等待签发", waiting_configuration: "申请中", presenting_dns: "提交 DNS 验证", waiting_dns: "等待 DNS 生效", validating: "验证中", issued: "已签发", active: "已签发", renewing: "续期中", retry_wait: "等待重试", failed: "申请失败", expired: "已过期", not_yet_valid: "尚未生效" }
+    : kind === "reverse_proxy" ? { ready: "已生效", failed: "配置失败", error: "配置失败", disabled: "已停用", checking: "配置中", pending: "配置中", applying: "配置中" }
     : { ready: "运行中", failed: "需处理", error: "需处理", disabled: "已关闭", checking: "检查中", pending: "待应用", applying: "应用中" };
   const tone = ["ready", "online", "applied", "issued", "active"].includes(value) ? "ready" : ["failed", "error", "expired"].includes(value) ? "failed" : ["pending", "checking", "applying", "waiting_configuration", "presenting_dns", "waiting_dns", "validating", "renewing", "retry_wait"].includes(value) ? "working" : "neutral";
   return <span className={`status ${tone}`}><i />{labels[value] ?? `未知状态：${value || "未返回"}`}</span>;

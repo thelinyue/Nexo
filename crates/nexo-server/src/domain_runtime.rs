@@ -19,6 +19,10 @@ use std::{
 };
 use x509_parser::{extensions::GeneralName, pem::parse_x509_pem};
 
+#[cfg(test)]
+#[path = "domain_runtime_reverse_proxy_tests.rs"]
+mod reverse_proxy_tests;
+
 #[derive(Debug, Clone, Serialize)]
 pub struct CertificateStatus {
     pub hostname: String,
@@ -217,13 +221,14 @@ fn specifications(
             };
             domain.token_reference = path.map(|path| format!("{{file.{}}}", path.display()));
         }
-        let mut services = connection.prepare("SELECT id,hostname,protocol,device_id,lan_redirect_enabled,local_address,local_port,origin_protocol FROM tunnels WHERE public_domain_id=?1 AND tenant_id=?2 AND enabled=1 AND deleted_at IS NULL AND protocol IN ('http','https')")?;
+        let mut services = connection.prepare("SELECT id,hostname,protocol,device_id,lan_redirect_enabled,local_address,local_port,origin_protocol,service_mode FROM tunnels WHERE public_domain_id=?1 AND tenant_id=?2 AND enabled=1 AND deleted_at IS NULL AND protocol IN ('http','https')")?;
         let mut rows = services.query(params![domain.id, domain.tenant_id])?;
         while let Some(row) = rows.next()? {
             let id: String = row.get(0)?;
             let hostname: Option<String> = row.get(1)?;
             let device_id: Option<String> = row.get(3)?;
-            let redirect_enabled: bool = row.get(4)?;
+            let direct = row.get::<_, String>(8)? == crate::reverse_proxy::MODE;
+            let redirect_enabled: bool = row.get::<_, bool>(4)? && !direct;
             // 只按本服务绑定的设备查询，其他 Agent 的公网出口不能授权此服务跳转。
             let public_ipv4 = device_id
                 .as_ref()
@@ -250,7 +255,17 @@ fn specifications(
             domain.services.push(WebService {
                 hostname: format!("{}.{}", hostname.unwrap_or_default(), domain.name),
                 protocol: row.get(2)?,
-                upstream: upstreams.get(&id).cloned(),
+                upstream: if direct {
+                    Some(crate::reverse_proxy::target(
+                        row.get::<_, Option<String>>(7)?
+                            .as_deref()
+                            .unwrap_or("http"),
+                        &row.get::<_, String>(5)?,
+                        row.get(6)?,
+                    ))
+                } else {
+                    upstreams.get(&id).cloned()
+                },
                 id,
                 lan_redirect,
             });
@@ -277,6 +292,26 @@ fn admin_listen(settings: &CaddyRuntimeConfig) -> Result<String> {
         "Caddy 管理接口只允许本机回环 HTTP 地址"
     );
     Ok(SocketAddr::new(ip, url.port_or_known_default().unwrap_or(8290)).to_string())
+}
+
+/// URL 只用于 Server 直连；隧道入口仍是已认证的本地 socket，保持原有回源方式。
+fn proxy_handler(upstream: &str) -> Result<Value> {
+    let mut handler = json!({"handler":"reverse_proxy","upstreams":[{"dial":upstream}],"stream_close_delay":300000000000_u64});
+    if upstream.starts_with("http://") || upstream.starts_with("https://") {
+        let url = reqwest::Url::parse(upstream)?;
+        let host = url.host_str().context("反代目标缺少主机名")?;
+        handler["upstreams"][0]["dial"] = json!(format!(
+            "{host}:{}",
+            url.port_or_known_default().context("反代目标缺少端口")?
+        ));
+        // Caddy 新版本 HTTPS 回源可能重写 Host；显式保留用户访问的公网主机名。
+        handler["headers"] = json!({"request":{"set":{"Host":["{http.request.hostport}"]}}});
+        if url.scheme() == "https" {
+            handler["transport"] =
+                json!({"protocol":"http","tls":{"server_name":host.trim_matches(['[', ']'])}});
+        }
+    }
+    Ok(handler)
 }
 
 /// 只发布显式域名；未知主机返回 404。没有可信 Tunnel socket 时明确返回 503，不连接 Agent 的私网地址。
@@ -311,7 +346,7 @@ fn build_config(settings: &CaddyRuntimeConfig, domains: &[DomainSpec]) -> Result
                 continue;
             }
             let handler = if let Some(upstream) = &service.upstream {
-                json!({"handler":"reverse_proxy","upstreams":[{"dial":upstream}],"stream_close_delay":300000000000_u64})
+                proxy_handler(upstream)?
             } else {
                 json!({"handler":"static_response","status_code":503,"body":"服务转发通道尚未就绪"})
             };
@@ -386,7 +421,7 @@ fn build_config(settings: &CaddyRuntimeConfig, domains: &[DomainSpec]) -> Result
     }
     Ok(config)
 }
-async fn reconcile(state: &AppState) -> Result<()> {
+pub(crate) async fn reconcile(state: &AppState) -> Result<()> {
     let _guard = state.domain_runtime.reconcile_lock.lock().await;
     reconcile_locked(state).await.map(|_| ())
 }

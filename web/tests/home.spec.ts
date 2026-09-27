@@ -69,7 +69,7 @@ test("首页概览、管理员用户与隧道筛选、时间图表和手机导�
   await expect(panel.getByRole("img")).toBeVisible();
   await expect(panel.locator(".traffic-usage strong")).toHaveText(["2 KiB", "20 KiB", "200 KiB"]);
   await expect(panel.getByRole("button", { name: "重置统计", exact: true })).toHaveCount(0);
-  await expect(page.locator(".home-summaries")).toContainText("1 / 1");
+  await expect(page.locator(".home-summaries")).toContainText("穿透运行 1 · 反代生效 0");
   await expect(page.getByRole("region", { name: "当前空间待处理" })).toContainText("备用 Agent");
   expect(queries.some(url => url.pathname === "/api/v1/admin/traffic/history" && !url.searchParams.has("user_id"))).toBeTruthy();
   await panel.getByLabel("搜索统计用户").fill("alice");
@@ -91,7 +91,7 @@ test("首页概览、管理员用户与隧道筛选、时间图表和手机导�
   await page.evaluate(() => window.scrollTo(0, 0));
   await page.screenshot({ path: info.outputPath("home-overview.png"), fullPage: true });
   if (info.project.name !== "desktop-dark") {
-    await expect(page.getByRole("navigation", { name: "底部导航" }).getByRole("link")).toHaveText(["首页", "隧道", "设备", "域名", "我的"]);
+    await expect(page.getByRole("navigation", { name: "底部导航" }).getByRole("link")).toHaveText(["首页", "服务", "设备", "域名", "我的"]);
   }
 });
 
@@ -139,7 +139,7 @@ test("切换用户丢弃迟到统计，切走首页停止统计请求", async ({
   await page.getByLabel("统计用户", { exact: true }).selectOption("");
   release!();
   await expect(page.locator(".traffic-numbers")).toContainText("2 KiB/s");
-  await page.locator(".sidebar").getByRole("link", { name: "隧道", exact: true }).click();
+  await page.locator(".sidebar").getByRole("link", { name: "服务", exact: true }).click();
   state.calls.length = 0;
   await page.clock.install(); await page.clock.fastForward(65000);
   expect(state.calls.filter(call => call.path.includes("/traffic/"))).toHaveLength(0);
@@ -157,7 +157,7 @@ test("首页空状态、零流量与缺口、窄屏主题与辅助功能", async
   const state = await installApiMocks(page, { empty: true }); state.devices = [];
   await page.route("**/api/v1/admin/traffic/history?**", route => route.fulfill({ json: { start: 100, end: 280, step: 60, sampled_at: 280, total: { to_origin: 0, to_public: 0 }, points: [{ at: 100, seconds: 60, covered_seconds: 60, bytes: { to_origin: 0, to_public: 0 }, rates: { to_origin: 0, to_public: 0 } }, { at: 160, seconds: 60, covered_seconds: 0, bytes: { to_origin: 0, to_public: 0 }, rates: null }, { at: 220, seconds: 60, covered_seconds: 60, bytes: { to_origin: 0, to_public: 0 }, rates: { to_origin: 0, to_public: 0 } }] } }));
   await page.goto("/");
-  await expect(page.getByRole("link", { name: "接入设备", exact: true })).toBeVisible();
+  await expect(page.getByRole("link", { name: "创建服务", exact: true })).toBeVisible();
   await page.getByRole("slider").fill("1");
   await expect(page.locator(".chart-reading")).toContainText("此时段未采集");
   await page.getByRole("slider").fill("0");

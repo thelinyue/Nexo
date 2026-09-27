@@ -21,7 +21,7 @@ export function QuotaSummary({ active, admin, userId, refresh }: { active: boole
     {!data && <p className="helper">{resource.error ? "暂时无法获取额度" : "正在获取额度…"}</p>}
     {data && <>{data.monthly_limit_bytes !== null ? <><progress aria-label="本月额度使用比例" value={Math.min(data.used_bytes, data.monthly_limit_bytes)} max={data.monthly_limit_bytes} /><div className="quota-details"><span>剩余 {bytes(data.remaining_bytes!)}</span><span>{calendarDate(data.period_end)} 恢复</span></div></> : <p className="helper">本月额度消耗 {bytes(data.used_bytes)}</p>}
       {data.exhausted && <p className="quota-warning" role="status">本月额度已用尽，隧道转发已暂停。提高或取消限制，或等待下月恢复后可重新连接。</p>}
-      <p className="helper">北京时间 · 双向合计 · 自 {calendarDate(data.started_at)} 独立计量。重置统计不会恢复额度。</p></>}
+      <p className="helper">仅内网穿透，不含反向代理 · 北京时间 · 双向合计 · 自 {calendarDate(data.started_at)} 独立计量。重置统计不会恢复额度。</p></>}
   </section>;
 }
 

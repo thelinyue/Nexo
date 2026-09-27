@@ -1,0 +1,80 @@
+import { expect, test } from "@playwright/test";
+import { installApiMocks } from "./api-mocks";
+import type { Tunnel } from "../src/ui";
+
+const proxy: Tunnel = { id: "proxy", service_mode: "reverse_proxy", name: "VPS 应用", protocol: "https", origin_protocol: "http", local_address: "127.0.0.1", local_port: 3000, hostname: "app", public_domain: "example.com", public_address: "https://app.example.com", device_id: null, enabled: true, apply_status: "ready", lan_redirect_enabled: false };
+
+test("没有 Agent 的管理员可创建反代，切换模式保留目标且清除穿透专属配置", async ({ page }, info) => {
+  const state = await installApiMocks(page);
+  state.tunnels = []; state.devices = [];
+  await page.goto("/#/services");
+  await page.getByRole("button", { name: "创建第一个服务" }).click();
+  const dialog = page.getByRole("dialog", { name: "创建服务" });
+  await dialog.getByLabel("服务名称").fill("VPS 应用");
+  await dialog.getByRole("radio", { name: "TCP 服务", exact: true }).check();
+  await dialog.getByLabel("内网端口").fill("3000");
+  await dialog.getByRole("radio", { name: "反向代理", exact: true }).check();
+  await expect(dialog.getByLabel("目标端口")).toHaveValue("3000");
+  await expect(dialog.getByRole("combobox", { name: "Agent", exact: true })).toHaveCount(0);
+  await expect(dialog.getByLabel("内网重定向")).toHaveCount(0);
+  await expect(dialog.getByRole("radio", { name: "TCP 服务", exact: true })).toHaveCount(0);
+  await dialog.getByLabel("主机名").fill("app");
+  await page.screenshot({ path: info.outputPath("reverse-proxy-form.png"), animations: "disabled" });
+  await dialog.getByRole("button", { name: "保存服务" }).click();
+  await expect(dialog).toBeHidden();
+  expect(state.calls.find(call => call.method === "POST" && call.path === "/api/v1/tunnels")?.body).toMatchObject({ service_mode: "reverse_proxy", device_id: null, protocol: "https", origin_protocol: "http", local_port: 3000, public_port: null, lan_redirect_enabled: false });
+  await expect(page.locator(".service-row")).toContainText("反向代理");
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBeTruthy();
+});
+
+test("反代详情解释已生效，编辑不绑定 Agent，混合批量操作保持权限边界", async ({ page }, info) => {
+  const state = await installApiMocks(page); state.tunnels.push({ ...proxy });
+  await page.goto("/#/services/proxy");
+  await expect(page.locator(".service-detail")).toContainText("已生效");
+  await expect(page.locator(".service-detail")).toContainText("不代表目标服务健康");
+  await expect(page.locator(".service-detail")).not.toContainText("Agent 已连接");
+  await expect(page.locator(".service-detail dt").filter({ hasText: /^Agent$/ })).toHaveCount(0);
+  await page.getByRole("button", { name: "编辑服务" }).click();
+  const dialog = page.getByRole("dialog", { name: "编辑服务" });
+  await expect(dialog.getByRole("radio", { name: "内网穿透", exact: true })).toHaveCount(0);
+  await dialog.getByLabel("目标端口").fill("4000");
+  await dialog.getByRole("button", { name: "保存服务" }).click();
+  await expect(dialog).toBeHidden();
+  expect(state.calls.find(call => call.method === "PUT")?.body).toMatchObject({ service_mode: "reverse_proxy", device_id: null, local_port: 4000 });
+  await page.goto("/#/services");
+  const select = page.getByRole("button", { name: "选择", exact: true }); await select.focus(); await select.press("Space");
+  await page.getByRole("button", { name: "全选", exact: true }).click();
+  await expect(page.getByRole("button", { name: "修改 Agent", exact: true })).toBeDisabled();
+  await expect(page.getByText("选择中包含反向代理，不能修改 Agent。", { exact: true })).toBeVisible();
+  await page.locator(".batch-actions").getByRole("button", { name: "关闭", exact: true }).click();
+  await expect(page.locator(".service-row").filter({ hasText: "VPS 应用" })).toContainText("已停用");
+  expect(state.calls.some(call => call.path === "/api/v1/tunnels/batch/disable")).toBeTruthy();
+  await page.screenshot({ path: info.outputPath("reverse-proxy-list.png"), animations: "disabled" });
+  await page.locator(".batch-actions").getByRole("button", { name: "删除", exact: true }).click();
+  await page.getByRole("dialog").getByRole("button", { name: "删除服务", exact: true }).click();
+  await expect(page.locator(".service-row")).toHaveCount(0);
+  expect(state.calls.some(call => call.path === "/api/v1/tunnels/batch" && call.method === "DELETE")).toBeTruthy();
+});
+
+test("纯反代首页不要求接入设备且反代不出现在穿透统计筛选", async ({ page }) => {
+  const state = await installApiMocks(page); state.tunnels = [{ ...proxy }]; state.devices = [];
+  await page.goto("/#/home");
+  await expect(page.locator(".home-summaries")).toContainText("穿透运行 0 · 反代生效 1");
+  await expect(page.getByText("接入第一台设备", { exact: true })).toHaveCount(0);
+  await page.getByLabel("统计用户", { exact: true }).selectOption("admin");
+  await expect(page.getByLabel("统计隧道").locator("option")).toHaveCount(1);
+  await expect(page.locator(".traffic-help")).toContainText("不含反向代理");
+});
+
+test("普通用户不提供反代创建入口且不能编辑管理员配置的反代", async ({ page }) => {
+  const state = await installApiMocks(page); state.tunnels.push({ ...proxy });
+  await page.route("**/api/v1/auth/status", route => route.fulfill({ json: { initialized: true, authenticated: true, user_id: "alice", workspace_id: "default", role: "tenant", username: "alice", csrf_token: "test-csrf" } }));
+  await page.goto("/#/services");
+  await page.getByRole("button", { name: "创建服务", exact: true }).click();
+  await expect(page.getByRole("radio", { name: "反向代理", exact: true })).toHaveCount(0);
+  await page.getByRole("dialog").getByRole("button", { name: "取消", exact: true }).click();
+  await page.getByRole("link", { name: "VPS 应用", exact: true }).click();
+  await expect(page.getByRole("button", { name: "编辑服务", exact: true })).toBeDisabled();
+  await expect(page.getByRole("button", { name: "关闭服务", exact: true })).toBeDisabled();
+  await expect(page.getByRole("button", { name: "删除服务", exact: true })).toBeDisabled();
+});

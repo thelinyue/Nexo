@@ -50,7 +50,7 @@ test("服务直达 Agent 可返回原服务，正常证书折叠且关联服务�
   const state = await installApiMocks(page);
   state.devices[0].certificate = { status: "valid", expires_at: 1893456000, renew_after: 1890864000, error: null, next_retry_at: null };
   await page.goto("/#/services");
-  await page.getByLabel("搜索穿透服务").fill("媒体");
+  await page.getByLabel("搜索服务").fill("媒体");
   await page.getByRole("link", { name: "媒体中心", exact: true }).click();
   await page.getByRole("link", { name: "家庭 Agent", exact: true }).click();
   await expect(page).toHaveURL(/#\/agents\/a-1$/);
@@ -68,5 +68,5 @@ test("服务直达 Agent 可返回原服务，正常证书折叠且关联服务�
   await expect(page).toHaveURL(/#\/services\/t-1$/);
   await expect(page.locator(".page-slot:not([hidden]) h1")).toHaveText("媒体中心");
   await page.getByRole("link", { name: "返回", exact: true }).click();
-  await expect(page.getByLabel("搜索穿透服务")).toHaveValue("媒体");
+  await expect(page.getByLabel("搜索服务")).toHaveValue("媒体");
 });

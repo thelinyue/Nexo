@@ -351,7 +351,7 @@ fn scope(
         Some(session.tenant_id)
     };
     if let Some(tunnel) = &filter.tunnel_id {
-        let exists: bool = db.query_row("SELECT EXISTS(SELECT 1 FROM tunnels WHERE id=?1 AND tenant_id=?2 AND deleted_at IS NULL)", params![tunnel,tenant], |r| r.get(0)).map_err(db_error)?;
+        let exists: bool = db.query_row("SELECT EXISTS(SELECT 1 FROM tunnels WHERE id=?1 AND tenant_id=?2 AND service_mode='tunnel' AND deleted_at IS NULL)", params![tunnel,tenant], |r| r.get(0)).map_err(db_error)?;
         if !exists {
             return Err(ApiError::new(StatusCode::NOT_FOUND, "隧道不存在"));
         }

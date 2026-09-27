@@ -40,6 +40,7 @@ mod domains;
 mod enrollment;
 mod identity_runtime;
 mod lan_redirect;
+mod reverse_proxy;
 mod security;
 mod traffic;
 mod transport;
@@ -166,6 +167,7 @@ struct ApproveEnrollment {
 }
 #[derive(Debug, Serialize, Deserialize)]
 struct Tunnel {
+    service_mode: String,
     id: String,
     tenant_id: String,
     device_id: Option<String>,
@@ -189,6 +191,7 @@ struct Tunnel {
 }
 #[derive(Debug, Deserialize)]
 struct TunnelInput {
+    service_mode: Option<String>,
     device_id: Option<String>,
     name: String,
     protocol: String,
@@ -444,6 +447,8 @@ fn router(state: AppState) -> Router {
         .route("/api/v1/tunnels/{id}/enable", post(enable_tunnel))
         .route("/api/v1/tunnels/{id}/disable", post(disable_tunnel))
         .route("/api/v1/tunnels/batch", delete(batch_delete_tunnels))
+        .route("/api/v1/tunnels/batch/enable", post(batch_enable_tunnels))
+        .route("/api/v1/tunnels/batch/disable", post(batch_disable_tunnels))
         .route(
             "/api/v1/public-domains",
             get(list_domains).post(create_domain),
@@ -506,6 +511,7 @@ fn initialize_database(connection: &Connection, is_new: bool) -> Result<()> {
         enrollment::initialize_schema(connection)?;
         access_keys::initialize_schema(connection)?;
         accounts::initialize_schema(connection)?;
+        reverse_proxy::initialize_schema(connection)?;
         lan_redirect::initialize_schema(connection)?;
         traffic::initialize_schema(connection)?;
         return domains::initialize_schema(connection);
@@ -514,6 +520,7 @@ fn initialize_database(connection: &Connection, is_new: bool) -> Result<()> {
     enrollment::initialize_schema(connection)?;
     access_keys::initialize_schema(connection)?;
     accounts::initialize_schema(connection)?;
+    reverse_proxy::initialize_schema(connection)?;
     lan_redirect::initialize_schema(connection)?;
     traffic::initialize_schema(connection)?;
     domains::initialize_schema(connection)
@@ -694,16 +701,17 @@ async fn create_tunnel(
     {
         let db = state.db.lock().map_err(|_| db_error("数据库锁不可用"))?;
         let db = db.unchecked_transaction().map_err(db_error)?;
+        reverse_proxy::prepare(&db, &session, &id, &mut input)?;
         prepare_tunnel(&db, &session.tenant_id, &id, &mut input)?;
-        db.execute("INSERT INTO tunnels (id,tenant_id,device_id,name,protocol,local_address,local_port,public_port,hostname,enabled,apply_status,apply_revision,public_domain_id,created_at,updated_at,lan_redirect_enabled,origin_protocol) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,'checking',1,?11,?12,?12,?13,?14)",params![id,session.tenant_id,input.device_id,input.name.trim(),input.protocol,input.local_address.trim(),input.local_port,input.public_port,input.hostname,input.enabled.unwrap_or(true),input.public_domain_id,unix_now(),input.lan_redirect_enabled.unwrap_or(false),input.origin_protocol]).map_err(db_error)?;
+        db.execute("INSERT INTO tunnels (id,tenant_id,device_id,name,protocol,local_address,local_port,public_port,hostname,enabled,apply_status,apply_revision,public_domain_id,created_at,updated_at,lan_redirect_enabled,origin_protocol,service_mode) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,'checking',1,?11,?12,?12,?13,?14,?15)",params![id,session.tenant_id,input.device_id,input.name.trim(),input.protocol,input.local_address.trim(),input.local_port,input.public_port,input.hostname,input.enabled.unwrap_or(true),input.public_domain_id,unix_now(),input.lan_redirect_enabled.unwrap_or(false),input.origin_protocol,input.service_mode]).map_err(db_error)?;
         accounts::audit(&db, &session, "service_created", "service", &id)?;
         db.commit().map_err(db_error)?;
     }
-    state
-        .tunnel_runtime
-        .changed(&state)
-        .await
-        .map_err(db_error)?;
+    reverse_proxy::changed(
+        &state,
+        input.service_mode.as_deref() != Some(reverse_proxy::MODE),
+    )
+    .await?;
     read_tunnel(&state, &session.tenant_id, &id, &headers).map(Json)
 }
 async fn update_tunnel(
@@ -717,16 +725,17 @@ async fn update_tunnel(
         let db = state.db.lock().map_err(|_| db_error("数据库锁不可用"))?;
         let db = db.unchecked_transaction().map_err(db_error)?;
         if !db.query_row("SELECT EXISTS(SELECT 1 FROM tunnels WHERE id=?1 AND tenant_id=?2 AND deleted_at IS NULL)",params![id,session.tenant_id], |r| r.get::<_,bool>(0)).map_err(db_error)? { return Err(ApiError::new(StatusCode::NOT_FOUND,"服务不存在")); }
+        reverse_proxy::prepare(&db, &session, &id, &mut input)?;
         prepare_tunnel(&db, &session.tenant_id, &id, &mut input)?;
-        db.execute("UPDATE tunnels SET device_id=?1,name=?2,protocol=?3,local_address=?4,local_port=?5,public_port=?6,hostname=?7,enabled=?8,apply_revision=apply_revision+1,apply_status='checking',updated_at=?9,public_domain_id=?12,lan_redirect_enabled=?13,origin_protocol=?14 WHERE id=?10 AND tenant_id=?11 AND deleted_at IS NULL",params![input.device_id,input.name.trim(),input.protocol,input.local_address.trim(),input.local_port,input.public_port,input.hostname,input.enabled.unwrap_or(true),unix_now(),id,session.tenant_id,input.public_domain_id,input.lan_redirect_enabled.unwrap_or(false),input.origin_protocol]).map_err(db_error)?;
+        db.execute("UPDATE tunnels SET device_id=?1,name=?2,protocol=?3,local_address=?4,local_port=?5,public_port=?6,hostname=?7,enabled=?8,apply_revision=apply_revision+1,apply_status='checking',updated_at=?9,public_domain_id=?12,lan_redirect_enabled=?13,origin_protocol=?14,service_mode=?15 WHERE id=?10 AND tenant_id=?11 AND deleted_at IS NULL",params![input.device_id,input.name.trim(),input.protocol,input.local_address.trim(),input.local_port,input.public_port,input.hostname,input.enabled.unwrap_or(true),unix_now(),id,session.tenant_id,input.public_domain_id,input.lan_redirect_enabled.unwrap_or(false),input.origin_protocol,input.service_mode]).map_err(db_error)?;
         accounts::audit(&db, &session, "service_updated", "service", &id)?;
         db.commit().map_err(db_error)?;
     }
-    state
-        .tunnel_runtime
-        .changed(&state)
-        .await
-        .map_err(db_error)?;
+    reverse_proxy::changed(
+        &state,
+        input.service_mode.as_deref() != Some(reverse_proxy::MODE),
+    )
+    .await?;
     read_tunnel(&state, &session.tenant_id, &id, &headers).map(Json)
 }
 async fn delete_tunnel(
@@ -735,9 +744,11 @@ async fn delete_tunnel(
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let session = require_write(&state, &headers)?;
+    let is_proxy;
     {
         let db = state.db.lock().map_err(|_| db_error("数据库锁不可用"))?;
         let db = db.unchecked_transaction().map_err(db_error)?;
+        is_proxy = reverse_proxy::existing(&db, &session, &id)?;
         let removed = db.execute("UPDATE tunnels SET deleted_at=?1,enabled=0,apply_status='disabled',apply_revision=apply_revision+1 WHERE id=?2 AND tenant_id=?3 AND deleted_at IS NULL",params![unix_now(),id,session.tenant_id]).map_err(db_error)?;
         if removed == 0 {
             return Err(ApiError::new(StatusCode::NOT_FOUND, "服务不存在"));
@@ -745,11 +756,7 @@ async fn delete_tunnel(
         accounts::audit(&db, &session, "service_deleted", "service", &id)?;
         db.commit().map_err(db_error)?;
     }
-    state
-        .tunnel_runtime
-        .changed(&state)
-        .await
-        .map_err(db_error)?;
+    reverse_proxy::changed(&state, !is_proxy).await?;
     Ok(Json(serde_json::json!({"deleted":true,"id":id})))
 }
 fn read_tunnel(
@@ -786,9 +793,11 @@ async fn set_tunnel_enabled(
     enabled: bool,
 ) -> Result<Json<Tunnel>, ApiError> {
     let session = require_write(&state, &headers)?;
+    let is_proxy;
     {
         let connection = state.db.lock().map_err(|_| db_error("数据库锁不可用"))?;
         let connection = connection.unchecked_transaction().map_err(db_error)?;
+        is_proxy = reverse_proxy::existing(&connection, &session, &id)?;
         let changed = connection.execute("UPDATE tunnels SET enabled=?1,apply_status=CASE WHEN ?1=1 THEN 'checking' ELSE 'disabled' END,apply_revision=apply_revision+1,updated_at=?2 WHERE id=?3 AND tenant_id=?4 AND deleted_at IS NULL",params![enabled,unix_now(),id,session.tenant_id]).map_err(db_error)?;
         if changed == 0 {
             return Err(ApiError::new(StatusCode::NOT_FOUND, "服务不存在"));
@@ -796,11 +805,7 @@ async fn set_tunnel_enabled(
         accounts::audit(&connection, &session, "service_toggled", "service", &id)?;
         connection.commit().map_err(db_error)?;
     }
-    state
-        .tunnel_runtime
-        .changed(&state)
-        .await
-        .map_err(db_error)?;
+    reverse_proxy::changed(&state, !is_proxy).await?;
     read_tunnel(&state, &session.tenant_id, &id, &headers).map(Json)
 }
 
@@ -808,15 +813,64 @@ async fn set_tunnel_enabled(
 struct BatchDelete {
     tunnel_ids: Vec<String>,
 }
+async fn batch_enable_tunnels(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(input): Json<BatchDelete>,
+) -> Result<Json<Vec<Tunnel>>, ApiError> {
+    batch_set_tunnels_enabled(state, headers, input, true).await
+}
+async fn batch_disable_tunnels(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(input): Json<BatchDelete>,
+) -> Result<Json<Vec<Tunnel>>, ApiError> {
+    batch_set_tunnels_enabled(state, headers, input, false).await
+}
+/// 混合选择时先验证每一项的归属及反代权限，再一次提交，避免越权失败前已修改部分服务。
+async fn batch_set_tunnels_enabled(
+    state: AppState,
+    headers: HeaderMap,
+    input: BatchDelete,
+    enabled: bool,
+) -> Result<Json<Vec<Tunnel>>, ApiError> {
+    let session = require_write(&state, &headers)?;
+    let mut has_tunnels = false;
+    {
+        let db = state.db.lock().map_err(|_| db_error("数据库锁不可用"))?;
+        let tx = db.unchecked_transaction().map_err(db_error)?;
+        for id in &input.tunnel_ids {
+            has_tunnels |= !reverse_proxy::existing(&tx, &session, id)?;
+        }
+        for id in &input.tunnel_ids {
+            tx.execute("UPDATE tunnels SET enabled=?1,apply_status=CASE WHEN ?1=1 THEN 'checking' ELSE 'disabled' END,apply_revision=apply_revision+1,updated_at=?2 WHERE id=?3 AND tenant_id=?4 AND deleted_at IS NULL", params![enabled,unix_now(),id,session.tenant_id]).map_err(db_error)?;
+            accounts::audit(&tx, &session, "service_toggled", "service", id)?;
+        }
+        tx.commit().map_err(db_error)?;
+    }
+    reverse_proxy::changed(&state, has_tunnels).await?;
+    let db = state.db.lock().map_err(|_| db_error("数据库锁不可用"))?;
+    Ok(Json(
+        query_tunnels(&db, &session.tenant_id, None, &headers)
+            .map_err(db_error)?
+            .into_iter()
+            .filter(|item| input.tunnel_ids.contains(&item.id))
+            .collect(),
+    ))
+}
 async fn batch_delete_tunnels(
     State(state): State<AppState>,
     headers: HeaderMap,
     Json(input): Json<BatchDelete>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let session = require_write(&state, &headers)?;
+    let mut has_tunnels = false;
     {
         let connection = state.db.lock().map_err(|_| db_error("数据库锁不可用"))?;
         let tx = connection.unchecked_transaction().map_err(db_error)?;
+        for id in &input.tunnel_ids {
+            has_tunnels |= !reverse_proxy::existing(&tx, &session, id)?;
+        }
         for id in &input.tunnel_ids {
             let changed = tx.execute("UPDATE tunnels SET deleted_at=?1,enabled=0,apply_status='disabled',apply_revision=apply_revision+1 WHERE id=?2 AND tenant_id=?3",params![unix_now(),id,session.tenant_id]).map_err(db_error)?;
             if changed > 0 {
@@ -825,11 +879,7 @@ async fn batch_delete_tunnels(
         }
         tx.commit().map_err(db_error)?;
     }
-    state
-        .tunnel_runtime
-        .changed(&state)
-        .await
-        .map_err(db_error)?;
+    reverse_proxy::changed(&state, has_tunnels).await?;
     Ok(Json(serde_json::json!({"deleted_ids":input.tunnel_ids})))
 }
 
@@ -1046,7 +1096,7 @@ fn query_tunnels(
         .get(axum::http::header::HOST)
         .and_then(|value| value.to_str().ok())
         .and_then(|host| host.parse::<axum::http::uri::Authority>().ok());
-    let sql="SELECT t.id,t.tenant_id,t.device_id,d.name,t.name,t.protocol,t.local_address,t.local_port,t.public_port,t.hostname,t.enabled,t.apply_status,t.apply_error,t.apply_revision,t.public_domain_id,t.deleted_at,p.domain,t.lan_redirect_enabled,CASE WHEN t.protocol='tcp' THEN NULL ELSE COALESCE(t.origin_protocol,'http') END FROM tunnels t LEFT JOIN devices d ON d.id=t.device_id LEFT JOIN public_domains p ON p.id=t.public_domain_id WHERE t.tenant_id=?1 AND t.deleted_at IS NULL AND (?2 IS NULL OR t.id=?2) ORDER BY t.created_at DESC";
+    let sql="SELECT t.id,t.tenant_id,t.device_id,d.name,t.name,t.protocol,t.local_address,t.local_port,t.public_port,t.hostname,t.enabled,t.apply_status,t.apply_error,t.apply_revision,t.public_domain_id,t.deleted_at,p.domain,t.lan_redirect_enabled,CASE WHEN t.protocol='tcp' THEN NULL ELSE COALESCE(t.origin_protocol,'http') END,t.service_mode FROM tunnels t LEFT JOIN devices d ON d.id=t.device_id LEFT JOIN public_domains p ON p.id=t.public_domain_id WHERE t.tenant_id=?1 AND t.deleted_at IS NULL AND (?2 IS NULL OR t.id=?2) ORDER BY t.created_at DESC";
     let mut q = connection.prepare(sql)?;
     let rows = q
         .query_map(params![tenant, only], |row| {
@@ -1064,6 +1114,7 @@ fn query_tunnels(
                     .map(|(host, domain)| format!("{protocol}://{host}.{domain}"))
             };
             Ok(Tunnel {
+                service_mode: row.get(19)?,
                 id: row.get(0)?,
                 tenant_id: row.get(1)?,
                 device_id: row.get(2)?,
@@ -1241,7 +1292,7 @@ fn desired_tunnels(state: &AppState, device_id: &str) -> Result<Vec<TunnelDesire
         .db
         .lock()
         .map_err(|_| anyhow::anyhow!("数据库锁不可用"))?;
-    let mut q=connection.prepare("SELECT id,protocol,local_address,local_port,hostname,origin_protocol,origin_tls_server_name,origin_tls_verification,apply_revision,enabled FROM tunnels WHERE device_id=?1 AND deleted_at IS NULL AND EXISTS(SELECT 1 FROM tenants w WHERE w.id=tunnels.tenant_id AND w.enabled=1)")?;
+    let mut q=connection.prepare("SELECT id,protocol,local_address,local_port,hostname,origin_protocol,origin_tls_server_name,origin_tls_verification,apply_revision,enabled FROM tunnels WHERE device_id=?1 AND service_mode='tunnel' AND deleted_at IS NULL AND EXISTS(SELECT 1 FROM tenants w WHERE w.id=tunnels.tenant_id AND w.enabled=1)")?;
     let mapped = q.query_map(params![device_id], |row| {
         Ok(TunnelDesiredState {
             tunnel_id: row.get(0)?,

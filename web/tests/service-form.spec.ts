@@ -77,7 +77,7 @@ test("协议直接点选且单域名自动填入，打开表单不抢占输入�
   await expect(dialog).toBeVisible();
   expect(await page.evaluate(() => document.activeElement instanceof HTMLInputElement)).toBeFalsy();
   await expect(dialog.getByRole("radio", { name: "网页服务", exact: true })).toBeChecked();
-  await expect(dialog.locator(".protocol-option")).toHaveText(["网页服务", "TCP 服务"]);
+  await expect(dialog.getByRole("group", { name: "服务类型", exact: true }).locator(".protocol-option")).toHaveText(["网页服务", "TCP 服务"]);
   await expect(dialog.getByLabel("公网协议")).toHaveValue("https");
   await expect(dialog.getByLabel("内网协议")).toHaveValue("http");
   await expect(dialog.getByLabel("公网端口", { exact: true })).toBeHidden();

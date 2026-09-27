@@ -52,7 +52,7 @@ test("详情显示完整地址，返回保留搜索与滚动位置", async ({ pa
   const state = await installApiMocks(page);
   state.tunnels = Array.from({ length: 20 }, (_, index) => ({ ...state.tunnels[0], id: `t-${index}`, name: `媒体中心 ${index}` }));
   await page.goto("/#/services");
-  await page.getByRole("textbox", { name: "搜索穿透服务" }).fill("媒体");
+  await page.getByRole("textbox", { name: "搜索服务" }).fill("媒体");
   const target = page.getByRole("link", { name: "媒体中心 12", exact: true });
   await target.scrollIntoViewIfNeeded();
   const scroll = await page.evaluate(() => window.scrollY);
@@ -60,7 +60,7 @@ test("详情显示完整地址，返回保留搜索与滚动位置", async ({ pa
   await expect(visiblePage(page).locator("h1")).toHaveText("媒体中心 12");
   await expect(page.locator(".detail-field code").first()).toHaveText(state.tunnels[0].public_address);
   await page.goBack();
-  await expect(page.getByRole("textbox", { name: "搜索穿透服务" })).toHaveValue("媒体");
+  await expect(page.getByRole("textbox", { name: "搜索服务" })).toHaveValue("媒体");
   await expect.poll(() => page.evaluate(() => window.scrollY)).toBeCloseTo(scroll, -1);
 });
 
@@ -189,26 +189,30 @@ test("无域名时先关闭表单再配置，不允许跨页保留编辑窗口",
   await expect(page.getByRole("dialog", { name: /^配置 / })).toBeVisible();
 });
 
-test("批量操作一次确认并逐项呈现失败", async ({ page }) => {
+test("批量操作失败保留整批选择，重试成功后一起更新", async ({ page }) => {
   const state = await installApiMocks(page);
   state.tunnels.push({ ...state.tunnels[0], id: "t-2", name: "备用服务" });
   await page.goto("/#/services");
-  await expect(page.getByRole("checkbox")).toHaveCount(0);
   await page.getByRole("button", { name: "选择", exact: true }).focus();
   await page.getByRole("button", { name: "选择", exact: true }).press("Space");
   await page.getByRole("checkbox", { name: "选择媒体中心" }).check();
   await page.getByRole("checkbox", { name: "选择备用服务" }).check();
-  state.failures.set("POST /api/v1/tunnels/t-2/disable", "节点暂不可达");
+  state.failures.set("POST /api/v1/tunnels/batch/disable", "批量保存失败");
   await page.locator(".batch-actions").getByRole("button", { name: "关闭", exact: true }).click();
-  await expect(page.getByRole("alert")).toContainText("备用服务：节点暂不可达");
-  await expect(page.locator(".service-row").filter({ hasText: "媒体中心" }).getByText("已关闭", { exact: true })).toBeVisible();
-  state.failures.set("DELETE /api/v1/tunnels/t-2", "删除失败");
+  await expect(page.getByRole("alert")).toContainText("批量保存失败");
+  expect(state.tunnels.every(item => item.enabled)).toBeTruthy();
+  state.failures.delete("POST /api/v1/tunnels/batch/disable");
+  await page.locator(".batch-actions").getByRole("button", { name: "关闭", exact: true }).click();
+  await expect(page.locator(".service-row .status")).toHaveText(["已关闭", "已关闭"]);
+  state.failures.set("DELETE /api/v1/tunnels/batch", "删除失败");
   await page.locator(".batch-actions").getByRole("button", { name: "删除", exact: true }).click();
   await page.getByRole("dialog").getByRole("button", { name: "删除服务" }).click();
+  await expect(page.getByRole("dialog").getByRole("alert")).toContainText("删除失败");
+  expect(state.tunnels).toHaveLength(2);
+  state.failures.delete("DELETE /api/v1/tunnels/batch");
+  await page.getByRole("dialog").getByRole("button", { name: "删除服务" }).click();
   await expect(page.getByRole("dialog")).toHaveCount(0);
-  await expect(page.getByRole("link", { name: "媒体中心", exact: true })).toHaveCount(0);
-  await expect(page.getByRole("alert")).toContainText("备用服务：删除失败");
-  await expect(page.getByRole("checkbox", { name: "选择备用服务" })).toBeChecked();
+  await expect(page.locator(".service-row")).toHaveCount(0);
 });
 
 test("复制失败有说明，服务启停失败不伪报成功", async ({ page }) => {
@@ -324,15 +328,15 @@ test("首次读取失败、重试、无结果与空列表互相区分", async ({
   state.failures.set("GET /api/v1/tunnels", "网络不可用");
   await page.goto("/#/services");
   await expect(page.getByRole("alert")).toContainText("网络不可用");
-  await expect(page.getByText("还没有穿透服务", { exact: true })).toHaveCount(0);
+  await expect(page.getByText("还没有服务", { exact: true })).toHaveCount(0);
   state.failures.clear();
   await page.getByRole("button", { name: "重试", exact: true }).click();
-  await page.getByRole("textbox", { name: "搜索穿透服务" }).fill("不存在");
+  await page.getByRole("textbox", { name: "搜索服务" }).fill("不存在");
   await expect(page.getByText("没有匹配的服务", { exact: true })).toBeVisible();
   await page.getByRole("button", { name: "清除筛选" }).click();
   state.tunnels = [];
   await page.clock.fastForward(5000);
-  await expect(page.getByText("还没有穿透服务", { exact: true })).toBeVisible();
+  await expect(page.getByText("还没有服务", { exact: true })).toBeVisible();
 });
 
 test("登录和初始化使用可自动填充的单栏表单", async ({ page }) => {
@@ -350,7 +354,7 @@ test("浏览器返回不能切走正在编辑的表单", async ({ page }) => {
   await installApiMocks(page);
   await page.goto("/#/manage");
   const nav = page.locator((page.viewportSize()?.width ?? 0) <= 900 ? ".bottom-nav" : ".sidebar nav");
-  await nav.getByRole("link", { name: "隧道", exact: true }).click();
+  await nav.getByRole("link", { name: "服务", exact: true }).click();
   await page.getByRole("button", { name: "创建服务", exact: true }).click();
   const editor = page.getByRole("dialog", { name: "创建服务" });
   await editor.getByLabel("服务名称").fill("未保存内容");

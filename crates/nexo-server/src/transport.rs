@@ -236,7 +236,7 @@ impl Runtime {
                 .db
                 .lock()
                 .map_err(|_| anyhow::anyhow!("数据库锁不可用"))?;
-            let mut query = db.prepare("SELECT t.id,t.device_id,t.apply_revision,t.protocol,t.public_port,t.tenant_id FROM tunnels t JOIN devices d ON d.id=t.device_id AND d.tenant_id=t.tenant_id JOIN tenants w ON w.id=t.tenant_id AND w.enabled=1 WHERE t.enabled=1 AND t.deleted_at IS NULL")?;
+            let mut query = db.prepare("SELECT t.id,t.device_id,t.apply_revision,t.protocol,t.public_port,t.tenant_id FROM tunnels t JOIN devices d ON d.id=t.device_id AND d.tenant_id=t.tenant_id JOIN tenants w ON w.id=t.tenant_id AND w.enabled=1 WHERE t.service_mode='tunnel' AND t.enabled=1 AND t.deleted_at IS NULL")?;
             let services = query
                 .query_map([], |r| {
                     Ok(Service {
@@ -308,6 +308,7 @@ impl Runtime {
         let data = connections.data.keys().cloned().collect::<Vec<_>>();
         drop(connections);
         refresh_status(state, &listeners, &online, &data, &failures)?;
+        crate::reverse_proxy::refresh_status(state)?;
         Ok(())
     }
 
@@ -639,7 +640,7 @@ fn apply_results(
         if !matches!(report.status.as_str(), "ready" | "failed" | "disabled") {
             continue;
         }
-        let changed = tx.execute("INSERT INTO tunnel_applied_states (tunnel_id,revision,status,error_message,updated_at) SELECT id,?1,?2,?3,?4 FROM tunnels WHERE id=?5 AND device_id=?6 AND apply_revision=?1 AND deleted_at IS NULL AND (enabled=1 OR ?2='disabled') ON CONFLICT(tunnel_id) DO UPDATE SET revision=excluded.revision,status=excluded.status,error_message=excluded.error_message,updated_at=excluded.updated_at", params![report.revision,if report.applied { report.status.as_str() } else { "failed" },report.error_message.map(|s| s.chars().take(512).collect::<String>()),unix_now(),report.tunnel_id,device])?;
+        let changed = tx.execute("INSERT INTO tunnel_applied_states (tunnel_id,revision,status,error_message,updated_at) SELECT id,?1,?2,?3,?4 FROM tunnels WHERE service_mode='tunnel' AND id=?5 AND device_id=?6 AND apply_revision=?1 AND deleted_at IS NULL AND (enabled=1 OR ?2='disabled') ON CONFLICT(tunnel_id) DO UPDATE SET revision=excluded.revision,status=excluded.status,error_message=excluded.error_message,updated_at=excluded.updated_at", params![report.revision,if report.applied { report.status.as_str() } else { "failed" },report.error_message.map(|s| s.chars().take(512).collect::<String>()),unix_now(),report.tunnel_id,device])?;
         if changed > 0 {
             accepted.push(report.tunnel_id);
         }
@@ -653,7 +654,7 @@ fn allowed(state: &AppState, service: &Service, device: &str) -> Result<bool> {
         .db
         .lock()
         .map_err(|_| anyhow::anyhow!("数据库锁不可用"))?;
-    Ok(db.query_row("SELECT EXISTS(SELECT 1 FROM tunnels t JOIN devices d ON d.id=t.device_id AND d.tenant_id=t.tenant_id JOIN tenants w ON w.id=t.tenant_id AND w.enabled=1 WHERE t.id=?1 AND t.device_id=?2 AND t.apply_revision=?3 AND t.enabled=1 AND t.deleted_at IS NULL AND d.status='online')", params![service.id,device,service.revision], |r| r.get(0))?)
+    Ok(db.query_row("SELECT EXISTS(SELECT 1 FROM tunnels t JOIN devices d ON d.id=t.device_id AND d.tenant_id=t.tenant_id JOIN tenants w ON w.id=t.tenant_id AND w.enabled=1 WHERE t.service_mode='tunnel' AND t.id=?1 AND t.device_id=?2 AND t.apply_revision=?3 AND t.enabled=1 AND t.deleted_at IS NULL AND d.status='online')", params![service.id,device,service.revision], |r| r.get(0))?)
 }
 
 async fn data_session(
@@ -740,7 +741,7 @@ fn refresh_status(
             .db
             .lock()
             .map_err(|_| anyhow::anyhow!("数据库锁不可用"))?;
-        let mut query = db.prepare("SELECT t.id,t.device_id,(t.enabled AND EXISTS(SELECT 1 FROM tenants w WHERE w.id=t.tenant_id AND w.enabled=1)),t.protocol,t.apply_revision,a.revision,a.status,a.error_message,t.public_domain_id,t.hostname,p.domain,t.tenant_id FROM tunnels t LEFT JOIN tunnel_applied_states a ON a.tunnel_id=t.id LEFT JOIN public_domains p ON p.id=t.public_domain_id AND p.tenant_id=t.tenant_id WHERE t.deleted_at IS NULL")?;
+        let mut query = db.prepare("SELECT t.id,t.device_id,(t.enabled AND EXISTS(SELECT 1 FROM tenants w WHERE w.id=t.tenant_id AND w.enabled=1)),t.protocol,t.apply_revision,a.revision,a.status,a.error_message,t.public_domain_id,t.hostname,p.domain,t.tenant_id FROM tunnels t LEFT JOIN tunnel_applied_states a ON a.tunnel_id=t.id LEFT JOIN public_domains p ON p.id=t.public_domain_id AND p.tenant_id=t.tenant_id WHERE t.service_mode='tunnel' AND t.deleted_at IS NULL")?;
         let rows = query
             .query_map([], |r| {
                 Ok((
@@ -1194,6 +1195,7 @@ mod tests {
         let occupied = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = occupied.local_addr().unwrap().port();
         let input = |device: &str| TunnelInput {
+            service_mode: None,
             device_id: Some(device.into()),
             name: "test".into(),
             protocol: "tcp".into(),

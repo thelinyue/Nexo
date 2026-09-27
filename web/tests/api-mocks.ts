@@ -1,5 +1,5 @@
 import type { Page } from "@playwright/test";
-import type { Device, Domain, DomainEvent, Enrollment, TransportIdentity } from "../src/ui";
+import type { Tunnel, Device, Domain, DomainEvent, Enrollment, TransportIdentity } from "../src/ui";
 
 /** 使用真实接口形状覆盖交互；失败注入用于验证界面不会把请求失败当作成功。 */
 export async function installApiMocks(page: Page, options: { empty?: boolean; anonymous?: boolean; initialize?: boolean } = {}) {
@@ -7,7 +7,7 @@ export async function installApiMocks(page: Page, options: { empty?: boolean; an
     authenticated: !options.anonymous,
     users: [{ id: "admin", username: "admin", role: "system_admin", workspace_id: "default", workspace_name: "admin的工作空间", enabled: true, devices: 2, services: 1, domains: 1 }, { id: "alice", username: "alice", role: "tenant", workspace_id: "alice-space", workspace_name: "alice 的工作空间", enabled: true, devices: 1, services: 1, domains: 0 }],
     accessKey: "nexo_join_shared-test-key",
-    tunnels: options.empty ? [] : [{ id: "t-1", name: "媒体中心", protocol: "https", local_address: "127.0.0.1", local_port: 8096, public_port: null, public_address: "https://media.example.com/a-very-long-public-address", hostname: "media", public_domain: "example.com", device_id: "a-1", device_name: "家庭 Agent", enabled: true, apply_status: "ready", apply_error: null, lan_redirect_enabled: false }] as any[],
+    tunnels: (options.empty ? [] : [{ id: "t-1", name: "媒体中心", protocol: "https", local_address: "127.0.0.1", local_port: 8096, public_port: null, public_address: "https://media.example.com/a-very-long-public-address", hostname: "media", public_domain: "example.com", device_id: "a-1", device_name: "家庭 Agent", enabled: true, apply_status: "ready", apply_error: null, lan_redirect_enabled: false }] as any[]) as Tunnel[],
     devices: [{ id: "a-1", name: "家庭 Agent", status: "online", os: "Linux", architecture: "amd64", last_seen_at: 1790000000, agent_version: "0.2.0", tunnel_count: 1 }, { id: "a-2", name: "备用 Agent", status: "offline", os: "Linux", agent_version: "0.2.0", tunnel_count: 0 }] as Device[],
     transportIdentity: { server: { status: "valid", expires_at: Math.floor(Date.now()/1000) + 825*86400, renew_after: Math.floor(Date.now()/1000) + 795*86400, error: null, next_retry_at: null }, ca_expires_at: Math.floor(Date.now()/1000) + 3650*86400, ca_needs_attention: false } as TransportIdentity,
     domains: [{ id: "d-1", domain: "example.com", is_primary: true, https_enabled: true, apply_status: "applied", runtime: { config_status: "applied", config_error: null, service_warning: null, checked_at: Math.floor(Date.now() / 1000), certificates: [{ hostname: "example.com", status: "issued", not_before: Math.floor(Date.now() / 1000) - 3600, expires_at: Math.floor(Date.now() / 1000) + 90 * 86400, error: null, next_retry_at: null }] } }] as Domain[],
@@ -89,6 +89,8 @@ export async function installApiMocks(page: Page, options: { empty?: boolean; an
     if (path.startsWith("/api/v1/public-domains/") && method === "DELETE") { state.domains = state.domains.filter(item => item.id !== path.split("/").pop()); return respond({}); }
     if (path === "/api/v1/tunnels" && method === "GET") return respond(state.tunnels);
     if (path === "/api/v1/tunnels" && method === "POST") { const item = { lan_redirect_enabled: false, ...body, id: "t-new", public_address: "new.example.com", public_domain: "example.com", apply_status: "checking" }; state.tunnels.push(item); return respond(item, 201); }
+    if (path === "/api/v1/tunnels/batch" && method === "DELETE") { state.tunnels = state.tunnels.filter(item => !body.tunnel_ids.includes(item.id)); return respond({ deleted_ids: body.tunnel_ids }); }
+    if (/^\/api\/v1\/tunnels\/batch\/(enable|disable)$/.test(path)) { const items = state.tunnels.filter(item => body.tunnel_ids.includes(item.id)); items.forEach(item => Object.assign(item, { enabled: path.endsWith("/enable"), apply_status: path.endsWith("/enable") ? "checking" : "disabled" })); return respond(items); }
     const toggle = path.match(/^\/api\/v1\/tunnels\/([^/]+)\/(enable|disable)$/);
     if (toggle) { const item = state.tunnels.find(item => item.id === toggle[1]); Object.assign(item, { enabled: toggle[2] === "enable", apply_status: toggle[2] === "enable" ? "checking" : "disabled" }); return respond(item); }
     if (path.startsWith("/api/v1/tunnels/") && method === "PUT") { const item = state.tunnels.find(item => item.id === path.split("/").pop()); Object.assign(item, body, { lan_redirect_enabled: body.protocol === "tcp" ? false : body.lan_redirect_enabled ?? item.lan_redirect_enabled ?? false }); return respond(item); }

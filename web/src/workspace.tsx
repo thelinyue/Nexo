@@ -11,7 +11,7 @@ import { PageNavigationContext, clearSavedTabs, emptyRoute, homeRoute, navigatio
 
 const resources = [
   { route: homeRoute, label: "首页", icon: House },
-  { route: "#/services", label: "隧道", icon: Network },
+  { route: "#/services", label: "服务", icon: Network },
   { route: "#/agents", label: "设备", icon: Server },
   { route: "#/domains", label: "域名", icon: Globe2 },
 ];
@@ -82,7 +82,7 @@ export function Workspace({ auth, onAuth, onExpired, managed, onManage, message,
           const active = page.route === route;
           return <PageNavigationContext.Provider key={page.route} value={{ route: page.route, desktop, deletions: navigation.deletions, reportTitle: navigation.reportTitle, removePages: navigation.removePages, openDomainConfiguration: navigation.openDomainConfiguration }}>
             <section className="page-slot" id={`page-${encodeURIComponent(page.route)}`} hidden={!active} role={desktop ? "tabpanel" : undefined} aria-labelledby={desktop && navigation.tabs.includes(page.route) ? `tab-${encodeURIComponent(page.route)}` : undefined}>
-              {page.route === homeRoute ? <HomePage active={active} auth={auth} managed={managed} /> : page.route.startsWith("#/services") ? <ServicesPage route={page.route} back={page.back} active={active} csrf={auth.csrf_token} /> :
+              {page.route === homeRoute ? <HomePage active={active} auth={auth} managed={managed} /> : page.route.startsWith("#/services") ? <ServicesPage admin={auth.role === "system_admin"} route={page.route} back={page.back} active={active} csrf={auth.csrf_token} /> :
                 page.route.startsWith("#/agents") ? <AgentsPage route={page.route} back={page.back ?? "#/agents"} active={active} csrf={auth.csrf_token} /> :
                 page.route.startsWith("#/domains") ? <DomainsPage route={page.route} back={page.back ?? "#/domains"} initialConfiguration={page.configureDomain} active={active} csrf={auth.csrf_token} /> :
                 <WorkspaceLabelContext.Provider value={undefined}>{page.route === "#/manage" ? <ManagePage auth={auth} active={active} onLogout={logout} onExpired={onExpired} /> : page.route === "#/settings/sessions" ? <SessionsPage auth={auth} active={active} onExpired={onExpired} /> : auth.role === "system_admin" ? <UsersPage active={active} auth={auth} onManage={switchWorkspace} onRenamed={onRenamed} onDeleted={onDeleted} onExpired={onExpired} /> : <Notice error="此页面需要管理员权限" />}</WorkspaceLabelContext.Provider>}

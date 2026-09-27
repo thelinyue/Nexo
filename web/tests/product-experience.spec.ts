@@ -19,7 +19,7 @@ test("桌面添加服务属于标题区，设备识别码可完整复制", async
       expect(box!.y + box!.height).toBeLessThanOrEqual(header!.y + header!.height);
       const workspace = await page.locator(".page-slot:not([hidden])").boundingBox();
       expect(workspace!.y + workspace!.height).toBeCloseTo(page.viewportSize()!.height - 24, 0);
-      const search = await page.getByLabel("搜索穿透服务").boundingBox();
+      const search = await page.getByLabel("搜索服务").boundingBox();
       expect(Math.abs(search!.y - box!.y)).toBeLessThanOrEqual(2);
       expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBeTruthy();
       if (width === 1440) await page.screenshot({ path: info.outputPath(`service-header-${colorScheme}.png`) });
@@ -63,8 +63,8 @@ test("协议、状态和 Agent 筛选组合可清空，空状态按资源给出�
   await expect(page.locator(".service-row")).toHaveCount(2);
   state.tunnels = []; state.devices = []; state.domains = [];
   await page.clock.fastForward(5000);
-  await expect(page.getByRole("link", { name: "接入 Agent", exact: true })).toBeVisible();
-  await expect(page.getByLabel("搜索穿透服务")).toBeHidden();
+  await expect(page.getByRole("button", { name: "创建第一个服务", exact: true })).toBeVisible();
+  await expect(page.getByLabel("搜索服务")).toBeHidden();
   await expect(page.getByRole("button", { name: "创建服务", exact: true })).toBeHidden();
   await expect(page.locator(".batch-actions")).toBeHidden();
 });
@@ -111,7 +111,7 @@ test("空服务页只有一个创建入口，删除最后一项后退出批量�
   await expect(page.getByRole("dialog", { name: "删除 媒体中心？" })).toBeVisible();
   await page.getByRole("dialog").getByRole("button", { name: "删除服务", exact: true }).click();
   await expect(page.locator(".batch-actions")).toBeHidden();
-  await expect(page.getByLabel("搜索穿透服务")).toBeHidden();
+  await expect(page.getByLabel("搜索服务")).toBeHidden();
   await expect(page.getByRole("button", { name: "创建服务", exact: true })).toBeHidden();
   await page.screenshot({ path: info.outputPath("services-empty.png") });
   await page.getByRole("button", { name: "创建第一个服务", exact: true }).click();
@@ -151,9 +151,10 @@ test("用户列表加载失败可就地重试", async ({ page }) => {
   await expect(page.getByRole("alert")).toHaveCount(0);
 });
 
-test("首次接入的空状态只有一个添加入口，手机可直接操作", async ({ page }, info) => {
+test("普通用户首次接入的空状态只有一个添加入口，手机可直接操作", async ({ page }, info) => {
   const state = await installApiMocks(page, { empty: true });
   state.devices = []; state.domains = []; state.enrollments = [];
+  await page.route("**/api/v1/auth/status", route => route.fulfill({ json: { initialized: true, authenticated: true, user_id: "alice", workspace_id: "default", role: "tenant", username: "alice", csrf_token: "test-csrf" } }));
   if (info.project.name === "mobile-light") await page.setViewportSize({ width: 320, height: 568 });
   await page.goto("/#/services");
   const connect = page.getByRole("link", { name: "接入 Agent", exact: true });

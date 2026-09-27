@@ -124,7 +124,7 @@ function TrafficPanel({ active, auth, managed, refresh }: { active: boolean; aut
     {scopeReady && <TrafficUsage key={`usage:${admin ? selected : "own"}`} active={active} admin={admin} user={selectedUser} refresh={refresh} csrf={auth.csrf_token} />}
     <div className="traffic-ranges" role="group" aria-label="流量时间范围">{ranges.map(([value, label]) => <button key={value} className="secondary-button" aria-pressed={range === value} onClick={() => setRange(value)}>{label}</button>)}</div>
     {scopeReady && <TrafficScope key={admin ? selected : "own"} active={active} admin={admin} user={selectedUser} range={range} refresh={refresh} />}
-    <details className="traffic-help"><summary>统计口径</summary><p>仅统计经过 Nexo 隧道的数据，包含应用协议数据，不含加密传输开销、局域网直连及未进入隧道的响应。趋势保留 7 天，日用量汇总保留 90 天。日／周／月用量跟随用户选择，不受隧道和趋势时间筛选影响。正常写盘时，进程异常退出可能丢失最后约一分钟记录，不作为计费依据。</p></details>
+    <details className="traffic-help"><summary>统计口径</summary><p>仅统计经过 Nexo 隧道的数据，包含应用协议数据，不含反向代理、加密传输开销、局域网直连及未进入隧道的响应。趋势保留 7 天，日用量汇总保留 90 天。日／周／月用量跟随用户选择，不受隧道和趋势时间筛选影响。正常写盘时，进程异常退出可能丢失最后约一分钟记录，不作为计费依据。</p></details>
   </section>;
 }
 
@@ -132,12 +132,12 @@ function TrafficScope({ active, admin, user, range, refresh }: { active: boolean
   const [tunnel, setTunnel] = useState("");
   const canSelect = !admin || Boolean(user);
   const tunnels = useResource(() => request<Tunnel[]>(user ? `/api/v1/admin/workspaces/${encodeURIComponent(user.workspace_id)}/tunnels` : "/api/v1/tunnels"), active && canSelect);
-  useEffect(() => { if (tunnel && tunnels.data && !tunnels.data.some(item => item.id === tunnel)) setTunnel(""); }, [tunnels.data, tunnel]);
+  useEffect(() => { if (tunnel && tunnels.data && !tunnels.data.some(item => item.id === tunnel && item.service_mode !== "reverse_proxy")) setTunnel(""); }, [tunnels.data, tunnel]);
   const query = new URLSearchParams();
   if (user) query.set("user_id", user.id);
   if (tunnel) query.set("tunnel_id", tunnel);
   return <>
-    {canSelect && <><Notice error={tunnels.error} updatedAt={tunnels.updatedAt} onRetry={() => void tunnels.reload()} /><label className="traffic-tunnel-filter">统计隧道<select aria-label="统计隧道" value={tunnel} onChange={event => setTunnel(event.target.value)}><option value="">全部隧道</option>{tunnels.data?.map(item => <option key={item.id} value={item.id}>{item.name}</option>)}</select></label></>}
+    {canSelect && <><Notice error={tunnels.error} updatedAt={tunnels.updatedAt} onRetry={() => void tunnels.reload()} /><label className="traffic-tunnel-filter">统计隧道<select aria-label="统计隧道" value={tunnel} onChange={event => setTunnel(event.target.value)}><option value="">全部隧道</option>{tunnels.data?.filter(item => item.service_mode !== "reverse_proxy").map(item => <option key={item.id} value={item.id}>{item.name}</option>)}</select></label></>}
     <TrafficReadings key={`${tunnel}:${range}`} active={active} base={admin ? "/api/v1/admin/traffic" : "/api/v1/traffic"} query={query.toString()} range={range} refresh={refresh} />
   </>;
 }
@@ -146,7 +146,7 @@ type Attention = { id: string; name: string; href: string; reasons: string[]; pr
 /** 首页保留资源自己的状态含义，不把 DNS 已解析或配置成功推断成公网可达。 */
 function attentionItems(tunnels: Tunnel[], devices: Device[], domains: Domain[]): Attention[] {
   const items: Attention[] = [];
-  for (const item of tunnels) if (item.enabled && (item.apply_status !== "ready" || item.apply_error)) items.push({ id: `t-${item.id}`, name: item.name, href: `#/services/${encodeURIComponent(item.id)}`, reasons: [item.apply_error || ({ failed: "隧道运行失败", error: "隧道运行失败", checking: "检查中", pending: "待应用", applying: "应用中" } as Record<string, string>)[item.apply_status] || `未知状态：${item.apply_status}`], priority: ["failed", "error"].includes(item.apply_status) ? 0 : 2 });
+  for (const item of tunnels) if (item.enabled && (item.apply_status !== "ready" || item.apply_error)) items.push({ id: `t-${item.id}`, name: item.name, href: `#/services/${encodeURIComponent(item.id)}`, reasons: [item.apply_error || (item.service_mode === "reverse_proxy" ? "反代配置待生效" : "") || ({ failed: "服务配置需处理", error: "服务配置需处理", checking: "检查中", pending: "待应用", applying: "应用中" } as Record<string, string>)[item.apply_status] || `未知状态：${item.apply_status}`], priority: ["failed", "error"].includes(item.apply_status) ? 0 : 2 });
   for (const item of devices) if (item.status === "offline") items.push({ id: `a-${item.id}`, name: item.name, href: `#/agents/${encodeURIComponent(item.id)}`, reasons: ["设备离线"], priority: 0 });
   for (const item of domains) {
     const reasons: string[] = []; let priority = 2;
@@ -196,12 +196,12 @@ export function HomePage({ active, auth, managed }: { active: boolean; auth: Aut
     <PageHeader title="首页" action={<button className="icon-button" aria-label="刷新首页" onClick={() => { void tunnels.reload(); void devices.reload(); void domains.reload(); setRefresh(value => value + 1); }}><RefreshCw size={19} /></button>} />
     <p className="home-workspace">当前空间：{spaceLabel}</p>
     <div className="home-summaries">
-      <a className="panel" href="#/services"><span>隧道</span><strong>{tunnels.data ? `${tunnels.data.filter(item => item.enabled && item.apply_status === "ready").length} / ${tunnels.data.length}` : "—"}</strong><small>运行中 / 总数</small></a>
+      <a className="panel" href="#/services"><span>服务</span><strong>{tunnels.data?.length ?? "—"}</strong><small>{tunnels.data ? `穿透运行 ${tunnels.data.filter(item => item.service_mode !== "reverse_proxy" && item.enabled && item.apply_status === "ready").length} · 反代生效 ${tunnels.data.filter(item => item.service_mode === "reverse_proxy" && item.enabled && item.apply_status === "ready").length}` : "正在加载"}</small></a>
       <a className="panel" href="#/agents"><span>设备</span><strong>{devices.data ? `${devices.data.filter(item => item.status === "online").length} / ${devices.data.length}` : "—"}</strong><small>在线 / 总数</small></a>
       <a className="panel" href="#/domains"><span>域名</span><strong>{domains.data?.length ?? "—"}</strong><small>{domains.data ? `${items.filter(item => item.id.startsWith("d-")).length} 个需关注` : "总数"}</small></a>
     </div>
     <Notice error={tunnels.error} updatedAt={tunnels.updatedAt} onRetry={() => void tunnels.reload()} /><Notice error={devices.error} updatedAt={devices.updatedAt} onRetry={() => void devices.reload()} /><Notice error={domains.error} updatedAt={domains.updatedAt} onRetry={() => void domains.reload()} />
-    {complete && !devices.data!.length ? <div className="panel home-onboarding"><div><strong>接入第一台设备</strong><p>安装 Agent，将内网服务连接到 Nexo。</p></div><a className="primary-button" href="#/agents">接入设备</a></div> : complete && !tunnels.data!.length ? <div className="panel home-onboarding"><div><strong>创建第一条隧道</strong><p>TCP 可直接创建；HTTP / HTTPS 需先配置域名。</p></div><a className="primary-button" href="#/services">创建隧道</a></div> : null}
+    {complete && !devices.data!.length && !tunnels.data!.length && auth.role !== "system_admin" ? <div className="panel home-onboarding"><div><strong>接入第一台设备</strong><p>安装 Agent，将内网服务连接到 Nexo。</p></div><a className="primary-button" href="#/agents">接入设备</a></div> : complete && !tunnels.data!.length ? <div className="panel home-onboarding"><div><strong>创建第一个服务</strong><p>内网穿透需要 Agent；管理员也可直接反代 VPS 服务。网页访问需先配置域名。</p></div><a className="primary-button" href="#/services">创建服务</a></div> : null}
     <TrafficPanel key={workspace ?? "own"} active={visible} auth={auth} managed={managed} refresh={refresh} />
     <section className="panel home-attention" aria-label="当前空间待处理"><div className="home-section-heading"><h2>当前空间待处理</h2><span>{spaceLabel}</span></div>{!complete && <p className="helper">部分资源状态尚未读取成功，以下仅展示已获取的结果。</p>}{complete && !items.length && <p className="helper">暂无待处理事项</p>}{["故障", "需核对", "等待处理"].map((title, priority) => <AttentionGroup key={title} title={title} items={items.filter(item => item.priority === priority)} />)}</section>
   </div>;
