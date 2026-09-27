@@ -12,7 +12,7 @@ RUN go install github.com/caddyserver/xcaddy/cmd/xcaddy@v0.4.7 \
     && /go/bin/xcaddy build v2.11.4 --output /usr/local/bin/caddy
 
 FROM debian:bookworm-slim@sha256:88200866dfff7ea7f5cbcb6ec7c8a701889efe6fe859fe64d6990e4b07ea4171
-ARG NEXO_VERSION=0.2.9
+ARG NEXO_VERSION=0.2.10
 ARG NEXO_REVISION=unknown
 RUN apt-get update \
     && apt-get install --no-install-recommends -y ca-certificates tzdata \

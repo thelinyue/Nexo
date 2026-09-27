@@ -162,29 +162,45 @@ pub async fn changed(state: &AppState, has_tunnels: bool) -> Result<(), ApiError
 
 /// “ready”在反代中只表示当前目标路由和公网证书已生效，不探测业务健康。
 pub fn refresh_status(state: &AppState) -> Result<()> {
-    let db = state
-        .db
-        .lock()
-        .map_err(|_| anyhow::anyhow!("数据库锁不可用"))?;
-    let mut query = db.prepare("SELECT t.id,t.enabled AND w.enabled,t.protocol,t.hostname,p.domain,t.public_domain_id,t.origin_protocol,t.local_address,t.local_port,t.https_port FROM tunnels t JOIN tenants w ON w.id=t.tenant_id LEFT JOIN public_domains p ON p.id=t.public_domain_id AND p.tenant_id=t.tenant_id WHERE t.service_mode='reverse_proxy' AND t.deleted_at IS NULL")?;
-    let rows = query
-        .query_map([], |r| {
-            Ok((
-                r.get::<_, String>(0)?,
-                r.get::<_, bool>(1)?,
-                r.get::<_, String>(2)?,
-                r.get::<_, Option<String>>(3)?,
-                r.get::<_, Option<String>>(4)?,
-                r.get::<_, Option<String>>(5)?,
-                r.get::<_, Option<String>>(6)?,
-                r.get::<_, String>(7)?,
-                r.get::<_, u16>(8)?,
-                r.get::<_, u16>(9)?,
-            ))
-        })?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    for (id, enabled, protocol, hostname, domain, domain_id, origin, address, port, https_port) in
+    // Caddy 持有域名状态锁时会写数据库事件；读取状态前必须释放数据库锁，避免反向等待。
+    let rows = {
+        let db = state
+            .db
+            .lock()
+            .map_err(|_| anyhow::anyhow!("数据库锁不可用"))?;
+        let mut query = db.prepare("SELECT t.id,t.enabled AND w.enabled,t.protocol,t.hostname,p.domain,t.public_domain_id,t.origin_protocol,t.local_address,t.local_port,t.https_port,t.apply_revision FROM tunnels t JOIN tenants w ON w.id=t.tenant_id LEFT JOIN public_domains p ON p.id=t.public_domain_id AND p.tenant_id=t.tenant_id WHERE t.service_mode='reverse_proxy' AND t.deleted_at IS NULL")?;
+        let rows = query
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, bool>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, Option<String>>(3)?,
+                    r.get::<_, Option<String>>(4)?,
+                    r.get::<_, Option<String>>(5)?,
+                    r.get::<_, Option<String>>(6)?,
+                    r.get::<_, String>(7)?,
+                    r.get::<_, u16>(8)?,
+                    r.get::<_, u16>(9)?,
+                    r.get::<_, i64>(10)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
         rows
+    };
+    for (
+        id,
+        enabled,
+        protocol,
+        hostname,
+        domain,
+        domain_id,
+        origin,
+        address,
+        port,
+        https_port,
+        revision,
+    ) in rows
     {
         let runtime = state
             .domain_runtime
@@ -222,9 +238,10 @@ pub fn refresh_status(state: &AppState) -> Result<()> {
         } else {
             ("ready", None)
         };
-        db.execute(
-            "UPDATE tunnels SET apply_status=?1,apply_error=?2 WHERE id=?3",
-            params![status, error, id],
+        // 状态读取期间配置可能改变；只回写仍属于本次快照且未删除的服务。
+        state.db.lock().map_err(|_| anyhow::anyhow!("数据库锁不可用"))?.execute(
+            "UPDATE tunnels SET apply_status=?1,apply_error=?2 WHERE id=?3 AND apply_revision=?4 AND deleted_at IS NULL",
+            params![status, error, id, revision],
         )?;
     }
     Ok(())

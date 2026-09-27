@@ -939,6 +939,56 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
 
+    #[test]
+    fn reverse_proxy_status_wait_does_not_block_database() {
+        let (state, _) = crate::tests::domain_fixture();
+        state.db.lock().unwrap().execute_batch("INSERT INTO public_domains(id,tenant_id,domain,created_at,updated_at) VALUES('domain','default','example.com',0,0);
+            INSERT INTO tunnels(id,tenant_id,name,protocol,local_address,local_port,hostname,public_domain_id,service_mode,created_at,updated_at) VALUES('proxy','default','proxy','http','127.0.0.1',3000,'app','domain','reverse_proxy',0,0);").unwrap();
+        // 模拟 Caddy 正持有状态锁并准备写事件；反代等待状态时必须释放数据库。
+        let statuses = state.domain_runtime.statuses.lock().unwrap();
+        let (started, ready) = std::sync::mpsc::channel();
+        let refresh_state = state.clone();
+        let refresh = std::thread::spawn(move || {
+            started.send(()).unwrap();
+            crate::reverse_proxy::refresh_status(&refresh_state)
+        });
+        ready.recv_timeout(Duration::from_secs(2)).unwrap();
+        std::thread::sleep(Duration::from_millis(100));
+        let (send, receive) = std::sync::mpsc::channel();
+        let reader_state = state.clone();
+        let reader = std::thread::spawn(move || {
+            let db = reader_state.db.lock().unwrap();
+            let value: i64 = db.query_row("SELECT 1", [], |row| row.get(0)).unwrap();
+            let _ = send.send(value);
+        });
+        let database_responded = receive.recv_timeout(Duration::from_secs(1));
+        if database_responded == Ok(1) {
+            state.db.lock().unwrap().execute("UPDATE tunnels SET apply_revision=apply_revision+1,apply_status='checking',apply_error='new configuration' WHERE id='proxy'", []).unwrap();
+        }
+        drop(statuses);
+        refresh.join().unwrap().unwrap();
+        reader.join().unwrap();
+        assert_eq!(
+            database_responded.ok(),
+            Some(1),
+            "反代等待域名状态时阻塞数据库，可能导致启动死锁"
+        );
+        let error: String = state
+            .db
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT apply_error FROM tunnels WHERE id='proxy'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            error, "new configuration",
+            "旧快照不得覆盖等待期间的新配置状态"
+        );
+    }
+
     fn settings(root: &Path) -> CaddyRuntimeConfig {
         CaddyRuntimeConfig {
             access_address: "127.0.0.1:0".into(),

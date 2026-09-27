@@ -5,10 +5,7 @@ use crate::{desired_tunnels, unix_now, AppState};
 use anyhow::{Context, Result};
 use futures_util::StreamExt;
 use nexo_protocol::{AgentControlMessage, ServerControlMessage, TunnelApplyResult};
-use nexo_tunnel::{
-    identity::{write_message, MAX_CONTROL_FRAME},
-    LogicalStreamHeader,
-};
+use nexo_tunnel::{identity::MAX_CONTROL_FRAME, LogicalStreamHeader};
 use rusqlite::params;
 use sha2::{Digest, Sha256};
 use std::{
@@ -598,11 +595,13 @@ async fn control_session(
     mut fingerprint: String,
     peer: IpAddr,
 ) -> Result<()> {
+    let mut diagnostics = nexo_tunnel::control_diagnostics::ControlDiagnostics::default();
     let (read, mut write) = tokio::io::split(stream);
     let mut lines = FramedRead::new(read, LinesCodec::new_with_max_length(MAX_CONTROL_FRAME));
     let first = tokio::time::timeout(Duration::from_secs(10), lines.next())
         .await?
         .context("Agent 未发送 Hello")??;
+    diagnostics.received();
     let AgentControlMessage::Hello {
         capabilities,
         device_id,
@@ -642,24 +641,25 @@ async fn control_session(
         }
     }
     let result: Result<()> = async {
-        write_message(&mut write, &ServerControlMessage::HelloAccepted { capabilities: vec![nexo_protocol::direct::CAPABILITY.into()], server_time: unix_now(), tunnels: desired_tunnels(&state, &device)?, tunnel_endpoint: state.tunnel_endpoint.clone(), udp_endpoint: state.udp_endpoint.clone() }).await?;
+        diagnostics.send(&mut write, &ServerControlMessage::HelloAccepted { capabilities: vec![nexo_protocol::direct::CAPABILITY.into()], server_time: unix_now(), tunnels: desired_tunnels(&state, &device)?, tunnel_endpoint: state.tunnel_endpoint.clone(), udp_endpoint: state.udp_endpoint.clone() }).await?;
         let deadline = tokio::time::sleep(Duration::from_secs(45)); tokio::pin!(deadline);
         loop { tokio::select! {
             _ = cancel.cancelled() => break,
-            _ = &mut deadline => anyhow::bail!("Agent 心跳超时"),
-            command = receiver.recv() => { let Some(command) = command else { break; }; write_message(&mut write, &command).await?; },
+            _ = &mut deadline => anyhow::bail!("Agent 心跳超时（45 秒）"),
+            command = receiver.recv() => { let Some(command) = command else { break; }; diagnostics.send(&mut write, &command).await?; },
             incoming = lines.next() => {
                 let line = incoming.context("Agent 控制通道已断开")??;
+                diagnostics.received();
                 deadline.as_mut().reset(tokio::time::Instant::now() + Duration::from_secs(45));
                 match serde_json::from_str::<AgentControlMessage>(&line)? {
                     AgentControlMessage::Heartbeat { device_id, agent_version } => {
                         anyhow::ensure!(device_id == device, "心跳设备 ID 与证书不一致");
                         state.db.lock().map_err(|_| anyhow::anyhow!("数据库锁不可用"))?.execute("UPDATE devices SET last_seen_at=?1,agent_version=?2 WHERE id=?3", params![unix_now(),agent_version,device])?;
-                        write_message(&mut write, &ServerControlMessage::HeartbeatAck { capabilities: vec![nexo_protocol::direct::CAPABILITY.into()], server_time: unix_now(), tunnels: desired_tunnels(&state, &device)?, tunnel_endpoint: state.tunnel_endpoint.clone(), udp_endpoint: state.udp_endpoint.clone() }).await?;
+                        diagnostics.send(&mut write, &ServerControlMessage::HeartbeatAck { capabilities: vec![nexo_protocol::direct::CAPABILITY.into()], server_time: unix_now(), tunnels: desired_tunnels(&state, &device)?, tunnel_endpoint: state.tunnel_endpoint.clone(), udp_endpoint: state.udp_endpoint.clone() }).await?;
                     }
                     AgentControlMessage::TunnelApplyReport { results } => {
                         let ids = apply_results(&state, &device, results)?;
-                        write_message(&mut write, &ServerControlMessage::TunnelApplyAccepted { tunnel_ids: ids }).await?;
+                        diagnostics.send(&mut write, &ServerControlMessage::TunnelApplyAccepted { tunnel_ids: ids }).await?;
                     }
                     AgentControlMessage::RenewCertificate { csr_pem } => {
                         let response = match crate::identity_runtime::renew_device(&state, &device, &fingerprint, &csr_pem, unix_now()) {
@@ -670,7 +670,7 @@ async fn control_session(
                                 ServerControlMessage::CertificateRenewalFailed { message,next_retry_at }
                             }
                         };
-                        write_message(&mut write, &response).await?;
+                        diagnostics.send(&mut write, &response).await?;
                     }
                     AgentControlMessage::CertificateInstalled { certificate_pem } => {
                         let digest = crate::identity_runtime::fingerprint(&certificate_pem)?;
@@ -704,7 +704,9 @@ async fn control_session(
             .map_err(|_| anyhow::anyhow!("数据库锁不可用"))?
             .execute("UPDATE devices SET status='offline' WHERE id=?1", [&device])?;
     }
-    result
+    result.with_context(|| {
+        format!("Server 控制通道诊断：device_id={device} peer={peer}；{diagnostics}")
+    })
 }
 
 fn apply_results(
@@ -1028,6 +1030,7 @@ mod tests {
     use super::*;
     use crate::{create_tunnel, TunnelInput};
     use axum::{extract::State, Json};
+    use nexo_tunnel::identity::write_message;
     use tokio::io::{AsyncBufReadExt, BufReader};
 
     type ClientStream = tokio_rustls::client::TlsStream<TcpStream>;
@@ -1108,6 +1111,43 @@ mod tests {
             serde_json::from_str::<ServerControlMessage>(&response).unwrap(),
             ServerControlMessage::HelloAccepted { .. }
         ));
+    }
+
+    #[tokio::test]
+    async fn heartbeat_timeout_keeps_io_diagnostics_and_disconnects_device() {
+        let (state, _) = crate::tests::domain_fixture();
+        populate(&state);
+        let config = test_client_config(&state, "mine");
+        let (mut client, task) = test_control_connection(&state, config, "8.8.8.8").await;
+        test_hello(&mut client, "mine").await;
+        // 保持 TLS 连接但不发送心跳，走生产环境的 45 秒超时和清理路径。
+        let error = tokio::time::timeout(Duration::from_secs(50), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err();
+        let detail = format!("{error:#}");
+        assert!(detail.contains("Agent 心跳超时（45 秒）"), "{detail}");
+        assert!(detail.contains("device_id=mine peer=8.8.8.8"), "{detail}");
+        assert!(
+            detail.contains("最后接收：[") && detail.contains("最后发送：["),
+            "{detail}"
+        );
+        assert_eq!(detail.matches("累计 1 条").count(), 2, "{detail}");
+        assert!(state.tunnel_runtime.agent_public_ipv4s().await.is_empty());
+        assert_eq!(
+            state
+                .db
+                .lock()
+                .unwrap()
+                .query_row("SELECT status FROM devices WHERE id='mine'", [], |r| r
+                    .get::<_, String>(
+                    0
+                ))
+                .unwrap(),
+            "offline"
+        );
+        drop(client);
     }
 
     #[tokio::test]

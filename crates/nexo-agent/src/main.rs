@@ -8,7 +8,8 @@ use nexo_protocol::{
     AgentEnrollmentResponse, ServerControlMessage, TunnelApplyResult, TunnelDataEndpoint,
     TunnelDesiredState,
 };
-use nexo_tunnel::identity::{self, write_message, MAX_CONTROL_FRAME, SERVER_NAME};
+use nexo_tunnel::control_diagnostics::ControlDiagnostics;
+use nexo_tunnel::identity::{self, MAX_CONTROL_FRAME, SERVER_NAME};
 use rcgen::{CertificateParams, KeyPair};
 use serde::{Deserialize, Serialize};
 use std::{env, fs, path::PathBuf, sync::Arc, time::Duration};
@@ -463,9 +464,13 @@ async fn run_control(
         },
     )
     .await?;
+    let peer = stream.get_ref().0.peer_addr()?;
+    let local = stream.get_ref().0.local_addr()?;
+    let mut diagnostics = ControlDiagnostics::default();
+    let result: Result<()> = async {
     let (read, mut write) = tokio::io::split(stream);
     let mut lines = FramedRead::new(read, LinesCodec::new_with_max_length(MAX_CONTROL_FRAME));
-    write_message(
+    diagnostics.send(
         &mut write,
         &AgentControlMessage::Hello {
             capabilities: vec![nexo_protocol::direct::CAPABILITY.into()],
@@ -497,32 +502,33 @@ async fn run_control(
     let mut renewal_deadline: Option<i64> = None;
     loop {
         tokio::select! {
-            _ = &mut deadline => anyhow::bail!("Server 控制响应超时"),
+            _ = &mut deadline => anyhow::bail!("Server 控制响应超时（45 秒）"),
             _ = heartbeat.tick(), if accepted => {
-                write_message(&mut write,&AgentControlMessage::Heartbeat { device_id: device.clone(),agent_version:config.agent_version.clone() }).await?;
+                diagnostics.send(&mut write,&AgentControlMessage::Heartbeat { device_id: device.clone(),agent_version:config.agent_version.clone() }).await?;
                 let now = certificate::now();
                 if renewal_deadline.is_some_and(|deadline| deadline <= now) {
                     renewal_deadline = None;
                     let report = certificate::failed(identity,identity_path,"等待续签响应超时",None);
-                    write_message(&mut write,&report).await?;
+                    diagnostics.send(&mut write,&report).await?;
                 }
                 if renewal_deadline.is_none() {
                     match certificate::request(identity,identity_path,now) {
-                        Ok(Some(message)) => { renewal_deadline = Some(now + 30); write_message(&mut write,&message).await?; }
+                        Ok(Some(message)) => { renewal_deadline = Some(now + 30); diagnostics.send(&mut write,&message).await?; }
                         Ok(None) => {},
                         Err(error) => {
                             let report = certificate::failed(identity,identity_path,&format!("准备设备续签失败：{error:#}"),None);
-                            write_message(&mut write,&report).await?;
+                            diagnostics.send(&mut write,&report).await?;
                         }
                     }
                 }
             },
             Some(result) = probes.join_next(), if !probes.is_empty() => {
-                if let Ok(results) = result { write_message(&mut write,&AgentControlMessage::TunnelApplyReport { results }).await?; }
+                if let Ok(results) = result { diagnostics.send(&mut write,&AgentControlMessage::TunnelApplyReport { results }).await?; }
             },
             Some(result) = data_tasks.join_next(), if !data_tasks.is_empty() => { result?; anyhow::bail!("数据连接任务意外停止"); },
             incoming = lines.next() => {
                 let line = incoming.context("Server 控制通道已关闭")??;
+                diagnostics.received();
                 deadline.as_mut().reset(tokio::time::Instant::now()+Duration::from_secs(45));
                 match serde_json::from_str::<ServerControlMessage>(&line)? {
                     ServerControlMessage::HelloAccepted { tunnels,tunnel_endpoint,udp_endpoint,capabilities,.. } | ServerControlMessage::HeartbeatAck { tunnels,tunnel_endpoint,udp_endpoint,capabilities,.. } => {
@@ -538,12 +544,12 @@ async fn run_control(
                         match certificate::install(identity,identity_path,&certificate_pem) {
                             Ok(connector) => {
                                 connectors.send_replace(connector);
-                                write_message(&mut write,&AgentControlMessage::CertificateInstalled { certificate_pem }).await?;
+                                diagnostics.send(&mut write,&AgentControlMessage::CertificateInstalled { certificate_pem }).await?;
                                 tracing::info!("设备证书已续签并保存，设备 ID、服务绑定及现有连接保持不变");
                             }
                             Err(error) => {
                                 let report = certificate::failed(identity,identity_path,&format!("保存续签证书失败：{error:#}"),None);
-                                write_message(&mut write,&report).await?;
+                                diagnostics.send(&mut write,&report).await?;
                             }
                         }
                     },
@@ -556,6 +562,10 @@ async fn run_control(
             }
         }
     }
+    }.await;
+    result.with_context(|| {
+        format!("Agent 控制通道诊断：device_id={device} peer={peer} local={local}；{diagnostics}")
+    })
 }
 
 /// Yamux 重连独立于心跳；每个逻辑流依照当前完整快照核对 ID 和版本，不接受服务端任意目标地址。

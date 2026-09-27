@@ -66,6 +66,42 @@ pub struct CaddyLogEvent {
 }
 
 impl CaddyLogEvent {
+    /// 按 Caddy 日志来源区分证书、握手和 HTTP 请求；HTTP 429 不能当成 CA 限流。
+    fn is_certificate_event(&self) -> bool {
+        match self.logger.as_deref() {
+            Some(logger) if logger == "tls.handshake" || logger.starts_with("tls.handshake.") => {
+                false
+            }
+            Some(logger) => {
+                logger == "tls" || logger.starts_with("tls.") || logger.starts_with("http.acme")
+            }
+            None => {
+                let message = self.message.to_ascii_lowercase();
+                message.contains("certificate") || message.contains("acme")
+            }
+        }
+    }
+
+    fn error_category(&self) -> &'static str {
+        if self.is_certificate_event() {
+            "Caddy 证书处理错误"
+        } else if self
+            .logger
+            .as_deref()
+            .is_some_and(|logger| logger == "tls.handshake" || logger.starts_with("tls.handshake."))
+        {
+            "Caddy TLS 握手错误"
+        } else if self
+            .logger
+            .as_deref()
+            .is_some_and(|logger| logger.starts_with("http."))
+        {
+            "Caddy HTTP 请求处理错误"
+        } else {
+            "Caddy 运行错误"
+        }
+    }
+
     pub fn is_rate_limited(&self) -> bool {
         self.status_code == Some(429)
             || self.message.to_ascii_lowercase().contains("rate limit")
@@ -683,18 +719,22 @@ fn spawn_caddy_log_reader<R>(
             if event.message.starts_with("Error:") {
                 *process_error.lock().await = Some(event.message.clone());
             }
-            if event.is_rate_limited() {
+            if event.is_certificate_event() && event.is_rate_limited() {
                 tracing::warn!(
                     stream,
-                    identifier = event.identifier.as_deref().unwrap_or("未知域名"),
+                    logger = event.logger.as_deref(),
+                    identifier = event.identifier.as_deref(),
                     "Caddy 报告 CA 限流：{}",
                     event.message
                 );
             } else if event.level.as_deref() == Some("error") {
                 tracing::error!(
                     stream,
-                    identifier = event.identifier.as_deref().unwrap_or("未知域名"),
-                    "Caddy 证书处理错误：{}",
+                    logger = event.logger.as_deref(),
+                    identifier = event.identifier.as_deref(),
+                    status_code = event.status_code,
+                    "{}：{}",
+                    event.error_category(),
                     event.message
                 );
             }
@@ -857,6 +897,50 @@ pub fn redact(message: &str, token_root: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn proxy_failures_and_http_rate_limits_are_not_certificate_errors() {
+        for message in [
+            "EOF",
+            "write unix @->/run/nexo/tunnel-sockets/service.sock: write: broken pipe",
+            "read unix @->/run/nexo/tunnel-sockets/service.sock: read: connection reset by peer",
+            "HTTP 429: rate limit",
+        ] {
+            let event = parse_caddy_log_line(
+                &serde_json::json!({"level":"error", "logger":"http.log.error", "msg":message, "status":502}).to_string(),
+            ).unwrap();
+            assert_eq!(event.error_category(), "Caddy HTTP 请求处理错误");
+            assert!(!event.is_certificate_event());
+            assert!(event.identifier.is_none());
+        }
+        let limited = parse_caddy_log_line(
+            r#"{"level":"error","logger":"tls.obtain","msg":"HTTP 429: rate limit","identifier":"example.com"}"#,
+        ).unwrap();
+        assert!(limited.is_certificate_event() && limited.is_rate_limited());
+        assert_eq!(limited.error_category(), "Caddy 证书处理错误");
+    }
+
+    #[test]
+    fn handshake_and_runtime_errors_keep_their_own_categories() {
+        for (logger, category) in [
+            ("tls.handshake", "Caddy TLS 握手错误"),
+            ("admin.api", "Caddy 运行错误"),
+            ("http.acme_client", "Caddy 证书处理错误"),
+            ("tls.issuance.acme", "Caddy 证书处理错误"),
+        ] {
+            let event = parse_caddy_log_line(
+                &serde_json::json!({"level":"error", "logger":logger, "msg":"EOF"}).to_string(),
+            )
+            .unwrap();
+            assert_eq!(event.error_category(), category);
+        }
+        assert_eq!(
+            parse_caddy_log_line("Error: listen: address already in use")
+                .unwrap()
+                .error_category(),
+            "Caddy 运行错误"
+        );
+    }
 
     #[test]
     fn parses_caddy_rate_limit_log_and_retry_after() {
