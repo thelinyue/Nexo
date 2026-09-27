@@ -2,6 +2,12 @@
 
 本项目使用 [Semantic Versioning](https://semver.org/) 记录公开版本。
 
+## [0.2.4]
+
+- 增加 UDP 隧道、VPS 反向代理服务、Web 服务密码保护、流量统计与配额管理。
+- 改进 Agent 入网、内网重定向、服务协议选择和工作区导航，并在首次启动时自动创建管理员账号。
+- Server 与 Agent 均有代码变化，必须共同升级。升级前备份数据和配置；现有 v0.2.x 数据目录继续使用，启动时会自动补齐所需数据库结构。详情见 [v0.2.4 发布说明](docs/releases/v0.2.4.md)。
+
 ## [0.2.1]
 
 - Agent 添加流程可生成 Docker Compose 或 `docker run` 部署命令，自动填入 Server 地址与一次性入网凭证。

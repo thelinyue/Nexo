@@ -10,3 +10,8 @@
 tmp-smoke-data/
 tmp-smoke-data-phase3/
 /data/nexo-agent/
+
+# 本地浏览器验收数据和生成文件
+/.edge-screenshot/
+__pycache__/
+/.tmp-headscale.swagger.json
