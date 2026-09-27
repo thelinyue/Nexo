@@ -51,6 +51,57 @@ fn local_key_survives_port_changes_and_corruption_is_not_overwritten() {
     );
 }
 
+#[test]
+fn public_csr_has_only_the_service_name_and_repairs_legacy_request() {
+    let root = tempfile::tempdir().unwrap();
+    let svc = service(9443);
+    let first = key(root.path(), &svc).unwrap();
+    let parsed = rcgen::CertificateSigningRequestParams::from_pem(&first.csr_pem).unwrap();
+    assert!(parsed
+        .params
+        .distinguished_name
+        .get(&rcgen::DnType::CommonName)
+        .is_none());
+    assert_eq!(
+        parsed.params.subject_alt_names,
+        vec![rcgen::SanType::DnsName(
+            svc.hostname.clone().try_into().unwrap()
+        )]
+    );
+
+    // 模拟 v0.2.9 已持久化的默认 CN，升级只能重签 CSR，不能更换私钥。
+    let private = KeyPair::from_pem(&first.key_pem).unwrap();
+    let legacy = Key {
+        hostname: svc.hostname.clone(),
+        key_pem: first.key_pem.clone(),
+        csr_pem: CertificateParams::new(vec![svc.hostname.clone()])
+            .unwrap()
+            .serialize_request(&private)
+            .unwrap()
+            .pem()
+            .unwrap(),
+    };
+    fs::write(
+        root.path().join("request.json"),
+        serde_json::to_vec(&legacy).unwrap(),
+    )
+    .unwrap();
+    let repaired = key(root.path(), &svc).unwrap();
+    assert_eq!(repaired.key_pem, first.key_pem);
+    assert_ne!(repaired.csr_pem, legacy.csr_pem);
+    let parsed = rcgen::CertificateSigningRequestParams::from_pem(&repaired.csr_pem).unwrap();
+    assert!(parsed
+        .params
+        .distinguished_name
+        .get(&rcgen::DnType::CommonName)
+        .is_none());
+    assert_eq!(
+        fs::read_to_string(root.path().join("key.pem")).unwrap(),
+        first.key_pem
+    );
+    assert_eq!(key(root.path(), &svc).unwrap().csr_pem, repaired.csr_pem);
+}
+
 #[tokio::test]
 async fn forwarder_closes_existing_stream_on_revision_change() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();

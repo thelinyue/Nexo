@@ -126,6 +126,57 @@ async fn authority_device_revision_and_csr_boundaries_fail_closed() {
         .is_err());
 }
 
+#[tokio::test]
+async fn csr_common_name_is_checked_before_persisting_or_issuing() {
+    let (state, _) = fixture();
+    let svc = service(&state, "agent", "media", 1).unwrap();
+    let key = rcgen::KeyPair::generate().unwrap();
+    for name in [
+        "rcgen self signed cert",
+        "other.direct.test",
+        "*.direct.test",
+    ] {
+        let mut params = rcgen::CertificateParams::new(vec![svc.hostname.clone()]).unwrap();
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, name);
+        let csr = params.serialize_request(&key).unwrap().pem().unwrap();
+        let error = certificates::request(&state, "agent", &svc, csr)
+            .await
+            .err()
+            .expect("非法 CN 必须拒绝");
+        assert!(error.to_string().contains("Common Name"));
+    }
+    let count: i64 = state
+        .db
+        .lock()
+        .unwrap()
+        .query_row("SELECT COUNT(*) FROM direct_certificates", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(count, 0);
+    // 已有任务占位，验证合法 CN/SAN 入库时不访问公网 ACME。
+    state
+        .tunnel_runtime
+        .direct
+        .jobs
+        .lock()
+        .await
+        .insert("media".into());
+    for name in [None, Some(svc.hostname.as_str())] {
+        let mut params = rcgen::CertificateParams::new(vec![svc.hostname.clone()]).unwrap();
+        params.distinguished_name = rcgen::DistinguishedName::new();
+        if let Some(name) = name {
+            params
+                .distinguished_name
+                .push(rcgen::DnType::CommonName, name);
+        }
+        let csr = params.serialize_request(&key).unwrap().pem().unwrap();
+        assert!(certificates::request(&state, "agent", &svc, csr)
+            .await
+            .is_ok());
+    }
+}
+
 #[test]
 fn old_ready_report_cannot_publish_changed_address_or_revision() {
     let (state, _) = fixture();

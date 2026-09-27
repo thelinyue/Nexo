@@ -401,6 +401,14 @@ async fn acme_dns01_issues_agent_csr_and_keeps_valid_chain_during_renewal_failur
                     STANDARD.encode(der)
                 );
                 let request = rcgen::CertificateSigningRequestParams::from_pem(&pem).unwrap();
+                assert!(
+                    request
+                        .params
+                        .distinguished_name
+                        .get(&rcgen::DnType::CommonName)
+                        .is_none(),
+                    "公网 CSR 不得带有 rcgen 默认 CN"
+                );
                 let mut params = rcgen::CertificateParams::default();
                 params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
                 let key = rcgen::KeyPair::generate().unwrap();
@@ -517,12 +525,9 @@ async fn acme_dns01_issues_agent_csr_and_keeps_valid_chain_during_renewal_failur
         .unwrap();
     *state.tunnel_runtime.direct.account.lock().await = Some(account);
     let key = rcgen::KeyPair::generate().unwrap();
-    let csr = rcgen::CertificateParams::new(vec!["emby.direct.test".into()])
-        .unwrap()
-        .serialize_request(&key)
-        .unwrap()
-        .pem()
-        .unwrap();
+    let mut params = rcgen::CertificateParams::new(vec!["emby.direct.test".into()]).unwrap();
+    params.distinguished_name = rcgen::DistinguishedName::new();
+    let csr = params.serialize_request(&key).unwrap().pem().unwrap();
     let service = crate::direct::service(&state, "agent", "media", 1).unwrap();
     crate::direct::certificates::request(&state, "agent", &service, csr.clone())
         .await

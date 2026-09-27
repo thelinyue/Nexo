@@ -245,16 +245,27 @@ fn key(root: &Path, service: &Service) -> Result<Key> {
         Err(error) => return Err(error).context("无法读取已有直连私钥，未覆盖"),
     };
     if let Some(bytes) = saved {
-        let key: Key = serde_json::from_slice(&bytes).context("直连私钥存储无效，请恢复备份")?;
+        let mut key: Key =
+            serde_json::from_slice(&bytes).context("直连私钥存储无效，请恢复备份")?;
         if key.hostname == service.hostname {
+            let request = rcgen::CertificateSigningRequestParams::from_pem(&key.csr_pem)
+                .context("已有直连 CSR 无效，未覆盖私钥")?;
+            // v0.2.9 的默认 CN 会被公网 CA 拒绝；保留原私钥，仅重签并持久化 CSR。
+            if request
+                .params
+                .distinguished_name
+                .get(&rcgen::DnType::CommonName)
+                == Some(&rcgen::DnValue::Utf8String("rcgen self signed cert".into()))
+            {
+                key.csr_pem = public_csr(&service.hostname, &KeyPair::from_pem(&key.key_pem)?)?;
+                identity::write_private_file(&path, &serde_json::to_vec(&key)?)?;
+            }
             identity::write_private_file(&root.join("key.pem"), key.key_pem.as_bytes())?;
             return Ok(key);
         }
     }
     let key = KeyPair::generate()?;
-    let csr = CertificateParams::new(vec![service.hostname.clone()])?
-        .serialize_request(&key)?
-        .pem()?;
+    let csr = public_csr(&service.hostname, &key)?;
     let key = Key {
         hostname: service.hostname.clone(),
         key_pem: key.serialize_pem(),
@@ -263,6 +274,13 @@ fn key(root: &Path, service: &Service) -> Result<Key> {
     identity::write_private_file(&path, &serde_json::to_vec(&key)?)?;
     identity::write_private_file(&root.join("key.pem"), key.key_pem.as_bytes())?;
     Ok(key)
+}
+
+fn public_csr(hostname: &str, key: &KeyPair) -> Result<String> {
+    let mut params = CertificateParams::new(vec![hostname.to_owned()])?;
+    // 公网证书只使用 SAN，清除 rcgen 默认的自签证书 CN。
+    params.distinguished_name = rcgen::DistinguishedName::new();
+    Ok(params.serialize_request(key)?.pem()?)
 }
 
 /// Agent 专用 Caddy 子进程，只绑定选定 IPv6；退出和热加载失败不得报告就绪。

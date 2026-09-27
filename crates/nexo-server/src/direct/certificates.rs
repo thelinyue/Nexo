@@ -5,6 +5,7 @@ use instant_acme::{
     RetryPolicy,
 };
 use std::time::Duration;
+use x509_parser::prelude::FromDer;
 
 pub async fn request(
     state: &AppState,
@@ -18,6 +19,18 @@ pub async fn request(
         parsed.params.subject_alt_names.len() == 1
             && matches!(&parsed.params.subject_alt_names[0],rcgen::SanType::DnsName(name) if name.as_str()==service.hostname),
         "CSR 必须且只能包含绑定服务的主机名"
+    );
+    // CA 同时校验 CN 与 SAN，不能把含库默认名称或其他域名的请求提交给 CA。
+    let (_, pem) = x509_parser::pem::parse_x509_pem(csr.as_bytes())?;
+    let (_, request) =
+        x509_parser::certification_request::X509CertificationRequest::from_der(&pem.contents)?;
+    anyhow::ensure!(
+        request
+            .certification_request_info
+            .subject
+            .iter_common_name()
+            .all(|name| name.as_str().is_ok_and(|name| name == service.hostname)),
+        "CSR Common Name 必须为空或与绑定服务主机名一致，请升级 Agent 后重试"
     );
     let id = &service.tunnel.tunnel_id;
     let (chain, retry, error, renew) = {
