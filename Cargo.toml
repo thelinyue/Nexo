@@ -42,6 +42,7 @@ tokio = { version = "1", features = ["io-util", "macros", "net", "process", "rt-
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "logging", "tls12"] }
 tokio-util = { version = "0.7", features = ["compat", "codec", "rt"] }
 yamux = "0.14"
+quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
 tower-http = { version = "0.6", features = ["fs"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["chrono", "env-filter", "fmt"] }

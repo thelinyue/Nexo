@@ -13,6 +13,7 @@ tokio-rustls.workspace = true
 tokio-util.workspace = true
 yamux.workspace = true
 anyhow.workspace = true
+quinn.workspace = true
 clap.workspace = true
 nexo-core = { path = "../nexo-core" }
 nexo-protocol = { path = "../nexo-protocol" }

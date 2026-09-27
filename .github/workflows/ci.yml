@@ -49,7 +49,7 @@ jobs:
         run: npm run test:e2e
       - name: 验收脚本语法检查
         run: |
-          python -c "import ast, pathlib; [ast.parse(pathlib.Path(path).read_text(encoding='utf-8'), filename=path) for path in ['docker/integration-terminal.py', 'docker/identity-renewal-smoke.py', 'docker/multiuser-smoke.py', 'docker/tunnel-smoke.py']]"
+          python -c "import ast, pathlib; [ast.parse(pathlib.Path(path).read_text(encoding='utf-8'), filename=path) for path in ['docker/integration-terminal.py', 'docker/identity-renewal-smoke.py', 'docker/multiuser-smoke.py', 'docker/tunnel-smoke.py', 'docker/udp-smoke.py']]"
           node --check docker/recovery-smoke.mjs
       - name: latest 发布规则测试
         run: python3 -m unittest discover -s .github/scripts -p 'test_*.py'

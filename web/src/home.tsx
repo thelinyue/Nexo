@@ -146,7 +146,7 @@ type Attention = { id: string; name: string; href: string; reasons: string[]; pr
 /** 首页保留资源自己的状态含义，不把 DNS 已解析或配置成功推断成公网可达。 */
 function attentionItems(tunnels: Tunnel[], devices: Device[], domains: Domain[]): Attention[] {
   const items: Attention[] = [];
-  for (const item of tunnels) if (item.enabled && (item.apply_status !== "ready" || item.apply_error)) items.push({ id: `t-${item.id}`, name: item.name, href: `#/services/${encodeURIComponent(item.id)}`, reasons: [item.apply_error || (item.service_mode === "reverse_proxy" ? "反代配置待生效" : "") || ({ failed: "服务配置需处理", error: "服务配置需处理", checking: "检查中", pending: "待应用", applying: "应用中" } as Record<string, string>)[item.apply_status] || `未知状态：${item.apply_status}`], priority: ["failed", "error"].includes(item.apply_status) ? 0 : 2 });
+  for (const item of tunnels) if (item.enabled && (item.apply_status !== "ready" || item.apply_error)) items.push({ id: `t-${item.id}`, name: item.name, href: `#/services/${encodeURIComponent(item.id)}`, reasons: [item.apply_error || (item.service_mode === "reverse_proxy" ? "反代配置待生效" : "") || ({ partial: "部分协议不可用", failed: "服务配置需处理", error: "服务配置需处理", checking: "检查中", pending: "待应用", applying: "应用中" } as Record<string, string>)[item.apply_status] || `未知状态：${item.apply_status}`], priority: ["failed", "error"].includes(item.apply_status) ? 0 : 2 });
   for (const item of devices) if (item.status === "offline") items.push({ id: `a-${item.id}`, name: item.name, href: `#/agents/${encodeURIComponent(item.id)}`, reasons: ["设备离线"], priority: 0 });
   for (const item of domains) {
     const reasons: string[] = []; let priority = 2;

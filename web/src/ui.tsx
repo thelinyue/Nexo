@@ -4,7 +4,7 @@ import { ArrowLeft, Check, ChevronRight, Copy, FileQuestion, Globe2, Network, Pl
 import { PageNavigationContext } from "./navigation";
 
 export type Auth = { initialized: boolean; authenticated: boolean; user_id?: string; username?: string; role?: "system_admin" | "tenant"; workspace_id?: string; csrf_token?: string | null; local_http_warning?: boolean };
-export type Tunnel = { access_mode?: "public" | "password"; service_mode?: "tunnel" | "reverse_proxy"; id: string; name: string; protocol: string; origin_protocol?: "http" | "https" | null; local_address: string; local_port: number; public_port?: number | null; public_address?: string | null; device_id?: string | null; device_name?: string | null; hostname?: string | null; enabled: boolean; apply_status: string; apply_error?: string | null; public_domain?: string | null; lan_redirect_enabled: boolean };
+export type Tunnel = { protocol_statuses?: Record<string, { status: string; error_message?: string | null }>; access_mode?: "public" | "password"; service_mode?: "tunnel" | "reverse_proxy"; id: string; name: string; protocol: string; origin_protocol?: "http" | "https" | null; local_address: string; local_port: number; public_port?: number | null; public_address?: string | null; device_id?: string | null; device_name?: string | null; hostname?: string | null; enabled: boolean; apply_status: string; apply_error?: string | null; public_domain?: string | null; lan_redirect_enabled: boolean };
 export type IdentityCertificate = { status: string; expires_at: number | null; renew_after: number | null; error: string | null; next_retry_at: number | null };
 export type TransportIdentity = { server: IdentityCertificate; ca_expires_at: number | null; ca_needs_attention: boolean };
 export type Device = { id: string; name: string; status: string; os?: string | null; architecture?: string | null; agent_version?: string | null; tunnel_count: number; enrolled_at?: number | null; last_seen_at?: number | null; certificate?: IdentityCertificate };
@@ -45,7 +45,9 @@ export const errorText = (error: unknown) => error instanceof Error ? error.mess
 let interactionTarget: HTMLElement | null = null;
 export function rememberInteraction(target: EventTarget | null) { interactionTarget = target instanceof Element ? target.closest<HTMLElement>("button,a,input,textarea,select") : null; }
 // 网页服务展示真实内网协议，避免把公网 HTTPS 误认为内网也使用 HTTPS。
-export const localTarget = (item: Tunnel) => `${item.protocol === "tcp" ? "" : `${item.origin_protocol ?? "http"}://`}${item.local_address.includes(":") ? `[${item.local_address.replace(/^\[|\]$/g, "")}]` : item.local_address}:${item.local_port}`;
+export const isPortProtocol = (protocol?: string) => ["tcp", "udp", "tcp_udp"].includes(protocol ?? "");
+export const protocolLabel = (protocol: string) => protocol === "tcp_udp" ? "TCP+UDP" : protocol.toUpperCase();
+export const localTarget = (item: Tunnel) => `${isPortProtocol(item.protocol) ? "" : `${item.origin_protocol ?? "http"}://`}${item.local_address.includes(":") ? `[${item.local_address.replace(/^\[|\]$/g, "")}]` : item.local_address}:${item.local_port}`;
 export const dateText = (value?: number | null) => value ? new Date(value * 1000).toLocaleString("zh-CN", { year: "numeric", month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit", hour12: false }) : "暂无记录";
 
 /** 密码显隐只改变当前输入的呈现，不改变自动填充语义或保存密码。 */
@@ -67,8 +69,8 @@ export function Status({ value, kind = "service" }: { value: string; kind?: "ser
     : kind === "domain" ? { applied: "配置已加载", pending: "等待加载", failed: "配置加载失败", disabled: "Caddy 已停用", unverified: "尚无运行状态" }
     : kind === "certificate" ? { pending: "等待签发", waiting_configuration: "申请中", presenting_dns: "提交 DNS 验证", waiting_dns: "等待 DNS 生效", validating: "验证中", issued: "已签发", active: "已签发", renewing: "续期中", retry_wait: "等待重试", failed: "申请失败", expired: "已过期", not_yet_valid: "尚未生效" }
     : kind === "reverse_proxy" ? { ready: "已生效", failed: "配置失败", error: "配置失败", disabled: "已停用", checking: "配置中", pending: "配置中", applying: "配置中" }
-    : { ready: "运行中", failed: "需处理", error: "需处理", disabled: "已关闭", checking: "检查中", pending: "待应用", applying: "应用中" };
-  const tone = ["ready", "online", "applied", "issued", "active"].includes(value) ? "ready" : ["failed", "error", "expired"].includes(value) ? "failed" : ["pending", "checking", "applying", "waiting_configuration", "presenting_dns", "waiting_dns", "validating", "renewing", "retry_wait"].includes(value) ? "working" : "neutral";
+    : { partial: "部分可用", ready: "运行中", failed: "需处理", error: "需处理", disabled: "已关闭", checking: "检查中", pending: "待应用", applying: "应用中" };
+  const tone = ["ready", "online", "applied", "issued", "active"].includes(value) ? "ready" : ["failed", "error", "expired"].includes(value) ? "failed" : ["partial", "pending", "checking", "applying", "waiting_configuration", "presenting_dns", "waiting_dns", "validating", "renewing", "retry_wait"].includes(value) ? "working" : "neutral";
   return <span className={`status ${tone}`}><i />{labels[value] ?? `未知状态：${value || "未返回"}`}</span>;
 }
 

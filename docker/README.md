@@ -6,7 +6,7 @@
 
 Agent 不需要 `NET_ADMIN`、`/dev/net/tun`、转发 sysctl、iptables 或 iproute2。宿主机需允许 Agent 访问 Server 入网 API、控制端口、数据端口和本地应用端口。
 
-默认监听：Server Web/API `8280`、Agent 控制 `9890`、Tunnel 数据 `9891`，TCP 自动分配公网端口范围 `20000-29999`。管理 API 可由前置 HTTPS 代理保护；`9890/9891` 使用设备证书双向 TLS，必须直连或 TCP 透传。Web Tunnel 的 `80/443` 交给 Caddy。
+默认监听：Server Web/API `8280`、Agent 控制 `9890`、Tunnel 数据 `9891`，TCP/UDP 自动分配公网端口范围 `20000-29999`。管理 API 可由前置 HTTPS 代理保护；`9890/9891` 使用设备证书双向 TLS，必须直连或 TCP 透传。UDP 数据通道独立使用 `9891/udp`，需要单独放行。Web Tunnel 的 `80/443` 交给 Caddy。
 
 ## 更新、备份与恢复
 
@@ -65,14 +65,17 @@ Server 数据包含数据库、内部 CA、身份、Caddy 证书及域名凭据�
 | Server `NEXO_CONTROL_ADDR` | `0.0.0.0:9890` | 控制监听地址 |
 | Server `NEXO_TUNNEL_ADDR` | `0.0.0.0:9891` | 数据监听地址 |
 | Server `NEXO_TUNNEL_ENDPOINT` | 未设置 | 向 Agent 下发外部可达的数据地址，格式为 `主机:端口` |
-| Server `NEXO_PUBLIC_BIND` | `0.0.0.0` | TCP 服务公网监听 IP，可指定 `::` 使用 IPv6 |
+| Server `NEXO_UDP_ADDR` | `0.0.0.0:9891` | QUIC UDP 数据监听地址 |
+| Server `NEXO_UDP_ENDPOINT` | 未设置 | 向 Agent 下发外部可达的 UDP 数据地址，格式为 `主机:端口` |
+| Agent `NEXO_UDP_ENDPOINT` | 同 Agent TCP 数据备用地址 | Server 未指定 UDP 地址时使用的备用地址 |
+| Server `NEXO_PUBLIC_BIND` | `0.0.0.0` | TCP/UDP 服务公网监听 IP，可指定 `::` 使用 IPv6 |
 | Agent `NEXO_CONTROL_ENDPOINT` | Server URL 主机的 `9890` 端口 | 覆盖控制连接地址，格式为 `主机:端口` |
 | Agent `NEXO_TUNNEL_ENDPOINT` | Server URL 主机的 `9891` 端口 | Server 未下发数据地址时使用的备用地址 |
 | Agent `NEXO_STATE_DIR` | 镜像内 `/data/nexo-agent`；本机 `./data/nexo-agent` | 身份持久化目录 |
 
 IPv6 地址使用 `[地址]:端口`。Compose 自定义变量需写入对应服务的 `environment`。Agent 的 `NEXO_SERVER_URL` 指向 Web/API；即使 API 使用 HTTPS 的 `443` 端口，控制与数据也仍使用各自端口。
 
-页面中的 TCP 访问地址使用请求管理页时的主机名，管理页反向代理应保留原始 `Host`。若管理域名经过仅支持 HTTP 的代理，TCP 客户端需改用直达 Server 的 IP 或 DNS 名称。HTTP/HTTPS 地址使用服务绑定的域名，公网端口默认为 `80/443`。
+页面中的 TCP/UDP 访问地址使用请求管理页时的主机名，管理页反向代理应保留原始 `Host`。若管理域名经过仅支持 HTTP 的代理，TCP 客户端需改用直达 Server 的 IP 或 DNS 名称。HTTP/HTTPS 地址使用服务绑定的域名，公网端口默认为 `80/443`。
 
 Server 的 `transport/identity.json` 保存私有 CA 与服务端身份；Agent 的 `identity.json` 保存设备私钥和证书。首次接入使用空间共享密钥提交 CSR，自动获得独立设备身份；旧临时凭证仍需审批。已保存身份后可清空 Token，重启复用原身份。更换 Server 时使用独立 Agent 目录。备份整个数据目录，包含 transport/identity.json 和 secrets/agent-access.key，避免仅恢复数据库而丢失 CA 或接入密钥的解密材料；不要复制同一 Agent 身份到多台主机。内部设备身份与 Caddy 公网证书相互独立。
 
@@ -169,3 +172,9 @@ Server 在新增域名或服务域名变化后自动检查一次，解析成功�
 具体命令、覆盖场景和验证边界见 [多用户与热重载验收](../docs/network-experience.md#多用户与热重载验收)。
 
 共享密钥本地验收（无需 Docker/Caddy）：`python docker/shared-access-smoke.py --server-bin target/debug/nexo-server.exe --agent-bin target/debug/nexo-agent.exe`。验证多设备独立身份、TCP 转发、密钥重置、删除防重放和进程重启。
+
+## UDP 与组合服务升级
+
+完整启用 UDP 需要升级有实际代码变化的 Server 和 Agent 两端；旧 Agent 仍可提供 TCP，组合服务会提示 UDP 需要升级。新版启动时原地升级 v0.2.x 服务协议约束，保留原数据和节点身份。升级前备份完整数据目录；迁移后回退旧版应恢复升级前备份。不要重新注册 Agent。
+
+使用 UDP 服务需放行 Server 的 `9891/udp`（或自定义数据端口）及实际分配的公网 UDP 端口。TCP+UDP 使用同一公网端口号，两种传输分别放行。Compose 使用 host 网络，无需额外端口映射；桥接部署须显式发布对应 `/udp` 端口。QUIC 不自动回退到 TCP，UDP 被阻断时组合服务保留 TCP 并显示部分可用。

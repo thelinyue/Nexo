@@ -55,9 +55,10 @@ ENV TZ=Asia/Shanghai \
     NEXO_CONTROL_ADDR=0.0.0.0:9890 \
     NEXO_CADDY_BIN=/usr/local/bin/caddy \
     NEXO_CADDY_ENABLED=true \
-    NEXO_TUNNEL_ADDR=0.0.0.0:9891
+    NEXO_TUNNEL_ADDR=0.0.0.0:9891 \
+    NEXO_UDP_ADDR=0.0.0.0:9891
 VOLUME ["/data/nexo"]
-EXPOSE 80 443 443/udp 8280 9890 9891 20000-29999
+EXPOSE 80 443 443/udp 8280 9890 9891 9891/udp 20000-29999 20000-29999/udp
 HEALTHCHECK --interval=10s --timeout=3s --start-period=20s --retries=6 \
   CMD curl --fail --silent http://127.0.0.1:8280/health >/dev/null || exit 1
 ENTRYPOINT ["/usr/local/bin/nexo-server"]

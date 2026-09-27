@@ -2,7 +2,7 @@
 //!
 //! 协议刻意只描述入网身份、心跳和 Tunnel Desired State，不携带路由
 //! 控制平面概念。Agent 身份负责认证，
-//! Tunnel 数据仍通过独立的 mTLS + Yamux 通道承载。
+//! TCP 数据通过 mTLS + Yamux 承载，UDP 数据通过独立 QUIC DATAGRAM 承载。
 
 use nexo_core::EnrollmentStatus;
 use serde::{Deserialize, Serialize};
@@ -40,7 +40,16 @@ pub struct TunnelDesiredState {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+/// 分协议应用结果；UDP 的 ready 只证明目标解析和 socket 配置成功，不证明应用健康。
+pub struct ProtocolStatus {
+    pub status: String,
+    pub error_message: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TunnelApplyResult {
+    #[serde(default)]
+    pub protocol_statuses: std::collections::BTreeMap<String, ProtocolStatus>,
     pub tunnel_id: String,
     pub revision: i64,
     pub applied: bool,
@@ -59,6 +68,8 @@ pub struct TunnelDataEndpoint {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AgentControlMessage {
     Hello {
+        #[serde(default)]
+        capabilities: Vec<String>,
         device_id: String,
         agent_version: String,
     },
@@ -90,6 +101,8 @@ pub enum ServerControlMessage {
         tunnels: Vec<TunnelDesiredState>,
         #[serde(default)]
         tunnel_endpoint: Option<TunnelDataEndpoint>,
+        #[serde(default)]
+        udp_endpoint: Option<TunnelDataEndpoint>,
     },
     HeartbeatAck {
         server_time: i64,
@@ -97,6 +110,8 @@ pub enum ServerControlMessage {
         tunnels: Vec<TunnelDesiredState>,
         #[serde(default)]
         tunnel_endpoint: Option<TunnelDataEndpoint>,
+        #[serde(default)]
+        udp_endpoint: Option<TunnelDataEndpoint>,
     },
     TunnelApplyAccepted {
         #[serde(default)]

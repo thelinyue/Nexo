@@ -11,7 +11,7 @@ test("网页类型包含 HTTP 和 HTTPS，内网 IPv6 地址单行展示并完�
   state.tunnels.push({ ...state.tunnels[0], id: "plain", name: "普通网页", protocol: "http", origin_protocol: "http" }, { ...state.tunnels[0], id: "tcp", name: "TCP 应用", protocol: "tcp" });
   await page.goto("/#/services");
   const filter = page.getByLabel("类型筛选");
-  await expect(filter.locator("option")).toHaveText(["全部类型", "网页服务", "TCP 服务"]);
+  await expect(filter.locator("option")).toHaveText(["全部类型", "网页服务", "TCP 服务", "UDP 服务", "TCP+UDP"]);
   await filter.selectOption("web");
   await expect(page.locator(".service-row")).toHaveCount(2);
   await expect(page.locator(".service-title .service-device")).toHaveText(["家庭 Agent", "家庭 Agent"]);

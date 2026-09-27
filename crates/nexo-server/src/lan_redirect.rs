@@ -72,11 +72,11 @@ pub fn prepare(
     id: &str,
     input: &mut TunnelInput,
 ) -> Result<(), ApiError> {
-    if input.protocol == "tcp" {
+    if nexo_tunnel::udp::is_port(&input.protocol) {
         if input.lan_redirect_enabled == Some(true) {
             return Err(ApiError::new(
                 StatusCode::BAD_REQUEST,
-                "TCP 服务不支持内网重定向",
+                "TCP/UDP 服务不支持内网重定向",
             ));
         }
         input.lan_redirect_enabled = Some(false);

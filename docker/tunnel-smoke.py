@@ -150,6 +150,7 @@ class Harness:
         self.server = self.launch("server", self.args.server_bin, {
             "NEXO_DATA_DIR": str(self.root / "server"), "NEXO_HTTP_ADDR": f"127.0.0.1:{self.ports['api']}",
             "NEXO_CONTROL_ADDR": f"127.0.0.1:{self.ports['control']}", "NEXO_TUNNEL_ADDR": f"127.0.0.1:{self.ports['data']}",
+            "NEXO_UDP_ADDR": f"127.0.0.1:{self.ports['data']}", "NEXO_UDP_ENDPOINT": f"127.0.0.1:{self.ports['data']}",
             "NEXO_TUNNEL_ENDPOINT": f"127.0.0.1:{self.ports['data']}", "NEXO_PUBLIC_BIND": "127.0.0.1",
             "NEXO_CADDY_BIN": str(Path(self.args.caddy_bin).resolve()), "NEXO_CADDY_ENABLED": "true",
             "NEXO_CADDY_ADMIN_URL": f"http://127.0.0.1:{self.ports['admin']}",

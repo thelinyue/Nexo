@@ -61,6 +61,31 @@ impl QuotaState {
     }
 }
 impl Quota {
+    /// 数据报不可截断。短锁内检查整包预算并同步提交，按实际提交载荷结算；
+    /// 与 TCP 写入共用锁，不需要持有跨 await 的预留额度，也不会多并发超支。
+    pub fn datagram(
+        &self,
+        length: usize,
+        cancel: &CancellationToken,
+        send: impl FnOnce() -> usize,
+    ) -> Option<usize> {
+        let mut state = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        state.refresh(unix_now());
+        let remaining = state
+            .limit
+            .map(|limit| limit.saturating_sub(state.used()))
+            .unwrap_or(u64::MAX);
+        if cancel.is_cancelled() || remaining == 0 || remaining < length as u64 {
+            return None;
+        }
+        let count = send().min(length);
+        let month = state.month;
+        *state.months.entry(month).or_default() += count as u64;
+        if state.exhausted() {
+            state.cancel.cancel();
+        }
+        Some(count)
+    }
     pub fn connection(&self) -> Option<CancellationToken> {
         let mut state = self.0.lock().unwrap_or_else(|e| e.into_inner());
         state.refresh(unix_now());

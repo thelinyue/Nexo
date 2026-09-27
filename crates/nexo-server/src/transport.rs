@@ -1,5 +1,6 @@
 //! mTLS 控制连接与 Yamux 数据面。公网端口/本机 Web 入口只打开已分配的服务，
 //! 每次开流再次校验设备、租户、配置版本；停用、修改和删除会取消既有连接。
+pub mod udp;
 use crate::{desired_tunnels, unix_now, AppState};
 use anyhow::{Context, Result};
 use futures_util::StreamExt;
@@ -63,6 +64,7 @@ struct DataSession {
     permits: Arc<Semaphore>,
 }
 struct ControlSession {
+    udp_capable: bool,
     sender: mpsc::Sender<ServerControlMessage>,
     cancel: CancellationToken,
     // 仅在 mTLS、设备身份和 Hello 全部通过后记录；连接替换或撤销时随会话清理。
@@ -70,6 +72,8 @@ struct ControlSession {
 }
 #[derive(Default)]
 struct Connections {
+    udp: HashMap<String, Arc<nexo_tunnel::udp::Peer>>,
+    udp_listeners: HashMap<String, Listener>,
     data: HashMap<String, DataSession>,
     control: HashMap<String, ControlSession>,
     listeners: HashMap<String, Listener>,
@@ -77,6 +81,7 @@ struct Connections {
 
 /// 监听器与连接的拥有者：协调串行化，连接任务使用取消令牌，不靠数据库标记假装关闭。
 pub struct Runtime {
+    udp_budget: nexo_tunnel::udp::Budget,
     pub traffic: crate::traffic::Collector,
     pub quotas: crate::traffic::quota::Manager,
     transfers: TaskTracker,
@@ -88,6 +93,7 @@ pub struct Runtime {
 impl Runtime {
     pub fn new(bind: IpAddr) -> Self {
         Self {
+            udp_budget: Default::default(),
             traffic: crate::traffic::Collector::default(),
             quotas: crate::traffic::quota::Manager::default(),
             transfers: TaskTracker::new(),
@@ -115,8 +121,9 @@ impl Runtime {
         for (device, session) in &connections.control {
             let message = ServerControlMessage::HeartbeatAck {
                 server_time: unix_now(),
-                tunnels: desired_tunnels(state, device)?,
+                tunnels: desired_for(state, device, session.udp_capable)?,
                 tunnel_endpoint: state.tunnel_endpoint.clone(),
+                udp_endpoint: state.udp_endpoint.clone(),
             };
             if session.sender.try_send(message).is_err() {
                 session.cancel.cancel();
@@ -129,6 +136,12 @@ impl Runtime {
         self.stop.cancel();
         let _guard = self.reconcile_lock.lock().await;
         let mut connections = self.connections.lock().await;
+        for (_, listener) in connections.udp_listeners.drain() {
+            stop_listener(listener).await;
+        }
+        for (_, peer) in connections.udp.drain() {
+            peer.connection.close(0u32.into(), b"shutdown");
+        }
         for (_, listener) in connections.listeners.drain() {
             stop_listener(listener).await;
         }
@@ -155,6 +168,7 @@ impl Runtime {
     ) -> Result<T, crate::ApiError> {
         let mut connections = self.connections.lock().await;
         let result = change()?;
+        udp::disconnect(&mut connections, device);
         if let Some(session) = connections.control.remove(device) {
             session.cancel.cancel();
         }
@@ -173,11 +187,23 @@ impl Runtime {
         let mut connections = self.connections.lock().await;
         let (devices, services) = change()?;
         for device in &devices {
+            udp::disconnect(&mut connections, device);
             if let Some(session) = connections.control.remove(device) {
                 session.cancel.cancel();
             }
             if let Some(session) = connections.data.remove(device) {
                 session.cancel.cancel();
+            }
+        }
+        let udp_ids = connections
+            .udp_listeners
+            .iter()
+            .filter(|(id, l)| services.contains(id) || devices.contains(&l.service.device))
+            .map(|(id, _)| id.clone())
+            .collect::<Vec<_>>();
+        for id in udp_ids {
+            if let Some(l) = connections.udp_listeners.remove(&id) {
+                stop_listener(l).await;
             }
         }
         let listeners = connections
@@ -256,6 +282,15 @@ impl Runtime {
             (services, devices)
         };
         let mut connections = self.connections.lock().await;
+        let udp_stale = connections
+            .udp
+            .keys()
+            .filter(|id| !devices.contains(id) || !connections.control.contains_key(*id))
+            .cloned()
+            .collect::<Vec<_>>();
+        for id in udp_stale {
+            udp::disconnect(&mut connections, &id);
+        }
         connections.control.retain(|id, session| {
             if !devices.contains(id) {
                 session.cancel.cancel();
@@ -285,8 +320,9 @@ impl Runtime {
                 stop_listener(listener).await;
             }
         }
+        let udp_failures = udp::reconcile(state, &mut connections, &wanted).await;
         let mut failures = HashMap::new();
-        for service in wanted {
+        for service in wanted.iter().filter(|s| s.protocol != "udp").cloned() {
             if connections.listeners.contains_key(&service.id) {
                 continue;
             }
@@ -307,14 +343,15 @@ impl Runtime {
         let online = connections.control.keys().cloned().collect::<Vec<_>>();
         let data = connections.data.keys().cloned().collect::<Vec<_>>();
         drop(connections);
-        refresh_status(state, &listeners, &online, &data, &failures)?;
+        let tcp_states = refresh_status(state, &listeners, &online, &data, &failures)?;
+        udp::refresh_status(state, &udp_failures, tcp_states).await?;
         crate::reverse_proxy::refresh_status(state)?;
         Ok(())
     }
 
     async fn listen(&self, state: &AppState, service: Service) -> Result<Listener> {
         let cancel = self.stop.child_token();
-        if service.protocol == "tcp" {
+        if matches!(service.protocol.as_str(), "tcp" | "tcp_udp") {
             let listener =
                 TcpListener::bind((self.bind, service.port.context("TCP 服务没有公网端口")?))
                     .await?;
@@ -470,9 +507,12 @@ fn authenticated_device(
         .peer_certificates()
         .and_then(|chain| chain.first())
         .context("连接缺少 Agent 证书")?;
-    let fingerprint = hex::encode(Sha256::digest(cert.as_ref()));
-    let (_, parsed) = x509_parser::parse_x509_certificate(cert.as_ref())
-        .map_err(|_| anyhow::anyhow!("设备证书无效"))?;
+    authenticated_certificate(state, cert.as_ref())
+}
+fn authenticated_certificate(state: &AppState, cert: &[u8]) -> Result<(String, String)> {
+    let fingerprint = hex::encode(Sha256::digest(cert));
+    let (_, parsed) =
+        x509_parser::parse_x509_certificate(cert).map_err(|_| anyhow::anyhow!("设备证书无效"))?;
     let device = parsed
         .subject()
         .iter_common_name()
@@ -530,6 +570,7 @@ async fn control_session(
     let AgentControlMessage::Hello {
         device_id,
         agent_version,
+        capabilities,
     } = serde_json::from_str(&first)?
     else {
         anyhow::bail!("Agent 首帧必须是 Hello");
@@ -552,16 +593,18 @@ async fn control_session(
         if let Some(previous) = connections.control.insert(
             device.clone(),
             ControlSession {
+                udp_capable: capabilities.iter().any(|c| c == "udp-v1"),
                 sender: sender.clone(),
                 cancel: cancel.clone(),
                 public_ipv4: public_ipv4(peer),
             },
         ) {
             previous.cancel.cancel();
+            udp::disconnect(&mut connections, &device);
         }
     }
     let result: Result<()> = async {
-        write_message(&mut write, &ServerControlMessage::HelloAccepted { server_time: unix_now(), tunnels: desired_tunnels(&state, &device)?, tunnel_endpoint: state.tunnel_endpoint.clone() }).await?;
+        write_message(&mut write, &ServerControlMessage::HelloAccepted { server_time: unix_now(), tunnels: desired_for(&state, &device, capabilities.iter().any(|c| c == "udp-v1"))?, tunnel_endpoint: state.tunnel_endpoint.clone(), udp_endpoint: state.udp_endpoint.clone() }).await?;
         let deadline = tokio::time::sleep(Duration::from_secs(45)); tokio::pin!(deadline);
         loop { tokio::select! {
             _ = cancel.cancelled() => break,
@@ -574,7 +617,7 @@ async fn control_session(
                     AgentControlMessage::Heartbeat { device_id, agent_version } => {
                         anyhow::ensure!(device_id == device, "心跳设备 ID 与证书不一致");
                         state.db.lock().map_err(|_| anyhow::anyhow!("数据库锁不可用"))?.execute("UPDATE devices SET last_seen_at=?1,agent_version=?2 WHERE id=?3", params![unix_now(),agent_version,device])?;
-                        write_message(&mut write, &ServerControlMessage::HeartbeatAck { server_time: unix_now(), tunnels: desired_tunnels(&state, &device)?, tunnel_endpoint: state.tunnel_endpoint.clone() }).await?;
+                        write_message(&mut write, &ServerControlMessage::HeartbeatAck { server_time: unix_now(), tunnels: desired_for(&state, &device, capabilities.iter().any(|c| c == "udp-v1"))?, tunnel_endpoint: state.tunnel_endpoint.clone(), udp_endpoint: state.udp_endpoint.clone() }).await?;
                     }
                     AgentControlMessage::TunnelApplyReport { results } => {
                         let ids = apply_results(&state, &device, results)?;
@@ -613,6 +656,7 @@ async fn control_session(
         .is_some_and(|current| current.sender.same_channel(&sender))
     {
         connections.control.remove(&device);
+        udp::disconnect(&mut connections, &device);
         if let Some(session) = connections.data.remove(&device) {
             session.cancel.cancel();
         }
@@ -623,6 +667,23 @@ async fn control_session(
             .execute("UPDATE devices SET status='offline' WHERE id=?1", [&device])?;
     }
     result
+}
+
+fn desired_for(
+    state: &AppState,
+    device: &str,
+    udp_capable: bool,
+) -> Result<Vec<nexo_protocol::TunnelDesiredState>> {
+    let mut tunnels = desired_tunnels(state, device)?;
+    if !udp_capable {
+        tunnels.retain(|t| t.protocol != "udp");
+        for tunnel in &mut tunnels {
+            if tunnel.protocol == "tcp_udp" {
+                tunnel.protocol = "tcp".into();
+            }
+        }
+    }
+    Ok(tunnels)
 }
 
 fn apply_results(
@@ -636,12 +697,28 @@ fn apply_results(
         .map_err(|_| anyhow::anyhow!("数据库锁不可用"))?;
     let tx = db.unchecked_transaction()?;
     let mut accepted = Vec::new();
-    for report in results {
+    for mut report in results {
+        report.protocol_statuses.retain(|protocol, status| {
+            protocol == "udp" && matches!(status.status.as_str(), "ready" | "failed" | "disabled")
+        });
+        for status in report.protocol_statuses.values_mut() {
+            status.error_message = status
+                .error_message
+                .take()
+                .map(|message| message.chars().take(512).collect());
+        }
         if !matches!(report.status.as_str(), "ready" | "failed" | "disabled") {
             continue;
         }
         let changed = tx.execute("INSERT INTO tunnel_applied_states (tunnel_id,revision,status,error_message,updated_at) SELECT id,?1,?2,?3,?4 FROM tunnels WHERE service_mode='tunnel' AND id=?5 AND device_id=?6 AND apply_revision=?1 AND deleted_at IS NULL AND (enabled=1 OR ?2='disabled') ON CONFLICT(tunnel_id) DO UPDATE SET revision=excluded.revision,status=excluded.status,error_message=excluded.error_message,updated_at=excluded.updated_at", params![report.revision,if report.applied { report.status.as_str() } else { "failed" },report.error_message.map(|s| s.chars().take(512).collect::<String>()),unix_now(),report.tunnel_id,device])?;
         if changed > 0 {
+            tx.execute(
+                "UPDATE tunnel_applied_states SET protocol_statuses=?1 WHERE tunnel_id=?2",
+                params![
+                    serde_json::to_string(&report.protocol_statuses)?,
+                    report.tunnel_id
+                ],
+            )?;
             accepted.push(report.tunnel_id);
         }
     }
@@ -735,7 +812,7 @@ fn refresh_status(
     online: &[String],
     data: &[String],
     failures: &HashMap<String, String>,
-) -> Result<()> {
+) -> Result<HashMap<String, (i64, nexo_protocol::ProtocolStatus)>> {
     let rows = {
         let db = state
             .db
@@ -762,6 +839,7 @@ fn refresh_status(
             .collect::<rusqlite::Result<Vec<_>>>()?;
         rows
     };
+    let mut combined = HashMap::new();
     for (
         id,
         device,
@@ -805,7 +883,7 @@ fn refresh_status(
                 "failed",
                 Some(applied_error.unwrap_or_else(|| "本地服务无法连接".into())),
             )
-        } else if protocol != "tcp" {
+        } else if !nexo_tunnel::udp::is_port(&protocol) {
             let runtime = state
                 .domain_runtime
                 .status(domain_id.as_deref().unwrap_or_default());
@@ -848,9 +926,23 @@ fn refresh_status(
         } else {
             ("ready", None)
         };
-        state.db.lock().map_err(|_| anyhow::anyhow!("数据库锁不可用"))?.execute("UPDATE tunnels SET apply_status=?1,apply_error=?2 WHERE id=?3 AND apply_revision=?4 AND deleted_at IS NULL", params![status,error,id,revision])?;
+        // 组合服务只写入聚合后的状态，避免两次落库之间短暂把部分可用误报为全部可用。
+        if nexo_tunnel::udp::has_udp(&protocol) {
+            combined.insert(
+                id,
+                (
+                    revision,
+                    nexo_protocol::ProtocolStatus {
+                        status: status.into(),
+                        error_message: error,
+                    },
+                ),
+            );
+            continue;
+        }
+        state.db.lock().map_err(|_| anyhow::anyhow!("数据库锁不可用"))?.execute("UPDATE tunnels SET apply_status=?1,apply_error=?2,protocol_statuses='{}' WHERE id=?3 AND apply_revision=?4 AND deleted_at IS NULL", params![status,error,id,revision])?;
     }
-    Ok(())
+    Ok(combined)
 }
 
 #[cfg(test)]
@@ -919,6 +1011,7 @@ mod tests {
         write_message(
             client,
             &AgentControlMessage::Hello {
+                capabilities: vec![],
                 device_id: device.into(),
                 agent_version: "test".into(),
             },
@@ -1014,6 +1107,7 @@ mod tests {
         write_message(
             &mut client,
             &AgentControlMessage::Hello {
+                capabilities: vec![],
                 device_id: "foreign".into(),
                 agent_version: "test".into(),
             },
@@ -1081,6 +1175,7 @@ mod tests {
         write_message(
             &mut new,
             &AgentControlMessage::Hello {
+                capabilities: vec![],
                 device_id: "mine".into(),
                 agent_version: "test".into(),
             },
@@ -1097,14 +1192,98 @@ mod tests {
         test_session_finished(old_task).await.unwrap();
     }
 
+    async fn test_udp_connection(
+        state: &AppState,
+        config: &rustls::ClientConfig,
+    ) -> (quinn::Endpoint, quinn::Endpoint, quinn::Connection) {
+        let server = quinn::Endpoint::server(
+            nexo_tunnel::udp::server_config(&state.authority.server_config()).unwrap(),
+            "127.0.0.1:0".parse().unwrap(),
+        )
+        .unwrap();
+        let mut client = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+        client.set_default_client_config(nexo_tunnel::udp::client_config(config).unwrap());
+        let (outgoing, incoming) = tokio::join!(
+            client
+                .connect(
+                    server.local_addr().unwrap(),
+                    nexo_tunnel::identity::SERVER_NAME
+                )
+                .unwrap(),
+            async { server.accept().await.unwrap().await.unwrap() }
+        );
+        let certs = incoming
+            .peer_identity()
+            .unwrap()
+            .downcast::<Vec<rustls::pki_types::CertificateDer<'static>>>()
+            .unwrap();
+        let (device, _) = authenticated_certificate(state, certs[0].as_ref()).unwrap();
+        state
+            .tunnel_runtime
+            .connections
+            .lock()
+            .await
+            .udp
+            .insert(device, nexo_tunnel::udp::Peer::new(incoming));
+        (server, client, outgoing.unwrap())
+    }
+
+    #[test]
+    fn old_agent_receives_tcp_part_without_udp_and_keeps_revision() {
+        let (state, _) = crate::tests::domain_fixture();
+        populate(&state);
+        state.db.lock().unwrap().execute_batch("UPDATE tunnels SET protocol='tcp_udp' WHERE id='own'; INSERT INTO tunnels(id,tenant_id,device_id,name,protocol,local_address,local_port,created_at,updated_at) VALUES('udp','default','mine','udp','udp','localhost',1234,0,0)").unwrap();
+        let old = desired_for(&state, "mine", false).unwrap();
+        assert_eq!(old.len(), 1);
+        assert_eq!(old[0].protocol, "tcp");
+        assert_eq!(old[0].revision, 2);
+        let new = desired_for(&state, "mine", true).unwrap();
+        assert_eq!(new.len(), 2);
+        assert!(new.iter().any(|t| t.protocol == "tcp_udp"));
+    }
+
+    #[test]
+    fn combined_status_is_not_published_before_udp_is_aggregated() {
+        let (state, _) = crate::tests::domain_fixture();
+        populate(&state);
+        state.db.lock().unwrap().execute_batch("UPDATE tunnels SET protocol='tcp_udp',apply_status='partial' WHERE id='own'; INSERT INTO tunnel_applied_states(tunnel_id,revision,status,updated_at) VALUES('own',2,'ready',0)").unwrap();
+        let listeners = HashMap::from([("own".into(), None)]);
+        let statuses = refresh_status(
+            &state,
+            &listeners,
+            &["mine".into()],
+            &["mine".into()],
+            &HashMap::new(),
+        )
+        .unwrap();
+        assert_eq!(statuses["own"].1.status, "ready");
+        let persisted: String = state
+            .db
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT apply_status FROM tunnels WHERE id='own'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            persisted, "partial",
+            "不能将 TCP 检查结果单独发布为组合服务状态"
+        );
+    }
+
     #[tokio::test]
     async fn cancellation_identity_recovery_and_removed_ownership_revoke_exits() {
         for reason in ["cancel", "identity", "workspace", "device", "tenant"] {
             let (state, _) = crate::tests::domain_fixture();
             populate(&state);
             let config = test_client_config(&state, "mine");
-            let (mut client, task) = test_control_connection(&state, config, "8.8.8.8").await;
+            let (mut client, task) =
+                test_control_connection(&state, config.clone(), "8.8.8.8").await;
             test_hello(&mut client, "mine").await;
+            let (_udp_server, _udp_client, udp_connection) =
+                test_udp_connection(&state, &config).await;
             assert_eq!(state.tunnel_runtime.agent_public_ipv4s().await.len(), 1);
             match reason {
                 "cancel" => state.tunnel_runtime.connections.lock().await.control["mine"]
@@ -1144,6 +1323,16 @@ mod tests {
                 "{reason}"
             );
             test_session_finished(task).await.unwrap();
+            tokio::time::timeout(Duration::from_secs(3), udp_connection.closed())
+                .await
+                .expect("撤销必须关闭 UDP 通道");
+            assert!(!state
+                .tunnel_runtime
+                .connections
+                .lock()
+                .await
+                .udp
+                .contains_key("mine"));
             state.tunnel_runtime.shutdown().await;
         }
     }
@@ -1158,6 +1347,7 @@ mod tests {
         let (state, _) = crate::tests::domain_fixture();
         populate(&state);
         let report = |id: &str, revision| TunnelApplyResult {
+            protocol_statuses: Default::default(),
             tunnel_id: id.into(),
             revision,
             applied: true,

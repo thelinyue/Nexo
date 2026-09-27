@@ -11,6 +11,7 @@ tokio-rustls.workspace = true
 tokio-util.workspace = true
 yamux.workspace = true
 anyhow.workspace = true
+quinn.workspace = true
 argon2.workspace = true
 chacha20poly1305 = "0.10"
 rand.workspace = true

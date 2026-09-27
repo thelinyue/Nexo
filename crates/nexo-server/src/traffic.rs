@@ -44,7 +44,7 @@ impl Bytes {
 #[derive(Default)]
 pub struct Meter(Mutex<BTreeMap<i64, Bytes>>);
 impl Meter {
-    fn record(&self, now: i64, origin: bool, count: usize) {
+    pub(crate) fn record(&self, now: i64, origin: bool, count: usize) {
         let mut buckets = self.0.lock().unwrap_or_else(|e| e.into_inner());
         let bytes = buckets.entry(now / 60 * 60).or_default();
         if origin {

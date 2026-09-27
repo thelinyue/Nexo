@@ -1,6 +1,6 @@
 # Nexo v0.2.0 穿透验收
 
-当前产品只覆盖 TCP、HTTP、HTTPS 三种内网穿透。验收以服务页、Agent 控制连接、公网域名和证书状态为中心，不依赖额外客户端或虚拟网卡。
+当前产品只覆盖 TCP、UDP、TCP+UDP、HTTP、HTTPS 内网穿透。验收以服务页、Agent 控制连接、公网域名和证书状态为中心，不依赖额外客户端或虚拟网卡。
 
 ## 场景
 
@@ -78,3 +78,11 @@ NEXO_TEST_CADDY_BIN=/usr/local/bin/caddy cargo test -p nexo-server real_caddy --
 ```
 
 包含相同 JSON 强制重载文件凭据、两种新版 Token 装配、无效候选配置保留旧 Applied 文件测试，不使用真实 Token、不访问 Cloudflare 或公网 CA。公网 DNS-01/HTTP-01 仍需在受控真实域名和 ACME staging 环境中单独验收。
+
+## UDP 真实进程验收
+
+```sh
+python docker/udp-smoke.py --server-bin target/debug/nexo-server --agent-bin target/debug/nexo-agent --report udp-report.json
+```
+
+Windows 二进制加 `.exe`。脚本使用独立临时数据目录和回环端口，不依赖 Caddy；验证 TCP+UDP 同端口、零长度/大数据报、多客户端隔离、1–1024 会话资源用量、UDP 阻断时 TCP 保留、自动恢复和重启。追加 `--idle` 可执行 1/5/15 分钟的真实空闲与恢复验收。真实 RDP 协商与公网丢包体验需在实际环境单独验证。

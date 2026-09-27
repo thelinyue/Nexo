@@ -1123,7 +1123,7 @@ pub(crate) mod tests {
                 [invite["id"].as_str().unwrap()],
             )
             .unwrap();
-            db.execute_batch("INSERT INTO devices(id,tenant_id,name,created_at,updated_at) VALUES('a','alice','Agent',0,0); INSERT INTO device_identities VALUES('a','secret',0); INSERT INTO tunnels(id,tenant_id,device_id,name,protocol,local_address,local_port,created_at,updated_at) VALUES('t','alice','a','service','tcp','127.0.0.1',80,0,0); INSERT INTO tunnel_applied_states VALUES('t',1,'ready',NULL,0);").unwrap();
+            db.execute_batch("INSERT INTO devices(id,tenant_id,name,created_at,updated_at) VALUES('a','alice','Agent',0,0); INSERT INTO device_identities VALUES('a','secret',0); INSERT INTO tunnels(id,tenant_id,device_id,name,protocol,local_address,local_port,created_at,updated_at) VALUES('t','alice','a','service','tcp','127.0.0.1',80,0,0); INSERT INTO tunnel_applied_states(tunnel_id,revision,status,error_message,updated_at) VALUES('t',1,'ready',NULL,0);").unwrap();
             db.execute("INSERT INTO public_domain_runtime_events(tenant_id,public_domain_id,summary,occurred_at) VALUES('alice',?1,'loaded',0)", [&domain.id]).unwrap();
         }
         let (url, task) = serve(state.clone()).await;

@@ -1,9 +1,9 @@
 //! Nexo 公网 Tunnel 的数据面协议基础。
 //!
-//! 数据通道固定为 TLS（由 Server/Agent 负责 mTLS）之上的 Yamux。Yamux
+//! TCP 数据通道使用 TLS（由 Server/Agent 负责 mTLS）之上的 Yamux。Yamux
 //! 负责多路复用，第一帧使用长度前缀 JSON 携带受限的 Tunnel/连接标识，
-//! 后续字节原样转发到 Agent 本地 TCP 服务。这里不实现 UDP、TLS passthrough
-//! 或应用层认证，保持公网访问入口与应用数据面的边界清晰。
+//! 后续字节原样转发到 Agent 本地 TCP 服务。UDP 独立使用带设备认证的 QUIC
+//! DATAGRAM；这里不实现应用层认证，保持公网入口与应用数据面的边界清晰。
 
 use std::{io, task::Poll, time::Duration};
 
@@ -15,6 +15,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio_util::compat::{Compat, FuturesAsyncReadCompatExt, TokioAsyncReadCompatExt};
 
 pub mod identity;
+pub mod udp;
 
 pub const PROTOCOL_VERSION: u8 = 2;
 pub const MAX_HEADER_BYTES: usize = 8 * 1024;
@@ -41,6 +42,9 @@ pub fn configure_tunnel_tcp_keepalive(stream: &tokio::net::TcpStream) -> io::Res
 #[serde(rename_all = "lowercase")]
 pub enum TunnelProtocol {
     Tcp,
+    Udp,
+    #[serde(rename = "tcp_udp")]
+    TcpUdp,
     Http,
     Https,
 }
@@ -49,6 +53,8 @@ impl TunnelProtocol {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Tcp => "tcp",
+            Self::Udp => "udp",
+            Self::TcpUdp => "tcp_udp",
             Self::Http => "http",
             Self::Https => "https",
         }
@@ -254,6 +260,12 @@ mod tests {
     fn protocol_names_are_stable() {
         assert_eq!(TunnelProtocol::Tcp.as_str(), "tcp");
         assert_eq!(TunnelProtocol::Https.as_str(), "https");
+        assert_eq!(TunnelProtocol::Udp.as_str(), "udp");
+        assert_eq!(TunnelProtocol::TcpUdp.as_str(), "tcp_udp");
+        assert_eq!(
+            serde_json::to_string(&TunnelProtocol::TcpUdp).unwrap(),
+            "\"tcp_udp\""
+        );
     }
 
     #[tokio::test]

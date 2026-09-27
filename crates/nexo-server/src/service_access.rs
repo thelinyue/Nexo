@@ -89,10 +89,10 @@ pub fn prepare(
         return Err(ApiError::new(StatusCode::BAD_REQUEST, "访问规则无效"));
     }
     if mode == "password" {
-        if input.protocol == "tcp" {
+        if nexo_tunnel::udp::is_port(&input.protocol) {
             return Err(ApiError::new(
                 StatusCode::BAD_REQUEST,
-                "TCP 服务不支持认证访问",
+                "TCP/UDP 服务不支持认证访问",
             ));
         }
         if hash.is_none() && previous.as_ref().and_then(|p| p.1.as_ref()).is_none() {

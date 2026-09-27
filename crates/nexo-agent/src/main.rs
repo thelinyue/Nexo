@@ -18,6 +18,7 @@ use tokio_util::codec::{FramedRead, LinesCodec};
 mod certificate;
 #[cfg(test)]
 mod origin_tests;
+mod udp;
 
 #[derive(Debug, Parser)]
 #[command(name = "nexo-agent", about = "Nexo 内网穿透 Agent")]
@@ -53,6 +54,7 @@ struct EnrollmentKey {
 }
 #[derive(Clone, PartialEq, Eq)]
 struct Desired {
+    udp_endpoint: Option<TunnelDataEndpoint>,
     endpoint: TunnelDataEndpoint,
     tunnels: Vec<TunnelDesiredState>,
 }
@@ -368,6 +370,7 @@ async fn run_control(
     write_message(
         &mut write,
         &AgentControlMessage::Hello {
+            capabilities: vec!["udp-v1".into()],
             device_id: device.clone(),
             agent_version: config.agent_version.clone(),
         },
@@ -379,6 +382,7 @@ async fn run_control(
         server_name: SERVER_NAME.into(),
     };
     let (desired, receiver) = watch::channel(Desired {
+        udp_endpoint: None,
         endpoint: fallback.clone(),
         tunnels: Vec::new(),
     });
@@ -420,10 +424,10 @@ async fn run_control(
                 let line = incoming.context("Server 控制通道已关闭")??;
                 deadline.as_mut().reset(tokio::time::Instant::now()+Duration::from_secs(45));
                 match serde_json::from_str::<ServerControlMessage>(&line)? {
-                    ServerControlMessage::HelloAccepted { tunnels,tunnel_endpoint,.. } | ServerControlMessage::HeartbeatAck { tunnels,tunnel_endpoint,.. } => {
-                        let next = Desired { endpoint: tunnel_endpoint.unwrap_or_else(||fallback.clone()),tunnels:tunnels.clone() };
+                    ServerControlMessage::HelloAccepted { tunnels,tunnel_endpoint,udp_endpoint,.. } | ServerControlMessage::HeartbeatAck { tunnels,tunnel_endpoint,udp_endpoint,.. } => {
+                        let next = Desired { udp_endpoint: udp_endpoint.map(|mut endpoint| { if endpoint.address.is_empty() { endpoint.address = env::var("NEXO_UDP_ENDPOINT").unwrap_or_else(|_| fallback.address.clone()); } endpoint }), endpoint: tunnel_endpoint.unwrap_or_else(||fallback.clone()),tunnels:tunnels.clone() };
                         if *desired.borrow() != next { desired.send_replace(next); }
-                        if !accepted { accepted=true; data_tasks.spawn(run_data(connector_updates.clone(),receiver.clone())); }
+                        if !accepted { accepted=true; data_tasks.spawn(run_data(connector_updates.clone(),receiver.clone())); data_tasks.spawn(udp::run(connector_updates.clone(),receiver.clone())); }
                         probes.abort_all();
                         probes.spawn(probe_tunnels(tunnels));
                     },
@@ -521,7 +525,10 @@ trait OriginIo: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send {}
 impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send> OriginIo for T {}
 async fn connect_origin(tunnel: &TunnelDesiredState) -> Result<Box<dyn OriginIo>> {
     anyhow::ensure!(
-        matches!(tunnel.protocol.as_str(), "tcp" | "http" | "https"),
+        matches!(
+            tunnel.protocol.as_str(),
+            "tcp" | "tcp_udp" | "http" | "https"
+        ),
         "服务协议不受支持"
     );
     let address = tunnel.local_address.trim_matches(['[', ']']);
@@ -533,7 +540,9 @@ async fn connect_origin(tunnel: &TunnelDesiredState) -> Result<Box<dyn OriginIo>
     .context("连接本地服务超时")?
     .context("无法连接本地服务")?;
     // 公网 HTTPS 不等于本地 HTTPS，只有明确的回源配置才建立第二层 TLS。
-    if tunnel.protocol == "tcp" || tunnel.origin_protocol.as_deref().unwrap_or("http") == "http" {
+    if matches!(tunnel.protocol.as_str(), "tcp" | "tcp_udp")
+        || tunnel.origin_protocol.as_deref().unwrap_or("http") == "http"
+    {
         return Ok(Box::new(stream));
     }
     anyhow::ensure!(
@@ -592,12 +601,37 @@ async fn probe_tunnels(tunnels: Vec<TunnelDesiredState>) -> Vec<TunnelApplyResul
         let permits = permits.clone();
         tasks.spawn(async move {
             let _permit = permits.acquire_owned().await.expect("探测许可未关闭");
-            let result = if tunnel.enabled {
+            let mut protocol_statuses = std::collections::BTreeMap::new();
+            if nexo_tunnel::udp::has_udp(&tunnel.protocol) {
+                let result = if tunnel.enabled {
+                    nexo_tunnel::udp::origin(&tunnel.local_address, tunnel.local_port)
+                        .await
+                        .map(|_| ())
+                } else {
+                    Ok(())
+                };
+                protocol_statuses.insert(
+                    "udp".into(),
+                    nexo_protocol::ProtocolStatus {
+                        status: if !tunnel.enabled {
+                            "disabled"
+                        } else if result.is_ok() {
+                            "ready"
+                        } else {
+                            "failed"
+                        }
+                        .into(),
+                        error_message: result.err().map(|e| format!("UDP 内网目标配置失败：{e:#}")),
+                    },
+                );
+            }
+            let result = if tunnel.enabled && tunnel.protocol != "udp" {
                 connect_origin(&tunnel).await.map(|_| ())
             } else {
                 Ok(())
             };
             TunnelApplyResult {
+                protocol_statuses,
                 tunnel_id: tunnel.tunnel_id,
                 revision: tunnel.revision,
                 applied: result.is_ok(),

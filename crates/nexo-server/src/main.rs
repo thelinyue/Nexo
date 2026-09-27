@@ -45,6 +45,7 @@ mod security;
 mod service_access;
 mod traffic;
 mod transport;
+mod udp_schema;
 use enrollment::{agent_enroll, agent_poll, approve_enrollment};
 
 #[derive(Debug, Parser)]
@@ -79,6 +80,7 @@ pub(crate) struct AppState {
     pub(crate) domain_runtime: Arc<domain_runtime::DomainRuntimeManager>,
     pub(crate) domain_access: Arc<domain_access::Runtime>,
     pub(crate) control_addr: String,
+    pub(crate) udp_endpoint: Option<TunnelDataEndpoint>,
     pub(crate) tunnel_endpoint: Option<TunnelDataEndpoint>,
     pub(crate) authority: Arc<identity_runtime::AuthorityRuntime>,
     pub(crate) tunnel_runtime: Arc<transport::Runtime>,
@@ -168,6 +170,8 @@ struct ApproveEnrollment {
 }
 #[derive(Debug, Serialize, Deserialize)]
 struct Tunnel {
+    #[serde(default)]
+    protocol_statuses: std::collections::BTreeMap<String, nexo_protocol::ProtocolStatus>,
     access_mode: String,
     service_mode: String,
     id: String,
@@ -291,6 +295,10 @@ async fn main() -> Result<()> {
         )),
         data_dir,
         control_addr: env::var("NEXO_CONTROL_ADDR").unwrap_or_else(|_| "0.0.0.0:9890".to_owned()),
+        udp_endpoint: Some(TunnelDataEndpoint {
+            address: env::var("NEXO_UDP_ENDPOINT").unwrap_or_default(),
+            server_name: nexo_tunnel::identity::SERVER_NAME.into(),
+        }),
         tunnel_endpoint: env::var("NEXO_TUNNEL_ENDPOINT")
             .ok()
             .map(|address| TunnelDataEndpoint {
@@ -310,6 +318,12 @@ async fn main() -> Result<()> {
         TcpListener::bind(env::var("NEXO_TUNNEL_ADDR").unwrap_or_else(|_| "0.0.0.0:9891".into()))
             .await
             .context("无法监听 Tunnel mTLS 数据端口")?;
+    let udp_state = state.clone();
+    let udp_task = tokio::spawn(async move {
+        if let Err(error) = transport::udp::serve(udp_state).await {
+            tracing::error!("UDP 数据监听停止：{error:#}");
+        }
+    });
     let control_task = tokio::spawn(transport::serve(state.clone(), control_listener, false));
     let data_task = tokio::spawn(transport::serve(state.clone(), data_listener, true));
     let transport_task = tokio::spawn(transport::Runtime::run(state.clone()));
@@ -340,6 +354,7 @@ async fn main() -> Result<()> {
     identity_task.abort();
     let _ = control_task.await;
     let _ = data_task.await;
+    let _ = udp_task.await;
     tunnel_runtime.finish_transfers().await;
     traffic_task.abort();
     let _ = traffic_task.await;
@@ -518,6 +533,7 @@ fn initialize_database(connection: &Connection, is_new: bool) -> Result<()> {
         reverse_proxy::initialize_schema(connection)?;
         lan_redirect::initialize_schema(connection)?;
         service_access::initialize_schema(connection)?;
+        udp_schema::initialize(connection)?;
         traffic::initialize_schema(connection)?;
         return domains::initialize_schema(connection);
     }
@@ -528,6 +544,7 @@ fn initialize_database(connection: &Connection, is_new: bool) -> Result<()> {
     reverse_proxy::initialize_schema(connection)?;
     lan_redirect::initialize_schema(connection)?;
     service_access::initialize_schema(connection)?;
+    udp_schema::initialize(connection)?;
     traffic::initialize_schema(connection)?;
     domains::initialize_schema(connection)
 }
@@ -1120,7 +1137,7 @@ fn query_tunnels(
         .get(axum::http::header::HOST)
         .and_then(|value| value.to_str().ok())
         .and_then(|host| host.parse::<axum::http::uri::Authority>().ok());
-    let sql="SELECT t.id,t.tenant_id,t.device_id,d.name,t.name,t.protocol,t.local_address,t.local_port,t.public_port,t.hostname,t.enabled,t.apply_status,t.apply_error,t.apply_revision,t.public_domain_id,t.deleted_at,p.domain,t.lan_redirect_enabled,CASE WHEN t.protocol='tcp' THEN NULL ELSE COALESCE(t.origin_protocol,'http') END,t.service_mode,t.access_mode FROM tunnels t LEFT JOIN devices d ON d.id=t.device_id LEFT JOIN public_domains p ON p.id=t.public_domain_id WHERE t.tenant_id=?1 AND t.deleted_at IS NULL AND (?2 IS NULL OR t.id=?2) ORDER BY t.created_at DESC";
+    let sql="SELECT t.id,t.tenant_id,t.device_id,d.name,t.name,t.protocol,t.local_address,t.local_port,t.public_port,t.hostname,t.enabled,t.apply_status,t.apply_error,t.apply_revision,t.public_domain_id,t.deleted_at,p.domain,t.lan_redirect_enabled,CASE WHEN t.protocol IN ('tcp','udp','tcp_udp') THEN NULL ELSE COALESCE(t.origin_protocol,'http') END,t.service_mode,t.access_mode,t.protocol_statuses FROM tunnels t LEFT JOIN devices d ON d.id=t.device_id LEFT JOIN public_domains p ON p.id=t.public_domain_id WHERE t.tenant_id=?1 AND t.deleted_at IS NULL AND (?2 IS NULL OR t.id=?2) ORDER BY t.created_at DESC";
     let mut q = connection.prepare(sql)?;
     let rows = q
         .query_map(params![tenant, only], |row| {
@@ -1128,7 +1145,7 @@ fn query_tunnels(
             let hostname: Option<String> = row.get(9)?;
             let protocol: String = row.get(5)?;
             let public_domain: Option<String> = row.get(16)?;
-            let public_address = if protocol == "tcp" {
+            let public_address = if nexo_tunnel::udp::is_port(&protocol) {
                 port.zip(authority.as_ref())
                     .map(|(port, authority)| format!("{}:{port}", authority.host()))
             } else {
@@ -1138,6 +1155,8 @@ fn query_tunnels(
                     .map(|(host, domain)| format!("{protocol}://{host}.{domain}"))
             };
             Ok(Tunnel {
+                protocol_statuses: serde_json::from_str(&row.get::<_, String>(21)?)
+                    .unwrap_or_default(),
                 access_mode: row.get(20)?,
                 service_mode: row.get(19)?,
                 id: row.get(0)?,
@@ -1174,7 +1193,7 @@ fn prepare_tunnel(
     validate_tunnel(input)?;
     // 先确定本次有效回源协议，随后重定向验证、持久化与 Agent 下发使用同一份值。
     // 旧客户端更新时省略字段必须保留已有 HTTPS，不能意外降级。
-    input.origin_protocol = if input.protocol == "tcp" {
+    input.origin_protocol = if nexo_tunnel::udp::is_port(&input.protocol) {
         None
     } else {
         Some(match input.origin_protocol.take() {
@@ -1202,14 +1221,14 @@ fn prepare_tunnel(
             ));
         }
     }
-    if input.protocol == "tcp" {
+    if nexo_tunnel::udp::is_port(&input.protocol) {
         input.hostname = None;
         input.public_domain_id = None;
         if input.public_port.is_none() {
-            input.public_port = db.query_row("SELECT public_port FROM tunnels WHERE id=?1 AND tenant_id=?2 AND protocol='tcp'",params![id,tenant],|r|r.get::<_,Option<u16>>(0)).optional().map_err(db_error)?.flatten();
+            input.public_port = db.query_row("SELECT public_port FROM tunnels WHERE id=?1 AND tenant_id=?2 AND protocol IN ('tcp','udp','tcp_udp')",params![id,tenant],|r|r.get::<_,Option<u16>>(0)).optional().map_err(db_error)?.flatten();
         }
         if input.public_port.is_none() {
-            let used = db.prepare("SELECT public_port FROM tunnels WHERE public_port IS NOT NULL AND deleted_at IS NULL").map_err(db_error)?.query_map([], |r|r.get::<_,u16>(0)).map_err(db_error)?.collect::<rusqlite::Result<std::collections::HashSet<_>>>().map_err(db_error)?;
+            let used = db.prepare("SELECT public_port FROM tunnels WHERE public_port IS NOT NULL AND deleted_at IS NULL AND id!=?2 AND (protocol=?1 OR protocol='tcp_udp' OR ?1='tcp_udp')").map_err(db_error)?.query_map(params![input.protocol,id], |r|r.get::<_,u16>(0)).map_err(db_error)?.collect::<rusqlite::Result<std::collections::HashSet<_>>>().map_err(db_error)?;
             input.public_port = (20000..=29999).find(|port| !used.contains(port));
         }
         if input.public_port.is_none_or(|port| port == 0) {
@@ -1218,7 +1237,7 @@ fn prepare_tunnel(
                 "没有可用公网端口，请指定有效端口",
             ));
         }
-        let occupied: bool = db.query_row("SELECT EXISTS(SELECT 1 FROM tunnels WHERE public_port=?1 AND id!=?2 AND deleted_at IS NULL)",params![input.public_port,id],|r|r.get(0)).map_err(db_error)?;
+        let occupied: bool = db.query_row("SELECT EXISTS(SELECT 1 FROM tunnels WHERE public_port=?1 AND id!=?2 AND deleted_at IS NULL AND (protocol=?3 OR protocol='tcp_udp' OR ?3='tcp_udp'))",params![input.public_port,id,input.protocol],|r|r.get(0)).map_err(db_error)?;
         if occupied {
             return Err(ApiError::new(
                 StatusCode::CONFLICT,
@@ -1281,10 +1300,13 @@ fn validate_tunnel(input: &TunnelInput) -> Result<(), ApiError> {
     if input.name.trim().is_empty() {
         return Err(ApiError::new(StatusCode::BAD_REQUEST, "服务名称不能为空"));
     }
-    if !matches!(input.protocol.as_str(), "tcp" | "http" | "https") {
+    if !matches!(
+        input.protocol.as_str(),
+        "tcp" | "udp" | "tcp_udp" | "http" | "https"
+    ) {
         return Err(ApiError::new(
             StatusCode::BAD_REQUEST,
-            "协议必须是 TCP、HTTP 或 HTTPS",
+            "协议必须是 TCP、UDP、TCP+UDP、HTTP 或 HTTPS",
         ));
     }
     if input
@@ -1449,6 +1471,7 @@ mod tests {
                 },
             )),
             control_addr: String::new(),
+            udp_endpoint: None,
             tunnel_endpoint: None,
         };
         let mut headers = HeaderMap::new();

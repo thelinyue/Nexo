@@ -10,6 +10,36 @@ fn set_limit(quota: &Quota, limit: Option<u64>) {
     state.refresh(unix_now());
 }
 
+#[tokio::test]
+async fn udp_atomic_budget_retains_partial_submission_and_shares_tcp_consumption() {
+    let (state, _) = crate::tests::domain_fixture();
+    let quota = state.tunnel_runtime.quotas.get(&state, "default").unwrap();
+    set_limit(&quota, Some(100));
+    let token = quota.connection().unwrap();
+    assert_eq!(
+        quota.datagram(101, &token, || panic!("余额不足不能发送部分数据报")),
+        None
+    );
+    assert_eq!(quota.datagram(80, &token, || 30), Some(30));
+    assert_eq!(quota.datagram(70, &token, || 0), Some(0));
+    assert_eq!(quota.view(unix_now()).used_bytes, 30);
+    let mut sink = tokio::io::sink();
+    let mut cx = TaskContext::from_waker(std::task::Waker::noop());
+    assert!(matches!(
+        quota.write(&mut sink, &mut cx, &[0; 20], &token),
+        Poll::Ready(Ok(20))
+    ));
+    assert_eq!(
+        quota.datagram(60, &token, || panic!("TCP 已消费预算")),
+        None
+    );
+    assert_eq!(quota.datagram(50, &token, || 50), Some(50));
+    assert!(token.is_cancelled());
+    assert_eq!(quota.view(unix_now()).used_bytes, 100);
+    set_limit(&quota, Some(200));
+    assert_eq!(quota.datagram(1, &token, || panic!("旧会话不得复活")), None);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn concurrent_tunnels_and_both_directions_share_exact_budget() {
     let (state, _) = crate::tests::domain_fixture();

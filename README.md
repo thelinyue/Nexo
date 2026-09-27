@@ -2,7 +2,7 @@
 
 **将内网服务发布到公网，集中管理访问入口。**
 
-Nexo 是一个自托管内网穿透平台，通过轻量 Agent 将内网 TCP、HTTP、HTTPS 服务发布到公网，提供可视化管理、独立工作空间、域名接入检查和自动 HTTPS 证书管理。适合访问家中或办公室的 Web 应用、开发服务和其他 TCP 服务。
+Nexo 是一个自托管内网穿透平台，通过轻量 Agent 将内网 TCP、UDP、HTTP、HTTPS 服务发布到公网，提供可视化管理、独立工作空间、域名接入检查和自动 HTTPS 证书管理。适合访问家中或办公室的 Web 应用、开发服务和远程桌面和其他 TCP/UDP 服务。
 
 [快速部署](#快速部署) · [发布第一个服务](#发布第一个服务) · [使用指南](https://github.com/thelinyue/Nexo/blob/master/docs/usage.md) · [容器与维护](https://github.com/thelinyue/Nexo/blob/master/docker/README.md) · [版本说明](https://github.com/thelinyue/Nexo/releases)
 
@@ -10,7 +10,7 @@ Nexo 是一个自托管内网穿透平台，通过轻量 Agent 将内网 TCP、H
 
 | 能力 | 说明 |
 | --- | --- |
-| TCP / HTTP / HTTPS | 配置本地目标、公网端口或域名，支持 WebSocket |
+| TCP / UDP / TCP+UDP / HTTP / HTTPS | 配置本地目标、公网端口或域名，支持 WebSocket |
 | 可视化管理 | 创建、编辑、启停服务，查看状态并复制访问地址 |
 | Agent 身份管理 | 共享密钥自动接入、mTLS 加密通道、证书自动续签与身份恢复 |
 | 多用户工作空间 | 邀请加入，分别管理 Agent、服务、域名和证书 |
@@ -20,7 +20,7 @@ Nexo 是一个自托管内网穿透平台，通过轻量 Agent 将内网 TCP、H
 
 ```mermaid
 flowchart LR
-    Visitor[公网访问者] -->|TCP / HTTP / HTTPS| Server[公网 Server]
+    Visitor[公网访问者] -->|TCP / UDP / HTTP / HTTPS| Server[公网 Server]
     Server <-->|mTLS 加密通道| Agent[内网 Agent]
     Agent --> App[内网应用]
     Admin[管理员 / 用户] -->|Web 管理入口| Server
@@ -32,7 +32,7 @@ Server 部署在公网可达的 Linux 主机上，提供管理页面和公网入
 
 - Server 和 Agent 的官方镜像支持 **Linux/amd64**；主机需安装 Docker Engine 和 Docker Compose v2。
 - Server 需要公网可达的地址。Agent 需能访问 Server 的管理 API、控制端口、数据端口及本地目标应用。
-- TCP 服务不需要域名；HTTP/HTTPS 服务需要自己拥有并能配置 DNS 的域名。
+- TCP/UDP 服务不需要域名；HTTP/HTTPS 服务需要自己拥有并能配置 DNS 的域名。
 - 默认使用 host 网络，先确认 Server 的相关端口没有被其他程序占用。同机反向代理与 Caddy 不能同时监听同一地址的 `80/443`，具体安排见 [容器说明](https://github.com/thelinyue/Nexo/blob/master/docker/README.md#管理入口与账号恢复)。
 
 | Server 端口 | 用途 | 访问要求 |
@@ -40,7 +40,8 @@ Server 部署在公网可达的 Linux 主机上，提供管理页面和公网入
 | TCP `8280` | Web 管理与入网 API | 初始化阶段限制为可信来源；公网使用时配置 HTTPS 反向代理 |
 | TCP `9890` / `9891` | Agent 控制 / Tunnel 数据 | 允许 Agent 访问；必须直连或 TCP 透传，不可中间终止 TLS |
 | TCP `80` / `443` | Web 服务与 HTTPS 证书验证 | 使用 Web Tunnel 时开放；HTTP-01 验证依赖标准端口 |
-| TCP `20000–29999` | TCP 服务公网端口池 | 开放实际分配端口；需要任意自动分配端口均可访问时再放行整个范围 |
+| TCP/UDP `20000–29999` | TCP/UDP 服务公网端口池 | 开放实际分配端口；需要任意自动分配端口均可访问时再放行整个范围 |
+| UDP `9891` | Agent QUIC 数据通道 | 使用 UDP 或 TCP+UDP 时开放，直连 Server；普通 HTTP 代理不支持 |
 | UDP `443` | HTTP/3 | 可选；普通 HTTPS 不要求此项 |
 
 **从 v0.1.x 切换：** 当前产品自 v0.2.0 起仅支持全新安装，不迁移旧版组网数据。请备份并保留旧目录、镜像和配置，给新 Server 与 Agent 使用空数据目录。检测到旧结构时 Server 会拒绝启动，不会转换或删除旧数据。
