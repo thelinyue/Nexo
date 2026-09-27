@@ -116,6 +116,7 @@ class Harness(base.Harness):
 
     def start_server(self):
         self.server = self.launch("server", self.args.server_bin, {
+            "NEXO_ADMIN_USERNAME": "admin", "NEXO_ADMIN_PASSWORD": "Test-udp-only-4821!",
             "NEXO_DATA_DIR": str(self.root / "server"), "NEXO_HTTP_ADDR": f"127.0.0.1:{self.ports['api']}",
             "NEXO_CONTROL_ADDR": f"127.0.0.1:{self.ports['control']}", "NEXO_TUNNEL_ADDR": f"127.0.0.1:{self.ports['data']}",
             "NEXO_TUNNEL_ENDPOINT": f"127.0.0.1:{self.ports['data']}", "NEXO_PUBLIC_BIND": "127.0.0.1",
@@ -131,8 +132,7 @@ class Harness(base.Harness):
             threading.Thread(target=service.serve_forever, daemon=True).start()
         try:
             self.start_server()
-            code = next((self.root / "server").glob("*bootstrap*")).read_text().strip()
-            self.csrf = self.api("auth/initialize", "POST", {"bootstrap_code": code, "username": "admin", "password": "Test-udp-only-4821!"})["csrf_token"]
+            self.csrf = self.api("auth/login", "POST", {"username": "admin", "password": "Test-udp-only-4821!"})["csrf_token"]
             invite = self.api("enrollments", "POST", {"ttl_seconds": 3600})
             self.start_agent(invite["token"])
             base.wait_for(lambda: any(r["status"] == "awaiting_approval" for r in self.api("enrollments")), "Agent CSR")

@@ -28,6 +28,7 @@ class Harness(smoke.Harness):
     """复用进程与临时目录隔离；每台 Agent 使用独立目录，所有密钥只留在测试目录内。"""
     def start_server(self):
         self.server = self.launch("server", self.args.server_bin, {
+            "NEXO_ADMIN_USERNAME": "admin", "NEXO_ADMIN_PASSWORD": "Local-shared-smoke-4821!",
             "NEXO_DATA_DIR": str(self.root / "server"),
             "NEXO_HTTP_ADDR": f"127.0.0.1:{self.ports['api']}",
             "NEXO_CONTROL_ADDR": f"127.0.0.1:{self.ports['control']}",
@@ -51,8 +52,7 @@ class Harness(smoke.Harness):
 
     def run(self):
         self.start_server()
-        code = (self.root / "server/bootstrap.code").read_text().strip()
-        self.csrf = self.api("auth/initialize", "POST", {"bootstrap_code": code, "username": "admin", "password": "Local-shared-smoke-4821!"})["csrf_token"]
+        self.csrf = self.api("auth/login", "POST", {"username": "admin", "password": "Local-shared-smoke-4821!"})["csrf_token"]
         with concurrent.futures.ThreadPoolExecutor(max_workers=6) as pool:
             keys = list(pool.map(lambda _: self.api("agent-access-key", "POST", {}), range(6)))
         key = keys[0]["token"]

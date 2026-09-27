@@ -3,7 +3,7 @@
 //! v0.2.0 只保留本地登录。会话摘要、CSRF 摘要和密码哈希进入 SQLite，
 //! 浏览器只持有随机 Cookie；Agent 控制通道不复用 Web 会话。
 
-use std::{fs, path::Path};
+use std::path::Path;
 
 use argon2::{
     password_hash::{
@@ -29,7 +29,6 @@ use crate::{security::RequestSecurity, unix_now, ApiError, AppState};
 #[cfg(test)]
 pub(crate) static PASSWORD_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
-const BOOTSTRAP_FILE: &str = "bootstrap.code";
 const SESSION_SECONDS: i64 = 7 * 24 * 60 * 60;
 
 #[derive(Debug, Clone, Serialize)]
@@ -45,12 +44,6 @@ pub struct AuthStatusResponse {
     pub local_http_warning: bool,
 }
 
-#[derive(Debug, Deserialize)]
-pub struct InitializeRequest {
-    pub bootstrap_code: String,
-    pub username: String,
-    pub password: String,
-}
 #[derive(Debug, Deserialize)]
 pub struct LoginRequest {
     pub username: String,
@@ -88,41 +81,45 @@ pub struct Session {
     pub csrf: String,
 }
 
-pub fn ensure_bootstrap_code(
-    connection: &rusqlite::Connection,
-    data_dir: &Path,
-) -> anyhow::Result<()> {
-    let users: i64 = connection.query_row("SELECT COUNT(*) FROM users", [], |row| row.get(0))?;
-    let path = data_dir.join(BOOTSTRAP_FILE);
-    if users > 0 {
-        if path.exists() {
-            fs::remove_file(path)?;
-        }
-        return Ok(());
+/// 仅空账号库创建管理员。立即事务串行化首次启动，已有账号时不校验或覆盖配置。
+/// 返回值仅包含自动生成的凭据，由启动入口在提交成功后输出；显式密码不会回传。
+pub fn ensure_admin(
+    connection: &mut rusqlite::Connection,
+    username: Option<&str>,
+    password: Option<&str>,
+) -> anyhow::Result<Option<(String, String)>> {
+    let transaction =
+        connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let exists: bool =
+        transaction.query_row("SELECT EXISTS(SELECT 1 FROM users)", [], |row| row.get(0))?;
+    if exists {
+        return Ok(None);
     }
-    if path.exists() {
-        return Ok(());
-    }
-    fs::create_dir_all(data_dir)?;
-    let mut bytes = [0_u8; 32];
-    OsRng.fill_bytes(&mut bytes);
-    let temporary = data_dir.join(format!(".{BOOTSTRAP_FILE}.{}.tmp", std::process::id()));
-    fs::write(&temporary, hex::encode(bytes))?;
-    set_private_permissions(&temporary)?;
-    fs::rename(&temporary, &path)?;
-    set_private_permissions(&path)?;
-    tracing::warn!("Nexo 尚未初始化；Bootstrap Code 已保存到受限 Secret 文件，请使用 `nexo bootstrap-code` 在本机读取");
-    Ok(())
-}
-
-pub fn read_bootstrap_code(data_dir: &Path) -> anyhow::Result<String> {
-    let code = fs::read_to_string(data_dir.join(BOOTSTRAP_FILE))?
-        .trim()
-        .to_owned();
-    if code.is_empty() {
-        anyhow::bail!("Bootstrap Code 为空");
-    }
-    Ok(code)
+    let username = username
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("admin");
+    validate_username(username)
+        .map_err(|error| anyhow::anyhow!("NEXO_ADMIN_USERNAME 配置无效：{}", error.message))?;
+    let generated = password.is_none_or(str::is_empty);
+    let password = if generated {
+        let mut bytes = [0_u8; 24];
+        OsRng
+            .try_fill_bytes(&mut bytes)
+            .map_err(|_| anyhow::anyhow!("无法生成管理员密码：系统安全随机源不可用"))?;
+        hex::encode(bytes)
+    } else {
+        password.unwrap().to_owned()
+    };
+    validate_password(&password)
+        .map_err(|error| anyhow::anyhow!("NEXO_ADMIN_PASSWORD 配置无效：{}", error.message))?;
+    let hash = hash_password(&password)?;
+    transaction.execute(
+        "INSERT INTO users (id, tenant_id, username, role, password_hash, enabled, created_at) VALUES (?1,'default',?2,'system_admin',?3,1,?4)",
+        params![Uuid::new_v4().to_string(), username, hash, unix_now()],
+    )?;
+    transaction.commit()?;
+    Ok(generated.then(|| (username.to_owned(), password)))
 }
 
 pub async fn session_middleware(
@@ -153,44 +150,6 @@ pub fn require_csrf(state: &AppState, headers: &HeaderMap) -> Result<(), ApiErro
         ));
     }
     Ok(())
-}
-
-pub async fn initialize(
-    State(state): State<AppState>,
-    Extension(security): Extension<RequestSecurity>,
-    headers: HeaderMap,
-    Json(input): Json<InitializeRequest>,
-) -> Result<Response, ApiError> {
-    let expected = read_bootstrap_code(&state.data_dir)
-        .map_err(|e| ApiError::new(StatusCode::SERVICE_UNAVAILABLE, e.to_string()))?;
-    if input.bootstrap_code.trim() != expected {
-        return Err(ApiError::new(StatusCode::UNAUTHORIZED, "初始化口令不正确"));
-    }
-    validate_username(&input.username)?;
-    validate_password(&input.password)?;
-    let hash = password_work(move || hash_password(&input.password))
-        .await?
-        .map_err(internal)?;
-    let user_id = Uuid::new_v4().to_string();
-    let now = unix_now();
-    let connection = state.db.lock().map_err(|_| internal("数据库锁不可用"))?;
-    let count: i64 = connection
-        .query_row("SELECT COUNT(*) FROM users", [], |row| row.get(0))
-        .map_err(internal)?;
-    if count != 0 {
-        return Err(ApiError::new(StatusCode::CONFLICT, "Nexo 已经完成初始化"));
-    }
-    connection.execute("INSERT INTO users (id, tenant_id, username, role, password_hash, enabled, created_at) VALUES (?1,'default',?2,'system_admin',?3,1,?4)", params![user_id, input.username.trim(), hash, now]).map_err(internal)?;
-    let _ = fs::remove_file(state.data_dir.join(BOOTSTRAP_FILE));
-    let (session, csrf) =
-        create_session(&connection, &user_id, "default", now, &headers).map_err(internal)?;
-    Ok(auth_response(
-        StatusCode::OK,
-        &session,
-        &csrf,
-        "管理员创建成功",
-        security.secure,
-    ))
 }
 
 pub async fn login(
@@ -732,20 +691,139 @@ pub(crate) fn validate_password(value: &str) -> Result<(), ApiError> {
 fn internal(error: impl std::fmt::Display) -> ApiError {
     ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, error.to_string())
 }
-#[cfg_attr(not(unix), allow(unused_variables))]
-fn set_private_permissions(path: &Path) -> anyhow::Result<()> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Arc, Mutex};
+    use std::{
+        fs,
+        sync::{Arc, Mutex},
+    };
+
+    #[test]
+    fn admin_initialization_defaults_and_explicit_credentials() {
+        for (username, password, expected_username) in [
+            (None, None, "admin"),
+            (Some(""), Some(""), "admin"),
+            (Some(" \t "), None, "admin"),
+            (Some(" owner "), None, "owner"),
+            (None, Some(" explicit-password-1234 "), "admin"),
+            (Some(" owner "), Some("explicit-password-1234"), "owner"),
+        ] {
+            let mut db = rusqlite::Connection::open_in_memory().unwrap();
+            crate::initialize_database(&db, true).unwrap();
+            let generated = ensure_admin(&mut db, username, password).unwrap();
+            let actual_password = if let Some(password) = password.filter(|value| !value.is_empty())
+            {
+                assert!(generated.is_none(), "显式密码不应回传用于打印");
+                password.to_owned()
+            } else {
+                let (name, password) = generated.expect("自动密码应在提交后返回");
+                assert_eq!(name, expected_username);
+                assert_eq!(password.len(), 48);
+                assert!(password.bytes().all(|byte| byte.is_ascii_hexdigit()));
+                password
+            };
+            let (name, role, tenant, enabled, hash): (String, String, String, i64, String) = db
+                .query_row(
+                    "SELECT username,role,tenant_id,enabled,password_hash FROM users",
+                    [],
+                    |row| {
+                        Ok((
+                            row.get(0)?,
+                            row.get(1)?,
+                            row.get(2)?,
+                            row.get(3)?,
+                            row.get(4)?,
+                        ))
+                    },
+                )
+                .unwrap();
+            assert_eq!(name, expected_username);
+            assert_eq!(role, "system_admin");
+            assert_eq!(tenant, "default");
+            assert_eq!(enabled, 1);
+            assert!(hash.starts_with("$argon2"));
+            assert!(verify_password(&actual_password, &hash));
+            assert!(!verify_password("wrong-password", &hash));
+        }
+    }
+
+    #[test]
+    fn admin_initialization_rejects_invalid_config_without_creating_accounts() {
+        for (username, password, variable) in [
+            (
+                "a".to_owned(),
+                "valid-password-1234".to_owned(),
+                "NEXO_ADMIN_USERNAME",
+            ),
+            (
+                "a".repeat(65),
+                "valid-password-1234".to_owned(),
+                "NEXO_ADMIN_USERNAME",
+            ),
+            (
+                "admin".to_owned(),
+                "short-123".to_owned(),
+                "NEXO_ADMIN_PASSWORD",
+            ),
+            ("admin".to_owned(), "a".repeat(1025), "NEXO_ADMIN_PASSWORD"),
+        ] {
+            let mut db = rusqlite::Connection::open_in_memory().unwrap();
+            crate::initialize_database(&db, true).unwrap();
+            let error = ensure_admin(&mut db, Some(&username), Some(&password))
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains(variable));
+            assert!(!error.contains(&password));
+            assert_eq!(
+                db.query_row("SELECT COUNT(*) FROM users", [], |row| row.get::<_, i64>(0))
+                    .unwrap(),
+                0
+            );
+            assert!(
+                ensure_admin(&mut db, None, None).unwrap().is_some(),
+                "配置修正后可以重新初始化"
+            );
+        }
+    }
+
+    #[test]
+    fn admin_initialization_preserves_existing_accounts_even_with_invalid_config() {
+        let mut db = rusqlite::Connection::open_in_memory().unwrap();
+        crate::initialize_database(&db, true).unwrap();
+        ensure_admin(&mut db, Some("owner"), Some("original-password-1234")).unwrap();
+        let original: (String, String) = db
+            .query_row("SELECT id,password_hash FROM users", [], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })
+            .unwrap();
+        for (username, password) in [
+            (None, None),
+            (Some("new-owner"), Some("replacement-password")),
+            (Some("x"), Some("invalid")),
+        ] {
+            assert!(ensure_admin(&mut db, username, password).unwrap().is_none());
+            let current: (String, String, String) = db
+                .query_row("SELECT id,username,password_hash FROM users", [], |row| {
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                })
+                .unwrap();
+            assert_eq!(
+                current,
+                (original.0.clone(), "owner".into(), original.1.clone())
+            );
+            assert_eq!(
+                db.query_row("SELECT COUNT(*) FROM users", [], |row| row.get::<_, i64>(0))
+                    .unwrap(),
+                1
+            );
+        }
+        db.execute("UPDATE users SET role='tenant'", []).unwrap();
+        assert!(
+            ensure_admin(&mut db, None, None).unwrap().is_none(),
+            "只要存在账号就不能重新初始化"
+        );
+    }
 
     #[tokio::test]
     async fn session_labels_preserve_existing_sessions_and_only_store_known_labels() {

@@ -27,7 +27,7 @@ async function wait(check, label, timeout = 30000) {
 async function port() { const listener = net.createServer(); listener.listen(0, "127.0.0.1"); await once(listener, "listening"); const value = listener.address().port; await new Promise(resolve => listener.close(resolve)); return value; }
 const ports = { api: await port(), control: await port(), data: await port(), public: await port() };
 const url = `http://127.0.0.1:${ports.api}`;
-const serverEnv = { NEXO_DATA_DIR: path.join(root, "server"), NEXO_HTTP_ADDR: `127.0.0.1:${ports.api}`, NEXO_CONTROL_ADDR: `127.0.0.1:${ports.control}`, NEXO_TUNNEL_ADDR: `127.0.0.1:${ports.data}`, NEXO_TUNNEL_ENDPOINT: `127.0.0.1:${ports.data}`, NEXO_PUBLIC_BIND: "127.0.0.1", NEXO_CADDY_ENABLED: "false", NEXO_PUBLIC_URL: "", NEXO_TRUSTED_PROXIES: "", NEXO_PUBLIC_IPS: "127.0.0.1" };
+const serverEnv = { NEXO_ADMIN_USERNAME: "admin", NEXO_ADMIN_PASSWORD: "old-test-password-1234", NEXO_DATA_DIR: path.join(root, "server"), NEXO_HTTP_ADDR: `127.0.0.1:${ports.api}`, NEXO_CONTROL_ADDR: `127.0.0.1:${ports.control}`, NEXO_TUNNEL_ADDR: `127.0.0.1:${ports.data}`, NEXO_TUNNEL_ENDPOINT: `127.0.0.1:${ports.data}`, NEXO_PUBLIC_BIND: "127.0.0.1", NEXO_CADDY_ENABLED: "false", NEXO_PUBLIC_URL: "", NEXO_TRUSTED_PROXIES: "", NEXO_PUBLIC_IPS: "127.0.0.1" };
 const agentEnv = { NEXO_STATE_DIR: path.join(root, "agent"), NEXO_SERVER_URL: url, NEXO_ENROLLMENT_TOKEN: "", NEXO_CONTROL_ENDPOINT: `127.0.0.1:${ports.control}`, NEXO_TUNNEL_ENDPOINT: `127.0.0.1:${ports.data}` };
 function launch(name, binary, environment, parameters = []) {
   const log = createWriteStream(path.join(root, `${name}-${processes.length}.log`)); logs.push(log);
@@ -67,8 +67,7 @@ console.log("测试目录：", root);
 try {
   server = launch("server", serverBin, serverEnv);
   await wait(async () => (await call("auth/status")).status === 200, "Server 启动");
-  const bootstrap = (await fs.readFile(path.join(root, "server/bootstrap.code"), "utf8")).trim();
-  await api("auth/initialize", "POST", { bootstrap_code: bootstrap, username: "admin", password: "old-test-password-1234" });
+  await api("auth/login", "POST", { username: "admin", password: "old-test-password-1234" });
   assert.equal((await api("auth/status", "GET", undefined, { "x-forwarded-proto": "https" })).channel, "local_http");
   assert.equal((await call("auth/logout", "POST", {}, { Origin: "https://attacker.invalid" })).status, 403);
   assert.equal((await call("auth/logout", "POST", {}, { "x-nexo-csrf": "wrong" })).status, 403);

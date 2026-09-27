@@ -2,7 +2,7 @@ import type { Page } from "@playwright/test";
 import type { Tunnel, Device, Domain, DomainEvent, Enrollment, TransportIdentity } from "../src/ui";
 
 /** 使用真实接口形状覆盖交互；失败注入用于验证界面不会把请求失败当作成功。 */
-export async function installApiMocks(page: Page, options: { empty?: boolean; anonymous?: boolean; initialize?: boolean } = {}) {
+export async function installApiMocks(page: Page, options: { empty?: boolean; anonymous?: boolean } = {}) {
   const state = {
     authenticated: !options.anonymous,
     users: [{ id: "admin", username: "admin", role: "system_admin", workspace_id: "default", workspace_name: "admin的工作空间", enabled: true, devices: 2, services: 1, domains: 1 }, { id: "alice", username: "alice", role: "tenant", workspace_id: "alice-space", workspace_name: "alice 的工作空间", enabled: true, devices: 1, services: 1, domains: 0 }],
@@ -64,8 +64,8 @@ export async function installApiMocks(page: Page, options: { empty?: boolean; an
     }
     const scopedResource = path.match(/^\/api\/v1\/admin\/workspaces\/[^/]+\/(tunnels|devices|public-domains)$/);
     if (scopedResource && method === "GET") return respond(scopedResource[1] === "tunnels" ? state.tunnels : scopedResource[1] === "devices" ? state.devices : state.domains);
-    if (path === "/api/v1/auth/status") return respond({ initialized: !options.initialize, authenticated: state.authenticated, user_id: "admin", workspace_id: "default", role: "system_admin", username: "admin", csrf_token: "test-csrf" });
-    if (path === "/api/v1/auth/login" || path === "/api/v1/auth/initialize") { state.authenticated = true; return respond({ user_id: "admin", workspace_id: "default", role: "system_admin", username: "admin", csrf_token: "test-csrf" }); }
+    if (path === "/api/v1/auth/status") return respond({ initialized: true, authenticated: state.authenticated, user_id: "admin", workspace_id: "default", role: "system_admin", username: "admin", csrf_token: "test-csrf" });
+    if (path === "/api/v1/auth/login") { state.authenticated = true; return respond({ user_id: "admin", workspace_id: "default", role: "system_admin", username: "admin", csrf_token: "test-csrf" }); }
     if (path === "/api/v1/auth/recover") return respond({ username: "admin", message: "密码已更新，请重新登录" });
     if (path === "/api/v1/auth/password" || path === "/api/v1/auth/logout") return respond({});
     if (path === "/api/v1/auth/session") return respond(state.sessions[0]);

@@ -340,14 +340,18 @@ test("首次读取失败、重试、无结果与空列表互相区分", async ({
   await expect(page.getByText("还没有服务", { exact: true })).toBeVisible();
 });
 
-test("登录和初始化使用可自动填充的单栏表单", async ({ page }) => {
-  await installApiMocks(page, { anonymous: true, initialize: true });
+test("登录使用可自动填充的单栏表单且不再提供网页初始化", async ({ page }) => {
+  const state = await installApiMocks(page, { anonymous: true });
   await page.goto("/");
-  await page.getByLabel("初始化口令").fill("bootstrap-code");
+  await expect(page.getByText("创建管理员", { exact: true })).toHaveCount(0);
+  await expect(page.getByLabel("初始化口令")).toHaveCount(0);
+  await expect(page.getByRole("button", { name: "首次安装 Nexo" })).toHaveCount(0);
   await page.getByLabel("用户名", { exact: true }).fill("admin");
   await page.getByLabel("密码", { exact: true }).fill("a-secure-password");
   if ((page.viewportSize()?.width ?? 0) <= 900) await expect(page.locator(".auth-visual")).toBeHidden();
-  await page.getByRole("button", { name: "开始使用" }).click();
+  await page.getByRole("button", { name: "登录", exact: true }).click();
+  expect(state.calls.some(call => call.path === "/api/v1/auth/initialize")).toBeFalsy();
+  expect(state.calls.some(call => call.path === "/api/v1/auth/login")).toBeTruthy();
   await expect(visiblePage(page).locator("h1")).toHaveText("首页");
 });
 

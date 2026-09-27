@@ -62,17 +62,18 @@ test("所有页面在移动尺寸和明暗主题中无溢出，输出实际截�
   }
 });
 
-test("登录与初始化在各尺寸可用", async ({ page }, testInfo) => {
+test("登录与恢复在各尺寸可用", async ({ page }, testInfo) => {
   test.skip(testInfo.project.name !== "desktop-dark", "尺寸矩阵由单个项目执行");
-  await installApiMocks(page, { anonymous: true, initialize: true });
+  await installApiMocks(page, { anonymous: true });
   for (const [name, width, height] of cases) {
     await page.setViewportSize({ width, height });
     await page.goto("/");
-    await expect(page.getByRole("heading", { name: "创建管理员" })).toBeVisible();
+    await expect(page.getByRole("heading", { name: "欢迎回来" })).toBeVisible();
     expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBeTruthy();
-    await page.screenshot({ path: testInfo.outputPath(`${name}-initialize.png`), fullPage: true });
-    await page.getByRole("button", { name: "已有管理员账号？登录" }).click();
     await page.screenshot({ path: testInfo.outputPath(`${name}-login.png`), fullPage: true });
+    await page.getByRole("button", { name: "忘记密码" }).click();
+    await expect(page.getByRole("heading", { name: "找回账号" })).toBeVisible();
+    await page.screenshot({ path: testInfo.outputPath(`${name}-recover.png`), fullPage: true });
   }
 });
 

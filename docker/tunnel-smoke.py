@@ -148,6 +148,7 @@ class Harness:
 
     def start_server(self):
         self.server = self.launch("server", self.args.server_bin, {
+            "NEXO_ADMIN_USERNAME": "admin", "NEXO_ADMIN_PASSWORD": "Test-tunnel-only-4821!",
             "NEXO_DATA_DIR": str(self.root / "server"), "NEXO_HTTP_ADDR": f"127.0.0.1:{self.ports['api']}",
             "NEXO_CONTROL_ADDR": f"127.0.0.1:{self.ports['control']}", "NEXO_TUNNEL_ADDR": f"127.0.0.1:{self.ports['data']}",
             "NEXO_UDP_ADDR": f"127.0.0.1:{self.ports['data']}", "NEXO_UDP_ENDPOINT": f"127.0.0.1:{self.ports['data']}",
@@ -206,8 +207,7 @@ class Harness:
             threading.Thread(target=service.serve_forever, daemon=True).start()
         try:
             self.start_server()
-            code = next((self.root / "server").glob("*bootstrap*")).read_text().strip()
-            result = self.api("auth/initialize", "POST", {"bootstrap_code": code, "username": "admin", "password": "Test-tunnel-only-4821!"})
+            result = self.api("auth/login", "POST", {"username": "admin", "password": "Test-tunnel-only-4821!"})
             self.csrf = result["csrf_token"]
             assert self.api("auth/status")["authenticated"], "登录后状态查询失败"
             invitation = self.api("enrollments", "POST", {"ttl_seconds": 3600})

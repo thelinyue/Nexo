@@ -37,7 +37,7 @@ Server 部署在公网可达的 Linux 主机上，提供管理页面和公网入
 
 | Server 端口 | 用途 | 访问要求 |
 | --- | --- | --- |
-| TCP `8280` | Web 管理与入网 API | 初始化阶段限制为可信来源；公网使用时配置 HTTPS 反向代理 |
+| TCP `8280` | Web 管理与入网 API | 限制为可信来源；公网使用时配置 HTTPS 反向代理 |
 | TCP `9890` / `9891` | Agent 控制 / Tunnel 数据 | 允许 Agent 访问；必须直连或 TCP 透传，不可中间终止 TLS |
 | TCP `80` / `443` | Web 服务与 HTTPS 证书验证 | 使用 Web Tunnel 时开放；HTTP-01 验证依赖标准端口 |
 | TCP/UDP `20000–29999` | TCP/UDP 服务公网端口池 | 开放实际分配端口；需要任意自动分配端口均可访问时再放行整个范围 |
@@ -71,6 +71,8 @@ services:
     network_mode: host
     environment:
       TZ: ${TZ:-Asia/Shanghai}
+      NEXO_ADMIN_USERNAME: ${NEXO_ADMIN_USERNAME:-admin}
+      NEXO_ADMIN_PASSWORD: ${NEXO_ADMIN_PASSWORD:-}
       NEXO_PUBLIC_URL: ${NEXO_PUBLIC_URL:-}
       NEXO_TRUSTED_PROXIES: ${NEXO_TRUSTED_PROXIES:-}
       NEXO_PUBLIC_IPS: ${NEXO_PUBLIC_IPS:-}
@@ -92,7 +94,13 @@ docker compose -f compose.yml up -d nexo-server
 docker compose -f compose.yml ps
 ```
 
-从可信网络打开 `http://服务器地址:8280`，按提示创建唯一管理员。首次初始化没有默认账号或密码。持久数据位于当前目录的 `data/nexo`。
+Server 首次启动会自动创建唯一管理员。可在启动前通过环境变量或安装目录的 `.env` 设置 `NEXO_ADMIN_USERNAME` 和 `NEXO_ADMIN_PASSWORD`；用户名默认 `admin`，显式密码至少 12 个字符且不超过 1024 字节。密码未设置或为空时自动生成，通过以下命令查看首次启动日志中的用户名和密码：
+
+```bash
+docker compose -f compose.yml logs nexo-server
+```
+
+从可信网络打开 `http://服务器地址:8280`，直接使用上述账号登录。自动密码只在成功创建账号时输出一次，请妥善保存，分享日志前删除凭据。已有账号时环境变量不再生效，重启不会重设密码；密码遗失时执行 `docker compose -f compose.yml exec nexo-server nexo admin recover`，然后在登录页选择“忘记密码”。持久数据位于当前目录的 `data/nexo`。
 
 面向公网使用前，为管理入口配置 HTTPS，并设置 `NEXO_PUBLIC_URL`、`NEXO_TRUSTED_PROXIES`；完整说明见 [管理入口](https://github.com/thelinyue/Nexo/blob/master/docker/README.md#管理入口与账号恢复)。Agent 的 Server URL 也应使用此 HTTPS 地址。
 

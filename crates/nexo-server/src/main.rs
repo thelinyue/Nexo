@@ -56,7 +56,6 @@ struct Cli {
 }
 #[derive(Debug, Subcommand)]
 enum CliCommand {
-    BootstrapCode,
     Admin {
         #[command(subcommand)]
         command: AdminCommand,
@@ -248,10 +247,6 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     let data_dir =
         PathBuf::from(env::var("NEXO_DATA_DIR").unwrap_or_else(|_| "./data/nexo".to_owned()));
-    if matches!(cli.command, Some(CliCommand::BootstrapCode)) {
-        println!("{}", auth::read_bootstrap_code(&data_dir)?);
-        return Ok(());
-    }
     if let Some(CliCommand::Admin {
         command: AdminCommand::Recover { username },
     }) = cli.command
@@ -263,9 +258,17 @@ async fn main() -> Result<()> {
     let db_path = data_dir.join("nexo.db");
     fs::create_dir_all(&data_dir)?;
     let is_new = !db_path.exists();
-    let connection = Connection::open(&db_path)?;
+    let mut connection = Connection::open(&db_path)?;
     initialize_database(&connection, is_new)?;
-    auth::ensure_bootstrap_code(&connection, &data_dir)?;
+    if let Some((username, password)) = auth::ensure_admin(
+        &mut connection,
+        env::var("NEXO_ADMIN_USERNAME").ok().as_deref(),
+        env::var("NEXO_ADMIN_PASSWORD").ok().as_deref(),
+    )
+    .context("无法初始化管理员账号")?
+    {
+        println!("管理员账号已创建\n用户名：{username}\n自动生成的密码：{password}\n密码仅在首次创建时显示，请妥善保存；遗失后可使用 nexo admin recover 恢复账号。");
+    }
     let identity_path = data_dir.join("transport/identity.json");
     let authority = Arc::new(identity_runtime::AuthorityRuntime::new(
         nexo_tunnel::identity::Authority::load_or_create(&identity_path)?,
@@ -426,7 +429,6 @@ fn router(state: AppState) -> Router {
             post(accounts::accept_invitation),
         )
         .route("/api/v1/auth/status", get(auth::status))
-        .route("/api/v1/auth/initialize", post(auth::initialize))
         .route("/api/v1/auth/login", post(auth::login))
         .route("/api/v1/auth/logout", post(auth::logout))
         .route("/api/v1/auth/password", post(auth::change_password))

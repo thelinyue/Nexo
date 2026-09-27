@@ -142,7 +142,6 @@ pub async fn protect(
             && matches!(
                 path,
                 "/api/v1/auth/login"
-                    | "/api/v1/auth/initialize"
                     | "/api/v1/auth/recover"
                     | "/api/v1/auth/invitations/inspect"
                     | "/api/v1/auth/invitations/accept"

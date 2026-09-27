@@ -8,6 +8,19 @@ Agent 不需要 `NET_ADMIN`、`/dev/net/tun`、转发 sysctl、iptables 或 ipro
 
 默认监听：Server Web/API `8280`、Agent 控制 `9890`、Tunnel 数据 `9891`，TCP/UDP 自动分配公网端口范围 `20000-29999`。管理 API 可由前置 HTTPS 代理保护；`9890/9891` 使用设备证书双向 TLS，必须直连或 TCP 透传。UDP 数据通道独立使用 `9891/udp`，需要单独放行。Web Tunnel 的 `80/443` 交给 Caddy。
 
+## 管理员首次创建
+
+Server 在开始监听前自动创建管理员，网页只负责登录和账号恢复。Compose 已透传以下变量，可在安装目录的 `.env` 中配置；直接运行二进制时设置同名环境变量。
+
+| 环境变量 | 默认行为 |
+| --- | --- |
+| `NEXO_ADMIN_USERNAME` | 未设置或去除首尾空白后为空时使用 `admin`；沿用 2–64 的用户名长度校验 |
+| `NEXO_ADMIN_PASSWORD` | 未设置或空字符串时生成 48 位随机密码；显式密码保留原值，至少 12 个字符且不超过 1024 字节 |
+
+只有账号库为空时配置才生效；已有账号不会被覆盖，非法首次配置会报错并停止启动。自动密码在账号成功保存后只输出一次，使用 `docker compose -f compose.yml logs nexo-server` 查看，直接运行时查看终端。显式密码不回显。日志包含自动生成的凭据，分享前请删除；重启不会再次输出或重新生成密码。
+
+密码遗失时执行 `docker compose -f compose.yml exec nexo-server nexo admin recover`，再在登录页选择“忘记密码”；直接运行时使用 `nexo-server admin recover` 并设置原 `NEXO_DATA_DIR`。不要清空数据目录或依靠修改环境变量重设已有账号。
+
 ## 更新、备份与恢复
 
 `latest` 是可移动的稳定版别名，不代表容器会自动更新。Server 和 Agent 独立发布，仅对发布说明列出的更新组件操作；需要配套更新时，先安排维护窗口，再按该版本说明处理两端。更新前记录正在运行的数字版本（管理页版本信息或容器镜像的 `org.opencontainers.image.version` 标签），保存原 Compose 和环境变量。
