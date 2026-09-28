@@ -334,7 +334,7 @@ test("用户始终单行，更多菜单显示完整名称且小屏不横向溢�
   await cards.nth(1).getByRole("button", { name: "更多" }).click();
   await expect(cards.nth(1).getByRole("heading")).toHaveText(longName);
   await expect(cards.nth(1).getByRole("heading")).toHaveCSS("white-space", "nowrap");
-  await expect(cards.nth(1).locator(".user-menu-summary>strong")).toHaveText(longName);
+  await expect(cards.nth(1).locator(".user-menu-identity strong")).toHaveText(longName);
   await expect(cards.nth(1).getByRole("button", { name: "更多" })).toHaveAttribute("aria-expanded", "true");
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBeTruthy();
   await page.screenshot({ path: info.outputPath("user-account-fields.png"), fullPage: true });

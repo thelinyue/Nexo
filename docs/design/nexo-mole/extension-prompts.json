@@ -1,0 +1,24 @@
+{
+  "tool": "built-in image_gen",
+  "reference": "masters/character.png",
+  "shared_character": "Use the attached Nexo mole as the exact character identity reference. Preserve the cocoa brown #86634F head and body, cream #F4E5CD long muzzle, dark coffee #352A26 round nose, tiny black eyes, tiny hidden ears, broad shovel paws, short sage green #8CA58B scarf, premium smooth 2.5D matte clay material, soft upper-left studio lighting, calm reliable personality. No text, watermark, fur, glossy plastic, extra characters, or branded devices.",
+  "images": [
+    {
+      "files": ["masters/banner-light.png", "masters/banner-dark.png"],
+      "prompt": "Create a wide brand banner character asset, 3:1 landscape composition. On the LEFT third only, the mole peeks from a shallow warm terracotta arched burrow opening with both paws resting on its lower edge, head and upper torso visible. Face turned slightly toward the right, welcoming but composed. Keep the RIGHT two-thirds completely empty transparent space for a separately typeset wordmark. Genuine transparent background outside the arch and character. No lettering. Entire arch and paws visible, generous edge margins.",
+      "composition": "The Nexo wordmark was added with browser Canvas and a system-ui font after generation. Light uses #302923; dark uses #F4EADF."
+    },
+    {
+      "file": "masters/avatar-admin.png",
+      "prompt": "Create an administrator account avatar, square 1024x1024, head-and-shoulders portrait in slight three-quarter view facing right. Add one simple terracotta orange work cap #C96835, clearly visible in silhouette, and keep a small portion of the sage scarf visible. Friendly responsible expression. Subject centered inside a circular safe area with 14% transparent margin. Genuine transparent background, no badge, no text, no body below shoulders, no tools."
+    },
+    {
+      "file": "masters/avatar-user.png",
+      "prompt": "Create a regular user account avatar, square 1024x1024, head-and-shoulders portrait in slight three-quarter view facing right. No hat. The sage green scarf is clearly visible as the distinguishing accessory. Friendly relaxed expression. Subject centered inside a circular safe area with 14% transparent margin. Genuine transparent background, no badge, no text, no body below shoulders, no tools."
+    },
+    {
+      "file": "masters/pwa-launch.png",
+      "prompt": "Use case: stylized-concept. Asset type: Nexo installed-PWA cold-start illustration. Use the attached Nexo mole as exact character identity reference: cocoa brown #86634F body, cream #F4E5CD long muzzle and belly, dark coffee #352A26 round nose, tiny black eyes and ears, broad shovel paws, short sage green #8CA58B scarf, premium smooth 2.5D matte clay material. Scene: the full-body mole stands just in front of one softly rounded warm terracotta archway, one paw extended in a small welcoming gesture toward the viewer, calm confident smile. The arch is an isolated object, not a landscape. Centered vertical-friendly square composition with generous transparent margins, character slightly above center. Genuine transparent background, only subtle contact shadow. No hat, no text, no watermark, no device, no cable, no additional characters, no scenery, no glow, no fur or glossy plastic."
+    }
+  ]
+}

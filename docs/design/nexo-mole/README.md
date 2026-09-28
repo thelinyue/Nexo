@@ -1,0 +1,68 @@
+# Nexo 暖棕鼹鼠品牌
+
+Nexo 使用暖棕鼹鼠作为统一角色：可可棕身体、奶油色口鼻、深咖啡鼻子、鼠尾草绿围巾，采用柔和的哑光陶土质感。应用图标使用杏橙色满底，页面插画使用透明背景。
+
+## 交付内容
+
+- `preview.html` / `preview.png`：角色、图标裁切、配色、六种场景及明暗空状态展示板。
+- `masters/`：10 张 1024px PNG 母版，包括角色、应用图标、品牌头像、favicon 和六张场景插画。
+- `prompts.json`：实际采用的生成提示词及参考关系。全部使用内置 ImageGen；Canvas 仅用于缩放和格式导出，没有重绘角色。
+- `screenshots/`：使用实际前端页面和模拟 API 拍摄的桌面、手机、横屏与登录页面截图。
+
+页面资源位于 `web/public/`：PWA 图标为 192/512px PNG，可裁切图标为 512px PNG，Apple Touch 图标为 180px PNG，favicon 为 16/32px PNG。品牌头像为 256px WebP，六张插画为 512px WebP，总计约 161 KiB。
+
+## 场景与使用边界
+
+| 状态 | 文件 | 场景含义 |
+| --- | --- | --- |
+| 服务为空 | `mole-services.webp` | 整理连接线，准备建立第一条连接 |
+| Agent 为空或等待入网 | `mole-agents.webp` | 轻拍设备，等待加入，不暗示已经在线 |
+| 域名为空 | `mole-domains.webp` | 抱着路牌，准备建立访问入口 |
+| 登录会话为空 | `mole-sessions.webp` | 翻开空白记录册 |
+| 搜索无结果 | `mole-search.webp` | 用放大镜查看空白卡片 |
+| 资源不存在 | `mole-missing.webp` | 拿地图站在岔路口，提示返回 |
+
+插画不承载业务信息：标题、说明、按钮保持原有逻辑，图片使用空 `alt` 和 `aria-hidden`。搜索与资源不存在共用紧凑尺寸，但使用不同图片；用户分类保留原图标，未新增没有实际入口的业务状态。加载、请求失败、表格小提示不增加插画。
+
+桌面插画 160px，手机 128px，搜索和资源不存在 112px。高度不超过 500px 时缩为 56px，并收紧上下留白；操作元素预留悬浮底栏的滚动距离，避免横屏遮挡。
+
+## 主题决策
+
+浅色使用暖米白背景 `#F7F3ED`、奶油白卡片 `#FFFCF7`、陶土橙主操作 `#A64B23` 和白色按钮文字。深色使用咖啡灰背景 `#171411`、暖炭灰卡片 `#211C19`、杏橙主操作 `#F3AA70` 和深棕按钮文字 `#302923`。
+
+浅色次级文字由设计初值 `#74665C` 调整为 `#716359`，使其在选中和抬高表面上也达到 4.5:1。品牌主操作与成功、警告、错误颜色独立；流量图第二条线使用随主题调整的鼠尾草绿并保留虚线。
+
+浏览器 `theme-color` 随系统主题变化。Manifest 默认背景为深色背景；沿用已有 Service Worker 更新机制，把 WebP 纳入预缓存，API 继续仅使用网络请求。
+
+## 验收
+
+从 `web/` 执行：
+
+```sh
+npm run build
+npx playwright test tests/brand.spec.ts tests/product-experience.spec.ts tests/navigation.spec.ts tests/responsive-accounts.spec.ts --project=desktop-dark --project=mobile-light --project=mobile-landscape --project=mobile-webkit
+```
+
+检查包括明暗两套主题、六种空状态、有数据列表、表单和登录页；实际图片解码、文字对比度、键盘焦点、减少动态效果、高对比度、减少透明度；按钮上下沿命中元素，防止浮动导航遮挡；Chromium Service Worker 断网读取全部新增品牌素材及离线页面重载。
+
+2026-09-28 验收：前端构建通过；上述四个测试文件、四个设备项目共 112 项，75 项通过、37 项按设备条件跳过，无失败。`git diff --check` 通过。浏览器项目覆盖 1440×900、375×812、812×375 和 WebKit 390×844；现有响应式测试另覆盖 320px 小屏与其他断点。
+
+实际页面截图：[浅色手机空状态](screenshots/mobile-light-empty.png)、[深色手机空状态](screenshots/mobile-dark-empty.png)、[横屏空状态](screenshots/landscape-dark-empty.png)、[浅色桌面](screenshots/desktop-light.png)、[深色桌面](screenshots/desktop-dark.png)、[浅色登录](screenshots/mobile-light-login.png)、[深色登录](screenshots/mobile-dark-login.png)、[深色表单](screenshots/mobile-dark-dialog.png)。
+
+PNG 母版和 WebP 图片均检查透明通道，展示板检查小尺寸图标、圆形裁切和透明边缘。截图来自浏览器与模拟数据，不代表设备端到端验收。实机 PWA 安装图标、系统启动画面和已安装应用更新效果尚未验证。
+
+本次仅修改 Web 与设计素材，不涉及后端逻辑、数据库、版本号或发布。已有后端工作区改动保持原状。
+
+## 横幅、角色头像与 PWA 启动插画
+
+新增的透明 PNG 母版位于 `masters/`：浅色和深色横幅各 1200×400、管理员和普通用户头像各 1024×1024、启动插画 1536×1536。页面资源位于 `web/public/brand/`：横幅各 600×200 WebP、头像各 256×256 WebP、启动插画 768×768 WebP。横幅中的 `Nexo` 字标使用浏览器 Canvas 以系统字体合成，保证文字准确；原始角色图由 ImageGen 生成。完整提示词记录在 `extension-prompts.json`。
+
+桌面侧栏在原 208px 宽度内显示 168×56 横幅，明暗模式切换字标颜色。统一的 `UserAvatar` 根据账号自身 `role` 选图：管理员戴陶土橙工作帽，普通用户只戴鼠尾草绿围巾。桌面账号入口、桌面和手机账号摘要、用户列表及用户操作浮层均已接入；管理员代管他人空间时仍显示本人管理员头像。没有增加头像上传或存储。
+
+应用内启动层由静态 HTML 在已安装 PWA 的新文档加载时提供，背景随系统明暗模式变化。首次认证状态明确后立即交还现有页面，最多使用 120ms 淡出；减少动态效果时直接移除。超过一秒才显示“正在连接 Nexo…”，图片加载失败和请求失败都不阻塞重试。普通浏览器、站内导航和后台恢复不会显示。系统原生启动屏仍由 Manifest 图标和背景生成，应用内插画不替代系统启动屏。
+
+实际截图：[桌面横幅与头像](screenshots/desktop-banner-and-avatars.png)、[深色桌面启动](screenshots/desktop-dark-pwa-launch.png)、[浅色手机竖屏启动](screenshots/mobile-light-pwa-launch.png)、[手机横屏启动](screenshots/mobile-landscape-pwa-launch.png)、[WebKit 手机启动](screenshots/mobile-webkit-pwa-launch.png)。`preview.html` / `preview.png` 已加入横幅明暗、28/32/48px 头像和三种启动构图。
+
+新增素材已进入 WebP 预缓存。浏览器模拟覆盖启动快慢、失败、离线重开、刷新、登录状态、角色与代管空间；真实设备上的已安装 PWA 系统启动屏、后台恢复及更新流程仍需单独验收。当前前端没有独立初始化页面：当接口返回 `initialized=false` 时仍显示现有登录页，本次启动层不改变该行为。
+
+2026-09-28 新增验收：品牌、PWA、产品体验、导航和响应式测试在桌面 Chromium、手机 Chromium 竖屏/横屏及手机 WebKit 共 144 项，86 项通过、58 项按设备条件跳过；管理员和多用户专项另有 19 项通过。构建及 `git diff --check` 通过。截图是浏览器页面和模拟 API 的结果，实机项目仍待单独验证。

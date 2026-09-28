@@ -5,7 +5,7 @@ import { UsersPage } from "./accounts";
 import type { ManagedWorkspace } from "./accounts";
 import { AgentsPage, DomainsPage, ManagePage, SessionsPage } from "./management";
 import { ServicesPage } from "./services";
-import { Notice, WorkspaceContext, WorkspaceLabelContext, errorText, rememberInteraction, request } from "./ui";
+import { Notice, UserAvatar, WorkspaceContext, WorkspaceLabelContext, errorText, rememberInteraction, request } from "./ui";
 import type { Auth } from "./ui";
 import { PageNavigationContext, clearSavedTabs, emptyRoute, homeRoute, navigationLocked, rootRoutes, routeInfo, useWorkspaceNavigation } from "./navigation";
 
@@ -22,7 +22,7 @@ function AccountMenu({ auth, onLogout }: { auth: Auth; onLogout: () => Promise<v
   const [open, setOpen] = useState(false); const [busy, setBusy] = useState(false); const [error, setError] = useState<string | null>(null);
   const close = () => menu.current?.hidePopover();
   return <div className="account-menu">
-    <button ref={trigger} className="account-trigger" popoverTarget="account-menu" aria-expanded={open} aria-controls="account-menu" onClick={() => setError(null)}><span title={auth.username}>{auth.username}</span><ChevronDown size={16} aria-hidden="true" /></button>
+    <button ref={trigger} className="account-trigger" popoverTarget="account-menu" aria-expanded={open} aria-controls="account-menu" onClick={() => setError(null)}><UserAvatar role={auth.role} size={28} /><span title={auth.username}>{auth.username}</span><ChevronDown size={16} aria-hidden="true" /></button>
     <div ref={menu} id="account-menu" popover="auto" className="account-popover" onToggle={event => setOpen((event.nativeEvent as ToggleEvent).newState === "open")} onKeyDown={event => { if (event.key === "Escape") trigger.current?.focus(); }}>
       <a href="#/manage" onClick={close}><Settings size={18} aria-hidden="true" />账号设置</a>
       <button disabled={busy} onClick={async () => { setBusy(true); setError(null); try { await onLogout(); close(); } catch (e) { setError(errorText(e)); } finally { setBusy(false); } }}><LogOut size={18} aria-hidden="true" />{busy ? "退出中…" : "退出登录"}</button>
@@ -61,7 +61,7 @@ export function Workspace({ auth, onAuth, onExpired, managed, onManage, message,
   const links = (items: typeof resources) => items.map(item => { const Icon = item.icon; const active = route === item.route || route.startsWith(`${item.route}/`); return <a key={item.route} href={item.route} aria-current={active ? "page" : undefined} className={active ? "active" : ""}><Icon size={22} aria-hidden="true" /><span>{item.label}</span></a>; });
   return <WorkspaceContext.Provider value={managed?.id}><WorkspaceLabelContext.Provider value={managed?.name}>
     <div className="app-shell" data-root-page={rootRoutes.includes(route)} data-detail-page={/^#\/(services|agents|domains)\//.test(route)} onPointerDownCapture={event => rememberInteraction(event.target)} onKeyDownCapture={() => rememberInteraction(null)}>
-      <aside className="sidebar"><div className="sidebar-brand">Nexo</div><nav aria-label="主导航">{links(desktopItems)}</nav></aside>
+      <aside className="sidebar"><div className="sidebar-brand" aria-label="Nexo"><picture aria-hidden="true"><source media="(prefers-color-scheme: dark)" srcSet="/brand/nexo-banner-dark.webp" /><img src="/brand/nexo-banner-light.webp" width="168" height="56" alt="" /></picture></div><nav aria-label="主导航">{links(desktopItems)}</nav></aside>
       <header className="workspace-header">
         <div className="workspace-topbar"><nav className="breadcrumbs" aria-label="面包屑">{parent && <><a href={parent}>{routeInfo(parent).label}</a><ChevronRight size={16} aria-hidden="true" /></>}<span aria-current="page" title={title}>{title}</span></nav><AccountMenu auth={auth} onLogout={logout} /></div>
         <div className="workspace-tabs" role="tablist" aria-label="已开页面" onKeyDown={event => {

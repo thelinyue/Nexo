@@ -46,7 +46,7 @@ test("用户在全部断点始终单行，更多菜单信息完整且操作可�
       await long.getByRole("button", { name: "更多", exact: true }).click();
       const menu = long.getByRole("dialog");
       await expect(menu).toBeVisible();
-      await expect(long.locator(".user-menu-summary>strong")).toHaveText(state.users[2].username);
+      await expect(long.locator(".user-menu-identity strong")).toHaveText(state.users[2].username);
       expect((await long.boundingBox())!.height).toBe(rowBefore!.height);
       const menuBox = await menu.boundingBox();
       expect(menuBox!.x).toBeGreaterThanOrEqual(16);

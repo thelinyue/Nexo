@@ -1,6 +1,6 @@
 import { createContext, useCallback, useContext, useEffect, useRef, useState } from "react";
 import type { InputHTMLAttributes, ReactNode } from "react";
-import { ArrowLeft, Check, ChevronRight, Copy, FileQuestion, Globe2, Network, Plus, Search, Server, ShieldCheck, Users, X } from "lucide-react";
+import { ArrowLeft, Check, ChevronRight, Copy, Plus, Users, X } from "lucide-react";
 import { PageNavigationContext } from "./navigation";
 
 export type Auth = { initialized: boolean; authenticated: boolean; user_id?: string; username?: string; role?: "system_admin" | "tenant"; workspace_id?: string; csrf_token?: string | null; local_http_warning?: boolean };
@@ -59,7 +59,13 @@ export function EnrollmentDevice({ item }: { item: Enrollment }) {
   return <div className="enrollment-device"><strong>{item.device_name || "尚未收到主机名"}</strong><p>{[item.os, item.architecture, item.agent_version && `Agent ${item.agent_version}`].filter(Boolean).join(" · ") || "等待设备信息"}</p><small>设备自报信息，请在批准前与目标主机核对。</small></div>;
 }
 
-export function Brand() { return <div className="brand"><span className="brand-icon">N</span><span><strong>Nexo</strong><small>联巢 · 内网穿透</small></span></div>; }
+export function Brand() { return <div className="brand"><img className="brand-icon" src="/brand/mole-head.webp" width="38" height="38" alt="" aria-hidden="true" /><span><strong>Nexo</strong><small>联巢 · 内网穿透</small></span></div>; }
+
+/** 默认头像只由登录账号的真实角色决定，代管其他空间时不会改变管理员本人的身份。 */
+export function UserAvatar({ role, size = 32 }: { role?: string; size?: 28 | 32 | 48 }) {
+  const kind = role === "system_admin" ? "admin" : "user";
+  return <img className="user-avatar" data-avatar-role={kind} src={`/brand/avatar-${kind}.webp`} width={size} height={size} alt="" aria-hidden="true" />;
+}
 
 /** 各资源分别解释状态，未知状态保留原值，避免把离线或未知情况误报为处理中。 */
 export function Status({ value, kind = "service" }: { value: string; kind?: "service" | "agent" | "domain" | "certificate" | "reverse_proxy" }) {
@@ -83,10 +89,9 @@ export function CreateButton({ label, onClick, disabled }: { label: string; onCl
   return <button className="primary-button page-create" data-resource={label} aria-label={label === "服务" ? "创建服务" : `添加 ${label}`} title={label === "服务" ? "添加服务" : `添加${label}`} onClick={onClick} disabled={disabled}><Plus size={20} strokeWidth={1.8} /><span>{label === "服务" ? "添加服务" : `添加${label}`}</span></button>;
 }
 export function Notice({ error, onRetry, updatedAt }: { error?: string | null; onRetry?: () => void; updatedAt?: number | null }) { return error ? <><div className="notice error" role="alert"><span>{error}</span>{onRetry && <button className="text-button" onClick={onRetry}>重试</button>}</div>{updatedAt && <p className="helper">保留上次数据 · 更新于 {dateText(updatedAt)}</p>}</> : null; }
-/** 空状态用场景图标和单一下一步引导，搜索无结果与资源不存在不冒充首次使用。 */
+/** 同一角色通过场景区分首次使用、搜索无结果和资源不存在；插画只作装饰，状态与操作由文字表达。 */
 export function Empty({ title, detail, children, kind = "missing" }: { title: string; detail?: string; children?: ReactNode; kind?: "services" | "agents" | "domains" | "users" | "sessions" | "search" | "missing" }) {
-  const Icon = { services: Network, agents: Server, domains: Globe2, users: Users, sessions: ShieldCheck, search: Search, missing: FileQuestion }[kind];
-  return <section className="empty" data-kind={kind}><div className="empty-symbol" aria-hidden="true"><Icon size={34} strokeWidth={1.5} /></div><h2>{title}</h2>{detail && <p>{detail}</p>}{children && <div className="empty-actions">{children}</div>}</section>;
+  return <section className="empty" data-kind={kind}>{kind === "users" ? <div className="empty-symbol" aria-hidden="true"><Users size={34} strokeWidth={1.5} /></div> : <img className="empty-illustration" src={`/illustrations/mole-${kind}.webp`} width="160" height="160" alt="" aria-hidden="true" />}<h2>{title}</h2>{detail && <p>{detail}</p>}{children && <div className="empty-actions">{children}</div>}</section>;
 }
 export function Loading() { return <div className="skeleton-list" role="status" aria-label="正在加载"><div /><div /><div /><span className="sr-only">正在加载</span></div>; }
 export function RowLink({ href, title, detail, icon }: { href: string; title: string; detail?: string; icon?: ReactNode }) { return <a className="row-link" href={href}>{icon}<span><strong>{title}</strong>{detail && <small>{detail}</small>}</span><ChevronRight size={19} /></a>; }

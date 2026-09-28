@@ -1,7 +1,7 @@
 import { Ellipsis, Plus, Search } from "lucide-react";
 import { useEffect, useId, useRef, useState } from "react";
 import type { FormEvent, ReactNode } from "react";
-import { Brand, PasswordInput, Empty, Confirm, CopyButton, Loading, Modal, Notice, PageHeader, errorText, rememberInteraction, request, useResource } from "./ui";
+import { Brand, PasswordInput, Empty, Confirm, CopyButton, Loading, Modal, Notice, PageHeader, UserAvatar, errorText, rememberInteraction, request, useResource } from "./ui";
 import type { Auth } from "./ui";
 import { PasswordForm } from "./management";
 import { QuotaForm } from "./traffic-quota";
@@ -47,7 +47,7 @@ function UserMenu({ user, active, busy, children }: { user: User; active: boolea
     <div ref={menu} id={id} popover="auto" role="dialog" aria-label={`${user.username} 的账号操作`} className="user-menu" onToggle={event => setOpen(event.currentTarget.matches(":popover-open"))} onKeyDown={event => { if (event.key === "Escape") { event.preventDefault(); close(); trigger.current?.focus(); } }} onBlur={event => { if (event.relatedTarget && !event.currentTarget.contains(event.relatedTarget as Node) && event.relatedTarget !== trigger.current) close(); }} onClickCapture={event => {
       if ((event.target as Element).closest("button,a")) { close(); trigger.current?.focus({ preventScroll: true }); rememberInteraction(trigger.current); }
     }}>
-      <div className="user-menu-summary"><strong>{user.username}</strong><p>创建于 {accountDate(user.created_at)}</p><UserResources user={user} /></div>
+      <div className="user-menu-summary"><div className="user-menu-identity"><UserAvatar role={user.role} size={32} /><div><strong>{user.username}</strong><p>创建于 {accountDate(user.created_at)}</p></div></div><UserResources user={user} /></div>
       <div className="user-account-actions">{children}</div>
     </div>
   </>;
@@ -83,7 +83,7 @@ export function UsersPage({ active, auth, onManage, onRenamed, onDeleted, onExpi
     {notice && <p role="status" className="action-status">{notice}</p>}
     {!resource.data && resource.busy && <Loading />}
     {resource.data && <><div className="users-filter"><label className="search"><Search size={18} aria-hidden="true" /><input aria-label="搜索用户" placeholder="搜索用户名" value={query} onChange={e => setQuery(e.target.value)} /></label><select aria-label="用户状态筛选" value={statusFilter} onChange={e => setStatusFilter(e.target.value)}><option value="all">全部状态</option><option value="enabled">已启用</option><option value="disabled">已停用</option></select></div><div className="users-caption"><span>{filtered ? `显示 ${visibleUsers.length} / ${resource.data.users.length} 个账号` : `共 ${resource.data.users.length} 个账号`}</span>{filtered && visibleUsers.length > 0 && <button className="text-button" onClick={() => { setQuery(""); setStatusFilter("all"); }}>清除筛选</button>}</div>{!visibleUsers.length && <Empty kind="search" title="没有匹配的用户" detail="更换关键词或清除筛选。"><button className="secondary-button" onClick={() => { setQuery(""); setStatusFilter("all"); }}>清除筛选</button></Empty>}{visibleUsers.length > 0 && <section className="panel user-list" aria-label="用户列表"><div className="user-list-header" aria-hidden="true"><div className="user-heading"><span>用户</span><span>状态</span></div><span>资源</span><span>操作</span></div>{visibleUsers.map(user => <article className="user-card" key={user.id}>
-      <div className="user-heading"><h2 title={user.username}>{user.username}</h2><span className={`status ${user.enabled ? "ready" : "neutral"}`}>{user.role === "system_admin" ? `管理员${user.id === auth.user_id ? " · 本人" : ""}` : user.enabled ? "已启用" : "已停用"}</span></div>
+      <div className="user-heading"><UserAvatar role={user.role} size={32} /><h2 title={user.username}>{user.username}</h2><span className={`status ${user.enabled ? "ready" : "neutral"}`}>{user.role === "system_admin" ? `管理员${user.id === auth.user_id ? " · 本人" : ""}` : user.enabled ? "已启用" : "已停用"}</span></div>
       <button className="user-resource-link" disabled={busy} title={`Agent ${user.devices} · 服务 ${user.services} · 域名 ${user.domains}`} aria-label={`管理 ${user.username} 的空间`} onClick={() => onManage({ id: user.workspace_id, name: user.workspace_name, enabled: user.enabled })}><span className="user-resource-summary">Agent {user.devices} · 服务 {user.services} · 域名 {user.domains}</span><span className="user-resource-mobile">资源</span></button>
       <div className="user-card-actions"><UserMenu user={user} active={active} busy={busy}>
         <button className="secondary-button" disabled={busy} onClick={() => setQuotaUser(user)}>流量限制</button><button className="secondary-button" disabled={busy} onClick={() => setEditing(user)}>修改用户名</button>{user.id === auth.user_id && <><button className="secondary-button" disabled={busy} onClick={() => setPassword(true)}>修改密码</button><a className="secondary-button" href="#/settings/sessions">登录会话</a></>}{user.role !== "system_admin" && <><button className="secondary-button" disabled={busy || !user.enabled} onClick={() => void createLink(user)}>重设密码</button><button className="secondary-button" disabled={busy} onClick={() => setChanging(user)}>{user.enabled ? "停用用户" : "启用用户"}</button><button className="secondary-button user-delete" disabled={busy} onClick={() => setDeleting(user)}>删除用户</button></>}

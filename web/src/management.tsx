@@ -6,7 +6,7 @@ import { AgentEnrollment } from "./agent-enrollment";
 import { ServerSettings } from "./server-settings";
 import { DomainSettings } from "./domain-settings";
 import { ChevronRight, Settings, Trash2, Eye, EyeOff, KeyRound, Server, ShieldCheck, Users, X } from "lucide-react";
-import { Confirm, CopyButton, EnrollmentDevice, CreateButton, DetailField, Empty, Loading, Modal, Notice, PageHeader, RowLink, Status, dateText, errorText, request, useApi, useResource } from "./ui";
+import { Confirm, CopyButton, EnrollmentDevice, CreateButton, DetailField, Empty, Loading, Modal, Notice, PageHeader, RowLink, Status, UserAvatar, dateText, errorText, request, useApi, useResource } from "./ui";
 import type { Auth, Device, Domain, DomainEvent, Enrollment, IdentityCertificate, Session, TransportIdentity, Tunnel } from "./ui";
 
 function identityCertificateLabel(certificate?: IdentityCertificate) {
@@ -67,7 +67,7 @@ export function ManagePage({ auth, active, onLogout, onExpired }: { auth: Auth; 
   return <div className="manage-page">
     <PageHeader title={navigation?.desktop ? "账号设置" : "我的"} />
     {auth.local_http_warning && <p className="notice" role="status">当前管理连接未使用 HTTPS，公网部署请通过 HTTPS 反向代理访问。</p>}
-    <section className="panel account-summary"><div><strong>{auth.username}</strong><small>{auth.role === "system_admin" ? "管理员" : "普通用户"}</small></div></section>
+    <section className="panel account-summary"><UserAvatar role={auth.role} size={48} /><div><strong>{auth.username}</strong><small>{auth.role === "system_admin" ? "管理员" : "普通用户"}</small></div></section>
     <div className="management-sections"><section><h2 className="section-title">账号与安全</h2><section className="panel management-group"><button className="row-link" onClick={() => setPassword(true)}><KeyRound size={23} /><span><strong>修改密码</strong></span><ChevronRight size={19} /></button><RowLink href="#/settings/sessions" title="登录会话" icon={<ShieldCheck size={23} />} /></section>
     </section>{auth.role === "system_admin" && <section><h2 className="section-title">管理员功能</h2><section className="panel management-group"><RowLink href="#/users" title="用户管理" icon={<Users size={23} />} /><button className="row-link" onClick={() => setServerSettings(true)}><Server size={23} /><span><strong>服务器设置</strong></span><ChevronRight size={19} /></button></section><ServerIdentityCard active={active} /></section>}</div>
     <Notice error={error} /><button className="danger-button danger-zone" disabled={busy} onClick={async () => { setBusy(true); setError(null); try { await onLogout(); } catch (e) { setError(errorText(e)); } finally { setBusy(false); } }}>{busy ? "退出中…" : "退出登录"}</button>

@@ -1,0 +1,58 @@
+{
+  "tool": "built-in image_gen",
+  "exports": "PNG masters at 1024px; transparent WebP at 512px; brand head at 256px. Browser canvas used only for resizing and format export.",
+  "images": [
+    {
+      "file": "masters/character.png",
+      "transparent_background": true,
+      "prompt": "Create a single full body mascot character master reference for Nexo software. ONE adorable but composed mole animal, three-quarter view, rounded pear-shaped cocoa brown body #86634F, creamy muzzle and belly #F4E5CD, slightly elongated snout and prominent dark coffee round nose #352A26, tiny expressive black eyes, tiny almost hidden ears, distinctive broad shovel-shaped front paws with small rounded pale claws, short legs. Short sage green scarf #8CA58B is the sole accessory. Premium 2.5D matte clay sculpture illustration, smooth tactile untextured surfaces, soft upper-left studio light, subtle ambient shading, quiet curious reliable personality. Standing relaxed with front paws visible. Whole character centered with generous clear margin, 1024x1024 square composition. Genuine transparent background, only very subtle contact shadow. No lettering, no watermark, no panel, no scenery, no fur, no plastic gloss, no huge anime eyes, no bear ears."
+    },
+    {
+      "file": "masters/app-icon.png",
+      "transparent_background": false,
+      "reference": "masters/character.png",
+      "prompt": "Use the attached mole as character identity reference. Preserve cocoa brown #86634F body, cream #F4E5CD muzzle, dark coffee #352A26 round nose, small eyes, long snout, tiny ears, sage #8CA58B short scarf and broad shovel paws. Premium matte clay 2.5D, same upper-left soft light. No text, watermark, large ears, glossy plastic or fur. Create one square app icon 1024x1024. Flat full-bleed apricot #F3AA70 background, no rounded outside corners or border. Mole head in slight three-quarter turn facing right, peeking from a very subtle arched burrow opening, two little paws resting on the lower lip. Friendly composed face. HEAD AND PAWS ONLY, not full body. Large bold silhouette but all critical facial features and paws must fit within the central circle of radius 38% of canvas, generous full-color padding for adaptive circular masks. No scenery, no device, no cable."
+    },
+    {
+      "file": "masters/brand-head.png",
+      "transparent_background": true,
+      "reference": "masters/character.png",
+      "prompt": "Use the attached mole as character identity reference. Preserve cocoa brown #86634F body, cream #F4E5CD muzzle, dark coffee #352A26 round nose, small eyes, long snout, tiny ears, sage #8CA58B short scarf and broad shovel paws. Premium matte clay 2.5D, same upper-left soft light. No text, watermark, large ears, glossy plastic or fur. Create a transparent head-and-shoulders brand mark of this same mole. Head in slight three-quarter turn facing right, scarf just visible, no body or paws. Large centered silhouette with 12% empty margin, bold clean edges. 1024x1024 square, genuine alpha transparency, no background, no contact shadow."
+    },
+    {
+      "file": "masters/favicon.png",
+      "transparent_background": true,
+      "prompt": "One minimalist favicon mascot: cute cocoa brown mole HEAD ONLY in three-quarter view facing right. Large elongated cream muzzle, prominent dark coffee round nose, tiny black dot eye, tiny hidden ear. Simple bold rounded silhouette designed to be recognizable at 16 pixels, very few flat color areas, subtle matte clay shading. Square composition, head occupies 85% canvas. Transparent background. No text, no border, no scarf, no body, no fur."
+    },
+    {
+      "file": "masters/services.png",
+      "transparent_background": true,
+      "prompt": "Nexo mascot empty-state illustration. ONE adorable composed mole animal: rounded pear-shaped cocoa brown body #86634F, cream muzzle and belly #F4E5CD, elongated tapered upward snout with prominent dark coffee round nose #352A26, small black bead eyes, tiny almost hidden ears, broad shovel front paws with three rounded cream claws, short legs. Short sage green scarf #8CA58B with one hanging end is sole accessory. Premium smooth 2.5D matte clay sculpture, soft upper-left studio lighting, warm calm reliable character, no fur or gloss. Whole character and props fully visible, centered compact square composition with 12% margins, transparent background with subtle contact shadow only. No text, watermark or scenery. Mole crouches beside one small terracotta arched tunnel entrance, carefully coiling a short sage cable with one free connector. Ready to make its first connection."
+    },
+    {
+      "file": "masters/agents.png",
+      "transparent_background": true,
+      "prompt": "Nexo mascot empty-state illustration. ONE adorable composed mole animal: rounded pear-shaped cocoa brown body #86634F, cream muzzle and belly #F4E5CD, elongated tapered upward snout with prominent dark coffee round nose #352A26, small black bead eyes, tiny almost hidden ears, broad shovel front paws with three rounded cream claws, short legs. Short sage green scarf #8CA58B with one hanging end is sole accessory. Premium smooth 2.5D matte clay sculpture, soft upper-left studio lighting, warm calm reliable character, no fur or gloss. Whole character and props fully visible, centered compact square composition with 12% margins, transparent background with subtle contact shadow only. No text, watermark or scenery. Mole sits next to one small cream generic computer appliance, gently patting its top with one paw and looking patiently at it. Device has blank front with no glowing status light or checkmark. Waiting for a device to join."
+    },
+    {
+      "file": "masters/domains.png",
+      "transparent_background": true,
+      "prompt": "Nexo mascot empty-state illustration. ONE adorable composed mole animal: rounded pear-shaped cocoa brown body #86634F, cream muzzle and belly #F4E5CD, elongated tapered upward snout with prominent dark coffee round nose #352A26, small black bead eyes, tiny almost hidden ears, broad shovel front paws with three rounded cream claws, short legs. Short sage green scarf #8CA58B with one hanging end is sole accessory. Premium smooth 2.5D matte clay sculpture, soft upper-left studio lighting, warm calm reliable character, no fur or gloss. Whole character and props fully visible, centered compact square composition with 12% margins, transparent background with subtle contact shadow only. No text, watermark or scenery. Mole stands holding one small unattached wooden signpost with a simple sage globe symbol and no lettering, ready to place it. Only one prop."
+    },
+    {
+      "file": "masters/search.png",
+      "transparent_background": true,
+      "prompt": "Nexo mascot empty-state illustration. ONE adorable composed mole animal: rounded pear-shaped cocoa brown body #86634F, cream muzzle and belly #F4E5CD, elongated tapered upward snout with prominent dark coffee round nose #352A26, small black bead eyes, tiny almost hidden ears, broad shovel front paws with three rounded cream claws, short legs. Short sage green scarf #8CA58B with one hanging end is sole accessory. Premium smooth 2.5D matte clay sculpture, soft upper-left studio lighting, warm calm reliable character, no fur or gloss. Whole character and props fully visible, centered compact square composition with 12% margins, transparent background with subtle contact shadow only. No text, watermark or scenery. Mole bends forward looking through one sage magnifying glass at one blank cream card. Slightly curious puzzled expression, not sad. No letters or question marks."
+    },
+    {
+      "file": "masters/missing.png",
+      "transparent_background": true,
+      "prompt": "Nexo mascot empty-state illustration. ONE adorable composed mole animal: rounded pear-shaped cocoa brown body #86634F, cream muzzle and belly #F4E5CD, elongated tapered upward snout with prominent dark coffee round nose #352A26, small black bead eyes, tiny almost hidden ears, broad shovel front paws with three rounded cream claws, short legs. Short sage green scarf #8CA58B with one hanging end is sole accessory. Premium smooth 2.5D matte clay sculpture, soft upper-left studio lighting, warm calm reliable character, no fur or gloss. Whole character and props fully visible, centered compact square composition with 12% margins, transparent background with subtle contact shadow only. No text, watermark or scenery. Mole stands at a tiny isolated terracotta fork in a path, holding a cream folded map with simple abstract route lines and no letters, looking back toward viewer helpfully. No landscape beyond the small fork immediately beneath its feet."
+    },
+    {
+      "file": "masters/sessions.png",
+      "transparent_background": true,
+      "prompt": "Nexo mascot empty-state illustration. ONE adorable composed mole animal: rounded pear-shaped cocoa brown body #86634F, cream muzzle and belly #F4E5CD, elongated tapered upward snout with prominent dark coffee round nose #352A26, small black bead eyes, tiny almost hidden ears, broad shovel front paws with three rounded cream claws, short legs. Short sage green scarf #8CA58B with one plain rounded hanging end is sole accessory. Premium smooth 2.5D matte clay sculpture, soft upper-left studio lighting, warm calm reliable character, no fur or gloss. Whole character and prop fully visible, centered compact square composition with 12% margins, transparent background with subtle contact shadow only. No text, watermark or scenery. Scene: mole sits with an open cream blank record book on its lap, calmly looking at its empty pages. Empty activity history, no writing, no shield or checkmark."
+    }
+  ]
+}

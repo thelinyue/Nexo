@@ -5,6 +5,8 @@ import type { Tunnel, Device, Domain, DomainEvent, Enrollment, TransportIdentity
 export async function installApiMocks(page: Page, options: { empty?: boolean; anonymous?: boolean } = {}) {
   const state = {
     authenticated: !options.anonymous,
+    initialized: true,
+    authRole: "system_admin" as "system_admin" | "tenant",
     users: [{ id: "admin", username: "admin", role: "system_admin", workspace_id: "default", workspace_name: "admin的工作空间", enabled: true, devices: 2, services: 1, domains: 1 }, { id: "alice", username: "alice", role: "tenant", workspace_id: "alice-space", workspace_name: "alice 的工作空间", enabled: true, devices: 1, services: 1, domains: 0 }],
     accessKey: "nexo_join_shared-test-key",
     tunnels: (options.empty ? [] : [{ id: "t-1", name: "媒体中心", protocol: "https", local_address: "127.0.0.1", local_port: 8096, public_port: null, public_address: "https://media.example.com/a-very-long-public-address", hostname: "media", public_domain: "example.com", device_id: "a-1", device_name: "家庭 Agent", enabled: true, apply_status: "ready", apply_error: null, lan_redirect_enabled: false }] as any[]) as Tunnel[],
@@ -58,7 +60,7 @@ export async function installApiMocks(page: Page, options: { empty?: boolean; an
     }
     const scopedResource = path.match(/^\/api\/v1\/admin\/workspaces\/[^/]+\/(tunnels|devices|public-domains)$/);
     if (scopedResource && method === "GET") return respond(scopedResource[1] === "tunnels" ? state.tunnels : scopedResource[1] === "devices" ? state.devices : state.domains);
-    if (path === "/api/v1/auth/status") return respond({ initialized: true, authenticated: state.authenticated, user_id: "admin", workspace_id: "default", role: "system_admin", username: "admin", csrf_token: "test-csrf" });
+    if (path === "/api/v1/auth/status") return respond({ initialized: state.initialized, authenticated: state.authenticated, user_id: "admin", workspace_id: "default", role: state.authRole, username: "admin", csrf_token: "test-csrf" });
     if (path === "/api/v1/auth/login") { state.authenticated = true; return respond({ user_id: "admin", workspace_id: "default", role: "system_admin", username: "admin", csrf_token: "test-csrf" }); }
     if (path === "/api/v1/auth/recover") return respond({ username: "admin", message: "密码已更新，请重新登录" });
     if (path === "/api/v1/auth/password" || path === "/api/v1/auth/logout") return respond({});

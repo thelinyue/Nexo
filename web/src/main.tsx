@@ -9,6 +9,20 @@ import { Brand, Loading, Notice, errorText, request, resumeSession } from "./ui"
 import type { Auth } from "./ui";
 import "./styles.css";
 
+declare global { interface Window { __nexoLaunchTimer?: number } }
+
+/** 启动层只覆盖已安装 PWA 的首次认证探测；无论成功或失败都立即把控制权交还现有页面。 */
+function dismissPwaLaunch() {
+  if (window.__nexoLaunchTimer) window.clearTimeout(window.__nexoLaunchTimer);
+  const root = document.documentElement; const launch = document.getElementById("pwa-launch");
+  if (!root.classList.contains("pwa-launch-active") || !launch) return;
+  const remove = () => { launch.remove(); root.classList.remove("pwa-launch-active", "pwa-launch-slow"); };
+  launch.setAttribute("aria-hidden", "true");
+  if (window.matchMedia("(prefers-reduced-motion: reduce)").matches) { remove(); return; }
+  launch.classList.add("pwa-launch-exit");
+  window.setTimeout(remove, 120);
+}
+
 /** 邀请/恢复也可在已打开的标签页进入；凭据读取后立即从地址栏移除。 */
 function readEntryLink() {
   const match = window.location.hash.match(/^#\/(invite|recover)\?token=([^&]+)$/);
@@ -29,6 +43,7 @@ function App() {
     window.addEventListener("nexo:session-expired", expiry); window.addEventListener("hashchange", readLink);
     return () => { window.removeEventListener("nexo:session-expired", expiry); window.removeEventListener("hashchange", readLink); };
   }, []);
+  useEffect(() => { if (auth || error) dismissPwaLaunch(); }, [auth, error]);
   function authenticated(value: Auth) { if (auth?.user_id !== value.user_id) setManaged(null); if (value.authenticated) setEntry(null); setMessage(null); setExpired(false); setAuth(value); resumeSession(); }
   if (!auth) return <main className="loading-screen"><Brand />{error ? <Notice error={error} onRetry={() => void connect()} /> : <Loading />}</main>;
   if (entry?.kind === "invite") return <InvitationScreen token={entry.token} auth={auth} onAuth={authenticated} onCancel={() => setEntry(null)} />;

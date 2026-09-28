@@ -3,15 +3,44 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
-    <meta name="theme-color" content="#101114" media="(prefers-color-scheme: dark)" />
-    <meta name="theme-color" content="#f2f3f7" media="(prefers-color-scheme: light)" />
+    <meta name="theme-color" content="#171411" media="(prefers-color-scheme: dark)" />
+    <meta name="theme-color" content="#f7f3ed" media="(prefers-color-scheme: light)" />
     <meta name="apple-mobile-web-app-capable" content="yes" />
     <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
     <meta name="apple-mobile-web-app-title" content="Nexo" />
     <link rel="apple-touch-icon" href="/apple-touch-icon.png" />
+    <link rel="icon" type="image/png" sizes="32x32" href="/favicon-32.png" />
+    <link rel="icon" type="image/png" sizes="16x16" href="/favicon-16.png" />
     <title>Nexo</title>
+    <script>
+      (() => {
+        const standalone = window.matchMedia("(display-mode: standalone)").matches || window.navigator.standalone === true;
+        if (!standalone) return;
+        document.documentElement.classList.add("pwa-launch-active");
+        window.__nexoLaunchTimer = window.setTimeout(() => document.documentElement.classList.add("pwa-launch-slow"), 1000);
+      })();
+    </script>
+    <style>
+      #pwa-launch { display:none; }
+      .pwa-launch-active #root { visibility:hidden; }
+      .pwa-launch-active #pwa-launch { position:fixed; z-index:10000; inset:0; display:flex; flex-direction:column; align-items:center; justify-content:center; gap:16px; padding:max(24px,env(safe-area-inset-top)) max(24px,env(safe-area-inset-right)) max(24px,env(safe-area-inset-bottom)) max(24px,env(safe-area-inset-left)); box-sizing:border-box; color:#302923; background:#f7f3ed; text-align:center; opacity:1; transition:opacity 120ms ease-out; }
+      .pwa-launch-active #pwa-launch.pwa-launch-exit { opacity:0; pointer-events:none; }
+      #pwa-launch img { display:block; width:clamp(240px,31vw,320px); height:auto; aspect-ratio:1; object-fit:contain; }
+      .pwa-launch-copy strong { display:block; font:700 32px/1.1 system-ui,-apple-system,"Segoe UI",sans-serif; letter-spacing:0; }
+      .pwa-launch-copy small { display:block; margin-top:7px; color:#74665c; font:500 13px/1.4 system-ui,-apple-system,"Segoe UI",sans-serif; letter-spacing:0; }
+      #pwa-launch-status { display:none; margin:8px 0 0; color:#74665c; font:400 14px/1.4 system-ui,-apple-system,"Segoe UI",sans-serif; }
+      .pwa-launch-slow #pwa-launch-status { display:block; }
+      @media (prefers-color-scheme:dark) { .pwa-launch-active #pwa-launch { color:#f4eadf; background:#171411; } .pwa-launch-copy small,#pwa-launch-status { color:#b4a69a; } }
+      @media (orientation:landscape) and (max-height:500px) { .pwa-launch-active #pwa-launch { gap:6px; padding-block:12px; } #pwa-launch img { width:min(176px,42vh); } .pwa-launch-copy strong { font-size:25px; } .pwa-launch-copy small { margin-top:4px; } #pwa-launch-status { margin-top:4px; } }
+      @media (max-width:420px) { #pwa-launch img { width:240px; } }
+      @media (prefers-reduced-motion:reduce) { .pwa-launch-active #pwa-launch { transition:none; } }
+    </style>
   </head>
   <body>
+    <div id="pwa-launch" role="status" aria-label="正在启动 Nexo">
+      <img src="/brand/pwa-launch.webp" width="768" height="768" alt="" aria-hidden="true" fetchpriority="high" />
+      <div class="pwa-launch-copy"><strong>Nexo</strong><small>联巢 · 内网穿透</small><p id="pwa-launch-status">正在连接 Nexo…</p></div>
+    </div>
     <div id="root"></div>
     <script type="module" src="/src/main.tsx"></script>
   </body>
