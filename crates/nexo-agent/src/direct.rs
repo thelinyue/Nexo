@@ -429,7 +429,8 @@ fn configuration(root: &Path, services: &[(Service, String)], access: &str) -> V
         let id = &service.tunnel.tunnel_id;
         certificates.push(json!({"certificate":root.join(id).join("chain.pem"),"key":root.join(id).join("key.pem")}));
         let name = format!("{}:{}", service.ipv6, service.port);
-        let server=servers.entry(name).or_insert_with(||json!({"listen":[format!("[{}]:{}",service.ipv6,service.port)],"protocols":["h1","h2"],"automatic_https":{"disable":true},"tls_connection_policies":[{}],"routes":[]}));
+        // 在 TLS 解码之前识别误入 HTTPS 端口的 HTTP 请求，跳转时保留原端口和 URI。
+        let server=servers.entry(name).or_insert_with(||json!({"listen":[format!("[{}]:{}",service.ipv6,service.port)],"listener_wrappers":[{"wrapper":"http_redirect"},{"wrapper":"tls"}],"protocols":["h1","h2"],"automatic_https":{"disable":true},"tls_connection_policies":[{}],"routes":[]}));
         let headers = json!({"request":{"set":{"X-Nexo-Access-Service":[id],"X-Nexo-Access-Authority":["{http.request.hostport}"],"X-Nexo-Access-Ip":["{http.request.remote.host}"],"X-Nexo-Access-Method":["{http.request.method}"],"X-Nexo-Access-Uri":["{http.request.uri}"]}}});
         let endpoint =
             json!({"handler":"reverse_proxy","upstreams":[{"dial":access}],"headers":headers});

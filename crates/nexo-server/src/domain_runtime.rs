@@ -468,7 +468,8 @@ fn build_config(settings: &CaddyRuntimeConfig, domains: &[DomainSpec]) -> Result
                 .context("HTTPS 监听地址无效")?;
             (format!("https_{port}"), format!("{address}:{port}"))
         };
-        servers.insert(name, json!({"listen":[listen],"automatic_https":{"disable":true},"routes":routes,"tls_connection_policies":[{}]}));
+        // 必须在 TLS 包装之前识别明文 HTTP，让同端口访问跳转到保留原 URI 的 HTTPS 地址。
+        servers.insert(name, json!({"listen":[listen],"listener_wrappers":[{"wrapper":"http_redirect"},{"wrapper":"tls"}],"automatic_https":{"disable":true},"routes":routes,"tls_connection_policies":[{}]}));
     }
     let mut config = json!({"admin":{"listen":admin_listen(settings)?},"storage":{"module":"file_system","root":settings.storage_root},"apps":{"http":{"servers":servers},"pki":{"certificate_authorities":{"local":{"install_trust":false}}}}});
     if !subjects.is_empty() {

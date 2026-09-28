@@ -114,6 +114,21 @@ async fn real_caddy_access_password_cookie_proxy_and_lan_priority() {
         .resolve("plain.access.localhost", http)
         .build()
         .unwrap();
+    // 明文误入 HTTPS 端口时，先跳转再认证，完整保留端口和编码后的路径、查询。
+    let path = "/photos/a%2Fb?q=%2F&v=4.9.5.0";
+    let redirect = client
+        .get(format!(
+            "http://web.access.localhost:{}{path}",
+            https.port()
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(redirect.status(), StatusCode::PERMANENT_REDIRECT);
+    assert_eq!(
+        redirect.headers()["location"],
+        format!("https://web.access.localhost:{}{path}", https.port())
+    );
     for (id, protocol, port) in [
         ("web", "https", https.port()),
         ("plain", "http", http.port()),

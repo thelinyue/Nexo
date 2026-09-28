@@ -354,12 +354,22 @@ async fn real_caddy_direct_range_upload_upgrade_authorization_and_revoke() {
     process.apply(config.clone()).await.unwrap();
     let client = reqwest::Client::builder()
         .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
         .add_root_certificate(reqwest::Certificate::from_pem(cert.pem().as_bytes()).unwrap())
         .resolve(&svc.hostname, format!("[::1]:{port}").parse().unwrap())
         .timeout(Duration::from_secs(5))
         .build()
         .unwrap();
     let base = format!("https://{}:{port}", svc.hostname);
+    // IPv6 直连也要在同一端口跳转，明文请求不能进入认证或业务回源。
+    let path = "/photos/a%2Fb?q=%2F&v=4.9.5.0";
+    let redirect = client
+        .get(format!("http://{}:{port}{path}", svc.hostname))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(redirect.status(), 308);
+    assert_eq!(redirect.headers()["location"], format!("{base}{path}"));
     let response = client
         .get(format!("{base}/video?v=4.9.5.0&start=2"))
         .header("Range", "bytes=2-4")
