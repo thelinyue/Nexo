@@ -589,6 +589,19 @@ async fn acme_dns01_issues_agent_csr_and_keeps_valid_chain_during_renewal_failur
         "configured"
     );
     assert_eq!(dns.records.lock().unwrap().len(), 2);
+    // 页面填写的公网 IPv4 优先于启动配置，下一轮 DNS 协调直接更新 A，无需重启。
+    state.security.configuration.write().unwrap().relay_ipv4 = Some("8.8.8.8".parse().unwrap());
+    crate::direct::dns::reconcile(&state).await.unwrap();
+    assert_eq!(
+        dns.records
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|r| r.kind == "A")
+            .unwrap()
+            .value,
+        "8.8.8.8"
+    );
     assert!(
         crate::direct::service(&state, "agent", "media", 1).is_ok(),
         "转发额度耗尽不得停止直连"

@@ -507,7 +507,7 @@ fn ensure_device_enabled(db: &rusqlite::Connection, device: &str) -> Result<()> 
 }
 
 /// 同出口仅是内网的近似判定，非公网或原生 IPv6 来源不参与，避免共享/保留网段误判。
-fn public_ipv4(peer: IpAddr) -> Option<Ipv4Addr> {
+pub(crate) fn public_ipv4(peer: IpAddr) -> Option<Ipv4Addr> {
     let ip = match peer {
         IpAddr::V4(ip) => ip,
         IpAddr::V6(ip) => ip.to_ipv4_mapped()?,

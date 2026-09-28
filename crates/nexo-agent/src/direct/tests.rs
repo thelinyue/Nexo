@@ -5,6 +5,7 @@ fn service(port: u16) -> Service {
     Service {
         hostname: "media.direct.test".into(),
         ipv6: "::1".into(),
+        domain_certificate: true,
         port,
         tunnel: TunnelDesiredState {
             tunnel_id: "media".into(),
@@ -49,6 +50,87 @@ fn local_key_survives_port_changes_and_corruption_is_not_overwritten() {
         fs::read_to_string(root.path().join("request.json")).unwrap(),
         "corrupt"
     );
+}
+
+#[tokio::test]
+async fn shared_certificate_survives_rename_and_installs_renewal_without_csr() {
+    let root = tempfile::tempdir().unwrap();
+    let mut svc = service(9443);
+    let make = || {
+        let key = KeyPair::generate().unwrap();
+        let chain = CertificateParams::new(vec!["*.direct.test".into()])
+            .unwrap()
+            .self_signed(&key)
+            .unwrap()
+            .pem();
+        (chain, key.serialize_pem())
+    };
+    let first = make();
+    let renewed = make();
+    let responses = vec![first.clone(), first.clone(), renewed.clone()];
+    let (sender, mut receiver) = mpsc::channel::<(Request, RpcReply)>(4);
+    let rpc = tokio::spawn(async move {
+        for (chain, key_pem) in responses {
+            let (request, reply) = receiver.recv().await.unwrap();
+            assert!(matches!(request, Request::DomainCertificate { .. }));
+            let _ = reply.send(Ok(Response::DomainCertificate { chain, key_pem }));
+        }
+    });
+    let client = Client { sender };
+    assert!(sync_certificate(&client, root.path(), &svc).await.unwrap());
+    svc.hostname = "emby.direct.test".into();
+    svc.tunnel.revision += 1;
+    assert!(!sync_certificate(&client, root.path(), &svc).await.unwrap());
+    assert!(sync_certificate(&client, root.path(), &svc).await.unwrap());
+    assert!(!root.path().join("request.json").exists());
+    assert_eq!(
+        fs::read_to_string(root.path().join("chain.pem")).unwrap(),
+        renewed.0
+    );
+    assert_eq!(
+        fs::read_to_string(root.path().join("key.pem")).unwrap(),
+        renewed.1
+    );
+    // 不匹配私钥和超出泛域名一层范围的主机名不得覆盖现有证书。
+    assert!(install_certificate(root.path(), &svc.hostname, &first.0, &renewed.1).is_err());
+    for hostname in ["direct.test", "nested.emby.direct.test", "other.test"] {
+        assert!(install_certificate(root.path(), hostname, &first.0, &first.1).is_err());
+    }
+    assert_eq!(
+        fs::read_to_string(root.path().join("chain.pem")).unwrap(),
+        renewed.0
+    );
+    rpc.await.unwrap();
+}
+
+#[tokio::test]
+async fn old_server_still_uses_agent_csr_and_persistent_key() {
+    let root = tempfile::tempdir().unwrap();
+    let mut svc = service(9443);
+    svc.domain_certificate = false;
+    let saved = key(root.path(), &svc).unwrap();
+    let chain = CertificateParams::new(vec![svc.hostname.clone()])
+        .unwrap()
+        .self_signed(&KeyPair::from_pem(&saved.key_pem).unwrap())
+        .unwrap()
+        .pem();
+    let (sender, mut receiver) = mpsc::channel::<(Request, RpcReply)>(1);
+    let rpc = tokio::spawn(async move {
+        let (request, reply) = receiver.recv().await.unwrap();
+        let Request::Certificate { csr_pem, .. } = request else {
+            panic!()
+        };
+        assert_eq!(csr_pem, saved.csr_pem);
+        let _ = reply.send(Ok(Response::Certificate {
+            chain: Some(chain),
+            error: None,
+            retry_at: None,
+        }));
+    });
+    assert!(sync_certificate(&Client { sender }, root.path(), &svc)
+        .await
+        .unwrap());
+    rpc.await.unwrap();
 }
 
 #[test]
@@ -198,6 +280,7 @@ async fn real_caddy_direct_range_upload_upgrade_authorization_and_revoke() {
                     let mut bytes=vec![0;size];socket.read_exact(&mut bytes).await.unwrap();assert!(bytes.iter().all(|b|*b==42));
                     socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 8\r\nConnection: close\r\n\r\nuploaded").await.unwrap();
                 } else {
+                    assert!(header.starts_with("GET /video?v=4.9.5.0&start=2 "));
                     assert!(header.to_ascii_lowercase().contains("range: bytes=2-4"));
                     socket.write_all(b"HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 2-4/10\r\nContent-Length: 3\r\nConnection: close\r\n\r\n234").await.unwrap();
                 }
@@ -209,11 +292,11 @@ async fn real_caddy_direct_range_upload_upgrade_authorization_and_revoke() {
     let directory = root.path().join("media");
     fs::create_dir_all(&directory).unwrap();
     let saved = key(&directory, &svc).unwrap();
-    let cert = CertificateParams::new(vec![svc.hostname.clone()])
+    let cert = CertificateParams::new(vec!["*.direct.test".into()])
         .unwrap()
         .self_signed(&KeyPair::from_pem(&saved.key_pem).unwrap())
         .unwrap();
-    fs::write(directory.join("chain.pem"), cert.pem()).unwrap();
+    assert!(install_certificate(&directory, &svc.hostname, &cert.pem(), &saved.key_pem).unwrap());
     let (sender, mut receiver) = mpsc::channel::<(Request, RpcReply)>(64);
     let denied = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let deny = denied.clone();
@@ -224,7 +307,7 @@ async fn real_caddy_direct_range_upload_upgrade_authorization_and_revoke() {
                 revision,
                 headers,
                 body,
-                ..
+                path,
             } = request
             else {
                 panic!("只允许认证流量")
@@ -232,6 +315,7 @@ async fn real_caddy_direct_range_upload_upgrade_authorization_and_revoke() {
             assert_eq!(service_id, "media");
             assert_eq!(revision, 1);
             assert!(body.is_empty());
+            assert_eq!(path, "/check", "业务查询参数不能进入认证路径");
             assert!(headers.iter().any(|(k, v)| k == "x-nexo-access-authority"
                 && v == &format!("media.direct.test:{port}")));
             let _ = reply.send(Ok(Response::Access {
@@ -277,7 +361,7 @@ async fn real_caddy_direct_range_upload_upgrade_authorization_and_revoke() {
         .unwrap();
     let base = format!("https://{}:{port}", svc.hostname);
     let response = client
-        .get(format!("{base}/video"))
+        .get(format!("{base}/video?v=4.9.5.0&start=2"))
         .header("Range", "bytes=2-4")
         .send()
         .await
@@ -313,7 +397,7 @@ async fn real_caddy_direct_range_upload_upgrade_authorization_and_revoke() {
     denied.store(true, std::sync::atomic::Ordering::SeqCst);
     assert_eq!(
         client
-            .get(format!("{base}/video"))
+            .get(format!("{base}/video?v=4.9.5.0&start=2"))
             .send()
             .await
             .unwrap()
@@ -341,13 +425,18 @@ async fn real_caddy_direct_range_upload_upgrade_authorization_and_revoke() {
     assert!(matches!(end, Ok(0) | Err(_)));
     // JSON 不变时仍必须强制 Caddy 重读更新后的证书/私钥文件。
     let replacement_key = KeyPair::generate().unwrap();
-    let replacement = CertificateParams::new(vec![svc.hostname.clone()])
+    let replacement = CertificateParams::new(vec!["*.direct.test".into()])
         .unwrap()
         .self_signed(&replacement_key)
         .unwrap();
-    fs::write(directory.join("key.pem"), replacement_key.serialize_pem()).unwrap();
-    fs::write(directory.join("chain.pem"), replacement.pem()).unwrap();
-    process.reload = true;
+    process.reload = install_certificate(
+        &directory,
+        &svc.hostname,
+        &replacement.pem(),
+        &replacement_key.serialize_pem(),
+    )
+    .unwrap();
+    assert!(process.reload);
     process.apply(config.clone()).await.unwrap();
     let renewed = reqwest::Client::builder()
         .no_proxy()
@@ -366,6 +455,45 @@ async fn real_caddy_direct_range_upload_upgrade_authorization_and_revoke() {
             .await
             .unwrap(),
         "media:1"
+    );
+    // 主机名变更只加载新路由，客户端使用同一泛域名证书完成真实 TLS 握手。
+    svc.hostname = "renamed.direct.test".into();
+    svc.tunnel.revision = 2;
+    assert!(!install_certificate(
+        &directory,
+        &svc.hostname,
+        &replacement.pem(),
+        &replacement_key.serialize_pem()
+    )
+    .unwrap());
+    process
+        .apply(configuration(
+            root.path(),
+            &[(svc.clone(), forward.address.clone())],
+            &auth,
+        ))
+        .await
+        .unwrap();
+    let renamed = reqwest::Client::builder()
+        .no_proxy()
+        .add_root_certificate(reqwest::Certificate::from_pem(replacement.pem().as_bytes()).unwrap())
+        .resolve(&svc.hostname, format!("[::1]:{port}").parse().unwrap())
+        .timeout(Duration::from_secs(5))
+        .build()
+        .unwrap();
+    assert_eq!(
+        renamed
+            .get(format!(
+                "https://{}:{port}/.nexo-direct/probe",
+                svc.hostname
+            ))
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap(),
+        "media:2"
     );
     process.child.kill().await.unwrap();
     assert!(process.apply(config).await.is_err());

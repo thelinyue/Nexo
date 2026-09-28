@@ -30,7 +30,7 @@ pub(crate) fn fixture() -> (AppState, String) {
 }
 
 #[test]
-fn ipv6_candidates_exclude_nonpublic_and_require_explicit_multiple_selection() {
+fn ipv6_candidates_exclude_nonpublic_and_automatically_select_multiple_addresses() {
     for ip in [
         "::",
         "::1",
@@ -44,6 +44,25 @@ fn ipv6_candidates_exclude_nonpublic_and_require_explicit_multiple_selection() {
         assert!(!public_address(ip), "{ip}");
     }
     let (state, _) = fixture();
+    // 首次上报多个地址时自动选取；无效地址和重复项不参与选择。
+    state
+        .db
+        .lock()
+        .unwrap()
+        .execute("DELETE FROM direct_agents", [])
+        .unwrap();
+    sync(
+        &state,
+        "agent",
+        vec![
+            "2400:3200::1".into(),
+            "::1".into(),
+            "2001:4860::123".into(),
+            "2001:4860::123".into(),
+        ],
+        vec![],
+    )
+    .unwrap();
     assert_eq!(
         service(&state, "agent", "media", 1).unwrap().ipv6,
         "2001:4860::123"
@@ -55,11 +74,39 @@ fn ipv6_candidates_exclude_nonpublic_and_require_explicit_multiple_selection() {
         vec![],
     )
     .unwrap();
-    assert!(service(&state, "agent", "media", 1).is_err());
+    assert_eq!(
+        service(&state, "agent", "media", 1).unwrap().ipv6,
+        "2001:4860::124"
+    );
     sync(&state, "agent", vec!["2400:3200::1".into()], vec![]).unwrap();
     assert_eq!(
         service(&state, "agent", "media", 1).unwrap().ipv6,
         "2400:3200::1"
+    );
+    // 候选增多或顺序改变时保留有效旧地址，避免不必要的监听和 DNS 切换。
+    for candidates in [
+        vec!["2001:4860::124".into(), "2400:3200::1".into()],
+        vec!["2400:3200::1".into(), "2001:4860::124".into()],
+    ] {
+        sync(&state, "agent", candidates, vec![]).unwrap();
+        assert_eq!(
+            service(&state, "agent", "media", 1).unwrap().ipv6,
+            "2400:3200::1"
+        );
+    }
+    sync(&state, "agent", vec!["fe80::1".into()], vec![]).unwrap();
+    assert!(service(&state, "agent", "media", 1).is_err());
+    // 公网地址恢复后无需人工重新选择。
+    sync(
+        &state,
+        "agent",
+        vec!["2400:3200::2".into(), "2400:3200::3".into()],
+        vec![],
+    )
+    .unwrap();
+    assert_eq!(
+        service(&state, "agent", "media", 1).unwrap().ipv6,
+        "2400:3200::2"
     );
 }
 
@@ -190,7 +237,7 @@ fn old_ready_report_cannot_publish_changed_address_or_revision() {
     sync(
         &state,
         "agent",
-        vec!["2001:4860::124".into()],
+        vec!["2001:4860::124".into(), "2400:3200::1".into()],
         vec![report("2001:4860::123", 1)],
     )
     .unwrap();

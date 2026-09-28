@@ -23,7 +23,7 @@ http_listen = ":80"
 https_listen = ":443"
 
 [direct]
-# relay_ipv4 = "203.0.113.10" # 开启直连前填写 Server 实际公网 IPv4，用于明确的 A 记录
+# relay_ipv4 = "203.0.113.10" # 可选兼容配置；推荐在页面「服务器设置」填写公网 IPv4，页面值优先
 # IPv6 直连证书由 Server 使用 DNS-01 申请，Server 不需要 IPv6。
 acme_directory = "https://acme-v02.api.letsencrypt.org/directory"
 probe_enabled = false # 可选公网 IPv6 探测，仅诊断，不因超时撤销 DNS

@@ -183,6 +183,28 @@ pub fn certificates(pem: &str) -> Result<Vec<CertificateDer<'static>>> {
     anyhow::ensure!(!certificates.is_empty(), "证书 PEM 为空或格式无效");
     Ok(certificates)
 }
+/// 校验可信存储或已认证管理通道提供的 HTTPS 证书：有效期、SAN 主机名和私钥匹配。
+/// 不用于校验远端信任链；远端连接仍须走常规 TLS 验证。
+pub fn validate_https_certificate(chain: &str, key: &str, hostname: &str, now: i64) -> Result<i64> {
+    let certificates = certificates(chain)?;
+    let (_, cert) = x509_parser::parse_x509_certificate(certificates[0].as_ref())
+        .map_err(|_| anyhow::anyhow!("HTTPS 证书格式无效"))?;
+    let expires = cert.validity().not_after.timestamp();
+    anyhow::ensure!(
+        cert.validity().not_before.timestamp() <= now && expires > now,
+        "HTTPS 证书尚未生效或已过期"
+    );
+    rustls::client::verify_server_name(
+        &rustls::server::ParsedCertificate::try_from(&certificates[0])?,
+        &rustls::pki_types::ServerName::try_from(hostname)?,
+    )
+    .context("HTTPS 证书不覆盖当前服务域名")?;
+    rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(certificates, private_key(key)?)
+        .context("HTTPS 证书与私钥不匹配")?;
+    Ok(expires)
+}
 fn private_key(pem: &str) -> Result<PrivateKeyDer<'static>> {
     rustls_pemfile::private_key(&mut pem.as_bytes())?.context("私钥 PEM 格式无效")
 }

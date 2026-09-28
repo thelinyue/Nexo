@@ -283,6 +283,53 @@ fn public_csr(hostname: &str, key: &KeyPair) -> Result<String> {
     Ok(params.serialize_request(key)?.pem()?)
 }
 
+/// 两端升级后复用域名证书；旧 Server 未声明支持时沿用 CSR，避免独立升级中断直连。
+async fn sync_certificate(client: &Client, directory: &Path, service: &Service) -> Result<bool> {
+    let (chain, key_pem) = if service.domain_certificate {
+        let Response::DomainCertificate { chain, key_pem } = client
+            .call(Request::DomainCertificate {
+                service_id: service.tunnel.tunnel_id.clone(),
+                revision: service.tunnel.revision,
+            })
+            .await?
+        else {
+            anyhow::bail!("域名证书响应类型错误");
+        };
+        (chain, key_pem)
+    } else {
+        let key = key(directory, service)?;
+        let Response::Certificate { chain, error, .. } = client
+            .call(Request::Certificate {
+                service_id: service.tunnel.tunnel_id.clone(),
+                revision: service.tunnel.revision,
+                csr_pem: key.csr_pem,
+            })
+            .await?
+        else {
+            anyhow::bail!("证书响应类型错误");
+        };
+        (
+            chain.context(error.unwrap_or_else(|| "等待 DNS 验证与证书签发".into()))?,
+            key.key_pem,
+        )
+    };
+    install_certificate(directory, &service.hostname, &chain, &key_pem)
+}
+
+/// 先校验再替换，错误响应不覆盖可用文件；证书或私钥变化均要求 Caddy 重新加载。
+fn install_certificate(directory: &Path, hostname: &str, chain: &str, key: &str) -> Result<bool> {
+    identity::validate_https_certificate(chain, key, hostname, certificate::now())?;
+    let mut changed = false;
+    for (name, value) in [("key.pem", key), ("chain.pem", chain)] {
+        let path = directory.join(name);
+        if fs::read(&path).ok().as_deref() != Some(value.as_bytes()) {
+            identity::write_private_file(&path, value.as_bytes())?;
+            changed = true;
+        }
+    }
+    Ok(changed)
+}
+
 /// Agent 专用 Caddy 子进程，只绑定选定 IPv6；退出和热加载失败不得报告就绪。
 struct Process {
     child: tokio::process::Child,
@@ -387,7 +434,9 @@ fn configuration(root: &Path, services: &[(Service, String)], access: &str) -> V
         let endpoint =
             json!({"handler":"reverse_proxy","upstreams":[{"dial":access}],"headers":headers});
         let mut check = endpoint.clone();
-        check["rewrite"] = json!({"method":"GET","uri":"/check"});
+        // Caddy 默认保留原查询串；显式清空认证子请求的查询，避免 /check?v=... 被拒绝。
+        // reverse_proxy 的 rewrite 只作用于子请求，Emby 收到的业务参数保持原样。
+        check["rewrite"] = json!({"method":"GET","uri":"/check?"});
         check["handle_response"] = json!([{"match":{"status_code":[2]},"routes":[{"handle":[{"handler":"headers","request":{"set":{"Cookie":["{http.reverse_proxy.header.X-Nexo-Upstream-Cookie}"]},"delete":["X-Nexo-Access-*","X-Nexo-Upstream-Cookie"]}}]}]}]);
         let routes = server["routes"].as_array_mut().unwrap();
         routes.push(json!({"match":[{"host":[service.hostname],"path":["/.nexo-direct/probe"],"method":["GET"]}],"handle":[{"handler":"static_response","body":format!("{}:{}",id,service.tunnel.revision),"headers":{"Cache-Control":["no-store"]}}],"terminal":true}));
@@ -470,14 +519,7 @@ async fn session(
                         anyhow::ensure!(id.len()<=64 && id.bytes().all(|b|b.is_ascii_alphanumeric()||b==b'-'),"直连服务 ID 无效");
                         anyhow::ensure!(addresses.contains(&service.ipv6) && desired.borrow().tunnels.contains(&service.tunnel),"直连配置不属于当前有效控制快照");
                         let directory=root.join(&id);fs::create_dir_all(&directory)?;
-                        let key=key(&directory,&service)?;
-                        let Response::Certificate {chain,error,..}=client.call(Request::Certificate {service_id:id.clone(),revision:service.tunnel.revision,csr_pem:key.csr_pem}).await? else {anyhow::bail!("证书响应类型错误");};
-                        let chain=chain.context(error.unwrap_or_else(||"等待 DNS 验证与证书签发".into()))?;
-                        anyhow::ensure!(identity::certificate_info(&chain)?.1>certificate::now(),"直连证书已过期");
-                        let key_der=rustls::pki_types::PrivateKeyDer::try_from(KeyPair::from_pem(&key.key_pem)?.serialize_der()).map_err(|_|anyhow::anyhow!("直连私钥格式错误"))?;
-                        rustls::ServerConfig::builder().with_no_client_auth().with_single_cert(identity::certificates(&chain)?,key_der)?;
-                        if fs::read(directory.join("chain.pem")).ok().as_deref()!=Some(chain.as_bytes()) {
-                            identity::write_private_file(&directory.join("chain.pem"),chain.as_bytes())?;
+                        if sync_certificate(&client,&directory,&service).await? {
                             if let Some(caddy)=process.as_mut() {caddy.reload=true;}
                         }
                         if !running.contains_key(&id) {

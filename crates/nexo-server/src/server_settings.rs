@@ -7,7 +7,7 @@ use axum::{
 };
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -24,6 +24,7 @@ pub struct Settings {
     pub public_url: String,
     pub trusted_proxies: Vec<IpAddr>,
     pub public_ips: Vec<IpAddr>,
+    pub relay_ipv4: Option<Ipv4Addr>,
     pub management_entry: Option<ManagementEntry>,
     pub managed: bool,
 }
@@ -146,6 +147,9 @@ pub struct Input {
     pub management_entry: Option<ManagementEntry>,
     #[serde(default)]
     pub public_ips: Vec<IpAddr>,
+    /// 省略时保留旧值，空字符串清除页面覆盖；兼容旧客户端仅修改管理入口。
+    #[serde(default)]
+    pub relay_ipv4: Option<String>,
 }
 #[derive(Debug, Serialize)]
 pub struct DomainChoice {
@@ -157,6 +161,7 @@ pub struct Response {
     management_entry: Option<ManagementEntry>,
     public_url: String,
     public_ips: Vec<IpAddr>,
+    relay_ipv4: Option<Ipv4Addr>,
     domains: Vec<DomainChoice>,
     caddy_enabled: bool,
     status: &'static str,
@@ -214,6 +219,7 @@ fn response(state: &AppState, tenant: &str) -> Result<Response, ApiError> {
         }
     }
     Ok(Response {
+        relay_ipv4: relay_ipv4(state)?,
         management_entry: settings.management_entry,
         public_url: settings.public_url,
         public_ips: settings.public_ips,
@@ -230,6 +236,20 @@ pub async fn get(
 ) -> Result<Json<Response>, ApiError> {
     let session = accounts::require_admin(&state, &headers)?;
     response(&state, &session.tenant_id).map(Json)
+}
+
+/// 页面保存后立即生效；未填写时兼容已有 TOML 与旧公网地址清单，不主动探测公网。
+pub(crate) fn relay_ipv4(state: &AppState) -> Result<Option<Ipv4Addr>, ApiError> {
+    let settings = state.security.settings()?;
+    Ok(settings
+        .relay_ipv4
+        .or(state.config.direct.relay_ipv4)
+        .or_else(|| {
+            settings.public_ips.iter().find_map(|ip| match ip {
+                IpAddr::V4(ip) => Some(*ip),
+                _ => None,
+            })
+        }))
 }
 
 /// 可从 HTTP 原入口保存。配置落库与内存发布保持一致，证书和路由由现有 Caddy 协调器异步收敛。
@@ -254,6 +274,17 @@ pub async fn update(
         let tx = db.unchecked_transaction().map_err(db_error)?;
         let mut settings = Settings {
             managed: true,
+            relay_ipv4: match input.relay_ipv4.as_deref().map(str::trim) {
+                None => current.relay_ipv4,
+                Some("") => None,
+                Some(value) => Some(
+                    value
+                        .parse::<Ipv4Addr>()
+                        .ok()
+                        .and_then(|ip| crate::transport::public_ipv4(ip.into()))
+                        .ok_or_else(|| bad_input("请填写有效的公网 IPv4 地址"))?,
+                ),
+            },
             public_ips: input.public_ips,
             management_entry: input.management_entry,
             ..Default::default()

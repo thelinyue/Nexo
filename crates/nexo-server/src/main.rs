@@ -249,7 +249,11 @@ pub(crate) fn unix_now() -> i64 {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // 按进程所在时区输出毫秒及 UTC 偏移；容器使用 TZ，避免排障时误把 UTC 当成本地时间。
     tracing_subscriber::fmt()
+        .with_timer(tracing_subscriber::fmt::time::ChronoLocal::new(
+            "%Y-%m-%d %H:%M:%S%.3f %:z".into(),
+        ))
         .with_target(false)
         .compact()
         .init();

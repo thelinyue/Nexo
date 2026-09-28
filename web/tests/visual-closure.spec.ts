@@ -7,6 +7,24 @@ const cases = [
   ["phone-large", 430, 932], ["landscape", 812, 375], ["tablet", 768, 1024], ["desktop", 1440, 900],
 ] as const;
 
+test("服务公网地址的复制按钮紧跟地址", async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name !== "desktop-dark", "布局检查由桌面项目执行");
+  const state = await installApiMocks(page);
+  state.tunnels.push({ ...state.tunnels[0], id: "long-address", name: "长地址服务", public_address: `https://${"very-long.".repeat(18)}example.com` });
+  for (const width of [1440, 375]) {
+    await page.setViewportSize({ width, height: 900 });
+    await page.goto("/#/services");
+    for (const row of await page.locator(".service-row:has(.public-address)").all()) {
+      const address = await row.locator(".public-address").boundingBox();
+      const button = await row.locator(".service-address .icon-copy").boundingBox();
+      expect(address && button).toBeTruthy();
+      expect(button!.x - (address!.x + address!.width)).toBeGreaterThanOrEqual(0);
+      expect(button!.x - (address!.x + address!.width)).toBeLessThanOrEqual(10);
+      expect(button!.x + button!.width).toBeLessThanOrEqual(width);
+    }
+  }
+});
+
 test("所有页面在移动尺寸和明暗主题中无溢出，输出实际截图", async ({ page }, testInfo) => {
   test.skip(testInfo.project.name !== "desktop-dark", "尺寸矩阵由单个项目执行");
   test.setTimeout(120000);

@@ -698,7 +698,7 @@ dd>code { display:block; margin-bottom:10px; user-select:text; font-size:.9375re
 .service-filter-control select { width:100%; }
 .service-filter-control>svg,.service-filter-result>span { display:none; }
 .service-filter-result { display:contents; }
-.public-address { min-width:0; flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; color:var(--primary); font-family:ui-monospace,monospace; }
+.public-address { min-width:0; flex:0 1 auto; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; color:var(--primary); font-family:ui-monospace,monospace; }
 .service-address>.icon-copy { flex:0 0 auto; }
 .password-input { display:flex; align-items:center; min-width:0; border:1px solid var(--border); border-radius:14px; background:var(--surface); }
 .password-input input { min-width:0; flex:1; border:0; background:transparent; }

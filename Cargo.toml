@@ -9,7 +9,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.2.10"
+version = "0.2.11"
 edition = "2021"
 license = "AGPL-3.0-only"
 
@@ -24,10 +24,10 @@ bytes = "1"
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 futures-io = "0.3"
 hex = "0.4"
-get_if_addrs = "0.5"
 ipnet = { version = "2", features = ["serde"] }
 libc = "0.2"
 clap = { version = "4", features = ["derive"] }
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 rand = "0.8"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 rcgen = { version = "0.14", features = ["x509-parser"] }

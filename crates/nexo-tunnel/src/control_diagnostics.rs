@@ -7,7 +7,7 @@ use serde::Serialize;
 use tokio::{io::AsyncWrite, time::Instant};
 
 /// 只记录完整消息的收发，不保存含证书或凭据的正文。
-/// UTC 时间用于跨主机对照，单调时钟用于计算间隔，避免系统校时干扰。
+/// 本地时间附带 UTC 偏移，与日志前缀一致；单调时钟用于计算间隔，避免系统校时干扰。
 /// 发送成功仅指本地写入及 flush 完成，不代表对端已接收或处理。
 #[derive(Default)]
 pub struct ControlDiagnostics {
@@ -17,13 +17,13 @@ pub struct ControlDiagnostics {
 
 #[derive(Default)]
 struct Activity {
-    last: Option<(time::OffsetDateTime, Instant)>,
+    last: Option<(chrono::DateTime<chrono::Local>, Instant)>,
     count: u64,
 }
 
 impl Activity {
     fn record(&mut self) {
-        self.last = Some((time::OffsetDateTime::now_utc(), Instant::now()));
+        self.last = Some((chrono::Local::now(), Instant::now()));
         self.count += 1;
     }
 }
@@ -33,7 +33,8 @@ impl fmt::Display for Activity {
         match self.last {
             Some((at, instant)) => write!(
                 f,
-                "{at}，距今 {} 毫秒，累计 {} 条",
+                "{}，距今 {} 毫秒，累计 {} 条",
+                at.format("%Y-%m-%d %H:%M:%S%.3f %:z"),
                 instant.elapsed().as_millis(),
                 self.count
             ),

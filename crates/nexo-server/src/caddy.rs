@@ -404,8 +404,32 @@ impl CaddySupervisor {
             tracing::error!(
                 "Caddy 未能启动，公网 Web 服务暂不可用；Nexo 核心仍继续运行：{error:#}"
             );
+        } else {
+            self.wait_for_admin(Duration::from_secs(10)).await?;
+            tracing::info!("Caddy 管理接口已就绪");
         }
         Ok(())
+    }
+
+    /// spawn 成功只表示进程已创建。首次协调前等待 Admin 能返回有效配置，
+    /// 避免正常启动被记为配置失败；超时仍保留错误，后台监督循环继续负责恢复。
+    async fn wait_for_admin(&self, timeout: Duration) -> Result<()> {
+        let mut last_error = None;
+        let ready = tokio::time::timeout(timeout, async {
+            loop {
+                match self.current_config().await {
+                    Ok(_) => return,
+                    Err(error) => last_error = Some(error),
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await;
+        match ready {
+            Ok(()) => Ok(()),
+            Err(_) => Err(last_error.unwrap_or_else(|| anyhow::anyhow!("管理接口未响应")))
+                .context("等待 Caddy 管理接口就绪超时"),
+        }
     }
 
     async fn spawn_once(&self) -> Result<()> {
@@ -897,6 +921,53 @@ pub fn redact(message: &str, token_root: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn admin_readiness_retries_startup_and_preserves_real_failure() {
+        use axum::{http::StatusCode, routing::get, Json, Router};
+        use std::sync::atomic::AtomicUsize;
+
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let requests = attempts.clone();
+        let app = Router::new().route(
+            "/config/",
+            get(move || {
+                let attempt = requests.fetch_add(1, Ordering::SeqCst);
+                async move {
+                    if attempt < 2 {
+                        Err(StatusCode::SERVICE_UNAVAILABLE)
+                    } else {
+                        Ok(Json(serde_json::json!({"apps": {}})))
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let settings = crate::config::Caddy {
+            admin_url: format!("http://{}", listener.local_addr().unwrap()),
+            ..Default::default()
+        };
+        let root = std::env::temp_dir().join(format!("nexo-caddy-ready-{}", uuid::Uuid::new_v4()));
+        let supervisor = CaddySupervisor::new(CaddyRuntimeConfig::new(root, &settings));
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        // 暂时不可用不能直接当作启动完成；必须实际读到配置。
+        supervisor
+            .wait_for_admin(Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert!(attempts.load(Ordering::SeqCst) >= 3);
+
+        attempts.store(0, Ordering::SeqCst);
+        let error = supervisor
+            .wait_for_admin(Duration::from_millis(50))
+            .await
+            .unwrap_err();
+        let message = format!("{error:#}");
+        assert!(message.contains("等待 Caddy 管理接口就绪超时"));
+        assert!(message.contains("503"));
+        server.abort();
+    }
 
     #[test]
     fn proxy_failures_and_http_rate_limits_are_not_certificate_errors() {

@@ -94,7 +94,11 @@ struct Desired {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // 与 Server 使用相同的本地时间和 UTC 偏移格式，遵循容器 TZ 或宿主机时区。
     tracing_subscriber::fmt()
+        .with_timer(tracing_subscriber::fmt::time::ChronoLocal::new(
+            "%Y-%m-%d %H:%M:%S%.3f %:z".into(),
+        ))
         .with_target(false)
         .compact()
         .init();

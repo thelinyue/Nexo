@@ -2,9 +2,9 @@ import { useEffect, useState } from "react";
 import { CopyButton, Loading, Modal, Notice, errorText, request } from "./ui";
 
 type Entry = { domain_id: string; hostname: string };
-type Settings = { management_entry: Entry | null; public_url: string; public_ips: string[]; domains: { id: string; domain: string }[]; caddy_enabled: boolean; status: string; error: string | null };
-type Fields = { enabled: boolean; domain_id: string; hostname: string };
-const fields = (value: Settings): Fields => ({ enabled: Boolean(value.management_entry), domain_id: value.management_entry?.domain_id ?? (value.domains.length === 1 ? value.domains[0].id : ""), hostname: value.management_entry?.hostname ?? "nexo" });
+type Settings = { management_entry: Entry | null; public_url: string; public_ips: string[]; relay_ipv4?: string | null; domains: { id: string; domain: string }[]; caddy_enabled: boolean; status: string; error: string | null };
+type Fields = { enabled: boolean; domain_id: string; hostname: string; relay_ipv4: string };
+const fields = (value: Settings): Fields => ({ enabled: Boolean(value.management_entry), domain_id: value.management_entry?.domain_id ?? (value.domains.length === 1 ? value.domains[0].id : ""), hostname: value.management_entry?.hostname ?? "nexo", relay_ipv4: value.relay_ipv4 ?? value.public_ips.find(ip => !ip.includes(":")) ?? "" });
 const statusLabel: Record<string, string> = { disabled: "未开启", pending: "正在配置", certificate_pending: "等待证书", ready: "已配置", failed: "配置失败" };
 
 /** 表单只保存期望配置；轮询运行状态不覆盖草稿，证书签发期间仍可关闭或修正入口。 */
@@ -42,13 +42,15 @@ export function ServerSettings({ csrf, onClose }: { csrf?: string | null; onClos
       event.preventDefault(); if (!value || busy) return;
       setBusy(true); setError(null); setMessage(null);
       try {
-        const result = await request<Settings>("/api/v1/admin/server-settings", { method: "PUT", body: JSON.stringify({ management_entry: value.enabled ? { domain_id: value.domain_id, hostname: value.hostname.trim() } : null, public_ips: settings?.public_ips ?? [] }) }, csrf);
+        const result = await request<Settings>("/api/v1/admin/server-settings", { method: "PUT", body: JSON.stringify({ management_entry: value.enabled ? { domain_id: value.domain_id, hostname: value.hostname.trim() } : null, public_ips: settings?.public_ips ?? [], ...(value.relay_ipv4 !== saved?.relay_ipv4 ? { relay_ipv4: value.relay_ipv4.trim() } : {}) }) }, csrf);
         setSettings(result); setSaved(fields(result)); setValue(fields(result)); setMessage("设置已保存。");
       } catch (e) { setError(errorText(e)); } finally { setBusy(false); }
     }}>
       <div className="modal-body">
         {loading && <Loading />}
         {value && settings && <fieldset disabled={busy}>
+          <label>公网 IPv4<input value={value.relay_ipv4} onChange={e => update("relay_ipv4", e.target.value)} placeholder="填写 VPS 的公网 IPv4" inputMode="decimal" autoComplete="off" spellCheck={false} aria-describedby="relay-ipv4-help" /></label>
+          <p className="helper" id="relay-ipv4-help">用于 IPv4 转发及直连域名的 A 记录。保存后生效，留空使用已有部署配置。</p>
           <div className="service-field-group"><label className="service-field service-toggle-field"><span>HTTPS 管理入口</span><span className="service-switch"><input type="checkbox" role="switch" checked={value.enabled} onChange={e => update("enabled", e.target.checked)} disabled={!settings.caddy_enabled && !value.enabled} /><span className="service-switch-track" aria-hidden="true" /></span></label></div>
           {!settings.caddy_enabled && <p className="notice">内置 Caddy 未启用，请在服务器启动配置中启用。</p>}
           {value.enabled && <>

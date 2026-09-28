@@ -2,6 +2,14 @@
 
 本项目使用 [Semantic Versioning](https://semver.org/) 记录公开版本。
 
+## [0.2.11]
+
+- Server 设置页可手动保存公网 IPv4，DNS A 记录按有效配置自动更新；Agent 在多个公网 IPv6 地址中自动保持或选择可用地址。
+- IPv6 直连复用已签发的域名泛域名证书，域名变更不再重复申请；修复 Emby 等带查询参数的资源请求被认证子请求错误拦截。
+- Server 启动时等待 Caddy 管理接口就绪，避免记录短暂的配置加载失败；Server 与 Agent 日志使用本地时区。
+- 服务列表的复制按钮紧跟公网地址，桌面和手机布局保持一致。
+- 本次发布 Server（含 Web）与 Agent；部署和兼容性见 [v0.2.11 发布说明](docs/releases/v0.2.11.md)。
+
 ## [0.2.10]
 
 - 修复 IPv6 直连证书 CSR 携带 rcgen 默认 CN 导致公网 CA 拒签；Agent 保留原私钥自动修复旧请求，Server 在提交订单前校验 CN。

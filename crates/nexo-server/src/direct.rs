@@ -7,6 +7,7 @@ use tokio_util::codec::{FramedRead, LinesCodec};
 
 pub mod certificates;
 pub mod dns;
+mod domain_certificate;
 
 /// 单进程共享签发任务与 DNS 写入锁，避免证书任务和撤销任务争用同一记录。
 #[derive(Default)]
@@ -97,7 +98,7 @@ pub fn service(state: &AppState, device: &str, id: &str, revision: i64) -> Resul
         .lock()
         .map_err(|_| anyhow::anyhow!("数据库锁不可用"))?;
     let (host,port,address): (String,u16,Option<String>) = db.query_row("SELECT t.hostname||'.'||p.domain,t.https_port,a.selected_address FROM tunnels t JOIN devices d ON d.id=t.device_id AND d.tenant_id=t.tenant_id AND d.status='online' JOIN tenants w ON w.id=t.tenant_id AND w.enabled=1 JOIN public_domains p ON p.id=t.public_domain_id AND p.tenant_id=t.tenant_id JOIN domain_settings s ON s.domain_id=p.id JOIN direct_agents a ON a.device_id=d.id WHERE t.id=?1 AND t.device_id=?2 AND t.apply_revision=?3 AND t.enabled=1 AND t.deleted_at IS NULL AND t.ipv6_direct_enabled=1 AND t.protocol='https' AND t.service_mode='tunnel' AND t.lan_redirect_enabled=0 AND p.https_enabled=1 AND s.verified=1 AND s.certificate_mode='cloudflare_dns' AND s.credential_file IS NOT NULL AND a.last_seen>?4",params![id,device,revision,unix_now()-45],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).context("直连服务不存在、已变更或无权访问")?;
-    let address = address.context("请选择 Agent 的公网 IPv6 地址")?;
+    let address = address.context("Agent 尚无可用公网 IPv6 地址，等待自动检测")?;
     anyhow::ensure!(public_address(&address), "Agent IPv6 地址无效");
     drop(db);
     let tunnel = desired_tunnels(state, device)?
@@ -109,6 +110,7 @@ pub fn service(state: &AppState, device: &str, id: &str, revision: i64) -> Resul
         hostname: host,
         port,
         ipv6: address,
+        domain_certificate: true,
     })
 }
 
@@ -142,16 +144,12 @@ fn sync(
             )
             .optional()?
             .flatten();
+        // 优先保留仍有效的地址，避免候选顺序变化导致监听和 DNS 抖动。
+        // 首次连接或旧地址失效时，从已排序的公网候选中自动换选；就绪报告仍须匹配新地址。
         let selected = previous
             .clone()
             .filter(|v| addresses.contains(v))
-            .or_else(|| {
-                if addresses.len() == 1 {
-                    Some(addresses[0].clone())
-                } else {
-                    None
-                }
-            });
+            .or_else(|| addresses.first().cloned());
         tx.execute("INSERT INTO direct_agents(device_id,addresses,selected_address,last_seen) VALUES(?1,?2,?3,?4) ON CONFLICT(device_id) DO UPDATE SET addresses=excluded.addresses,selected_address=excluded.selected_address,last_seen=excluded.last_seen",params![device,serde_json::to_string(&addresses)?,selected,unix_now()])?;
         if previous != selected {
             tx.execute("UPDATE direct_services SET ready=0,probe_status='unverified' WHERE service_id IN (SELECT id FROM tunnels WHERE device_id=?1)",[device])?;
@@ -225,6 +223,10 @@ async fn handle(state: &AppState, device: &str, request: Request) -> Result<Dire
             let service = service(state, device, &service_id, revision)?;
             certificates::request(state, device, &service, csr_pem).await
         }
+        Request::DomainCertificate {
+            service_id,
+            revision,
+        } => domain_certificate::request(state, device, &service_id, revision),
         Request::Access {
             service_id,
             revision,

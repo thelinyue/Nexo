@@ -1764,14 +1764,11 @@ mod tests {
             .write_startup_config(&build_config(&cfg, &[]).unwrap())
             .unwrap();
         supervisor.clone().start().await.unwrap();
+        // start 返回时管理接口必须已经就绪，首轮协调不能产生虚假的配置失败事件。
+        supervisor.current_config().await.unwrap();
         let domain = crate::tests::add_test_domain(&state, &headers, "caddy-integration.localhost")
             .await
             .unwrap();
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
-        while supervisor.current_config().await.is_err() {
-            assert!(tokio::time::Instant::now() < deadline);
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
         // 本机夹具显式验证域名；localhost 仅由 Caddy 内部 CA 签发。
         state.db.lock().unwrap().execute("UPDATE domain_settings SET verified=1,certificate_mode='cloudflare_dns' WHERE domain_id=?1",[&domain.id]).unwrap();
         let add_service = |hostname: &str| {

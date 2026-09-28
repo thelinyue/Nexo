@@ -104,6 +104,11 @@ pub async fn ensure(
             if let Some(ip) = state.config.direct.relay_ipv4 {
                 servers.push(ip.into());
             }
+            if let Some(ip) =
+                crate::server_settings::relay_ipv4(state).map_err(|e| anyhow::anyhow!(e.message))?
+            {
+                servers.push(ip.into());
+            }
             anyhow::ensure!(
                 record
                     .value
@@ -255,23 +260,11 @@ pub async fn reconcile(state: &AppState) -> Result<()> {
         active.insert((id.clone(), service.hostname.clone()));
         let result = async {
             let domain = domain_id(state, &id)?;
-            let zone = zone(state, &domain).await?;
-            let ipv4 = state
-                .config
-                .direct
-                .relay_ipv4
-                .map(std::net::IpAddr::V4)
-                .or_else(|| {
-                    state
-                        .security
-                        .settings()
-                        .ok()?
-                        .public_ips
-                        .into_iter()
-                        .find(|ip| ip.is_ipv4())
-                })
-                .context("请在 Server 的 [direct].relay_ipv4 填写用于转发的公网 IPv4")?
+            let ipv4 = crate::server_settings::relay_ipv4(state)
+                .map_err(|e| anyhow::anyhow!(e.message))?
+                .context("请管理员在「服务器设置」中填写用于转发的公网 IPv4")?
                 .to_string();
+            let zone = zone(state, &domain).await?;
             ensure(state, &zone, &id, &domain, &service.hostname, "A", &ipv4).await?;
             // 网络请求期间配置可能已被撤销；在写 AAAA 前再次核验当前版本。
             super::service(state, &device, &id, revision)?;
