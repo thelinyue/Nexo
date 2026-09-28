@@ -87,7 +87,7 @@ CREATE TABLE service_access_sessions (
 
 CREATE TABLE "tunnels" (
     id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
-    device_id TEXT REFERENCES devices(id) ON DELETE SET NULL, name TEXT NOT NULL,
+    device_id TEXT REFERENCES devices(id) ON DELETE SET NULL, name TEXT NOT NULL, icon_id TEXT,
     protocol TEXT NOT NULL CHECK(protocol IN ('tcp','http','https','udp','tcp_udp')), local_address TEXT NOT NULL,
     local_port INTEGER NOT NULL, public_port INTEGER, https_port INTEGER NOT NULL DEFAULT 443 CHECK(https_port BETWEEN 1 AND 65535), hostname TEXT, enabled INTEGER NOT NULL DEFAULT 1,
     apply_status TEXT NOT NULL DEFAULT 'checking', apply_error TEXT, apply_revision INTEGER NOT NULL DEFAULT 1,

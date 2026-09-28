@@ -47,6 +47,7 @@ mod reverse_proxy;
 mod security;
 mod server_settings;
 mod service_access;
+mod service_icons;
 mod traffic;
 mod transport;
 use enrollment::{agent_enroll, agent_poll, approve_enrollment};
@@ -172,6 +173,7 @@ struct Enrollment {
 struct ApproveEnrollment {}
 #[derive(Debug, Serialize, Deserialize)]
 struct Tunnel {
+    icon_id: Option<String>,
     #[serde(default)]
     protocol_statuses: std::collections::BTreeMap<String, nexo_protocol::ProtocolStatus>,
     access_mode: String,
@@ -203,6 +205,9 @@ struct Tunnel {
 }
 #[derive(Deserialize)]
 struct TunnelInput {
+    /// 省略保留原图标，显式 null 恢复协议默认图标。
+    #[serde(default, deserialize_with = "service_icons::deserialize")]
+    icon_id: Option<Option<String>>,
     access_mode: Option<String>,
     access_password: Option<String>,
     service_mode: Option<String>,
@@ -532,6 +537,7 @@ fn initialize_database(connection: &Connection, is_new: bool) -> Result<()> {
     https_ports::migrate(connection)?;
     dns_provider::migrate(connection)?;
     direct::migrate(connection)?;
+    service_icons::migrate(connection)?;
     server_settings::load(connection).context("无法读取服务器设置")?;
     connection.prepare("SELECT enabled FROM tenants")?;
     connection.prepare("SELECT service_mode,protocol_statuses,access_mode FROM tunnels")?;
@@ -704,6 +710,7 @@ async fn create_tunnel(
             params![id, input.ipv6_direct_enabled.unwrap_or(false)],
         )
         .map_err(db_error)?;
+        service_icons::save(&db, &session.tenant_id, &id, &input)?;
         service_access::save(&db, &id, &input, access_hash.as_deref())?;
         accounts::audit(&db, &session, "service_created", "service", &id)?;
         db.commit().map_err(db_error)?;
@@ -745,6 +752,7 @@ async fn update_tunnel(
             params![id, input.ipv6_direct_enabled.unwrap_or(false)],
         )
         .map_err(db_error)?;
+        service_icons::save(&db, &session.tenant_id, &id, &input)?;
         service_access::save(&db, &id, &input, access_hash.as_deref())?;
         accounts::audit(&db, &session, "service_updated", "service", &id)?;
         db.commit().map_err(db_error)?;
@@ -1129,7 +1137,7 @@ fn query_tunnels(
         .get(axum::http::header::HOST)
         .and_then(|value| value.to_str().ok())
         .and_then(|host| host.parse::<axum::http::uri::Authority>().ok());
-    let sql="SELECT t.id,t.tenant_id,t.device_id,d.name,t.name,t.protocol,t.local_address,t.local_port,t.public_port,t.hostname,t.enabled,t.apply_status,t.apply_error,t.apply_revision,t.public_domain_id,t.deleted_at,p.domain,t.lan_redirect_enabled,CASE WHEN t.protocol IN ('tcp','udp','tcp_udp') THEN NULL ELSE COALESCE(t.origin_protocol,'http') END,t.service_mode,t.access_mode,t.protocol_statuses,t.http_redirect_enabled,t.https_port,t.ipv6_direct_enabled FROM tunnels t LEFT JOIN devices d ON d.id=t.device_id LEFT JOIN public_domains p ON p.id=t.public_domain_id WHERE t.tenant_id=?1 AND t.deleted_at IS NULL AND (?2 IS NULL OR t.id=?2) ORDER BY t.created_at DESC";
+    let sql="SELECT t.id,t.tenant_id,t.device_id,d.name,t.name,t.protocol,t.local_address,t.local_port,t.public_port,t.hostname,t.enabled,t.apply_status,t.apply_error,t.apply_revision,t.public_domain_id,t.deleted_at,p.domain,t.lan_redirect_enabled,CASE WHEN t.protocol IN ('tcp','udp','tcp_udp') THEN NULL ELSE COALESCE(t.origin_protocol,'http') END,t.service_mode,t.access_mode,t.protocol_statuses,t.http_redirect_enabled,t.https_port,t.ipv6_direct_enabled,t.icon_id FROM tunnels t LEFT JOIN devices d ON d.id=t.device_id LEFT JOIN public_domains p ON p.id=t.public_domain_id WHERE t.tenant_id=?1 AND t.deleted_at IS NULL AND (?2 IS NULL OR t.id=?2) ORDER BY t.created_at DESC";
     let mut q = connection.prepare(sql)?;
     let rows = q
         .query_map(params![tenant, only], |row| {
@@ -1150,6 +1158,7 @@ fn query_tunnels(
                     })
             };
             Ok(Tunnel {
+                icon_id: row.get(25)?,
                 protocol_statuses: serde_json::from_str(&row.get::<_, String>(21)?)
                     .unwrap_or_default(),
                 access_mode: row.get(20)?,

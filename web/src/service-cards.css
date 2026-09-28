@@ -1,0 +1,72 @@
+/* 应用单元只有图标和名称；以 rem 定义最小列宽，放大文字时自然减少列数。 */
+.service-list { --app-icon-size:72px; grid-template-columns:repeat(auto-fill,minmax(min(100%,6rem),1fr)); gap:20px 16px; border:0; border-radius:0; overflow:visible; }
+.service-list .service-row,.service-list .service-row:last-child { position:relative; display:flex; flex-direction:column; align-items:center; gap:4px; padding:12px 0 0; border:0; border-radius:0; background:transparent; box-shadow:none; min-width:0; }
+.service-row[data-opens-application=true] { cursor:pointer; }
+.service-list .service-row[data-selected=true] { background:transparent; box-shadow:none; }
+.application-icon { display:inline-flex; align-items:center; justify-content:center; width:48px; height:48px; flex:0 0 48px; border-radius:12px; background:var(--surface-raised); color:var(--primary); overflow:hidden; }
+.application-icon img { width:100%; height:100%; object-fit:contain; }
+.service-list .application-icon { width:var(--app-icon-size); height:var(--app-icon-size); flex-basis:var(--app-icon-size); border-radius:22%; }
+.service-list .application-icon>svg { width:32px; height:32px; }
+.application-launch { position:relative; width:var(--app-icon-size); min-height:var(--app-icon-size); }
+.service-open,.application-copy,.application-unavailable { display:flex; align-items:center; justify-content:center; width:var(--app-icon-size); height:var(--app-icon-size); padding:0; border:0; border-radius:22%; background:transparent; }
+.application-unavailable { cursor:default; }
+.application-unavailable .application-icon { opacity:.45; filter:grayscale(1); }
+.service-list .service-row[data-selected=true] .application-icon { outline:2px solid var(--primary); outline-offset:3px; }
+.service-list .service-row[data-pressing=true] .application-icon,.service-open:active .application-icon,.application-copy:active .application-icon { opacity:.7; }
+.service-list .service-name { display:flex; align-items:flex-start; justify-content:center; width:100%; min-height:44px; padding:4px 0; border-radius:8px; text-align:center; }
+.service-list .service-name strong { display:-webkit-box; -webkit-box-orient:vertical; -webkit-line-clamp:2; overflow:hidden; white-space:normal; overflow-wrap:anywhere; font-size:.8125rem; font-weight:500; line-height:1.4; }
+/* 角标与选择控件分居两角，不用整块底色遮挡应用；完整状态文字仍供读屏读取。 */
+.service-list .application-status { position:absolute; top:-6px; right:-6px; display:flex; align-items:center; justify-content:center; width:24px; height:24px; padding:0; border:2px solid var(--bg); border-radius:50%; background:var(--surface-raised); color:var(--secondary); pointer-events:auto; }
+.service-list .application-status.failed { background:var(--danger-soft); color:var(--danger); }
+.service-list .application-status.working { background:var(--warning-soft); color:var(--warning); }
+.application-launch>.check { position:absolute; top:-16px; left:-16px; z-index:1; margin:0; cursor:pointer; }
+.application-launch>.check input { appearance:none; -webkit-appearance:none; width:22px; height:22px; min-height:22px; margin:0; padding:0; border:1.5px solid var(--secondary); border-radius:50%; background:var(--surface); cursor:inherit; }
+.application-launch>.check input:checked { border-color:var(--primary); background:var(--primary); }
+.application-launch>.check:has(input:checked)::after { content:""; position:absolute; width:6px; height:10px; border:solid var(--primary-on); border-width:0 2px 2px 0; transform:translateY(-1px) rotate(45deg); pointer-events:none; }
+.application-launch>.check:has(input:disabled) { cursor:default; opacity:.5; }
+.application-launch>.copy-control { display:flex; flex-direction:column; align-items:center; gap:8px; width:100%; }
+.application-copy-feedback { position:absolute; top:calc(var(--app-icon-size) - 22px); left:50%; transform:translateX(-50%); padding:2px 6px; border-radius:6px; background:var(--primary); color:var(--primary-on); font-size:.6875rem; white-space:nowrap; pointer-events:none; }
+/* 复制失败后为手动复制文本让出整行；正常图标网格不承担表单布局。 */
+.service-list .service-row:has(.copy-fallback) { grid-column:1 / -1; }
+.application-launch:has(.copy-fallback) { width:100%; }
+.application-launch:has(.copy-fallback)>.check { left:calc(50% - var(--app-icon-size)/2 - 16px); }
+.application-launch:has(.copy-fallback)>.application-status { right:calc(50% - var(--app-icon-size)/2 - 6px); }
+.application-launch .form-error { text-align:center; }
+.service-toolbar .service-selection-toggle { gap:6px; min-height:44px; padding:8px 12px; border-radius:12px; background:var(--surface-soft); color:var(--secondary); font-size:.8125rem; font-weight:600; white-space:nowrap; }
+.service-toolbar .service-selection-toggle[data-selecting=true] { background:var(--nav-selected); color:var(--primary); }
+.service-toolbar .service-selection-toggle:not(:disabled):active { background:var(--surface-raised); }
+@media (hover:hover) { .service-toolbar .service-selection-toggle:not(:disabled):hover { background:var(--surface-raised); } }
+.application-name-row { display:grid; grid-template-columns:auto minmax(0,1fr); align-items:center; padding:8px; gap:8px; }
+.application-name-row>.service-field { grid-column:2; grid-row:1; display:flex; flex-direction:column; align-items:stretch; min-width:0; padding-left:8px; border:0; }
+.service-form .application-name-row>.service-field>span { flex-basis:auto; color:var(--secondary); font-size:.8125rem; }
+.service-form .application-name-row>.service-field>input { flex:auto; width:100%; min-height:40px; text-align:left; }
+.service-icon-picker { display:contents; }
+.service-icon-trigger { display:flex; align-items:center; flex-direction:column; gap:4px; padding:4px; border:0; background:transparent; color:var(--secondary); font-size:.6875rem; }
+.icon-picker-panel { grid-column:1 / -1; border-top:1px solid var(--border); padding:12px 4px 4px; min-width:0; }
+.icon-picker-heading { display:flex; align-items:center; gap:8px; }
+.icon-picker-heading strong { margin-right:auto; }
+.icon-picker-heading .text-button { min-height:44px; }
+.icon-picker-panel .search { width:100%; }
+.icon-picker-styles { display:flex; gap:6px; margin-top:10px; }
+.icon-picker-styles button { flex:1; min-height:44px; border:1px solid var(--border); border-radius:10px; background:var(--surface); color:var(--secondary); }
+.icon-picker-styles button[aria-pressed=true] { background:var(--nav-selected); border-color:var(--primary); color:var(--primary); }
+.icon-picker-grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(76px,1fr)); gap:6px; }
+.icon-picker-option { display:flex; align-items:center; flex-direction:column; gap:6px; min-width:0; padding:8px 4px; border:1px solid transparent; border-radius:12px; background:transparent; color:var(--text); }
+.icon-picker-option[aria-pressed=true] { border-color:var(--primary); background:var(--nav-selected); }
+.icon-picker-option span:last-child { font-size:.6875rem; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; max-width:100%; }
+.icon-picker-pages { display:flex; align-items:center; justify-content:space-between; margin-top:8px; font-size:.8125rem; }
+.icon-picker-pages button { min-height:44px; }
+.icon-picker-source { margin-bottom:0; }
+.icon-picker-source a { color:var(--primary); text-decoration:underline; }
+@media (max-width:900px) {
+  .service-list { --app-icon-size:64px; grid-template-columns:repeat(auto-fill,minmax(min(100%,4.5rem),1fr)); gap:16px 12px; }
+  .service-toolbar .service-selection-toggle[data-selecting=false]:not(:focus-visible) { position:static; width:auto; height:auto; padding:8px 12px; clip-path:none; overflow:visible; pointer-events:auto; }
+}
+@media (prefers-contrast:more) {
+  .service-list .application-icon { outline:1px solid var(--secondary); }
+  .icon-picker-option { border-color:currentColor; }
+}
+@media (forced-colors:active) {
+  .application-launch>.check input { appearance:auto; -webkit-appearance:auto; }
+  .application-launch>.check::after { display:none; }
+}

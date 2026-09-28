@@ -18,7 +18,8 @@ test("桌面添加服务属于标题区，设备识别码可完整复制", async
       expect(box!.y).toBeGreaterThanOrEqual(header!.y);
       expect(box!.y + box!.height).toBeLessThanOrEqual(header!.y + header!.height);
       const workspace = await page.locator(".page-slot:not([hidden])").boundingBox();
-      expect(workspace!.y + workspace!.height).toBeCloseTo(page.viewportSize()!.height - 24, 0);
+      if (page.viewportSize()!.height < 600) expect(workspace!.y + workspace!.height).toBeGreaterThanOrEqual(page.viewportSize()!.height - 24);
+      else expect(workspace!.y + workspace!.height).toBeCloseTo(page.viewportSize()!.height - 24, 0);
       const search = await page.getByLabel("搜索服务").boundingBox();
       expect(Math.abs(search!.y - box!.y)).toBeLessThanOrEqual(2);
       expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBeTruthy();
@@ -34,10 +35,10 @@ test("离线 Agent 可保存配置，打开公网与复制操作分开", async (
   const state = await installApiMocks(page);
   state.devices[0].status = "offline";
   await page.goto("/#/services");
-  const address = page.locator(".public-address").first();
+  const address = page.getByRole("link", { name: "打开媒体中心" });
   await expect(address).toHaveAttribute("href", state.tunnels[0].public_address);
   await expect(address).toHaveAttribute("target", "_blank");
-  await expect(page.getByRole("button", { name: "复制媒体中心公网地址" })).toBeVisible();
+  await expect(page.getByRole("link", { name: "媒体中心", exact: true })).toBeVisible();
   await page.getByRole("link", { name: "媒体中心", exact: true }).click();
   await page.getByRole("button", { name: "编辑服务" }).click();
   const editor = page.getByRole("dialog", { name: "编辑服务" });

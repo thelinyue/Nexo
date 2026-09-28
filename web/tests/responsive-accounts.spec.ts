@@ -86,7 +86,10 @@ test("桌面主页面填满可用宽度，服务详情不再受固定上限限�
       if (route === "services/t-1") {
         const detail = page.locator(".service-detail");
         await expect(detail).toBeVisible();
-        expect((await detail.boundingBox())!.width).toBeCloseTo(box!.width - 42, 0);
+        expect((await detail.boundingBox())!.width).toBeLessThanOrEqual(760);
+        await page.keyboard.press("Escape");
+        await expect(detail).toHaveCount(0);
+        await expect(page).toHaveURL(/#\/services$/);
       }
     }
   }

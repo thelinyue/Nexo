@@ -8,6 +8,8 @@ import { homeRoute } from "./navigation";
 import { Brand, Loading, Notice, errorText, request, resumeSession } from "./ui";
 import type { Auth } from "./ui";
 import "./styles.css";
+import "./service-cards.css";
+import "./service-detail.css";
 
 declare global { interface Window { __nexoLaunchTimer?: number } }
 

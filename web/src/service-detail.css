@@ -1,0 +1,50 @@
+/* 详情浮层保留列表背景，摘要固定，只有正文滚动；尺寸由可见视口决定。 */
+.modal.application-modal { inset:var(--visual-top,0px) 0 calc(100dvh - var(--visible-height,100dvh) - var(--visual-top,0px)); translate:none; transform:none; margin:auto; width:min(760px,calc(100vw - 32px)); max-width:calc(100vw - 32px); max-height:calc(var(--visible-height,100dvh)*.85); height:fit-content; padding:0; border-radius:24px; background:var(--bg); overflow:visible; }
+.application-modal::backdrop { background:#0005; animation:application-backdrop-in .18s ease-out; }
+.application-modal[data-closing=true]::backdrop { animation:application-backdrop-out .18s ease-out both; }
+@keyframes application-backdrop-in { from { background:transparent; } to { background:#0005; } }
+@keyframes application-backdrop-out { from { background:#0005; } to { background:transparent; } }
+.application-modal>.modal-heading { padding:20px; align-items:flex-start; border:0; gap:12px; }
+.application-modal>.modal-heading>.icon-button { flex:none; width:44px; min-width:44px; background:var(--surface-soft); color:var(--secondary); }
+.application-summary { display:flex; align-items:center; gap:12px; min-width:0; flex:1; }
+.application-summary>.application-icon { width:56px; height:56px; flex-basis:56px; border-radius:14px; transform-origin:0 0; position:relative; z-index:1; }
+.application-summary>div { display:grid; gap:6px; min-width:0; }
+.application-summary h2 { font-size:1.125rem; line-height:1.4; overflow-wrap:anywhere; max-height:4.2em; overflow-y:auto; }
+.service-detail .application-summary .status { justify-self:start; white-space:normal; max-width:100%; padding:0; border:0; background:transparent; font-size:.8125rem; }
+.application-modal>.service-detail-body { display:flex; flex-direction:column; gap:16px; padding:0 20px 20px; border-radius:0 0 24px 24px; scroll-padding-block:16px; }
+.application-modal .service-detail-section { flex:none; min-width:0; padding:12px 14px; border:1px solid var(--border); border-radius:16px; background:var(--surface); }
+.application-modal .service-detail-section h3 { margin:0 0 4px; color:var(--secondary); font-size:.8125rem; font-weight:600; }
+.application-modal .service-detail-section dl { margin:0; }
+.application-modal .detail-field { grid-template-columns:5rem minmax(0,1fr); padding:8px 0; gap:8px; }
+.application-modal .detail-field:first-child { border:0; }
+.application-modal .detail-field:last-child { padding-bottom:0; }
+.application-modal .service-detail-meta dd { white-space:normal; overflow-wrap:anywhere; overflow:visible; }
+.application-modal .service-detail-addresses .detail-field,.application-modal .service-detail-connections .detail-field { grid-template-columns:minmax(0,1fr); gap:0; }
+.application-modal .service-detail-addresses dt { font-size:.8125rem; }
+.application-modal .service-detail-address { min-width:0; }
+.application-modal .service-detail-address .icon-button { border:0; border-radius:10px; background:var(--surface-soft); }
+.application-modal .service-detail-address .copy-fallback { grid-column:1 / -1; }
+.application-modal .service-detail-address .copy-control>.text-button { grid-column:1 / -1; }
+.application-modal .service-detail-address code { margin:0; min-height:44px; align-content:center; }
+.application-modal .service-detail-connections .detail-field>dd { display:grid; gap:6px; }
+.application-modal .service-detail-connections code { white-space:normal; overflow-wrap:anywhere; }
+.application-modal .service-protocol-state { align-items:flex-start; flex-wrap:wrap; }
+.application-modal .notice { display:block; margin:0; flex:none; }
+.application-modal .notice p { margin:6px 0; }
+.application-modal .notice summary,.application-modal .service-state-explanation summary { min-height:44px; align-content:center; cursor:pointer; }
+.application-modal .service-state-explanation { color:var(--secondary); font-size:.875rem; }
+.application-modal .service-state-explanation>span { display:block; padding-top:4px; }
+.application-modal .service-detail-note { border:0; padding:0; }
+.application-modal .service-detail-actions { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:10px; padding-top:0; border:0; flex:none; }
+.application-modal .service-detail-actions button { min-width:0; min-height:44px; padding:10px 8px; border-radius:12px; }
+.application-modal .service-detail-danger { grid-column:1 / -1; margin:0; padding:0; border:0; }
+.application-modal .service-detail-danger .danger-button { width:100%; }
+@media (max-width:600px) {
+  .application-modal>.modal-heading { padding:16px; gap:8px; }
+  .application-modal>.service-detail-body { padding:0 16px 16px; gap:12px; }
+  .application-modal .service-detail-section { padding:10px 12px; }
+}
+@media (prefers-reduced-motion:reduce) {
+  .application-modal::backdrop,.application-modal[data-closing=true]::backdrop { animation-duration:.12s; }
+}
+@media (prefers-reduced-transparency:reduce) { .modal.application-modal { backdrop-filter:none; -webkit-backdrop-filter:none; } }

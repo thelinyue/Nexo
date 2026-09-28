@@ -2,6 +2,13 @@
 
 本项目使用 [Semantic Versioning](https://semver.org/) 记录公开版本。
 
+## [0.2.12]
+
+- Server 与 Agent 修复 HTTPS 服务端口收到明文 HTTP 请求时的跳转，避免错误地按 TLS 处理。
+- Web 更新 Nexo 品牌插画、头像与 PWA 启动层；服务页改为应用图标网格，增加图标选择、详情浮层和多选操作。
+- Server 为服务保存可选图标，旧客户端更新不清除已有选择；现有数据库启动时增量添加可空字段。
+- 清理仓库中的历史设计截图；本次发布 Server（含 Web）与 Agent。部署和兼容性见 [v0.2.12 发布说明](docs/releases/v0.2.12.md)。
+
 ## [0.2.11]
 
 - Server 设置页可手动保存公网 IPv4，DNS A 记录按有效配置自动更新；Agent 在多个公网 IPv6 地址中自动保持或选择可用地址。

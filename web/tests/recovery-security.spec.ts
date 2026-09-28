@@ -59,7 +59,7 @@ test("服务状态自动更新，编辑和后台暂停，返回前台立即刷�
   await expect(page.getByText("媒体中心", { exact: true })).toBeVisible();
   state.tunnels[0].apply_status = "failed"; state.tunnels[0].apply_error = "目标无法连接";
   await page.clock.fastForward(5000);
-  await expect(page.getByText("目标无法连接", { exact: true })).toBeVisible();
+  await expect(page.getByRole("region", { name: "服务列表" }).getByText("需处理", { exact: true })).toBeVisible();
   await page.evaluate(() => Object.defineProperty(document, "visibilityState", { configurable: true, get: () => "hidden" }));
   const count = () => state.calls.filter(call => call.path === "/api/v1/tunnels").length;
   const before = count(); await page.clock.fastForward(10000); expect(count()).toBe(before);

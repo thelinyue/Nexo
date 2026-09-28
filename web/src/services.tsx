@@ -1,7 +1,9 @@
+import { ApplicationModal } from "./application-modal";
+import { ServiceIcon, ServiceIconPicker } from "./service-icons";
 import { PageNavigationContext, useResourceDeletions } from "./navigation";
 import { useContext, useEffect, useId, useMemo, useRef, useState } from "react";
-import type { FormEvent, PointerEvent as ReactPointerEvent } from "react";
-import { Check, ChevronDown, ChevronRight, Globe, Power, PowerOff, Plus, Search, Server, Trash2 } from "lucide-react";
+import type { FormEvent, MouseEvent as ReactMouseEvent, PointerEvent as ReactPointerEvent } from "react";
+import { Check, CircleCheck, ChevronDown, ChevronRight, Globe, Power, PowerOff, Plus, Search, Server, Trash2 } from "lucide-react";
 import { Confirm, CopyButton, CreateButton, DetailField, Empty, Loading, Modal, Notice, PageHeader, Status, errorText, isPortProtocol, protocolLabel, localTarget, useApi, useResource } from "./ui";
 import type { Device, Domain, Tunnel } from "./ui";
 import { isLanRedirectAddress } from "./lan-redirect";
@@ -68,8 +70,9 @@ function ServiceSelect({ label, name, value, placeholder, options, disabled, com
   useEffect(() => {
     const menu = menuRef.current; const option = menu?.children[highlighted] as HTMLElement | undefined;
     if (!open || !menu || !option) return;
-    if (option.offsetTop < menu.scrollTop) menu.scrollTop = option.offsetTop;
-    else if (option.offsetTop + option.offsetHeight > menu.scrollTop + menu.clientHeight) menu.scrollTop = option.offsetTop + option.offsetHeight - menu.clientHeight;
+    // 表单高度变化可能产生小数像素，保留菜单内边距，避免末项被裁掉半个像素。
+    if (option.offsetTop < menu.scrollTop + 6) menu.scrollTop = option.offsetTop - 6;
+    else if (option.offsetTop + option.offsetHeight > menu.scrollTop + menu.clientHeight - 6) menu.scrollTop = Math.ceil(option.offsetTop + option.offsetHeight - menu.clientHeight + 6);
   }, [open, highlighted]);
   const status = (option: ServiceSelectOption) => option.status && <span className={`service-select-status ${option.status}`}><i aria-hidden="true" />{option.status === "online" ? "在线" : "离线"}</span>;
   return <div className={`service-field service-select-field${compact ? " service-select-compact" : ""}`}>
@@ -93,7 +96,7 @@ function ServiceSelect({ label, name, value, placeholder, options, disabled, com
 /** 表单草稿只驻留内存；跳转配置 Agent / 域名时暂时隐藏，返回后继续填写。 */
 function ServiceEditor({ tunnel, mode, data, active, csrf, onClose, onSaved }: { tunnel?: Tunnel; mode: "tunnel" | "reverse_proxy"; data: ServiceData; active: boolean; csrf?: string | null; onClose: () => void; onSaved: (item: Tunnel) => void }) {
   const request = useApi();
-  const initial = useMemo(() => ({ ipv6_direct_enabled: tunnel?.ipv6_direct_enabled ?? false, https_port: String(tunnel?.https_port ?? 443), http_redirect_enabled: tunnel ? tunnel.http_redirect_enabled ?? false : mode === "reverse_proxy", access_mode: tunnel?.access_mode ?? "public", access_password: "", service_mode: tunnel?.service_mode ?? mode, name: tunnel?.name ?? "", protocol: tunnel?.protocol ?? "https", origin_protocol: tunnel?.origin_protocol ?? "http", device_id: tunnel?.device_id ?? data.devices.find(item => item.status === "online")?.id ?? data.devices[0]?.id ?? "", local_address: tunnel?.local_address ?? "127.0.0.1", local_port: String(tunnel?.local_port ?? ""), public_port: String(tunnel?.public_port ?? ""), hostname: tunnel?.hostname ?? "", public_domain_id: tunnel ? data.domains.find(item => item.domain === tunnel.public_domain)?.id ?? "" : data.domains.length === 1 ? data.domains[0].id : "", lan_redirect_enabled: !isPortProtocol(tunnel?.protocol) && (tunnel?.lan_redirect_enabled ?? false) }), []);
+  const initial = useMemo(() => ({ icon_id: tunnel?.icon_id ?? "", ipv6_direct_enabled: tunnel?.ipv6_direct_enabled ?? false, https_port: String(tunnel?.https_port ?? 443), http_redirect_enabled: tunnel ? tunnel.http_redirect_enabled ?? false : mode === "reverse_proxy", access_mode: tunnel?.access_mode ?? "public", access_password: "", service_mode: tunnel?.service_mode ?? mode, name: tunnel?.name ?? "", protocol: tunnel?.protocol ?? "https", origin_protocol: tunnel?.origin_protocol ?? "http", device_id: tunnel?.device_id ?? data.devices.find(item => item.status === "online")?.id ?? data.devices[0]?.id ?? "", local_address: tunnel?.local_address ?? "127.0.0.1", local_port: String(tunnel?.local_port ?? ""), public_port: String(tunnel?.public_port ?? ""), hostname: tunnel?.hostname ?? "", public_domain_id: tunnel ? data.domains.find(item => item.domain === tunnel.public_domain)?.id ?? "" : data.domains.length === 1 ? data.domains[0].id : "", lan_redirect_enabled: !isPortProtocol(tunnel?.protocol) && (tunnel?.lan_redirect_enabled ?? false) }), []);
   const webProtocol = useRef(!isPortProtocol(tunnel?.protocol) && tunnel?.protocol ? tunnel.protocol : "https");
   const [draft, setDraft] = useState(initial); const [busy, setBusy] = useState(false); const [error, setError] = useState<string | null>(null);
   const [invalidField, setInvalidField] = useState<keyof typeof initial | null>(null);
@@ -158,7 +161,7 @@ function ServiceEditor({ tunnel, mode, data, active, csrf, onClose, onSaved }: {
     if (draft.access_mode === "password" && (draft.access_password || tunnel?.access_mode !== "password") && !/^[!-~]{4,16}$/.test(draft.access_password)) { fail("access_password", "请输入 4–16 位字母、数字或符号，不含空格"); return; }
     setBusy(true);
     try {
-      const body = { ...draft, https_port: Number(draft.https_port), access_password: draft.access_mode === "password" && draft.access_password ? draft.access_password : undefined, device_id: direct ? null : draft.device_id, origin_protocol: isPortProtocol(draft.protocol) ? null : draft.origin_protocol, name: draft.name.trim(), local_address: draft.local_address.trim(), local_port: Number(draft.local_port), public_port: isPortProtocol(draft.protocol) && draft.public_port ? Number(draft.public_port) : null, hostname: isPortProtocol(draft.protocol) ? null : draft.hostname.trim(), public_domain_id: isPortProtocol(draft.protocol) ? null : draft.public_domain_id, enabled: tunnel?.enabled ?? true, lan_redirect_enabled: !isPortProtocol(draft.protocol) && draft.lan_redirect_enabled };
+      const body = { ...draft, icon_id: draft.icon_id || null, https_port: Number(draft.https_port), access_password: draft.access_mode === "password" && draft.access_password ? draft.access_password : undefined, device_id: direct ? null : draft.device_id, origin_protocol: isPortProtocol(draft.protocol) ? null : draft.origin_protocol, name: draft.name.trim(), local_address: draft.local_address.trim(), local_port: Number(draft.local_port), public_port: isPortProtocol(draft.protocol) && draft.public_port ? Number(draft.public_port) : null, hostname: isPortProtocol(draft.protocol) ? null : draft.hostname.trim(), public_domain_id: isPortProtocol(draft.protocol) ? null : draft.public_domain_id, enabled: tunnel?.enabled ?? true, lan_redirect_enabled: !isPortProtocol(draft.protocol) && draft.lan_redirect_enabled };
       onSaved(await request<Tunnel>(tunnel ? `/api/v1/tunnels/${encodeURIComponent(tunnel.id)}` : "/api/v1/tunnels", { method: tunnel ? "PUT" : "POST", body: JSON.stringify(body) }, csrf));
       onClose();
     } catch (e) { setError(errorText(e)); } finally { setBusy(false); }
@@ -176,7 +179,7 @@ function ServiceEditor({ tunnel, mode, data, active, csrf, onClose, onSaved }: {
       <div className="modal-body"><fieldset disabled={busy}>
         {direct && <p className="helper">由 Nexo Server 直接访问目标，无需 Agent。仅管理员可管理，不计入穿透流量。</p>}
         <section className="service-form-section"><h3 className="desktop-form-label">基本信息</h3><div className="service-field-group">
-          <label className="service-field"><span>服务名称</span><input {...fieldProps("name")} value={draft.name} onChange={e => update("name", e.target.value)} placeholder="例如：家庭 NAS" enterKeyHint="next" autoComplete="off" required /></label>
+          <div className="application-name-row"><ServiceIconPicker value={draft.icon_id} name={draft.name} protocol={draft.protocol} onChange={value => update("icon_id", value)} /><label className="service-field"><span>服务名称</span><input {...fieldProps("name")} value={draft.name} onChange={e => update("name", e.target.value)} placeholder="例如：家庭 NAS" enterKeyHint="next" autoComplete="off" required /></label></div>
           {!direct && <ServiceSelect {...fieldProps("device_id")} label="Agent" value={draft.device_id} placeholder="选择 Agent" options={devices.map(item => ({ value: item.id, label: item.name, status: item.status === "online" ? "online" : "offline" }))} disabled={busy} onChange={value => update("device_id", value)} />}
         </div>{!direct && !devices.length && <div className="notice"><span>请关闭表单，到设备页添加 Agent。</span></div>}{!direct && devices.find(item => item.id === draft.device_id)?.status === "offline" && <p className="helper" role="status">Agent 当前离线，可保存配置，连接恢复后下发。</p>}</section>
         <section className="service-form-section"><h3>{direct ? "目标地址" : "内网地址"}</h3><div className="service-field-group service-address-input" role="group" aria-label={direct ? "目标连接" : "内网连接"}>
@@ -265,11 +268,9 @@ function BatchAgentEditor({ items, devices, csrf, onSaved, onClose, onComplete }
 }
 
 /** 列表在二级详情和其他页之间保持挂载，保存筛选、选择和表单草稿。 */
-export function ServicesPage({ route, active, admin = false, csrf, back }: { route: string; active: boolean; admin?: boolean; csrf?: string | null; back?: string }) {
+export function ServicesPage({ route, active, admin = false, csrf }: { route: string; active: boolean; admin?: boolean; csrf?: string | null; back?: string }) {
   const request = useApi();
   const navigation = useContext(PageNavigationContext);
-  const resource = useResource(() => loadServices(request), active);
-  useResourceDeletions(routes => { if (routes.some(route => route.startsWith("#/services/"))) resource.setData(previous => previous && ({ ...previous, tunnels: previous.tunnels.filter(item => !routes.includes(`#/services/${encodeURIComponent(item.id)}`)) })); });
   const [protocol, setProtocol] = useState("all"); const [agent, setAgent] = useState("all");
   const [query, setQuery] = useState(""); const [filter, setFilter] = useState("all"); const [selecting, setSelecting] = useState(false); const [selected, setSelected] = useState<string[]>([]);
   const [pressing, setPressing] = useState<string | null>(null);
@@ -279,10 +280,37 @@ export function ServicesPage({ route, active, admin = false, csrf, back }: { rou
   const [changingAgent, setChangingAgent] = useState<Tunnel[] | null>(null);
   const [creationMenu, setCreationMenu] = useState(false);
   const creationTrigger = useRef<HTMLButtonElement | null>(null);
+  const [detailId, setDetailId] = useState<string | null>(() => route.startsWith("#/services/") ? route.slice("#/services/".length) : null);
+  useEffect(() => { if (active && route.startsWith("#/services/")) setDetailId(route.slice("#/services/".length)); }, [active, route]);
+  const pendingDetailRoute = useRef<string | null>(null);
+  useEffect(() => {
+    // 子弹窗的卸载清理先于此 effect，路由不会再被刚关闭的弹窗拦截。
+    if (!detailId && pendingDetailRoute.current) { const next = pendingDetailRoute.current; pendingDetailRoute.current = null; window.location.hash = next; }
+  }, [detailId]);
+  const detailPresentation = useRef<{ origin: HTMLElement | null; trigger: HTMLElement | null; animate: boolean; scroll: number }>({ origin: null, trigger: null, animate: false, scroll: 0 });
+  const seenDetail = useRef<string | null>(null);
+  const resource = useResource(() => loadServices(request), active && !editor && !deleting && !changingAgent, true, Boolean(detailId));
+  useResourceDeletions(routes => { if (routes.some(route => route.startsWith("#/services/"))) resource.setData(previous => previous && ({ ...previous, tunnels: previous.tunnels.filter(item => !routes.includes(`#/services/${encodeURIComponent(item.id)}`)) })); });
   const data = resource.data;
   const tunnels = data?.tunnels ?? [];
-  const detailId = route.startsWith("#/services/") ? route.slice("#/services/".length) : null;
   const detail = tunnels.find(item => encodeURIComponent(item.id) === detailId);
+  if (detail) seenDetail.current = detailId;
+  function detailFocus() {
+    const trigger = detailPresentation.current.trigger;
+    if (trigger?.isConnected && !trigger.closest("[hidden]")) return trigger;
+    const page = document.querySelector('.page-slot:not([hidden])');
+    return page?.querySelector<HTMLElement>('input[aria-label="搜索服务"],.empty .primary-button') ?? null;
+  }
+  function closeDetail(next?: string) {
+    pendingDetailRoute.current = next ?? (route.startsWith("#/services/") ? "#/services" : null);
+    setDetailId(null); setActionError(null);
+  }
+  function openDetail(event: ReactMouseEvent<HTMLAnchorElement>, item: Tunnel) {
+    if (event.defaultPrevented || event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
+    event.preventDefault();
+    detailPresentation.current = { origin: event.currentTarget.closest(".service-row")?.querySelector<HTMLElement>(".application-icon") ?? null, trigger: event.currentTarget, animate: true, scroll: 0 };
+    setActionError(null); setMessage(null); setDetailId(encodeURIComponent(item.id));
+  }
   const detailProxy = detail?.service_mode === "reverse_proxy";
   const readonlyDetail = detailProxy && !admin;
   const selectedProxy = tunnels.some(item => selected.includes(item.id) && item.service_mode === "reverse_proxy");
@@ -303,8 +331,17 @@ export function ServicesPage({ route, active, admin = false, csrf, back }: { rou
   useEffect(() => { if (data) { setSelected(current => current.filter(id => visible.some(item => item.id === id))); if (!data.tunnels.length) setSelecting(false); } }, [data, query, filter, protocol, agent]);
   useEffect(() => { if (!active) return; document.body.classList.toggle("selection-mode", selecting && !detailId); return () => document.body.classList.remove("selection-mode"); }, [active, selecting, detailId]);
   function cancelPress() { if (press.current) window.clearTimeout(press.current.timer); press.current = null; setPressing(null); }
-  function selectionTarget(target: EventTarget) { return target instanceof Element && !target.closest('button,input,label,select,code,a:not(.service-name)'); }
+  function selectionTarget(target: EventTarget) { return target instanceof Element && !target.closest('input,textarea,label,select,code') && (!target.closest('button,a') || Boolean(target.closest('.service-name,.service-open,.application-copy,.application-unavailable'))); }
   function toggleSelected(id: string) { if (!busy) setSelected(current => current.includes(id) ? current.filter(value => value !== id) : [...current, id]); }
+  /** 单元空白复用原生图标入口，网页打开新标签页，端口服务复制地址；名称与独立控件不触发访问。
+   * 长按与多选已在捕获阶段消费点击，键盘用户仍通过现有链接访问，无需增加嵌套链接。
+   */
+  function openCard(event: ReactMouseEvent<HTMLElement>) {
+    if (selecting || event.defaultPrevented || !(event.target instanceof Element)
+      || event.target.closest("a,button,input,textarea,select,label")
+      || window.getSelection()?.isCollapsed === false) return;
+    event.currentTarget.querySelector<HTMLElement>(".service-open,.application-copy")?.click();
+  }
   /** 长按只在手机布局启用；滑动、滚动和多指立即取消计时，不阻止浏览器原生滚动。
    * 成功后吞掉抬手产生的点击，避免进入详情或把刚选中的项再次取消。
    */
@@ -346,32 +383,14 @@ export function ServicesPage({ route, active, admin = false, csrf, back }: { rou
     setMessage(`已删除 ${items.length} 个服务`);
   }
   return <>
-    <PageHeader title={detailId ? detail?.name ?? "服务详情" : "服务"} back={detailId ? back ?? "#/services" : undefined} action={!detailId && !selecting && Boolean(tunnels.length) && (admin && !navigation?.desktop
+    <PageHeader title={route.startsWith("#/services/") ? detail?.name ?? "服务详情" : "服务"} action={!selecting && Boolean(tunnels.length) && (admin && !navigation?.desktop
       ? <button className="primary-button page-create" data-resource="服务" aria-label="添加" aria-haspopup="dialog" aria-expanded={creationMenu} onClick={event => { creationTrigger.current = event.currentTarget; setCreationMenu(true); }}><Plus size={24} aria-hidden="true" /></button>
       : <>{addProxyButton}<CreateButton label="服务" onClick={() => create("new")} /></>)} />
-    <Notice updatedAt={resource.updatedAt} error={resource.error} onRetry={() => void resource.reload()} /><Notice error={actionError} />{message && <p className="action-status" role="status">{message}</p>}
+    {!detailId && <><Notice updatedAt={resource.updatedAt} error={resource.error} onRetry={() => void resource.reload()} /><Notice error={actionError} />{message && <p className="action-status" role="status">{message}</p>}</>}
     {!data && resource.busy && <Loading />}
-    {data && (detailId ? detail ? <>
-      <section className="panel detail-panel service-detail">
-        <div className="detail-heading"><h2 title={detail.name}>{detail.name}</h2><Status kind={detailProxy ? "reverse_proxy" : "service"} value={detail.enabled ? detail.apply_status : "disabled"} /></div>
-        <dl>
-          <DetailField label="公网地址"><div className="service-detail-address">{detail.public_address && !isPortProtocol(detail.protocol) ? <a className="service-public-link" href={detail.public_address} target="_blank" rel="noopener noreferrer" title="在新标签页打开"><code>{detail.public_address}</code></a> : <code>{detail.public_address ?? "等待配置"}</code>}{detail.public_address && <CopyButton value={detail.public_address} label="复制公网地址" iconOnly />}</div></DetailField>
-{detail.ipv6_direct_enabled && <DetailField label="IPv6 直连"><div><p>{detail.direct_status?.status === "configured" ? (detail.direct_status?.public_reachability === "verified" ? "已配置，探测通过" : "已配置，公网未验证") : detail.direct_status?.status === "disabled" ? "已停用" : detail.direct_status?.status === "offline" ? "Agent 未连接" : detail.direct_status?.status === "address_required" ? "等待公网 IPv6" : "配置中"}</p>{detail.direct_status?.address && <code>{detail.direct_status.address}</code>}{detail.direct_status?.certificate_expires_at && <p className="helper">证书到期：{new Date(detail.direct_status.certificate_expires_at * 1000).toLocaleString()}</p>}{[detail.direct_status?.error, detail.direct_status?.dns_error, detail.direct_status?.certificate_error].filter(Boolean).map((error, i) => <p className="form-error" key={i}>{error}</p>)}{detail.direct_status?.public_reachability === "verified" && <p className="helper">探测结果不代表当前连接路径。</p>}{detail.direct_status?.probe_error && <p className="helper">{detail.direct_status.probe_error}</p>}</div></DetailField>}
-          <DetailField label={detailProxy ? "目标地址" : "内网地址"}><div className="service-detail-address"><code>{localTarget(detail)}</code><CopyButton value={localTarget(detail)} label="复制内网地址" iconOnly /></div></DetailField>
-          {!detailProxy && !isPortProtocol(detail.protocol) && <DetailField label="内网重定向" className="service-detail-meta">{detail.lan_redirect_enabled ? "已开启" : "未开启"}</DetailField>}
-          {!isPortProtocol(detail.protocol) && <DetailField label="访问规则" className="service-detail-meta">{detail.access_mode === "password" ? "认证访问" : "公开访问"}</DetailField>}
-          {isPortProtocol(detail.protocol) && Object.entries(detail.protocol_statuses ?? {}).map(([protocol, state]) => <DetailField key={protocol} label={protocolLabel(protocol)} className="service-detail-meta"><div className="service-protocol-state"><Status value={state.status} />{state.error_message && <span className="helper">{state.error_message}</span>}</div></DetailField>)}
-          <DetailField label="服务类型" className="service-detail-meta">{detailProxy ? "反向代理" : isPortProtocol(detail.protocol) ? `${protocolLabel(detail.protocol)} 服务` : "网页服务"}</DetailField>
-          {!detailProxy && <DetailField label="Agent" className="service-detail-meta">{detail.device_id ? <a className="text-link" href={`#/agents/${encodeURIComponent(detail.device_id)}`}>{detail.device_name ?? "查看 Agent"}</a> : "未分配 Agent"}</DetailField>}
-        </dl>
-        {detail.apply_error && detail.apply_status === "partial" && <p className="service-detail-note">可用协议继续运行，请检查上方异常协议。</p>}
-        {detail.apply_error && detail.apply_status !== "partial" && <div className="notice error"><strong>转发配置需处理</strong><p>{detailProxy ? "请检查目标地址与域名配置。" : "当前服务可能无法访问。请核对 Agent 连接与内网地址；网页服务还需检查域名配置。"}</p><details><summary>技术详情</summary><p>{detail.apply_error}</p></details></div>}
-        {((detail.enabled && detail.apply_status === "ready") || !isPortProtocol(detail.protocol)) && <div className="service-detail-note">{detail.enabled && detail.apply_status === "ready" && <span>{detailProxy ? "入口配置已生效，不代表目标服务健康。请通过公网地址测试实际访问；反代不计入穿透流量。" : ["udp", "tcp_udp"].includes(detail.protocol) ? "转发入口和数据通道已建立，不代表 UDP 目标应用已响应。请通过公网地址测试实际访问。" : "Agent 已连接，内网地址连接检查已通过。请通过公网地址测试实际访问。"}</span>}{!isPortProtocol(detail.protocol) && <a className="text-link" href={detailDomain ? `#/domains/${encodeURIComponent(detailDomain.id)}` : "#/domains"}>域名与 DNS</a>}</div>}
-        <div className="service-detail-actions"><button className="primary-button" disabled={readonlyDetail} onClick={() => setEditor(detail)}>编辑服务</button><button className="secondary-button" disabled={busy || readonlyDetail} onClick={() => void toggle([detail], !detail.enabled)}>{busy ? "提交中…" : detail.enabled ? "关闭服务" : "启用服务"}</button><div className="service-detail-danger"><button className="danger-button" disabled={readonlyDetail} onClick={() => setDeleting([detail])}><Trash2 size={18} aria-hidden="true" />删除服务</button></div></div>
-      </section>
-    </> : <Empty title="服务不存在" detail="该服务可能已被删除。"><a href="#/services" className="secondary-button">返回服务列表</a></Empty> : <>
+    {data && <>
       {tunnels.length > 0 && <div className="toolbar service-toolbar">
-        <div className="service-search-row"><label className="search"><Search size={19} /><input aria-label="搜索服务" placeholder="搜索服务" value={query} onChange={e => setQuery(e.target.value)} /></label><button className="text-button service-selection-toggle" data-selecting={selecting} disabled={busy} onClick={() => { setSelecting(value => !value); setSelected([]); }}>{selecting ? "完成" : "选择"}</button></div>
+        <div className="service-search-row"><label className="search"><Search size={19} /><input aria-label="搜索服务" placeholder="搜索服务" value={query} onChange={e => setQuery(e.target.value)} /></label><button className="text-button service-selection-toggle" data-selecting={selecting} disabled={busy} onClick={() => { setSelecting(value => !value); setSelected([]); }}><CircleCheck size={18} aria-hidden="true" /><span>{selecting ? "完成" : "选择"}</span></button></div>
         <div className="toolbar-row">
           <div className="service-filter-control" data-active={filter !== "all"}><select aria-label="服务筛选" value={filter} onChange={e => setFilter(e.target.value)}>{[["all", "全部状态"], ["attention", "需处理"], ["enabled", "已启用"], ["disabled", "已关闭"]].map(([value, label]) => <option key={value} value={value}>{label}{navigation?.desktop ? ` ${matching.filter(item => matchesFilter(item, value)).length}` : ""}</option>)}</select><ChevronDown size={14} aria-hidden="true" /></div>
           <div className="service-filter-control" data-active={protocol !== "all"}><select aria-label="类型筛选" value={protocol} onChange={e => setProtocol(e.target.value)}><option value="all">全部类型</option><option value="web">网页服务</option><option value="tcp">TCP 服务</option><option value="udp">UDP 服务</option><option value="tcp_udp">TCP+UDP</option></select><ChevronDown size={14} aria-hidden="true" /></div>
@@ -379,10 +398,40 @@ export function ServicesPage({ route, active, admin = false, csrf, back }: { rou
           {visible.length > 0 && (query || filter !== "all" || protocol !== "all" || agent !== "all") && <div className="service-filter-result"><span role="status">找到 {visible.length} 个服务</span><button className="text-button" onClick={() => { setQuery(""); setFilter("all"); setProtocol("all"); setAgent("all"); }}>清除筛选</button></div>}
         </div>
       </div>}
-      {!visible.length ? <Empty kind={tunnels.length ? "search" : "services"} title={tunnels.length ? "没有匹配的服务" : "还没有服务"} detail={tunnels.length ? "更换关键词或清除筛选。" : !admin && !data.devices.length ? "先接入 Agent，再创建服务。" : !data.domains.length ? "TCP/UDP 服务可直接创建，网页服务需先配置域名。" : "通过内网穿透或反向代理访问应用。"}>{tunnels.length ? <button className="secondary-button" onClick={() => { setQuery(""); setFilter("all"); setProtocol("all"); setAgent("all"); }}>清除筛选</button> : !admin && !data.devices.length ? <a href="#/agents" className="primary-button">接入 Agent</a> : <><button className="primary-button" onClick={() => setEditor("new")}>创建服务</button>{addProxyButton}{!data.domains.length && <a href="#/domains" className="text-button">配置网页域名</a>}</>}</Empty> : <section className={`service-list ${selecting ? "selectable" : ""}`} aria-label="服务列表">{visible.map(item => <article className="service-row" key={item.id} data-pressing={pressing === item.id} data-selected={selecting && selected.includes(item.id)} onPointerDown={event => startPress(event, item.id)} onPointerMove={event => { const current = press.current; if (current && (current.pointer !== event.pointerId || Math.hypot(event.clientX - current.x, event.clientY - current.y) > 10)) cancelPress(); }} onPointerUp={cancelPress} onPointerCancel={cancelPress} onPointerLeave={cancelPress} onContextMenu={event => { if (longPressed.current || press.current) event.preventDefault(); }} onClickCapture={event => { if (longPressed.current) { longPressed.current = false; event.preventDefault(); event.stopPropagation(); } else if (selecting && selectionTarget(event.target)) { event.preventDefault(); toggleSelected(item.id); } }}>{selecting && <label className="check"><input type="checkbox" aria-label={`选择${item.name}`} checked={selected.includes(item.id)} disabled={busy} onChange={() => toggleSelected(item.id)} /></label>}<div className="service-card-content"><div className="service-title"><a className="service-name" href={`#/services/${encodeURIComponent(item.id)}`}><strong title={item.name}>{item.name}</strong></a><span className="service-device" title={item.service_mode === "reverse_proxy" ? "反向代理" : item.device_name ?? "未分配 Agent"}>{item.service_mode === "reverse_proxy" ? "反向代理" : item.device_name ?? "未分配 Agent"}</span><Status kind={item.service_mode === "reverse_proxy" ? "reverse_proxy" : "service"} value={item.enabled ? item.apply_status : "disabled"} /></div><div className="service-address"><span>公网</span>{item.public_address ? isPortProtocol(item.protocol) ? <CopyButton value={item.public_address} compact label={`复制${item.name}公网地址`} /> : <><a className="public-address" href={item.public_address} target="_blank" rel="noopener noreferrer" title={item.public_address}>{item.public_address}</a><CopyButton value={item.public_address} iconOnly label={`复制${item.name}公网地址`} /></> : <span className="muted">等待配置</span>}</div><div className="service-origin"><span>{item.service_mode === "reverse_proxy" ? "目标" : "内网"}</span><code title={localTarget(item)}>{localTarget(item)}</code>{!isPortProtocol(item.protocol) && <span className="service-access-mode">{item.ipv6_direct_enabled ? `IPv6 ${item.direct_status?.status === "configured" ? "已配置" : "待就绪"} · ` : ""}{item.access_mode === "password" ? "认证访问" : "公开访问"}</span>}<a className="icon-button" aria-label={`查看${item.name}详情`} href={`#/services/${encodeURIComponent(item.id)}`}><ChevronRight size={18} /></a></div>{item.apply_error && <a className="row-error" href={`#/services/${encodeURIComponent(item.id)}`}><span>{item.apply_error}</span>查看 <ChevronRight size={15} /></a>}</div></article>)}</section>}
+      {!visible.length ? <Empty kind={tunnels.length ? "search" : "services"} title={tunnels.length ? "没有匹配的服务" : "还没有服务"} detail={tunnels.length ? "更换关键词或清除筛选。" : !admin && !data.devices.length ? "先接入 Agent，再创建服务。" : !data.domains.length ? "TCP/UDP 服务可直接创建，网页服务需先配置域名。" : "通过内网穿透或反向代理访问应用。"}>{tunnels.length ? <button className="secondary-button" onClick={() => { setQuery(""); setFilter("all"); setProtocol("all"); setAgent("all"); }}>清除筛选</button> : !admin && !data.devices.length ? <a href="#/agents" className="primary-button">接入 Agent</a> : <><button className="primary-button" onClick={() => setEditor("new")}>创建服务</button>{addProxyButton}{!data.domains.length && <a href="#/domains" className="text-button">配置网页域名</a>}</>}</Empty> : <section className={`service-list ${selecting ? "selectable" : ""}`} aria-label="服务列表">{visible.map(item => <article className="service-row" key={item.id} onClick={openCard} data-opens-application={!selecting && item.enabled && Boolean(item.public_address)} data-pressing={pressing === item.id} data-selected={selecting && selected.includes(item.id)} onPointerDown={event => startPress(event, item.id)} onPointerMove={event => { const current = press.current; if (current && (current.pointer !== event.pointerId || Math.hypot(event.clientX - current.x, event.clientY - current.y) > 10)) cancelPress(); }} onPointerUp={cancelPress} onPointerCancel={cancelPress} onPointerLeave={cancelPress} onContextMenu={event => { if (longPressed.current || press.current) event.preventDefault(); }} onClickCapture={event => { if (longPressed.current) { longPressed.current = false; event.preventDefault(); event.stopPropagation(); } else if (selecting && event.target instanceof Element && !event.target.closest("input,label")) { event.preventDefault(); event.stopPropagation(); toggleSelected(item.id); } }}><div className="application-launch">
+        {selecting && <label className="check"><input type="checkbox" aria-label={`选择${item.name}`} checked={selected.includes(item.id)} disabled={busy} onChange={() => toggleSelected(item.id)} /></label>}
+        {!item.enabled || !item.public_address ? <button type="button" className="application-unavailable" aria-disabled="true" aria-label={`${isPortProtocol(item.protocol) ? "复制" : "打开"}${item.name}`}><ServiceIcon id={item.icon_id} protocol={item.protocol} /></button> : isPortProtocol(item.protocol) ? <CopyButton value={item.public_address} label={`复制${item.name}地址`}><ServiceIcon id={item.icon_id} protocol={item.protocol} /></CopyButton> : <a className="service-open" href={item.public_address} target="_blank" rel="noopener noreferrer" aria-label={`打开${item.name}`}><ServiceIcon id={item.icon_id} protocol={item.protocol} /></a>}
+        {(!item.enabled || item.apply_status !== "ready" || !item.public_address) && <Status badge kind={item.service_mode === "reverse_proxy" ? "reverse_proxy" : "service"} value={!item.enabled ? "disabled" : item.apply_status === "ready" && !item.public_address ? "waiting_address" : item.apply_status} />}
+      </div>
+      <a className="service-name" href={`#/services/${encodeURIComponent(item.id)}`} onClick={event => openDetail(event, item)} title={`${item.name} · 查看详情`}><strong>{item.name}</strong></a>
+      </article>)}</section>}
       {selecting && selectedProxy && <p className="helper" role="status">选择中包含反向代理，不能修改 Agent。{readonlySelection && "反向代理仅允许管理员管理。"}</p>}
       {selecting && <div className="batch-actions"><div className="batch-selection"><span aria-live="polite">已选择 {selected.length} 项</span><button className="text-button" disabled={busy || !visible.length} onClick={() => setSelected(selected.length === visible.length ? [] : visible.map(item => item.id))}>{visible.length > 0 && selected.length === visible.length ? "取消全选" : "全选"}</button>{!navigation?.desktop && <button className="text-button" disabled={busy} onClick={() => { setSelecting(false); setSelected([]); }}>完成</button>}</div><div className="batch-commands"><button className="secondary-button" title={selectedProxy ? "反向代理不能修改 Agent，请仅选择内网穿透服务" : undefined} disabled={!selected.length || busy || !data.devices.length || selectedProxy} onClick={() => { setActionError(null); setMessage(null); setChangingAgent(tunnels.filter(item => selected.includes(item.id))); }}><Server size={20} aria-hidden="true" /><span>修改 Agent</span></button><button className="secondary-button" disabled={!selected.length || busy || readonlySelection} onClick={() => void toggle(tunnels.filter(item => selected.includes(item.id)), true)}><Power size={20} aria-hidden="true" /><span>启用</span></button><button className="secondary-button" disabled={!selected.length || busy || readonlySelection} onClick={() => void toggle(tunnels.filter(item => selected.includes(item.id)), false)}><PowerOff size={20} aria-hidden="true" /><span>关闭</span></button><button className="danger-button" disabled={!selected.length || busy || readonlySelection} onClick={() => setDeleting(tunnels.filter(item => selected.includes(item.id)))}><Trash2 size={20} aria-hidden="true" /><span>删除</span></button></div></div>}
-    </>)}
+    </>}
+    {detailId && active && !editor && <ApplicationModal title={detail?.name ?? "服务详情"} header={detail ? <div className="application-summary"><ServiceIcon id={detail.icon_id} protocol={detail.protocol} /><div><h2>{detail.name}</h2><Status kind={detailProxy ? "reverse_proxy" : "service"} value={detail.enabled ? detail.apply_status : "disabled"} /></div></div> : undefined} origin={detailPresentation.current.origin} enterFromOrigin={detailPresentation.current.animate} returnFocus={detailFocus} busy={busy} dismissWhen={Boolean(data && !detail && seenDetail.current === detailId)} onClose={() => closeDetail()}>{leave => <div className="modal-body service-detail-body" ref={element => { if (element) element.scrollTop = detailPresentation.current.scroll; }} onScroll={event => { detailPresentation.current.scroll = event.currentTarget.scrollTop; }}>
+      <Notice updatedAt={resource.updatedAt} error={resource.error} onRetry={() => void resource.reload()} /><Notice error={actionError} />{message && <p className="action-status" role="status">{message}</p>}
+      {!data ? <Loading /> : !detail ? <Empty title="服务不存在" detail="该服务可能已被删除。"><button className="secondary-button" onClick={() => leave()}>返回服务列表</button></Empty> : <>
+        {detail.apply_error && detail.apply_status !== "partial" && <div className="notice error"><strong>转发配置需处理</strong><p>{detailProxy ? "请检查目标地址与域名配置。" : "当前服务可能无法访问。请核对 Agent 连接与内网地址；网页服务还需检查域名配置。"}</p><details><summary>技术详情</summary><p>{detail.apply_error}</p></details></div>}
+        {detail.apply_error && detail.apply_status === "partial" && <p className="service-detail-note">可用协议继续运行，请检查下方异常协议。</p>}
+        <section className="service-detail-section service-detail-addresses"><dl>
+          <DetailField label="公网地址"><div className="service-detail-address">{detail.public_address && !isPortProtocol(detail.protocol) ? <a className="service-public-link" href={detail.public_address} target="_blank" rel="noopener noreferrer" title="在新标签页打开"><code>{detail.public_address}</code></a> : <code>{detail.public_address ?? "等待配置"}</code>}{detail.public_address && <CopyButton value={detail.public_address} label="复制公网地址" iconOnly />}</div></DetailField>
+          <DetailField label={detailProxy ? "目标地址" : "内网地址"}><div className="service-detail-address"><code>{localTarget(detail)}</code><CopyButton value={localTarget(detail)} label="复制内网地址" iconOnly /></div></DetailField>
+        </dl></section>
+        <section className="service-detail-section"><h3>服务配置</h3><dl>
+          {!detailProxy && !isPortProtocol(detail.protocol) && <DetailField label="内网重定向" className="service-detail-meta">{detail.lan_redirect_enabled ? "已开启" : "未开启"}</DetailField>}
+          {!isPortProtocol(detail.protocol) && <DetailField label="访问规则" className="service-detail-meta">{detail.access_mode === "password" ? "认证访问" : "公开访问"}</DetailField>}
+          <DetailField label="服务类型" className="service-detail-meta">{detailProxy ? "反向代理" : isPortProtocol(detail.protocol) ? `${protocolLabel(detail.protocol)} 服务` : "网页服务"}</DetailField>
+          {!detailProxy && <DetailField label="Agent" className="service-detail-meta">{detail.device_id ? <a className="text-link" href={`#/agents/${encodeURIComponent(detail.device_id)}`} onClick={event => { if (event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return; event.preventDefault(); const href = event.currentTarget.hash; leave(() => closeDetail(href)); }}>{detail.device_name ?? "查看 Agent"}</a> : "未分配 Agent"}</DetailField>}
+        {!isPortProtocol(detail.protocol) && <DetailField label="域名配置" className="service-detail-meta"><a className="text-link" href={detailDomain ? `#/domains/${encodeURIComponent(detailDomain.id)}` : "#/domains"} onClick={event => { if (event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return; event.preventDefault(); const href = event.currentTarget.hash; leave(() => closeDetail(href)); }}>域名与 DNS</a></DetailField>}
+        </dl></section>
+        {(detail.ipv6_direct_enabled || (isPortProtocol(detail.protocol) && Object.keys(detail.protocol_statuses ?? {}).length > 0)) && <section className="service-detail-section service-detail-connections"><h3>连接状态</h3><dl>
+          {isPortProtocol(detail.protocol) && Object.entries(detail.protocol_statuses ?? {}).map(([protocol, state]) => <DetailField key={protocol} label={protocolLabel(protocol)} className="service-detail-meta"><div className="service-protocol-state"><Status value={state.status} />{state.error_message && <span className="helper">{state.error_message}</span>}</div></DetailField>)}
+{detail.ipv6_direct_enabled && <DetailField label="IPv6 直连"><div><p>{detail.direct_status?.status === "configured" ? (detail.direct_status?.public_reachability === "verified" ? "已配置，探测通过" : "已配置，公网未验证") : detail.direct_status?.status === "disabled" ? "已停用" : detail.direct_status?.status === "offline" ? "Agent 未连接" : detail.direct_status?.status === "address_required" ? "等待公网 IPv6" : "配置中"}</p>{detail.direct_status?.address && <code>{detail.direct_status.address}</code>}{detail.direct_status?.certificate_expires_at && <p className="helper">证书到期：{new Date(detail.direct_status.certificate_expires_at * 1000).toLocaleString()}</p>}{[detail.direct_status?.error, detail.direct_status?.dns_error, detail.direct_status?.certificate_error].filter(Boolean).map((error, i) => <p className="form-error" key={i}>{error}</p>)}{detail.direct_status?.public_reachability === "verified" && <p className="helper">探测结果不代表当前连接路径。</p>}{detail.direct_status?.probe_error && <p className="helper">{detail.direct_status.probe_error}</p>}</div></DetailField>}
+        </dl></section>}
+        {detail.enabled && detail.apply_status === "ready" && <details className="service-state-explanation"><summary>状态说明</summary><span>{detailProxy ? "入口配置已生效，不代表目标服务健康。请通过公网地址测试实际访问；反代不计入穿透流量。" : ["udp", "tcp_udp"].includes(detail.protocol) ? "转发入口和数据通道已建立，不代表 UDP 目标应用已响应。请通过公网地址测试实际访问。" : "Agent 已连接，内网地址连接检查已通过。请通过公网地址测试实际访问。"}</span></details>}
+        <div className="service-detail-actions"><button className="primary-button" disabled={busy || readonlyDetail} onClick={() => leave(() => { detailPresentation.current.animate = false; setEditor(detail); })}>编辑服务</button><button className="secondary-button" disabled={busy || readonlyDetail} onClick={() => void toggle([detail], !detail.enabled)}>{busy ? "提交中…" : detail.enabled ? "关闭服务" : "启用服务"}</button><div className="service-detail-danger"><button className="danger-button" disabled={busy || readonlyDetail} onClick={() => setDeleting([detail])}><Trash2 size={18} aria-hidden="true" />删除服务</button></div></div>
+      </>}
+    </div>}</ApplicationModal>}
     {creationMenu && active && <Modal title="添加" onClose={() => setCreationMenu(false)}><div className="modal-body service-create-options">
       <button aria-label="创建服务" onClick={() => create("new")}><Server size={22} aria-hidden="true" /><span>创建服务<small>通过 Agent 访问内网服务</small></span><ChevronRight size={18} aria-hidden="true" /></button>
       <button aria-label="添加反向代理" onClick={() => create("new-proxy")}><Globe size={22} aria-hidden="true" /><span>添加反向代理<small>直接转发到目标地址</small></span><ChevronRight size={18} aria-hidden="true" /></button>

@@ -62,6 +62,7 @@ test("暖色主题与六种空状态在明暗页面中可读且操作可达", as
         })).toBeTruthy();
       }
       await page.screenshot({ path: info.outputPath(`${colorScheme}-empty-${kind}.png`), fullPage: true });
+      if (kind === "missing") { await page.keyboard.press("Escape"); await expect(page.locator(".application-modal")).toHaveCount(0); await expect(page).toHaveURL(/#\/services$/); }
     }
     state.authenticated = false;
     await page.goto("/");

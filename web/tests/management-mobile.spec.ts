@@ -46,7 +46,7 @@ test("我的页兼容旧链接，设备作为独立导航入口", async ({ page 
   await expect(page.locator(".page-slot:not([hidden]) .agent-row")).toHaveCount(2);
 });
 
-test("服务直达 Agent 可返回原服务，正常证书折叠且关联服务优先", async ({ page }, info) => {
+test("服务直达 Agent 可返回原列表，正常证书折叠且关联服务优先", async ({ page }, info) => {
   const state = await installApiMocks(page);
   state.devices[0].certificate = { status: "valid", expires_at: 1893456000, renew_after: 1890864000, error: null, next_retry_at: null };
   await page.goto("/#/services");
@@ -65,8 +65,7 @@ test("服务直达 Agent 可返回原服务，正常证书折叠且关联服务�
   await page.evaluate(() => window.dispatchEvent(new Event("focus")));
   await expect(certificates.getByText("续签失败：磁盘空间不足", { exact: true })).toBeVisible();
   await page.getByRole("link", { name: "返回", exact: true }).click();
-  await expect(page).toHaveURL(/#\/services\/t-1$/);
-  await expect(page.locator(".page-slot:not([hidden]) h1")).toHaveText("媒体中心");
-  await page.getByRole("link", { name: "返回", exact: true }).click();
+  await expect(page).toHaveURL(/#\/services$/);
+  await expect(page.locator(".page-slot:not([hidden]) h1")).toHaveText("服务");
   await expect(page.getByLabel("搜索服务")).toHaveValue("媒体");
 });

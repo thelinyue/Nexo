@@ -5,6 +5,7 @@ import { isLanRedirectAddress } from "../src/lan-redirect";
 import { installApiMocks } from "./api-mocks";
 
 async function createWebService(page: Page) {
+  if (await page.locator(".application-modal").count()) { await page.keyboard.press("Escape"); await expect(page.locator(".application-modal")).toHaveCount(0); await expect(page).toHaveURL(/#\/services$/); }
   await page.goto("/#/services");
   await openServiceEditor(page);
   const dialog = page.getByRole("dialog", { name: "创建服务" });

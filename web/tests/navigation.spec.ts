@@ -4,33 +4,23 @@ import { installApiMocks } from "./api-mocks";
 
 const current = (page: import("@playwright/test").Page) => page.locator(".page-slot:not([hidden])");
 
-test("桌面独立详情标签、去重、关闭、刷新和后台轮询", async ({ page }, info) => {
+test("桌面详情不新增标签，关闭后保留筛选，其他页面轮询仍隔离", async ({ page }, info) => {
   test.skip(info.project.name !== "desktop-dark", "桌面标签交互");
   const state = await installApiMocks(page);
   state.tunnels.push({ ...state.tunnels[0], id: "t-2", name: "备用媒体" });
   await page.goto("/#/services");
   await page.getByLabel("搜索服务").fill("媒体");
-  await page.getByRole("link", { name: "媒体中心", exact: true }).click();
-  await expect(page.getByRole("tab", { name: "媒体中心", exact: true })).toHaveAttribute("aria-selected", "true");
-  await page.getByRole("tab", { name: "服务", exact: true }).click();
-  await expect(page.getByLabel("搜索服务")).toHaveValue("媒体");
-  await page.getByRole("link", { name: "备用媒体", exact: true }).click();
-  await expect(page.getByRole("tab")).toHaveCount(4);
-  for (const close of await page.locator(".workspace-tab .tab-close").all()) {
-    await expect(close).toBeVisible();
-    const bounds = await close.boundingBox();
-    expect(bounds!.width).toBeGreaterThanOrEqual(32);
-    expect(bounds!.height).toBeGreaterThanOrEqual(32);
+  for (const name of ["媒体中心", "备用媒体", "媒体中心"]) {
+    await page.getByRole("link", { name, exact: true }).click();
+    await expect(page.getByRole("dialog", { name, exact: true })).toBeVisible();
+    await expect(page.locator(".workspace-tab")).toHaveCount(2);
+    await expect(page).toHaveURL(/#\/services$/);
+    await page.keyboard.press("Escape");
+    await expect(page.getByRole("dialog")).toHaveCount(0);
+    await expect(page.getByLabel("搜索服务")).toHaveValue("媒体");
   }
-  await page.getByRole("tab", { name: "媒体中心", exact: true }).click();
-  await expect(current(page).locator(".service-detail h2")).toHaveText("媒体中心");
-  await page.getByRole("tab", { name: "服务", exact: true }).click();
-  await page.getByRole("link", { name: "媒体中心", exact: true }).click();
-  await expect(page.getByRole("tab")).toHaveCount(4);
-  await expect(page.getByRole("navigation", { name: "面包屑" })).toContainText("服务媒体中心");
   await page.reload();
-  await expect(page.getByRole("tab")).toHaveCount(4);
-  await expect(page.getByRole("tab", { name: "媒体中心", exact: true })).toHaveAttribute("aria-selected", "true");
+  await expect(page.getByRole("tab")).toHaveCount(2);
   await page.locator(".sidebar").getByRole("link", { name: "设备", exact: true }).click();
   await expect(current(page).locator(".agent-row")).toHaveCount(2);
   state.calls.length = 0;
@@ -38,17 +28,11 @@ test("桌面独立详情标签、去重、关闭、刷新和后台轮询", async
   await expect.poll(() => state.calls.filter(call => call.path === "/api/v1/devices").length).toBe(1);
   expect(state.calls.filter(call => call.path === "/api/v1/public-domains")).toHaveLength(0);
   await page.getByRole("button", { name: "关闭 设备", exact: true }).click();
-  await expect(page).toHaveURL(/#\/services\/t-2$/);
-  await page.getByRole("button", { name: "关闭 媒体中心", exact: true }).click();
-  await expect(page).toHaveURL(/#\/services\/t-2$/);
-  const workspace = await current(page).boundingBox();
-  expect(workspace!.x + workspace!.width).toBeCloseTo(page.viewportSize()!.width - 24, 0);
-  await page.mouse.move(800, 850);
-  await page.screenshot({ animations: "disabled", scale: "css", path: info.outputPath("desktop-tabs.png") });
-  await current(page).getByRole("button", { name: "编辑服务", exact: true }).click();
+  await expect(page).toHaveURL(/#\/services$/);
+  await page.getByRole("link", { name: "备用媒体", exact: true }).click();
+  await page.getByRole("button", { name: "编辑服务", exact: true }).click();
   const editor = page.getByRole("dialog", { name: "编辑服务" });
   await expect(editor.getByLabel("服务名称")).toHaveValue("备用媒体");
-  await page.screenshot({ animations: "disabled", scale: "css", path: info.outputPath("desktop-service-editor.png") });
 });
 
 test("首页标签固定，关闭其他页面回到首页，旧空工作区跳转兼容", async ({ page }, info) => {
@@ -142,13 +126,12 @@ test("手机五入口和玻璃底栏、详情返回与我的", async ({ page }, 
   await nav.getByRole("link", { name: "服务", exact: true }).click();
   await expect(page.getByLabel("搜索服务")).toHaveValue("媒体");
   await page.getByRole("link", { name: "媒体中心", exact: true }).click();
-  await expect(nav).toBeHidden();
+  await expect(page.getByRole("dialog", { name: "媒体中心", exact: true })).toBeVisible();
   await page.getByRole("link", { name: "家庭 Agent", exact: true }).click();
   await expect(current(page).locator("h1")).toHaveText("家庭 Agent");
   await page.getByRole("link", { name: "返回", exact: true }).click();
-  await expect(page).toHaveURL(/#\/services\/t-1$/);
-  await page.screenshot({ animations: "disabled", scale: "css", path: info.outputPath("mobile-detail.png") });
-  await page.getByRole("link", { name: "返回", exact: true }).click();
+  await expect(page).toHaveURL(/#\/services$/);
+  await expect(page.locator(".application-modal")).toHaveCount(0);
   await expect(page.getByLabel("搜索服务")).toHaveValue("媒体");
   await page.screenshot({ animations: "disabled", scale: "css", path: info.outputPath("mobile-glass-navigation.png") });
   await nav.getByRole("link", { name: "我的", exact: true }).click();

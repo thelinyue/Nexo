@@ -7,20 +7,28 @@ const cases = [
   ["phone-large", 430, 932], ["landscape", 812, 375], ["tablet", 768, 1024], ["desktop", 1440, 900],
 ] as const;
 
-test("服务公网地址的复制按钮紧跟地址", async ({ page }, testInfo) => {
+test("应用图标自适应列数，图标访问与名称详情分开", async ({ page }, testInfo) => {
   test.skip(testInfo.project.name !== "desktop-dark", "布局检查由桌面项目执行");
   const state = await installApiMocks(page);
   state.tunnels.push({ ...state.tunnels[0], id: "long-address", name: "长地址服务", public_address: `https://${"very-long.".repeat(18)}example.com` });
-  for (const width of [1440, 375]) {
+  for (const width of [1440, 320, 375, 812]) {
     await page.setViewportSize({ width, height: 900 });
     await page.goto("/#/services");
-    for (const row of await page.locator(".service-row:has(.public-address)").all()) {
-      const address = await row.locator(".public-address").boundingBox();
-      const button = await row.locator(".service-address .icon-copy").boundingBox();
-      expect(address && button).toBeTruthy();
-      expect(button!.x - (address!.x + address!.width)).toBeGreaterThanOrEqual(0);
-      expect(button!.x - (address!.x + address!.width)).toBeLessThanOrEqual(10);
-      expect(button!.x + button!.width).toBeLessThanOrEqual(width);
+    const rows = page.locator(".page-slot:not([hidden]) .service-row");
+    await expect(rows).toHaveCount(2);
+    const columns = await page.locator(".service-list").evaluate(el => getComputedStyle(el).gridTemplateColumns.split(" ").length);
+    if (width === 320) expect(columns).toBe(3);
+    if (width === 375) expect(columns).toBe(4);
+    const first = (await rows.nth(0).boundingBox())!;
+    const second = (await rows.nth(1).boundingBox())!;
+    expect(Math.abs(first.y - second.y)).toBeLessThan(1);
+    expect(second.x).toBeGreaterThan(first.x + first.width);
+    for (const row of await rows.all()) {
+      await expect(row.locator(".public-address,.application-card-actions")).toHaveCount(0);
+      await expect(row.getByRole("link", { name: /^打开/ })).toBeVisible();
+      await expect(row.locator(".service-name")).toBeVisible();
+      expect((await row.locator(".service-name").boundingBox())!.height).toBeGreaterThanOrEqual(44);
+      expect((await row.boundingBox())!.x + (await row.boundingBox())!.width).toBeLessThanOrEqual(width);
     }
   }
 });
@@ -45,8 +53,8 @@ test("所有页面在移动尺寸和明暗主题中无溢出，输出实际截�
           if (!["services", "agents", "domains", "manage", "settings"].includes(route)) await expect(page.locator(".bottom-nav")).toBeHidden();
           else await expect(page.locator(".bottom-nav")).toBeVisible();
           if (route === "services") {
-            await expect(page.locator(".service-address .public-address").first()).toHaveCSS("white-space", "nowrap");
-            await expect(page.locator(".service-origin code").first()).toHaveCSS("white-space", "nowrap");
+            await expect(page.locator(".page-slot:not([hidden]) .service-name strong").first()).toHaveCSS("-webkit-line-clamp", "2");
+            await expect(page.locator(".service-address").first()).toBeHidden();
             const fab = await page.getByRole("button", { name: "添加", exact: true }).boundingBox();
             const nav = await page.locator(".bottom-nav").boundingBox();
             expect(fab!.y + fab!.height).toBeLessThanOrEqual(nav!.y);
@@ -55,13 +63,14 @@ test("所有页面在移动尺寸和明暗主题中无溢出，输出实际截�
             expect(nav!.x + nav!.width).toBeLessThanOrEqual(width - 16);
             expect(nav!.y + nav!.height).toBeLessThanOrEqual(height - 12);
             await page.evaluate(() => window.scrollTo(0, document.documentElement.scrollHeight));
-            const lastRow = await page.locator(".service-row").last().boundingBox();
+            const lastRow = await page.locator(".page-slot:not([hidden]) .service-row").last().boundingBox();
             expect(lastRow!.y + lastRow!.height).toBeLessThanOrEqual(fab!.y);
             await page.evaluate(() => window.scrollTo(0, 0));
           }
           if (route === "agents") await expect(page.locator(".page-slot:not([hidden])").getByText("离线", { exact: true })).toBeVisible();
         }
         await page.screenshot({ path: testInfo.outputPath(`${name}-${theme}-${route.replaceAll("/", "-")}.png`) });
+        if (route.startsWith("services/")) { await page.keyboard.press("Escape"); await expect(page.locator(".application-modal")).toHaveCount(0); await expect(page).toHaveURL(/#\/services$/); }
       }
       await page.goto("/#/services");
       await openServiceEditor(page);
@@ -101,7 +110,7 @@ test("小屏放大文字和关键触控热区", async ({ page }, testInfo) => {
   await page.setViewportSize({ width: 320, height: 568 });
   for (const route of ["services", "agents", "manage", "domains", "settings", "settings/sessions"]) {
     await page.goto(`/#/${route}`);
-    await page.addStyleTag({ content: "html { font-size: 200%; }" });
+    await page.evaluate(() => { document.documentElement.style.fontSize = "200%"; });
     await expect(page.locator(".page-slot:not([hidden]) .skeleton-list")).toHaveCount(0);
     await expect.poll(() => page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBeTruthy();
     const buttons = page.locator(".page-slot:not([hidden]) button:visible");
@@ -110,6 +119,10 @@ test("小屏放大文字和关键触控热区", async ({ page }, testInfo) => {
       await page.getByRole("button", { name: "选择", exact: true }).focus();
       await page.getByRole("button", { name: "选择", exact: true }).press("Space");
       expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBeTruthy();
+      const label = (await page.locator(".service-row .check").first().boundingBox())!;
+      expect(label.width).toBe(44);
+      expect(label.height).toBe(44);
+      expect(await page.locator(".service-list").evaluate(el => getComputedStyle(el).gridTemplateColumns.split(" ").length)).toBeLessThan(3);
     }
   }
 });

@@ -54,10 +54,13 @@ for (const transport of ["loopback", "http", "https"]) test(`${transport} 真实
   await page.goto(`${base}/#/services`); await page.bringToFront();
   expect(await page.evaluate(() => isSecureContext)).toBe(!insecure);
   if (insecure) expect(await page.evaluate(() => Boolean(navigator.clipboard))).toBe(false);
-  await page.getByRole("button", { name: "复制媒体中心公网地址", exact: true }).click();
+  await page.getByRole("link", { name: "媒体中心", exact: true }).click();
+  await page.getByRole("button", { name: "复制公网地址", exact: true }).click();
   await expect(page.getByRole("status")).toHaveText("已复制");
   expect(await readClipboard()).toBe(state.tunnels[0].public_address);
 
+  await page.keyboard.press("Escape");
+  await expect(page.locator(".application-modal")).toHaveCount(0);
   let linksCreated = 0;
   await page.route("**/api/v1/admin/invitations", route => {
     if (route.request().method() === "POST") { linksCreated++; return route.fulfill({ json: { token: "invite/with+fragment=".repeat(20), expires_at: Date.now()/1000 + 3600 } }); }

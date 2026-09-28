@@ -1,10 +1,10 @@
 import { createContext, useCallback, useContext, useEffect, useRef, useState } from "react";
-import type { InputHTMLAttributes, ReactNode } from "react";
-import { ArrowLeft, Check, ChevronRight, Copy, Plus, Users, X } from "lucide-react";
+import type { InputHTMLAttributes, ReactNode, RefObject } from "react";
+import { ArrowLeft, Check, ChevronRight, CircleAlert, CircleHelp, Clock, Copy, Pause, Plus, TriangleAlert, Users, X } from "lucide-react";
 import { PageNavigationContext } from "./navigation";
 
 export type Auth = { initialized: boolean; authenticated: boolean; user_id?: string; username?: string; role?: "system_admin" | "tenant"; workspace_id?: string; csrf_token?: string | null; local_http_warning?: boolean };
-export type Tunnel = { ipv6_direct_enabled?: boolean; direct_status?: { status: string; address?: string; error?: string; dns_error?: string; certificate_error?: string; certificate_expires_at?: number; public_reachability?: string; probe_error?: string }; https_port?: number; http_redirect_enabled?: boolean; protocol_statuses?: Record<string, { status: string; error_message?: string | null }>; access_mode?: "public" | "password"; service_mode?: "tunnel" | "reverse_proxy"; id: string; name: string; protocol: string; origin_protocol?: "http" | "https" | null; local_address: string; local_port: number; public_port?: number | null; public_address?: string | null; device_id?: string | null; device_name?: string | null; hostname?: string | null; enabled: boolean; apply_status: string; apply_error?: string | null; public_domain?: string | null; lan_redirect_enabled: boolean };
+export type Tunnel = { icon_id?: string | null; ipv6_direct_enabled?: boolean; direct_status?: { status: string; address?: string; error?: string; dns_error?: string; certificate_error?: string; certificate_expires_at?: number; public_reachability?: string; probe_error?: string }; https_port?: number; http_redirect_enabled?: boolean; protocol_statuses?: Record<string, { status: string; error_message?: string | null }>; access_mode?: "public" | "password"; service_mode?: "tunnel" | "reverse_proxy"; id: string; name: string; protocol: string; origin_protocol?: "http" | "https" | null; local_address: string; local_port: number; public_port?: number | null; public_address?: string | null; device_id?: string | null; device_name?: string | null; hostname?: string | null; enabled: boolean; apply_status: string; apply_error?: string | null; public_domain?: string | null; lan_redirect_enabled: boolean };
 export type IdentityCertificate = { status: string; expires_at: number | null; renew_after: number | null; error: string | null; next_retry_at: number | null };
 export type TransportIdentity = { server: IdentityCertificate; ca_expires_at: number | null; ca_needs_attention: boolean };
 export type Device = { id: string; name: string; status: string; os?: string | null; architecture?: string | null; agent_version?: string | null; tunnel_count: number; enrolled_at?: number | null; last_seen_at?: number | null; certificate?: IdentityCertificate };
@@ -68,7 +68,7 @@ export function UserAvatar({ role, size = 32 }: { role?: string; size?: 28 | 32 
 }
 
 /** 各资源分别解释状态，未知状态保留原值，避免把离线或未知情况误报为处理中。 */
-export function Status({ value, kind = "service" }: { value: string; kind?: "service" | "agent" | "domain" | "certificate" | "reverse_proxy" }) {
+export function Status({ value, kind = "service", badge = false }: { value: string; kind?: "service" | "agent" | "domain" | "certificate" | "reverse_proxy"; badge?: boolean }) {
   const labels: Record<string, string> = kind === "agent"
     ? { online: "在线", offline: "离线" }
     : kind === "domain" ? { applied: "配置已加载", pending: "等待加载", failed: "配置加载失败", disabled: "Caddy 已停用", unverified: "尚无运行状态" }
@@ -76,7 +76,10 @@ export function Status({ value, kind = "service" }: { value: string; kind?: "ser
     : kind === "reverse_proxy" ? { ready: "已生效", failed: "配置失败", error: "配置失败", disabled: "已停用", checking: "配置中", pending: "配置中", applying: "配置中" }
     : { partial: "部分可用", ready: "运行中", failed: "需处理", error: "需处理", disabled: "已关闭", checking: "检查中", pending: "待应用", applying: "应用中" };
   const tone = ["ready", "online", "applied", "issued", "active"].includes(value) ? "ready" : ["failed", "error", "expired"].includes(value) ? "failed" : ["partial", "pending", "checking", "applying", "waiting_configuration", "presenting_dns", "waiting_dns", "validating", "renewing", "retry_wait"].includes(value) ? "working" : "neutral";
-  return <span className={`status ${tone}`}><i />{labels[value] ?? `未知状态：${value || "未返回"}`}</span>;
+  const label = labels[value] ?? (value === "waiting_address" ? "等待地址" : `未知状态：${value || "未返回"}`);
+  // 应用角标复用完整状态文案，用形状区分异常、等待和关闭，读屏仍能获取原意。
+  const Icon = value === "disabled" ? Pause : value === "partial" ? TriangleAlert : tone === "failed" ? CircleAlert : tone === "working" || value === "waiting_address" ? Clock : CircleHelp;
+  return badge ? <span className={`status application-status ${tone}`} title={label}><Icon size={14} aria-hidden="true" /><span className="sr-only">{label}</span></span> : <span className={`status ${tone}`}><i />{label}</span>;
 }
 
 export function PageHeader({ title, back, action }: { title: string; back?: string; action?: ReactNode }) {
@@ -127,25 +130,26 @@ export async function copyText(value: string, synchronous = false, trigger?: HTM
 }
 
 /** 异步权限失败后允许用新的点击直接同步复制；凭据仅保留在当前组件内存。 */
-export function CopyButton({ value, label = "复制地址", compact = false, iconOnly = false }: { value: string; label?: string; compact?: boolean; iconOnly?: boolean }) {
+export function CopyButton({ value, label = "复制地址", compact = false, iconOnly = false, children }: { value: string; label?: string; compact?: boolean; iconOnly?: boolean; children?: ReactNode }) {
   const [state, setState] = useState<"idle" | "copied" | "failed">("idle");
   const manual = useRef<HTMLTextAreaElement>(null);
   useEffect(() => { setState("idle"); }, [value]);
   useEffect(() => { if (state !== "copied") return; const timer = window.setTimeout(() => setState("idle"), 2500); return () => clearTimeout(timer); }, [state]);
   useEffect(() => { if (state === "failed") manual.current?.scrollIntoView({ block: "nearest" }); }, [state]);
   return <div className={`copy-control ${compact ? "compact-copy" : ""}${iconOnly ? " icon-copy" : ""}`}>
-    <button type="button" className={iconOnly ? "icon-button" : compact ? "address-button" : "secondary-button"} aria-label={state === "failed" ? "再次复制" : label} title={iconOnly ? label : undefined} onClick={async e => {
+    <button type="button" className={children ? "application-copy" : iconOnly ? "icon-button" : compact ? "address-button" : "secondary-button"} aria-label={state === "failed" ? "再次复制" : label} title={iconOnly || children ? label : undefined} onClick={async e => {
       try { await copyText(value, state === "failed", e.currentTarget); setState("copied"); } catch { setState("failed"); }
-    }}>{compact && <code>{value}</code>}{state === "copied" ? <Check size={17} /> : <Copy size={17} />}{!compact && !iconOnly && (state === "copied" ? "已复制" : state === "failed" ? "再次复制" : label)}</button>
-    {state !== "idle" && <span className={state === "failed" ? "form-error" : "sr-only"} role={state === "failed" ? "alert" : "status"}>{state === "copied" ? "已复制" : "无法复制，可再次复制，或选择下方完整文本手动复制"}</span>}
+    }}>{children ?? <>{compact && <code>{value}</code>}{state === "copied" ? <Check size={17} /> : <Copy size={17} />}{!compact && !iconOnly && (state === "copied" ? "已复制" : state === "failed" ? "再次复制" : label)}</>}</button>
+    {state !== "idle" && <span className={state === "failed" ? "form-error" : children ? "application-copy-feedback" : "sr-only"} role={state === "failed" ? "alert" : "status"}>{state === "copied" ? "已复制" : "无法复制，可再次复制，或选择下方完整文本手动复制"}</span>}
     {state === "failed" && <><textarea ref={manual} className="copy-fallback" aria-label="手动复制内容" readOnly value={value} onFocus={e => e.currentTarget.select()} /><button type="button" className="text-button" onClick={() => { manual.current?.focus(); manual.current?.select(); }}>选择全部</button></>}
   </div>;
 }
 
 /** 原生 dialog 提供焦点约束和背景隔离；长表单与短操作共享关闭和未保存保护。 */
-export function Modal({ title, children, onClose, full = false, dirty = false, busy = false, dismissible = true }: { title: string; children: ReactNode | ((close: () => void) => ReactNode); onClose: () => void; full?: boolean; dirty?: boolean; busy?: boolean; dismissible?: boolean }) {
+export function Modal({ title, children, onClose, full = false, dirty = false, busy = false, dismissible = true, header, className = "", dialogRef, returnFocus }: { title: string; children: ReactNode | ((close: () => void) => ReactNode); onClose: () => void; full?: boolean; dirty?: boolean; busy?: boolean; dismissible?: boolean; header?: ReactNode; className?: string; dialogRef?: RefObject<HTMLDialogElement | null>; returnFocus?: () => HTMLElement | null }) {
   const workspaceLabel = useContext(WorkspaceLabelContext);
-  const ref = useRef<HTMLDialogElement>(null);
+  const localRef = useRef<HTMLDialogElement>(null);
+  const ref = dialogRef ?? localRef;
   const pendingNavigation = useRef<(() => void) | null>(null);
   const [discard, setDiscard] = useState(false);
   const close = () => { if (busy || !dismissible) return; if (dirty) setDiscard(true); else onClose(); };
@@ -156,7 +160,7 @@ export function Modal({ title, children, onClose, full = false, dirty = false, b
     dialog.showModal();
     const resize = () => { dialog.style.setProperty("--visible-height", `${window.visualViewport?.height ?? window.innerHeight}px`); dialog.style.setProperty("--visual-top", `${window.visualViewport?.offsetTop ?? 0}px`); };
     resize(); window.visualViewport?.addEventListener("resize", resize); window.visualViewport?.addEventListener("scroll", resize);
-    return () => { dialog.close(); window.visualViewport?.removeEventListener("resize", resize); window.visualViewport?.removeEventListener("scroll", resize); window.setTimeout(() => { const top = Array.from(document.querySelectorAll("dialog[open]")).at(-1); if (trigger?.isConnected && !trigger.closest("[hidden]") && (!top || top.contains(trigger))) trigger.focus({ preventScroll: true }); }, 0); };
+    return () => { dialog.close(); window.visualViewport?.removeEventListener("resize", resize); window.visualViewport?.removeEventListener("scroll", resize); window.setTimeout(() => { const target = returnFocus ? returnFocus() : trigger; const top = Array.from(document.querySelectorAll("dialog[open]")).at(-1); if (target?.isConnected && !target.closest("[hidden]") && (!top || top.contains(target))) target.focus({ preventScroll: true }); }, 0); };
   }, []);
   // 使用独立监听读取最新 dirty，避免首次打开时的状态被闭包固定。
   useEffect(() => { if (!dirty) return; const handler = (e: BeforeUnloadEvent) => { e.preventDefault(); }; window.addEventListener("beforeunload", handler); return () => window.removeEventListener("beforeunload", handler); }, [dirty]);
@@ -173,14 +177,14 @@ export function Modal({ title, children, onClose, full = false, dirty = false, b
     window.addEventListener("nexo:route-change", handler);
     return () => window.removeEventListener("nexo:route-change", handler);
   }, [dirty, busy, dismissible, full, onClose]);
-  return <><dialog ref={ref} data-navigation-lock={full} className={`modal ${full ? "full-form" : "short-modal"}`} aria-label={title} tabIndex={-1} onKeyDown={event => {
+  return <><dialog ref={ref} data-navigation-lock={full} className={`modal ${full ? "full-form" : "short-modal"} ${className}`} aria-label={title} tabIndex={-1} onKeyDown={event => {
     if (event.key !== "Tab") return;
     const items = Array.from(ref.current!.querySelectorAll<HTMLElement>('button:not(:disabled),a[href],input:not(:disabled),textarea:not(:disabled),select:not(:disabled),summary,[tabindex="0"]')).filter(item => item.getClientRects().length > 0);
     const first = items[0]; const last = items[items.length - 1];
     if (!first) { event.preventDefault(); ref.current?.focus(); }
     else if (event.shiftKey && (document.activeElement === first || document.activeElement === ref.current)) { event.preventDefault(); last.focus(); }
     else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first.focus(); }
-  }} onCancel={e => { e.preventDefault(); close(); }} onClick={e => { if (e.target === ref.current) { const box = ref.current.getBoundingClientRect(); if (e.clientX < box.left || e.clientX > box.right || e.clientY < box.top || e.clientY > box.bottom) close(); } }}><header className="modal-heading"><h2>{title}</h2>{dismissible && <><button className={`icon-button${full ? " form-cancel" : ""}${full ? " mobile-form-cancel" : ""}`} aria-label={full ? "取消" : "关闭"} onClick={close} disabled={busy}>{full ? "取消" : <X size={21} />}</button>{full && <button className="icon-button desktop-modal-close" aria-label="关闭" onClick={close} disabled={busy}><X size={19} /></button>}</>}</header>{workspaceLabel && <p className="modal-workspace">操作空间：{workspaceLabel}</p>}{/* 自定义底部取消复用同一关闭入口，保留提交锁、草稿确认和焦点恢复。 */}{typeof children === "function" ? children(close) : children}</dialog>{discard && <Confirm title="放弃未保存的修改？" description="离开后，本次填写的内容将丢失。" label="放弃修改" onClose={() => { pendingNavigation.current = null; setDiscard(false); }} onConfirm={async () => { const resume = pendingNavigation.current; pendingNavigation.current = null; setDiscard(false); onClose(); if (resume) window.setTimeout(resume, 0); }} />}</>;
+  }} onCancel={e => { e.preventDefault(); close(); }} onClick={e => { if (e.target === ref.current) { const box = ref.current.getBoundingClientRect(); if (e.clientX < box.left || e.clientX > box.right || e.clientY < box.top || e.clientY > box.bottom) close(); } }}><header className="modal-heading">{header ?? <h2>{title}</h2>}{dismissible && <><button className={`icon-button${full ? " form-cancel" : ""}${full ? " mobile-form-cancel" : ""}`} aria-label={full ? "取消" : "关闭"} onClick={close} disabled={busy}>{full ? "取消" : <X size={21} />}</button>{full && <button className="icon-button desktop-modal-close" aria-label="关闭" onClick={close} disabled={busy}><X size={19} /></button>}</>}</header>{workspaceLabel && <p className="modal-workspace">操作空间：{workspaceLabel}</p>}{/* 自定义底部取消复用同一关闭入口，保留提交锁、草稿确认和焦点恢复。 */}{typeof children === "function" ? children(close) : children}</dialog>{discard && <Confirm title="放弃未保存的修改？" description="离开后，本次填写的内容将丢失。" label="放弃修改" onClose={() => { pendingNavigation.current = null; setDiscard(false); }} onConfirm={async () => { const resume = pendingNavigation.current; pendingNavigation.current = null; setDiscard(false); onClose(); if (resume) window.setTimeout(resume, 0); }} />}</>;
 }
 export function Confirm({ title, description, label, onClose, onConfirm, tone = "danger" }: { title: string; description: string; label: string; tone?: "danger" | "primary"; onClose: () => void; onConfirm: () => Promise<void> }) {
   const [busy, setBusy] = useState(false); const [error, setError] = useState<string | null>(null);

@@ -14,7 +14,7 @@ test("网页类型包含 HTTP 和 HTTPS，内网 IPv6 地址单行展示并完�
   await expect(filter.locator("option")).toHaveText(["全部类型", "网页服务", "TCP 服务", "UDP 服务", "TCP+UDP"]);
   await filter.selectOption("web");
   await expect(page.locator(".service-row")).toHaveCount(2);
-  await expect(page.locator(".service-title .service-device")).toHaveText(["家庭 Agent", "家庭 Agent"]);
+  await expect(page.locator(".service-row .status")).toHaveCount(0);
   await page.getByRole("link", { name: "媒体中心", exact: true }).click();
   const field = page.locator(".detail-field", { has: page.getByText("内网地址", { exact: true }) });
   const code = field.locator("code");
@@ -43,7 +43,9 @@ test("五入口导航、旧链接和不存在的详情均可返回", async ({ pa
   await expect(visiblePage(page).locator("h1")).toHaveText((page.viewportSize()?.width ?? 0) <= 900 ? "我的" : "账号设置");
   await page.goto("/#/services/missing");
   await expect(page.getByText("服务不存在", { exact: true })).toBeVisible();
-  await page.getByRole("link", { name: "返回服务列表" }).click();
+  await page.getByRole("button", { name: "返回服务列表" }).click();
+  await expect(page.locator(".application-modal")).toHaveCount(0);
+  await expect(page).toHaveURL(/#\/services$/);
   await expect(page.getByRole("link", { name: "媒体中心", exact: true })).toBeVisible();
   await page.goto("/#/overview");
   await expect(visiblePage(page).locator("h1")).toHaveText("首页");
@@ -55,12 +57,14 @@ test("详情显示完整地址，返回保留搜索与滚动位置", async ({ pa
   await page.goto("/#/services");
   await page.getByRole("textbox", { name: "搜索服务" }).fill("媒体");
   const target = page.getByRole("link", { name: "媒体中心 12", exact: true });
-  await target.scrollIntoViewIfNeeded();
+  // 名称进入视口中部，避免底部浮层遮挡后由自动点击额外滚动。
+  await target.evaluate(el => el.scrollIntoView({ block: "center" }));
   const scroll = await page.evaluate(() => window.scrollY);
   await target.click();
-  await expect(visiblePage(page).locator("h1")).toHaveText("媒体中心 12");
+  await expect(page.getByRole("dialog", { name: "媒体中心 12", exact: true })).toBeVisible();
   await expect(page.locator(".detail-field code").first()).toHaveText(state.tunnels[0].public_address);
-  await page.goBack();
+  await page.keyboard.press("Escape");
+  await expect(page.getByRole("dialog")).toHaveCount(0);
   await expect(page.getByRole("textbox", { name: "搜索服务" })).toHaveValue("媒体");
   await expect.poll(() => page.evaluate(() => window.scrollY)).toBeCloseTo(scroll, -1);
 });
@@ -101,7 +105,7 @@ test("小屏服务详情滚动后仍可操作", async ({ page }, testInfo) => {
   await expect(page.locator(".bottom-nav")).toBeHidden();
   const actions = page.locator(".service-detail-actions");
   await expect(actions).toBeVisible();
-  await page.evaluate(() => window.scrollTo(0, document.documentElement.scrollHeight));
+  await page.locator(".service-detail-body").evaluate(el => { el.scrollTop = el.scrollHeight; });
   for (const name of ["编辑服务", "关闭服务", "删除服务"]) await expect(actions.getByRole("button", { name })).toBeInViewport({ ratio: 1 });
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBeTruthy();
   await page.screenshot({ path: testInfo.outputPath("service-detail-small-bottom.png") });
@@ -223,12 +227,12 @@ test("复制失败有说明，服务启停失败不伪报成功", async ({ page 
     document.execCommand = () => false;
   });
   await page.goto("/#/services");
-  await page.getByRole("button", { name: "复制媒体中心公网地址" }).click();
-  await expect(page.getByRole("alert")).toContainText("无法复制");
   await page.getByRole("link", { name: "媒体中心", exact: true }).click();
+  await page.getByRole("button", { name: "复制公网地址", exact: true }).click();
+  await expect(page.getByRole("alert")).toContainText("无法复制");
   state.failures.set("POST /api/v1/tunnels/t-1/disable", "关闭失败");
   await page.getByRole("button", { name: "关闭服务", exact: true }).click();
-  await expect(page.getByRole("alert")).toContainText("关闭失败");
+  await expect(page.getByRole("alert").filter({ hasText: "关闭失败" })).toBeVisible();
   await expect(page.getByRole("button", { name: "关闭服务", exact: true })).toBeEnabled();
 });
 
@@ -248,10 +252,13 @@ test("公网 HTTP 页面可复制服务地址和弹窗内的 Compose 配置", as
   const state = await installApiMocks(page);
   await page.goto("http://copy.example.test:4173/#/services");
   expect(await page.evaluate(() => window.isSecureContext)).toBe(false);
-  await page.getByRole("button", { name: "复制媒体中心公网地址" }).click();
+  await page.getByRole("link", { name: "媒体中心", exact: true }).click();
+  await page.getByRole("button", { name: "复制公网地址", exact: true }).click();
   await expect(page.getByRole("status")).toHaveText("已复制");
   expect(await page.evaluate(() => (window as any).copiedFallback)).toBe(state.tunnels[0].public_address);
 
+  await page.keyboard.press("Escape");
+  await expect(page.locator(".application-modal")).toHaveCount(0);
   await page.goto("http://copy.example.test:4173/#/agents");
   await page.getByRole("button", { name: "添加 Agent", exact: true }).click();
   const dialog = page.getByRole("dialog", { name: "添加 Agent" });

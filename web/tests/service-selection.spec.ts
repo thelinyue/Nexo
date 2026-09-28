@@ -32,10 +32,10 @@ test("手机长按进入多选，抬手不跳转，全选限定当前筛选结�
   await expect(page.locator(".bottom-nav")).toBeVisible();
   await expect(page.getByRole("checkbox")).toHaveCount(0);
   await page.getByRole("link", { name: "TCP 服务", exact: true }).click();
-  await expect(page).toHaveURL(/#\/services\/t-3$/);
+  await expect(page.getByRole("dialog", { name: "TCP 服务", exact: true })).toBeVisible();
 });
 
-test("滑动、取消触摸、多指和离开列表取消长按，地址复制不触发选择", async ({ page }, info) => {
+test("滑动、取消触摸、多指和离开列表取消长按，短按不触发选择", async ({ page }, info) => {
   test.skip(info.project.name === "desktop-dark", "手机手势取消");
   await installApiMocks(page);
   await page.goto("/#/services");
@@ -53,9 +53,9 @@ test("滑动、取消触摸、多指和离开列表取消长按，地址复制�
     await expect(page.getByRole("checkbox"), reason).toHaveCount(0);
     await row.dispatchEvent("pointerup", down);
   }
-  for (const target of [row.getByRole("button", { name: "复制媒体中心公网地址" }), row.locator(".public-address")]) {
+  for (const target of [row.getByRole("link", { name: "打开媒体中心" }), row.getByRole("link", { name: "媒体中心", exact: true })]) {
     await target.dispatchEvent("pointerdown", down);
-    await page.clock.fastForward(600);
+    await page.clock.fastForward(200);
     await target.dispatchEvent("pointerup", down);
     await expect(page.getByRole("checkbox")).toHaveCount(0);
   }
@@ -69,7 +69,7 @@ test("滑动、取消触摸、多指和离开列表取消长按，地址复制�
 
 test("批量修改 Agent 保留最新配置，部分失败只重试失败项", async ({ page }, info) => {
   const state = await installApiMocks(page);
-  Object.assign(state.tunnels[0], { public_domain: "example.com", origin_protocol: "https", enabled: false, lan_redirect_enabled: true, local_address: "192.168.1.10" });
+  Object.assign(state.tunnels[0], { icon_id: "border-radius/emby-1.png", public_domain: "example.com", origin_protocol: "https", enabled: false, lan_redirect_enabled: true, local_address: "192.168.1.10" });
   state.tunnels.push({ ...state.tunnels[0], id: "t-2", name: "TCP 应用", protocol: "tcp", public_port: 23456, hostname: null, public_domain: null, lan_redirect_enabled: false });
   await page.goto("/#/services");
   const select = page.getByRole("button", { name: "选择", exact: true });
@@ -99,6 +99,7 @@ test("批量修改 Agent 保留最新配置，部分失败只重试失败项", a
   expect(state.calls.filter(call => call.method === "PUT" && call.path === "/api/v1/tunnels/t-2")).toHaveLength(2);
   await expect(page.locator(".batch-actions")).toContainText("已选择 0 项");
   expect(state.tunnels.every(item => item.device_id === "a-2")).toBeTruthy();
+  expect(state.tunnels.every(item => item.icon_id === "border-radius/emby-1.png")).toBeTruthy();
 });
 
 test("批量提交期间禁止关闭，失败后保留选择，放弃修改需要确认", async ({ page }) => {

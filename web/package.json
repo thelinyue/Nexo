@@ -1,7 +1,7 @@
 {
   "name": "nexo-web",
   "private": true,
-  "version": "0.2.11",
+  "version": "0.2.12",
   "type": "module",
   "scripts": {
     "build": "vite build",
@@ -12,6 +12,7 @@
   "dependencies": {
     "@vitejs/plugin-react": "latest",
     "lucide-react": "^1.41.0",
+    "motion": "^13.4.4",
     "react": "latest",
     "react-dom": "latest",
     "typescript": "latest",
