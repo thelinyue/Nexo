@@ -1,6 +1,6 @@
-import { createContext, useCallback, useContext, useEffect, useRef, useState } from "react";
+import { Component, createContext, useCallback, useContext, useEffect, useRef, useState } from "react";
 import type { InputHTMLAttributes, ReactNode, RefObject } from "react";
-import { ArrowLeft, Check, ChevronRight, CircleAlert, CircleHelp, Clock, Copy, Pause, Plus, TriangleAlert, Users, X } from "lucide-react";
+import { ArrowLeft, Check, ChevronRight, CircleAlert, CircleHelp, Clock, Copy, Pause, Plus, TriangleAlert, Users, X } from "./icons";
 import { PageNavigationContext } from "./navigation";
 
 export type Auth = { initialized: boolean; authenticated: boolean; user_id?: string; username?: string; role?: "system_admin" | "tenant"; workspace_id?: string; csrf_token?: string | null; local_http_warning?: boolean };
@@ -82,19 +82,24 @@ export function Status({ value, kind = "service", badge = false }: { value: stri
   return badge ? <span className={`status application-status ${tone}`} title={label}><Icon size={14} aria-hidden="true" /><span className="sr-only">{label}</span></span> : <span className={`status ${tone}`}><i />{label}</span>;
 }
 
+/** 账号入口只注入活动桌面页面，保留页面实例时不会复制 popover 或登录状态。 */
+export const PageAccountContext = createContext<ReactNode>(null);
+
+/** 同一标题服务于桌面内容面板和手机导航；桌面业务操作与账号分层，手机保留原有操作入口。 */
 export function PageHeader({ title, back, action }: { title: string; back?: string; action?: ReactNode }) {
   const navigation = useContext(PageNavigationContext);
-  const route = navigation?.route; const report = navigation?.reportTitle;
-  useEffect(() => { if (route) report?.(route, title); }, [route, report, title]);
-  return <header className="page-header" data-has-action={Boolean(action)} data-has-back={Boolean(back)}>{back && <a className="icon-button page-back" href={back} aria-label="返回"><ArrowLeft size={21} /></a>}<div><h1 className="mobile-page-title" title={title} tabIndex={-1}>{title}</h1></div>{action && <div className="page-actions">{action}</div>}</header>;
+  const account = useContext(PageAccountContext);
+  const toolbarAction = navigation?.desktop && navigation.route !== "#/home";
+  const showBack = back && !(navigation?.desktop && navigation.route === "#/users");
+  return <><header className="page-header" data-has-action={Boolean(action && !toolbarAction)} data-has-back={Boolean(showBack)}>{showBack && <a className="icon-button page-back" href={back} aria-label="返回"><ArrowLeft size={21} /></a>}<div><h1 id={navigation ? `heading-${encodeURIComponent(navigation.route)}` : undefined} className="mobile-page-title" title={title} tabIndex={-1}>{title}</h1></div>{action && !toolbarAction && <div className="page-actions">{action}</div>}{account}</header>{action && toolbarAction && <div className="page-toolbar-actions">{action}</div>}</>;
 }
 export function CreateButton({ label, onClick, disabled }: { label: string; onClick: () => void; disabled?: boolean }) {
-  return <button className="primary-button page-create" data-resource={label} aria-label={label === "服务" ? "创建服务" : `添加 ${label}`} title={label === "服务" ? "添加服务" : `添加${label}`} onClick={onClick} disabled={disabled}><Plus size={20} strokeWidth={1.8} /><span>{label === "服务" ? "添加服务" : `添加${label}`}</span></button>;
+  return <button className="primary-button page-create" data-resource={label} aria-label={label === "服务" ? "创建服务" : `添加 ${label}`} title={label === "服务" ? "添加服务" : `添加${label}`} onClick={onClick} disabled={disabled}><Plus size={20} /><span>{label === "服务" ? "添加服务" : `添加${label}`}</span></button>;
 }
 export function Notice({ error, onRetry, updatedAt }: { error?: string | null; onRetry?: () => void; updatedAt?: number | null }) { return error ? <><div className="notice error" role="alert"><span>{error}</span>{onRetry && <button className="text-button" onClick={onRetry}>重试</button>}</div>{updatedAt && <p className="helper">保留上次数据 · 更新于 {dateText(updatedAt)}</p>}</> : null; }
 /** 同一角色通过场景区分首次使用、搜索无结果和资源不存在；插画只作装饰，状态与操作由文字表达。 */
 export function Empty({ title, detail, children, kind = "missing" }: { title: string; detail?: string; children?: ReactNode; kind?: "services" | "agents" | "domains" | "users" | "sessions" | "search" | "missing" }) {
-  return <section className="empty" data-kind={kind}>{kind === "users" ? <div className="empty-symbol" aria-hidden="true"><Users size={34} strokeWidth={1.5} /></div> : <img className="empty-illustration" src={`/illustrations/mole-${kind}.webp`} width="160" height="160" alt="" aria-hidden="true" />}<h2>{title}</h2>{detail && <p>{detail}</p>}{children && <div className="empty-actions">{children}</div>}</section>;
+  return <section className="empty" data-kind={kind}>{kind === "users" ? <div className="empty-symbol" aria-hidden="true"><Users size={34} /></div> : <img className="empty-illustration" src={`/illustrations/mole-${kind}.webp`} width="160" height="160" alt="" aria-hidden="true" />}<h2>{title}</h2>{detail && <p>{detail}</p>}{children && <div className="empty-actions">{children}</div>}</section>;
 }
 export function Loading() { return <div className="skeleton-list" role="status" aria-label="正在加载"><div /><div /><div /><span className="sr-only">正在加载</span></div>; }
 export function RowLink({ href, title, detail, icon }: { href: string; title: string; detail?: string; icon?: ReactNode }) { return <a className="row-link" href={href}>{icon}<span><strong>{title}</strong>{detail && <small>{detail}</small>}</span><ChevronRight size={19} /></a>; }
@@ -223,4 +228,13 @@ export function useResource<T>(load: () => Promise<T>, active: boolean, poll: bo
     };
   }, [active, poll, pollInDialog]);
   return { updatedAt, data, setData, busy, error, reload };
+}
+
+/** 页面分包失败由局部边界呈现，已有页面和草稿保持挂载；重载由用户主动触发。 */
+export class PageLoadBoundary extends Component<{ children: ReactNode }, { failed: boolean }> {
+  state = { failed: false };
+  static getDerivedStateFromError() { return { failed: true }; }
+  render() {
+    return this.state.failed ? <Notice error="页面加载失败，请检查网络后重新加载。" onRetry={() => window.location.reload()} /> : this.props.children;
+  }
 }

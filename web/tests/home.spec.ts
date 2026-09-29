@@ -143,7 +143,7 @@ test("切换用户丢弃迟到统计，切走首页停止统计请求", async ({
   state.calls.length = 0;
   await page.clock.install(); await page.clock.fastForward(65000);
   expect(state.calls.filter(call => call.path.includes("/traffic/"))).toHaveLength(0);
-  await page.getByRole("tab", { name: "首页", exact: true }).click();
+  await page.locator(".sidebar").getByRole("link", { name: "首页", exact: true }).click();
   await expect(page.locator(".traffic-numbers")).toContainText("2 KiB/s");
   await page.evaluate(() => { Object.defineProperty(document, "visibilityState", { configurable: true, get: () => "hidden" }); document.dispatchEvent(new Event("visibilitychange")); });
   state.calls.length = 0; await page.clock.fastForward(65000);

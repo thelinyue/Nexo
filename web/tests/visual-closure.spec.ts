@@ -46,7 +46,7 @@ test("所有页面在移动尺寸和明暗主题中无溢出，输出实际截�
       for (const route of ["services", "agents", "manage", "domains", "settings", "settings/sessions", "services/t-2", "agents/a-2", "domains/d-1"]) {
         await page.goto(`/#/${route}`);
         if (width <= 900) await expect(page.locator(".page-slot:not([hidden]) h1")).toBeVisible();
-        else await expect(page.getByRole("navigation", { name: "面包屑" })).toBeVisible();
+        else { await expect(page.locator(".page-slot:not([hidden]) h1")).toBeVisible(); await expect(page.locator(".account-trigger")).toBeVisible(); }
         await expect(page.locator(".page-slot:not([hidden]) .skeleton-list")).toHaveCount(0);
         await expect.poll(() => page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBeTruthy();
         if (width <= 900) {

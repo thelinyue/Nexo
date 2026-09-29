@@ -20,8 +20,8 @@ export function routeInfo(route: string) {
 export function navigationLocked() { return Boolean(document.querySelector('dialog[open][data-navigation-lock="true"]')); }
 
 type Page = { route: string; back?: string; configureDomain?: Domain };
-type NavigationState = { route: string; pages: Page[]; tabs: string[] };
-type PageNavigation = { route: string; desktop: boolean; deletions: EventTarget; reportTitle: (route: string, title: string) => void; removePages: (routes: string[], fallback: string) => void; openDomainConfiguration: (domain: Domain) => void };
+type NavigationState = { route: string; pages: Page[] };
+type PageNavigation = { route: string; desktop: boolean; deletions: EventTarget; removePages: (routes: string[], fallback: string) => void; openDomainConfiguration: (domain: Domain) => void };
 export const PageNavigationContext = createContext<PageNavigation | null>(null);
 
 /** 已成功删除的资源立即从保留的列表中移除，即使随后刷新失败也不会重新显示。
@@ -37,41 +37,19 @@ export function useResourceDeletions(onRemoved: (routes: string[]) => void) {
   }, [events]);
 }
 
-export function clearSavedTabs(user: string) {
-  try {
-    const prefix = `nexo:tabs:${encodeURIComponent(user)}:`;
-    Object.keys(sessionStorage).filter(key => key.startsWith(prefix)).forEach(key => sessionStorage.removeItem(key));
-  } catch { /* 禁用存储时仍可正常使用当前页面。 */ }
-}
-
-/** 页面实例按路由隔离，桌面标签只是实例的入口；断点变化不会重新挂载活动表单。
- * 存储仅包含路由，资源、草稿和凭据不落盘；空间由已认证外壳指定，不能由缓存选择。
+/** 页面实例按路由保留搜索、筛选和滚动位置，与导航入口的呈现无关。
+ * 地址栏是唯一启动入口；缓存只存在于内存，用户或空间切换由外壳 key 重建，断点变化不重挂载表单。
  */
-export function useWorkspaceNavigation(user: string, space: string, admin: boolean) {
+export function useWorkspaceNavigation() {
   const [desktop, setDesktop] = useState(() => matchMedia("(min-width:901px)").matches);
-  const desktopRef = useRef(desktop);
-  const key = `nexo:tabs:${encodeURIComponent(user)}:${encodeURIComponent(space)}`;
   const [state, setState] = useState<NavigationState>(() => {
-    let tabs = [homeRoute]; let savedRoute = homeRoute;
-    if (desktop) {
-      try {
-        const saved = JSON.parse(sessionStorage.getItem(key) ?? "null");
-        if (Array.isArray(saved?.tabs)) tabs = [...new Set(saved.tabs.filter((value: unknown) => typeof value === "string" && value !== emptyRoute && normalizeRoute(value) === value && (admin || value !== "#/users")))] as string[];
-        if (tabs.includes(saved?.route) || saved?.route === emptyRoute) savedRoute = saved.route;
-      } catch { /* 旧记录或禁用存储不阻断页面加载。 */ }
-    }
-    tabs = [homeRoute, ...tabs.filter(item => item !== homeRoute)];
-    let route = normalizeRoute(window.location.hash || savedRoute);
-    if (!desktop && route === emptyRoute) route = homeRoute;
-    if (route !== emptyRoute && !tabs.includes(route)) tabs.push(route);
-    return { route, tabs, pages: tabs.map(route => ({ route, back: routeInfo(route).parent })) };
+    const route = normalizeRoute(window.location.hash);
+    return { route, pages: [{ route, back: routeInfo(route).parent }] };
   });
   const stateRef = useRef(state);
   const mounted = useRef(true);
   const positions = useRef(new Map<string, number>());
   const [deletions] = useState(() => new EventTarget());
-  const [titles, setTitles] = useState<Record<string, string>>({});
-  const reportTitle = useCallback((route: string, title: string) => setTitles(previous => previous[route] === title ? previous : { ...previous, [route]: title }), []);
   const commit = useCallback((next: NavigationState) => { stateRef.current = next; setState(next); }, []);
   const activate = useCallback((next: string, remove: string[] = []) => {
     if (!mounted.current) return;
@@ -83,11 +61,9 @@ export function useWorkspaceNavigation(user: string, space: string, admin: boole
     // 进入另一个详情时记住来源；从后退链接返回已有页不覆盖它原本的返回关系。
     const source = current.pages.find(page => page.route === current.route);
     const back = parent && next !== source?.back && !remove.includes(current.route) ? current.route : parent;
-    if (!existing && next !== emptyRoute) pages = [...pages, { route: next, back }];
-    let tabs = current.tabs.filter(route => !remove.includes(route));
-    if (desktopRef.current && next !== emptyRoute && !tabs.includes(next)) tabs = [...tabs, next];
+    if (!existing) pages = [...pages, { route: next, back }];
     remove.forEach(route => positions.current.delete(route));
-    commit({ route: next, pages, tabs });
+    commit({ route: next, pages });
   }, [commit]);
   const removePages = useCallback((routes: string[], fallback: string) => {
     if (!mounted.current) return;
@@ -99,30 +75,17 @@ export function useWorkspaceNavigation(user: string, space: string, admin: boole
   }, [activate, deletions]);
   const openDomainConfiguration = useCallback((domain: Domain) => {
     if (!mounted.current) return;
-    // 创建成功后把一次性配置意图交给新详情实例；该数据不会写入标签存储。
+    // 创建成功后把一次性配置意图交给新详情实例；配置意图仅在当前空间内存中保留。
     const route = `#/domains/${encodeURIComponent(domain.id)}`;
     activate(route);
     commit({ ...stateRef.current, pages: stateRef.current.pages.map(page => page.route === route ? { ...page, configureDomain: domain } : page) });
     window.history.pushState(null, "", route);
   }, [activate, commit]);
-  const closeTab = useCallback((route: string) => {
-    if (route === homeRoute) return;
-    if (navigationLocked() || document.querySelector("dialog[open]")) return;
-    const current = stateRef.current;
-    const index = current.tabs.indexOf(route);
-    if (index < 0) return;
-    // 首页固定在首位，其他标签关闭后优先激活左邻。
-    const next = current.route === route ? current.tabs[index - 1] ?? homeRoute : current.route;
-    activate(next, [route]);
-    if (next !== current.route) window.history.pushState(null, "", next);
-  }, [activate]);
-
   useLayoutEffect(() => {
     mounted.current = true;
     window.history.replaceState(null, "", stateRef.current.route);
     const update = () => {
-      const normalized = normalizeRoute(window.location.hash);
-      const next = !desktopRef.current && normalized === emptyRoute ? homeRoute : normalized;
+      const next = normalizeRoute(window.location.hash);
       if (next === stateRef.current.route) {
         if (window.location.hash !== next) window.history.replaceState(null, "", next);
         return;
@@ -133,30 +96,26 @@ export function useWorkspaceNavigation(user: string, space: string, admin: boole
       if (window.location.hash !== next) window.history.replaceState(null, "", next);
     };
     const media = matchMedia("(min-width:901px)");
-    const resize = () => {
-      desktopRef.current = media.matches; setDesktop(media.matches);
-      // 空工作区仅存在于桌面；切换到手机时回到隧道入口，避免出现没有导航的空屏。
-      if (!media.matches && stateRef.current.route === emptyRoute) {
-        activate(homeRoute); window.history.replaceState(null, "", homeRoute);
-      } else if (media.matches && stateRef.current.route !== emptyRoute && !stateRef.current.tabs.includes(stateRef.current.route)) commit({ ...stateRef.current, tabs: [...stateRef.current.tabs, stateRef.current.route] });
-    };
+    const resize = () => setDesktop(media.matches);
     const previous = window.history.scrollRestoration; window.history.scrollRestoration = "manual";
     window.addEventListener("hashchange", update); window.addEventListener("popstate", update); media.addEventListener("change", resize);
     return () => { mounted.current = false; window.removeEventListener("hashchange", update); window.removeEventListener("popstate", update); media.removeEventListener("change", resize); window.history.scrollRestoration = previous; };
-  }, [activate, commit]);
-  useLayoutEffect(() => {
-    if (desktop) {
-      try { sessionStorage.setItem(key, JSON.stringify({ tabs: state.tabs, route: state.route })); } catch { /* 当前会话继续可用，仅不恢复标签。 */ }
-    }
-  }, [desktop, key, state.tabs, state.route]);
+  }, [activate]);
   useLayoutEffect(() => {
     window.scrollTo(0, positions.current.get(state.route) ?? 0);
-    if (!document.querySelector("dialog[open]")) document.querySelector<HTMLElement>(".page-slot:not([hidden]) h1")?.focus({ preventScroll: true });
-    const selected = document.querySelector<HTMLElement>('.workspace-tabs [aria-selected="true"]');
-    if (desktopRef.current && selected) {
-      const strip = selected.closest<HTMLElement>(".workspace-tabs");
-      if (strip) { const box = selected.getBoundingClientRect(); const bounds = strip.getBoundingClientRect(); if (box.left < bounds.left) strip.scrollLeft -= bounds.left - box.left; else if (box.right > bounds.right) strip.scrollLeft += box.right - bounds.right; }
+    const slot = document.querySelector<HTMLElement>(".page-slot:not([hidden])");
+    const focusHeading = () => {
+      const heading = slot?.querySelector<HTMLElement>("h1");
+      if (!heading) return false;
+      if (!document.querySelector("dialog[open]")) heading.focus({ preventScroll: true });
+      return true;
+    };
+    // 分包首次加载时标题尚未挂载；仅等待当前页面，切页时取消，避免迟到焦点抢占。
+    if (!focusHeading() && slot) {
+      const observer = new MutationObserver(() => { if (focusHeading()) observer.disconnect(); });
+      observer.observe(slot, { childList: true, subtree: true });
+      return () => observer.disconnect();
     }
   }, [state.route]);
-  return { ...state, desktop, titles, deletions, reportTitle, removePages, openDomainConfiguration, closeTab };
+  return { ...state, desktop, deletions, removePages, openDomainConfiguration };
 }

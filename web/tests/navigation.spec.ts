@@ -4,8 +4,22 @@ import { installApiMocks } from "./api-mocks";
 
 const current = (page: import("@playwright/test").Page) => page.locator(".page-slot:not([hidden])");
 
-test("桌面详情不新增标签，关闭后保留筛选，其他页面轮询仍隔离", async ({ page }, info) => {
-  test.skip(info.project.name !== "desktop-dark", "桌面标签交互");
+test("页面分包失败保留导航，用户重试后恢复页面", async ({ page }, info) => {
+  test.skip(info.project.name !== "desktop-dark", "桌面导航分包错误恢复");
+  await installApiMocks(page);
+  await page.route("**/assets/services-*.js", route => route.abort());
+  await page.goto("/");
+  await expect(page.getByRole("heading", { name: "首页", exact: true })).toBeVisible();
+  await page.locator(".sidebar").getByRole("link", { name: "服务", exact: true }).click();
+  await expect(current(page).getByRole("alert")).toContainText("页面加载失败");
+  await expect(page.locator(".sidebar")).toBeVisible();
+  await page.unroute("**/assets/services-*.js");
+  await current(page).getByRole("button", { name: "重试", exact: true }).click();
+  await expect(current(page).getByRole("heading", { name: "服务", exact: true })).toBeVisible();
+});
+
+test("桌面侧栏切换保留筛选，详情关闭和其他页面轮询仍隔离", async ({ page }, info) => {
+  test.skip(info.project.name !== "desktop-dark", "桌面侧栏交互");
   const state = await installApiMocks(page);
   state.tunnels.push({ ...state.tunnels[0], id: "t-2", name: "备用媒体" });
   await page.goto("/#/services");
@@ -13,21 +27,21 @@ test("桌面详情不新增标签，关闭后保留筛选，其他页面轮询�
   for (const name of ["媒体中心", "备用媒体", "媒体中心"]) {
     await page.getByRole("link", { name, exact: true }).click();
     await expect(page.getByRole("dialog", { name, exact: true })).toBeVisible();
-    await expect(page.locator(".workspace-tab")).toHaveCount(2);
+    await expect(page.getByRole("tablist")).toHaveCount(0);
     await expect(page).toHaveURL(/#\/services$/);
     await page.keyboard.press("Escape");
     await expect(page.getByRole("dialog")).toHaveCount(0);
     await expect(page.getByLabel("搜索服务")).toHaveValue("媒体");
   }
   await page.reload();
-  await expect(page.getByRole("tab")).toHaveCount(2);
+  await expect(current(page).getByRole("heading", { name: "服务", exact: true })).toBeVisible();
   await page.locator(".sidebar").getByRole("link", { name: "设备", exact: true }).click();
   await expect(current(page).locator(".agent-row")).toHaveCount(2);
   state.calls.length = 0;
   await page.evaluate(() => window.dispatchEvent(new Event("focus")));
   await expect.poll(() => state.calls.filter(call => call.path === "/api/v1/devices").length).toBe(1);
   expect(state.calls.filter(call => call.path === "/api/v1/public-domains")).toHaveLength(0);
-  await page.getByRole("button", { name: "关闭 设备", exact: true }).click();
+  await page.locator(".sidebar").getByRole("link", { name: "服务", exact: true }).click();
   await expect(page).toHaveURL(/#\/services$/);
   await page.getByRole("link", { name: "备用媒体", exact: true }).click();
   await page.getByRole("button", { name: "编辑服务", exact: true }).click();
@@ -35,51 +49,53 @@ test("桌面详情不新增标签，关闭后保留筛选，其他页面轮询�
   await expect(editor.getByLabel("服务名称")).toHaveValue("备用媒体");
 });
 
-test("首页标签固定，关闭其他页面回到首页，旧空工作区跳转兼容", async ({ page }, info) => {
-  test.skip(info.project.name !== "desktop-dark", "桌面固定首页");
-  await installApiMocks(page);
+test("侧栏与历史导航保留搜索和滚动，刷新以地址栏为准", async ({ page }, info) => {
+  test.skip(info.project.name !== "desktop-dark", "桌面页面缓存");
+  const state = await installApiMocks(page);
+  state.tunnels = Array.from({ length: 120 }, (_, index) => ({ ...state.tunnels[0], id: `t-${index}`, name: `媒体 ${index}` }));
   await page.goto("/#/services");
-  await expect(page.getByRole("tab")).toHaveText(["首页", "服务"]);
-  await expect(page.getByRole("button", { name: "关闭 首页" })).toHaveCount(0);
-  await page.getByRole("tab", { name: "首页", exact: true }).click();
-  await page.getByRole("tab", { name: "首页", exact: true }).press("Delete");
-  await expect(page.getByRole("tab")).toHaveText(["首页", "服务"]);
-  await page.getByRole("tab", { name: "服务", exact: true }).click();
-  await openServiceEditor(page);
-  await page.evaluate(() => document.querySelector<HTMLButtonElement>('.tab-close[aria-label="关闭 服务"]')!.click());
+  await page.getByLabel("搜索服务").fill("媒体");
+  await page.getByLabel("类型筛选").selectOption("web");
+  await page.evaluate(() => window.scrollTo(0, 350));
+  await expect.poll(() => page.evaluate(() => window.scrollY)).toBe(350);
+  await page.locator(".sidebar").getByRole("link", { name: "设备", exact: true }).click();
+  await expect(current(page).getByRole("heading", { name: "设备", exact: true })).toBeFocused();
+  await page.goBack();
   await expect(page).toHaveURL(/#\/services$/);
-  await expect(page.getByRole("dialog", { name: "创建服务" })).toBeVisible();
-  await page.getByRole("dialog").getByRole("button", { name: "取消", exact: true }).click();
-  await page.getByRole("button", { name: "关闭 服务", exact: true }).click();
-  await expect(page).toHaveURL(/#\/home$/);
-  await expect(page.getByRole("tab")).toHaveText(["首页"]);
+  await expect.poll(() => page.evaluate(() => window.scrollY)).toBe(350);
+  await expect(page.getByLabel("搜索服务")).toHaveValue("媒体");
+  await expect(page.getByLabel("类型筛选")).toHaveValue("web");
+  await page.goForward();
+  await expect(page).toHaveURL(/#\/agents$/);
   await page.reload();
-  await expect(page.getByRole("tab")).toHaveText(["首页"]);
+  await expect(current(page).getByRole("heading", { name: "设备", exact: true })).toBeVisible();
+  await expect(page.locator(".page-slot")).toHaveCount(1);
   await page.goto("/#/workspace");
   await expect(page).toHaveURL(/#\/home$/);
   await page.setViewportSize({ width: 390, height: 844 });
   await expect(page.getByRole("navigation", { name: "底部导航" })).toBeVisible();
   await expect(current(page).locator("h1")).toHaveText("首页");
   await page.setViewportSize({ width: 1440, height: 900 });
-  await expect(page.getByRole("tab")).toHaveText(["首页"]);
+  await expect(page.locator(".account-trigger")).toHaveCount(1);
+  await expect(page.getByRole("tablist")).toHaveCount(0);
 });
 
-test("标签恢复只读取当前用户空间，地址栏优先且不会恢复表单", async ({ page }, info) => {
-  test.skip(info.project.name !== "desktop-dark", "桌面标签存储");
+test("忽略旧页签记录，无路径进入首页且不恢复其他用户资源", async ({ page }, info) => {
+  test.skip(info.project.name !== "desktop-dark", "启动路由兼容");
   await installApiMocks(page);
   await page.addInitScript(() => {
     sessionStorage.setItem("nexo:tabs:admin:default", JSON.stringify({ tabs: ["#/services", "#/agents/a-1", "#/domains"], route: "#/domains" }));
-    sessionStorage.setItem("nexo:tabs:admin:alice-space", JSON.stringify({ tabs: ["#/services", "#/services/private-resource"], route: "#/services/private-resource" }));
-    sessionStorage.setItem("nexo:tabs:alice:default", JSON.stringify({ tabs: ["#/services", "#/services/other-user"], route: "#/services/other-user" }));
+    sessionStorage.setItem("nexo:tabs:admin:alice-space", JSON.stringify({ tabs: ["#/services/private-resource"], route: "#/services/private-resource" }));
   });
   await page.goto("/");
-  await expect(page).toHaveURL(/#\/domains$/);
-  await expect(page.getByRole("tab")).toHaveCount(4);
+  await expect(page).toHaveURL(/#\/home$/);
+  await expect(page.locator(".page-slot")).toHaveCount(1);
   await expect(page.getByRole("dialog")).toHaveCount(0);
-  await expect(page.locator('a[href*="private-resource"],a[href*="other-user"]')).toHaveCount(0);
+  await expect(page.locator('a[href*="private-resource"]')).toHaveCount(0);
   await page.goto("/#/agents");
-  await expect(page.getByRole("tab", { name: "设备", exact: true })).toHaveAttribute("aria-selected", "true");
-  await expect(page.getByRole("tab")).toHaveCount(5);
+  await expect(page.locator(".sidebar").getByRole("link", { name: "设备", exact: true })).toHaveAttribute("aria-current", "page");
+  await expect(current(page).getByRole("heading", { name: "设备", exact: true })).toBeVisible();
+  expect(await page.evaluate(() => JSON.parse(sessionStorage.getItem("nexo:tabs:admin:default")!).route)).toBe("#/domains");
 });
 
 test("PWA 玻璃底栏在复杂背景和辅助功能偏好下仍可用", async ({ page }, info) => {
@@ -107,7 +123,7 @@ test("PWA 玻璃底栏在复杂背景和辅助功能偏好下仍可用", async (
   await expect(page.locator(".bottom-nav")).toBeVisible();
   await page.setViewportSize({ width: 901, height: 900 });
   await expect(page.locator(".bottom-nav")).toBeHidden();
-  await expect(page.getByRole("tablist")).toBeVisible();
+  await expect(page.locator(".account-trigger")).toBeVisible();
 });
 
 test("手机五入口和玻璃底栏、详情返回与我的", async ({ page }, info) => {
@@ -168,7 +184,7 @@ test("空白与已修改表单锁住历史导航，跨断点保持实例", async
   await expect(page).toHaveURL(/#\/domains$/);
 });
 
-test("账号菜单键盘关闭与退出清理标签", async ({ page }, info) => {
+test("账号菜单键盘关闭与退出，不写入页签记录", async ({ page }, info) => {
   test.skip(info.project.name !== "desktop-dark", "桌面账号菜单");
   await installApiMocks(page);
   await page.goto("/#/agents");
@@ -180,7 +196,8 @@ test("账号菜单键盘关闭与退出清理标签", async ({ page }, info) => 
   await expect(trigger).toBeFocused();
   await trigger.click();
   await page.locator(".account-popover").getByRole("link", { name: "账号设置" }).click();
-  await expect(page.getByRole("tab", { name: "账号设置" })).toHaveAttribute("aria-selected", "true");
+  await expect(current(page).getByRole("heading", { name: "账号设置", exact: true })).toBeVisible();
+  await expect(page.locator(".account-trigger")).toHaveCount(1);
   await current(page).getByRole("button", { name: "退出登录", exact: true }).click();
   await expect(page.getByRole("heading", { name: "登录", exact: true })).toBeVisible();
   expect(await page.evaluate(() => Object.keys(sessionStorage).filter(key => key.startsWith("nexo:tabs:")))).toEqual([]);

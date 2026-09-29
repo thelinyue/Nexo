@@ -754,11 +754,13 @@ dd>code { display:block; margin-bottom:10px; user-select:text; font-size:.9375re
 /* 标题区共享主操作；窄屏审批先核对设备，再在下方明确批准。 */
 .page-header .page-create { background:var(--primary); color:var(--primary-on); border-color:transparent; }
 
-/* 桌面使用定位与多标签外壳；手机仅显示业务页头，业务实例不会随断点重建。 */
-.workspace-header { display:none; }
+/* 桌面账号入口融入页面标题；手机保留业务页头，业务实例不会随断点重建。 */
+.account-menu { flex:none; min-width:0; }
 .account-trigger { display:flex; align-items:center; gap:8px; min-height:44px; max-width:200px; padding:8px 12px; color:var(--text); background:transparent; border:0; border-radius:12px; }
 .account-trigger span { min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-.account-popover { position:fixed; inset:60px 24px auto auto; margin:0; width:220px; padding:6px; color:var(--text); background:var(--sheet-material); border:1px solid var(--border); border-radius:16px; box-shadow:var(--shadow); backdrop-filter:blur(24px); }
+.account-trigger:hover,.account-trigger[aria-expanded=true] { background:var(--surface-soft); }
+.account-trigger .user-avatar { flex:none; }
+.account-popover { position:fixed; inset:auto; margin:0; width:220px; max-height:calc(100dvh - 100px); overflow-y:auto; padding:6px; color:var(--text); background:var(--sheet-material); border:1px solid var(--border); border-radius:16px; box-shadow:var(--shadow); backdrop-filter:blur(24px); }
 .account-popover a,.account-popover>button { display:flex; align-items:center; gap:10px; width:100%; min-height:44px; padding:10px; border:0; border-radius:10px; background:transparent; color:inherit; text-align:left; }
 .account-popover a:hover,.account-popover>button:hover { background:var(--surface-raised); }
 .account-popover>button { color:var(--danger); }
@@ -768,27 +770,17 @@ dd>code { display:block; margin-bottom:10px; user-select:text; font-size:.9375re
 @media (min-width:901px) {
   .app-shell { min-height:100dvh; display:flex; flex-direction:column; }
   .sidebar { padding-top:24px; }
-  .workspace-header { display:block; position:sticky; top:0; margin-left:208px; flex-shrink:0; z-index:20; background:var(--sheet-material); backdrop-filter:blur(24px); -webkit-backdrop-filter:blur(24px); border-bottom:1px solid var(--border); }
-  .workspace-topbar { min-height:56px; display:flex; align-items:center; justify-content:space-between; gap:20px; padding:6px 24px; }
-  .breadcrumbs { display:flex; align-items:center; gap:8px; min-width:0; font-size:.875rem; }
-  .breadcrumbs a { display:flex; align-items:center; min-height:44px; flex-shrink:0; color:var(--secondary); }
-  .breadcrumbs>span { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-weight:600; }
-  .breadcrumbs svg { color:var(--muted); }
-  .workspace-tabs { display:flex; min-height:44px; padding:0 16px; gap:4px; overflow-x:auto; scrollbar-width:thin; }
-  .workspace-tab { position:relative; display:flex; align-items:center; flex:none; width:max-content; max-width:240px; border:1px solid transparent; border-radius:12px 12px 0 0; color:var(--secondary); }
-  .workspace-tab[data-active=true] { background:var(--bg); color:var(--primary); border-color:var(--border); border-bottom-color:var(--bg); }
-  .workspace-tab>a { flex:1; min-width:0; min-height:44px; display:block; padding:11px 40px; text-align:center; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-size:.875rem; }
-  .workspace-tab[data-active=true]>a { font-weight:600; }
-  .tab-close { position:absolute; inset:0 4px 0 auto; display:flex; align-items:center; justify-content:center; width:36px; height:36px; margin-block:auto; padding:0; border:0; border-radius:9px; background:transparent; color:var(--muted); }
-  .tab-close:hover,.tab-close:focus-visible { background:var(--surface-raised); color:var(--text); }
-  /* 内容面板填满标签下方的剩余空间，长列表仍使用页面滚动，保持标签间的滚动恢复。 */
-  .content { flex:1; display:flex; flex-direction:column; min-width:0; padding:16px 24px 24px; }
+  /* 标题、账号和业务工具栏属于内容面板；页面缓存与导航外观相互独立。 */
+  .content { flex:1; display:flex; flex-direction:column; min-width:0; padding:24px; }
   .page-slot { flex:1; width:100%; max-width:none; min-width:0; margin:0; padding:20px; border:1px solid var(--border); border-radius:16px; background:var(--surface); box-shadow:var(--card-shadow); }
   .page-slot:has(>.empty):not(:has(>.service-toolbar)) { display:flex; flex-direction:column; }
   .page-slot>.empty { flex:1; max-width:none; margin:0; border:0; box-shadow:none; }
-  .page-header { min-height:0; margin-bottom:16px; }
-  .page-header h1 { position:absolute; width:1px; height:1px; overflow:hidden; clip-path:inset(50%); white-space:nowrap; }
-  .page-header:not([data-has-action=true]):not([data-has-back=true]) { margin:0; }
+  .app-shell .page-header { position:relative; top:auto; min-height:44px; padding:0; margin:0 0 12px; gap:12px; background:none; backdrop-filter:none; -webkit-backdrop-filter:none; }
+  .page-header h1 { position:static; width:auto; height:auto; overflow:hidden; clip-path:none; text-overflow:ellipsis; white-space:nowrap; font-size:1.375rem; font-weight:600; }
+  .page-toolbar-actions { display:flex; justify-content:flex-end; align-items:center; gap:8px; margin-bottom:12px; min-width:0; }
+  .page-toolbar-actions>button { flex:none; white-space:nowrap; }
+  .page-toolbar-actions .page-create { position:static; min-height:44px; width:auto; height:auto; padding:8px 12px; border-radius:10px; box-shadow:none; font-size:14px; }
+  .page-toolbar-actions .page-create span { display:inline; }
   /* 桌面表单统一居中；覆盖移动表单的高度上限，长内容内部滚动并保留操作区。 */
   .modal.full-form { inset:0; margin:auto; width:min(560px,calc(100vw - 48px)); height:fit-content; max-height:calc(var(--visible-height,100dvh) - 48px); border:1px solid var(--border); border-radius:24px; }
   .modal-heading>.mobile-form-cancel { display:none; }
@@ -801,8 +793,7 @@ dd>code { display:block; margin-bottom:10px; user-select:text; font-size:.9375re
   /* 域名页有独立容器：让空状态填满内容区，避免面板内再嵌套一张空卡片。 */
   .page-slot:has(>.domains-page) { display:flex; flex-direction:column; }
   .domains-page { display:flex; flex-direction:column; flex:1; min-width:0; }
-  .page-slot>.domains-page>.page-header { flex-shrink:0; min-height:44px; margin:0 0 16px; }
-  .domains-page>.page-header h1 { position:static; width:auto; height:auto; overflow:visible; clip-path:none; white-space:normal; font-size:1.25rem; }
+  .page-slot>.domains-page>.page-header { flex-shrink:0; min-height:44px; margin:0 0 12px; }
   .domains-page>.empty { flex:1; max-width:none; min-height:320px; margin:0; border:0; border-radius:0; background:transparent; box-shadow:none; }
   .domains-page>.empty .empty-symbol { width:64px; height:64px; margin-bottom:20px; border-radius:20px; }
   .domains-page>.empty p { max-width:40ch; font-size:.9375rem; text-wrap:balance; }
@@ -819,22 +810,24 @@ dd>code { display:block; margin-bottom:10px; user-select:text; font-size:.9375re
   .domain-form .modal-actions { flex-direction:row; padding:0 20px 20px; border-top:0; }
   .domain-form .modal-actions>button { width:auto; min-width:88px; min-height:44px; border-radius:10px; font-size:.875rem; }
   .domain-form .modal-actions>.primary-button { width:auto; min-width:104px; min-height:44px; }
-  /* 用户工具栏与列表共用横向空间，桌面通过侧栏返回，无需额外占一行。 */
+  /* 标题独占首行，邀请操作与用户筛选同行。 */
   .page-slot:has(>.users-filter) { display:grid; grid-template-columns:minmax(0,1fr) auto; column-gap:12px; align-content:start; align-items:start; }
   .page-slot:has(>.users-filter)>* { grid-column:1 / -1; }
-  .page-slot:has(>.users-filter)>.page-header { grid-column:2; grid-row:1; margin:0; }
-  .page-slot:has(>.users-filter)>.page-header .page-back { display:none; }
-  .page-slot>.users-filter { grid-column:1; grid-row:1; grid-template-columns:minmax(0,1fr) 140px; gap:12px; }
+  .page-slot:has(>.users-filter)>.page-header { grid-column:1 / -1; grid-row:1; }
+  .page-slot:has(>.users-filter)>.page-toolbar-actions { grid-column:2; grid-row:2; margin:0; }
+  .page-slot>.users-filter { grid-column:1; grid-row:2; grid-template-columns:minmax(0,1fr) 140px; gap:12px; }
   .page-slot>.users-caption { min-height:40px; }
-  /* 将隧道的搜索、筛选和新增放入同一工具区，不额外占用一行标题空间。 */
+  /* 服务标题独占首行；窄桌面把筛选放到下一行，宽桌面合并为一条工具栏。 */
   .page-slot:has(>.service-toolbar) { display:grid; grid-template-columns:minmax(0,1fr) auto auto; gap:12px; align-content:start; align-items:start; }
   .page-slot:has(>.service-toolbar)>* { grid-column:1 / -1; }
-  .page-slot:has(>.service-toolbar)>.page-header { grid-column:3; grid-row:1; margin:0; }
+  .page-slot:has(>.service-toolbar)>.page-header { grid-column:1 / -1; grid-row:1; margin:0; }
+  .page-slot:has(>.service-toolbar)>.page-toolbar-actions { grid-column:3; grid-row:2; margin:0; }
   .page-slot>.service-toolbar,.service-toolbar .service-search-row { display:contents; }
-  .service-toolbar .search { grid-column:1; grid-row:1; min-width:0; border-radius:10px; background:var(--surface-soft); box-shadow:none; }
+  .service-toolbar .search { grid-column:1; grid-row:2; min-width:0; border-radius:10px; background:var(--surface-soft); box-shadow:none; }
   .service-toolbar .search input { min-height:44px; padding-block:8px; }
-  .service-toolbar .service-selection-toggle { grid-column:2; grid-row:1; order:0; }
-  .page-slot>.service-toolbar>.toolbar-row { grid-column:1 / -1; grid-row:2; min-width:0; margin:0; }
+  .service-toolbar .service-selection-toggle { grid-column:2; grid-row:2; order:0; }
+  .page-slot>.service-toolbar>.toolbar-row { grid-column:1 / -1; grid-row:3; min-width:0; margin:0; }
+  .service-toolbar .service-filter-control { flex:1 1 0; }
   .service-toolbar .service-filter-control select { min-height:44px; padding:8px 10px; border:1px solid var(--border); border-radius:10px; background:var(--surface-soft); }
   .service-list { gap:0; border:1px solid var(--border); border-radius:12px; overflow:hidden; }
   .service-list .service-row { border:0; border-bottom:1px solid var(--border); border-radius:0; box-shadow:none; background:transparent; }
@@ -869,10 +862,10 @@ dd>code { display:block; margin-bottom:10px; user-select:text; font-size:.9375re
   .service-detail-danger .danger-button { width:auto; min-width:0; }
 }
 @media (min-width:1200px) {
-  .page-slot:has(>.service-toolbar) { grid-template-columns:minmax(160px,.9fr) minmax(360px,1.8fr) auto auto; }
-  .page-slot:has(>.service-toolbar)>.page-header { grid-column:4; }
+  .page-slot:has(>.service-toolbar) { grid-template-columns:minmax(120px,1fr) minmax(378px,1.6fr) auto auto; }
+  .page-slot:has(>.service-toolbar)>.page-toolbar-actions { grid-column:4; }
   .service-toolbar .service-selection-toggle { grid-column:3; }
-  .page-slot>.service-toolbar>.toolbar-row { grid-column:2; grid-row:1; }
+  .page-slot>.service-toolbar>.toolbar-row { grid-column:2; grid-row:2; }
 }
 @media (max-width:900px) {
   /* 手机筛选固定三列，原生选择器保留系统弹出体验；辅助操作独立一行，避免筛选项换行跳动。 */
@@ -914,8 +907,8 @@ dd>code { display:block; margin-bottom:10px; user-select:text; font-size:.9375re
   body:has(.full-form[open]) .bottom-nav { display:none; }
   @media (prefers-contrast:more) { .page-header .page-create[data-resource="服务"] { border-color:var(--text); } }
 }
-@supports not ((backdrop-filter:blur(1px)) or (-webkit-backdrop-filter:blur(1px))) { .workspace-header,.account-popover,.user-menu { background:var(--surface); } }
-@media (prefers-reduced-transparency:reduce), (prefers-contrast:more) { .workspace-header,.account-popover,.user-menu { background:var(--surface); backdrop-filter:none; -webkit-backdrop-filter:none; } }
+@supports not ((backdrop-filter:blur(1px)) or (-webkit-backdrop-filter:blur(1px))) { .account-popover,.user-menu { background:var(--surface); } }
+@media (prefers-reduced-transparency:reduce), (prefers-contrast:more) { .account-popover,.user-menu { background:var(--surface); -webkit-backdrop-filter:none; backdrop-filter:none; } }
 @media (max-width:600px) {
   .pending-row { flex-direction:column; align-items:stretch; }
   .pending-row>.pending-actions { justify-content:flex-end; }
