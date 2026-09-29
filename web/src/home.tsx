@@ -1,5 +1,5 @@
 import { useContext, useEffect, useState } from "react";
-import { ArrowDownLeft, ArrowUpRight, ChevronRight, RefreshCw, RotateCcw } from "lucide-react";
+import { ArrowDownLeft, ArrowUpRight, ChevronRight, RefreshCw, RotateCcw } from "./icons";
 import type { ManagedWorkspace } from "./accounts";
 import { WorkspaceContext, WorkspaceLabelContext, Confirm, Notice, Loading, PageHeader, dateText, request, useApi, useResource } from "./ui";
 import type { Auth, Device, Domain, Tunnel } from "./ui";
@@ -103,7 +103,7 @@ function TrafficUsage({ active, admin, user, refresh, csrf }: { active: boolean;
 }
 
 /** 用户筛选只作用于统计；跨用户接口仍以当前管理员会话鉴权，不改资源管理空间。 */
-function TrafficPanel({ active, auth, managed, refresh }: { active: boolean; auth: Auth; managed: ManagedWorkspace | null; refresh: number }) {
+function TrafficPanel({ active, auth, managed, refresh, ownTunnels }: { active: boolean; auth: Auth; managed: ManagedWorkspace | null; refresh: number; ownTunnels: ReturnType<typeof useResource<Tunnel[]>> }) {
   const admin = auth.role === "system_admin";
   const users = useResource(() => request<User[]>("/api/v1/admin/users"), active && admin);
   const [choice, setChoice] = useState<string | null>(managed ? null : "");
@@ -123,15 +123,18 @@ function TrafficPanel({ active, auth, managed, refresh }: { active: boolean; aut
     {notice && <p className="helper" role="status">{notice}</p>}
     {scopeReady && <TrafficUsage key={`usage:${admin ? selected : "own"}`} active={active} admin={admin} user={selectedUser} refresh={refresh} csrf={auth.csrf_token} />}
     <div className="traffic-ranges" role="group" aria-label="流量时间范围">{ranges.map(([value, label]) => <button key={value} className="secondary-button" aria-pressed={range === value} onClick={() => setRange(value)}>{label}</button>)}</div>
-    {scopeReady && <TrafficScope key={admin ? selected : "own"} active={active} admin={admin} user={selectedUser} range={range} refresh={refresh} />}
+    {scopeReady && <TrafficScope key={admin ? selected : "own"} active={active} admin={admin} user={selectedUser} range={range} refresh={refresh} ownTunnels={ownTunnels} ownWorkspace={managed?.id ?? auth.workspace_id} />}
     <details className="traffic-help"><summary>统计口径</summary><p>仅统计经过 Nexo 隧道的数据，包含应用协议数据，不含反向代理、加密传输开销、局域网直连及未进入隧道的响应。趋势保留 7 天，日用量汇总保留 90 天。日／周／月用量跟随用户选择，不受隧道和趋势时间筛选影响。正常写盘时，进程异常退出可能丢失最后约一分钟记录，不作为计费依据。</p></details>
   </section>;
 }
 
-function TrafficScope({ active, admin, user, range, refresh }: { active: boolean; admin: boolean; user?: User; range: Range; refresh: number }) {
+function TrafficScope({ active, admin, user, range, refresh, ownTunnels, ownWorkspace }: { active: boolean; admin: boolean; user?: User; range: Range; refresh: number; ownTunnels: ReturnType<typeof useResource<Tunnel[]>>; ownWorkspace?: string }) {
   const [tunnel, setTunnel] = useState("");
   const canSelect = !admin || Boolean(user);
-  const tunnels = useResource(() => request<Tunnel[]>(user ? `/api/v1/admin/workspaces/${encodeURIComponent(user.workspace_id)}/tunnels` : "/api/v1/tunnels"), active && canSelect);
+  // 当前展示空间复用概览请求；其他空间保持独立生命周期，避免跨空间迟到结果混入。
+  const shared = !admin || Boolean(user && user.workspace_id === ownWorkspace);
+  const otherTunnels = useResource(() => request<Tunnel[]>(`/api/v1/admin/workspaces/${encodeURIComponent(user!.workspace_id)}/tunnels`), active && canSelect && !shared);
+  const tunnels = shared ? ownTunnels : otherTunnels;
   useEffect(() => { if (tunnel && tunnels.data && !tunnels.data.some(item => item.id === tunnel && item.service_mode !== "reverse_proxy")) setTunnel(""); }, [tunnels.data, tunnel]);
   const query = new URLSearchParams();
   if (user) query.set("user_id", user.id);
@@ -202,7 +205,7 @@ export function HomePage({ active, auth, managed }: { active: boolean; auth: Aut
     </div>
     <Notice error={tunnels.error} updatedAt={tunnels.updatedAt} onRetry={() => void tunnels.reload()} /><Notice error={devices.error} updatedAt={devices.updatedAt} onRetry={() => void devices.reload()} /><Notice error={domains.error} updatedAt={domains.updatedAt} onRetry={() => void domains.reload()} />
     {complete && !devices.data!.length && !tunnels.data!.length && auth.role !== "system_admin" ? <div className="panel home-onboarding"><div><strong>接入第一台设备</strong><p>安装 Agent，将内网服务连接到 Nexo。</p></div><a className="primary-button" href="#/agents">接入设备</a></div> : complete && !tunnels.data!.length ? <div className="panel home-onboarding"><div><strong>创建第一个服务</strong><p>内网穿透需要 Agent；管理员也可直接反代 VPS 服务。网页访问需先配置域名。</p></div><a className="primary-button" href="#/services">创建服务</a></div> : null}
-    <TrafficPanel key={workspace ?? "own"} active={visible} auth={auth} managed={managed} refresh={refresh} />
+    <TrafficPanel key={workspace ?? "own"} active={visible} auth={auth} managed={managed} refresh={refresh} ownTunnels={tunnels} />
     <section className="panel home-attention" aria-label="当前空间待处理"><div className="home-section-heading"><h2>当前空间待处理</h2><span>{spaceLabel}</span></div>{!complete && <p className="helper">部分资源状态尚未读取成功，以下仅展示已获取的结果。</p>}{complete && !items.length && <p className="helper">暂无待处理事项</p>}{["故障", "需核对", "等待处理"].map((title, priority) => <AttentionGroup key={title} title={title} items={items.filter(item => item.priority === priority)} />)}</section>
   </div>;
 }

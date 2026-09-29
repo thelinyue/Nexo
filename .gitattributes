@@ -1,0 +1,3 @@
+docker/install-node.sh text eol=lf
+docker/build-node.sh text eol=lf
+docker/node-updater.py text eol=lf

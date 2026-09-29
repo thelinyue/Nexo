@@ -13,6 +13,7 @@ COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
 COPY config ./config
 COPY migrations ./migrations
+COPY docker/install-node.sh ./docker/install-node.sh
 COPY web/src/data/hd-icons.json ./web/src/data/hd-icons.json
 COPY --from=web-build /src/web/dist ./web/dist
 RUN cargo build --release -p nexo-server
@@ -21,6 +22,8 @@ FROM golang:1.27.1-bookworm@sha256:69a7b9788769bec032d238959b61854e9ae87f57be902
 ARG CADDY_VERSION=2.11.4
 ARG XCADDY_VERSION=0.4.7
 ARG CLOUDFLARE_MODULE_VERSION=0.2.4
+# 原生节点包复用此构建阶段，静态 Caddy 可在支持的旧版 Linux 上启动。
+ENV CGO_ENABLED=0
 RUN go install "github.com/caddyserver/xcaddy/cmd/xcaddy@v${XCADDY_VERSION}" \
     && /go/bin/xcaddy build "v${CADDY_VERSION}" \
       --with "github.com/caddy-dns/cloudflare@v${CLOUDFLARE_MODULE_VERSION}" \
@@ -31,7 +34,7 @@ RUN go install "github.com/caddyserver/xcaddy/cmd/xcaddy@v${XCADDY_VERSION}" \
     && /usr/local/bin/caddy list-modules | grep -q "dns.providers.cloudflare"
 
 FROM debian:bookworm-slim@sha256:88200866dfff7ea7f5cbcb6ec7c8a701889efe6fe859fe64d6990e4b07ea4171
-ARG NEXO_VERSION=0.2.12
+ARG NEXO_VERSION=0.2.13
 ARG NEXO_REVISION=unknown
 ARG TARGETARCH=amd64
 ARG CADDY_VERSION=2.11.4

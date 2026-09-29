@@ -156,6 +156,29 @@ impl Authority {
         Ok(params.signed_by(&request.public_key, &issuer)?.pem())
     }
 
+    /// 节点证书同时用于向控制器认证和接受 Agent mTLS；只签 CSR，不离开控制器的 CA 私钥。
+    pub fn issue_node(&self, csr: &str, id: &str) -> Result<String> {
+        validate_csr(csr)?;
+        anyhow::ensure!(
+            id.starts_with("node-") && id.len() == 41,
+            "节点身份格式无效"
+        );
+        let request = CertificateSigningRequestParams::from_pem(csr)?;
+        let issuer = Issuer::from_ca_cert_pem(&self.ca_pem, KeyPair::from_pem(&self.ca_key)?)?;
+        let mut params = CertificateParams::new(vec![id.to_owned()])?;
+        params.distinguished_name = DistinguishedName::new();
+        params.distinguished_name.push(DnType::CommonName, id);
+        params.extended_key_usages = vec![
+            ExtendedKeyUsagePurpose::ClientAuth,
+            ExtendedKeyUsagePurpose::ServerAuth,
+        ];
+        params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
+        params.not_before = OffsetDateTime::now_utc() - Duration::minutes(5);
+        params.not_after = OffsetDateTime::from_unix_timestamp(
+            (OffsetDateTime::now_utc().unix_timestamp() + 365 * 86400).min(self.ca_expires_at()?),
+        )?;
+        Ok(params.signed_by(&request.public_key, &issuer)?.pem())
+    }
     pub fn server_config(&self) -> Result<Arc<rustls::ServerConfig>> {
         let verifier =
             rustls::server::WebPkiClientVerifier::builder(Arc::new(roots(&self.ca_pem)?))
@@ -205,7 +228,7 @@ pub fn validate_https_certificate(chain: &str, key: &str, hostname: &str, now: i
         .context("HTTPS 证书与私钥不匹配")?;
     Ok(expires)
 }
-fn private_key(pem: &str) -> Result<PrivateKeyDer<'static>> {
+pub fn private_key(pem: &str) -> Result<PrivateKeyDer<'static>> {
     rustls_pemfile::private_key(&mut pem.as_bytes())?.context("私钥 PEM 格式无效")
 }
 pub fn roots(pem: &str) -> Result<rustls::RootCertStore> {
@@ -220,6 +243,14 @@ pub fn client_config(ca: &str, cert: &str, key: &str) -> Result<Arc<rustls::Clie
         rustls::ClientConfig::builder()
             .with_root_certificates(roots(ca)?)
             .with_client_auth_cert(certificates(cert)?, private_key(key)?)?,
+    ))
+}
+pub fn node_server_config(ca: &str, cert: &str, key: &str) -> Result<Arc<rustls::ServerConfig>> {
+    let verifier = rustls::server::WebPkiClientVerifier::builder(Arc::new(roots(ca)?)).build()?;
+    Ok(Arc::new(
+        rustls::ServerConfig::builder()
+            .with_client_cert_verifier(verifier)
+            .with_single_cert(certificates(cert)?, private_key(key)?)?,
     ))
 }
 

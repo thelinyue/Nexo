@@ -126,18 +126,19 @@ test("PWA 玻璃底栏在复杂背景和辅助功能偏好下仍可用", async (
   await expect(page.locator(".account-trigger")).toBeVisible();
 });
 
-test("手机五入口和玻璃底栏、详情返回与我的", async ({ page }, info) => {
+test("手机常用入口与更多列表、详情返回与账号设置", async ({ page }, info) => {
   test.skip(info.project.name === "desktop-dark", "手机 App 导航");
   await installApiMocks(page);
   await page.goto("/#/services");
   const nav = page.getByRole("navigation", { name: "底部导航" });
-  await expect(nav.getByRole("link")).toHaveText(["首页", "服务", "设备", "域名", "我的"]);
+  await expect(nav.getByRole("link")).toHaveText(["首页", "服务", "设备"]);
   await expect(page.getByRole("tablist")).toBeHidden();
   await expect(page.getByRole("navigation", { name: "面包屑" })).toBeHidden();
   await page.getByLabel("搜索服务").fill("媒体");
   await nav.getByRole("link", { name: "设备", exact: true }).click();
   await expect(nav).toBeVisible();
-  await nav.getByRole("link", { name: "域名", exact: true }).click();
+  await nav.getByRole("button", { name: "更多功能" }).click();
+  await page.getByRole("navigation", { name: "更多功能" }).getByRole("link", { name: "域名", exact: true }).click();
   await expect(nav).toBeVisible();
   await nav.getByRole("link", { name: "服务", exact: true }).click();
   await expect(page.getByLabel("搜索服务")).toHaveValue("媒体");
@@ -150,9 +151,10 @@ test("手机五入口和玻璃底栏、详情返回与我的", async ({ page }, 
   await expect(page.locator(".application-modal")).toHaveCount(0);
   await expect(page.getByLabel("搜索服务")).toHaveValue("媒体");
   await page.screenshot({ animations: "disabled", scale: "css", path: info.outputPath("mobile-glass-navigation.png") });
-  await nav.getByRole("link", { name: "我的", exact: true }).click();
+  await nav.getByRole("button", { name: "更多功能" }).click();
+  await page.getByRole("navigation", { name: "更多功能" }).getByRole("link", { name: "账号设置", exact: true }).click();
   await expect(current(page).locator("h1")).toHaveText("我的");
-  await expect(nav.getByRole("link", { name: "我的", exact: true })).toHaveAttribute("aria-current", "page");
+  await expect(nav.getByRole("button", { name: "更多功能" })).toHaveClass("active");
   await expect(current(page).getByRole("link", { name: "用户管理", exact: true })).toBeVisible();
   await expect(current(page).getByRole("region", { name: "服务端内部证书" })).not.toContainText("读取中");
   await page.screenshot({ animations: "disabled", scale: "css", path: info.outputPath("mobile-account.png") });

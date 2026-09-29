@@ -3,16 +3,16 @@ import type { Domain } from "./ui";
 
 export const homeRoute = "#/home";
 export const emptyRoute = "#/workspace";
-export const rootRoutes = [homeRoute, "#/services", "#/agents", "#/domains", "#/manage"];
+export const rootRoutes = [homeRoute, "#/services", "#/agents", "#/nodes", "#/domains", "#/manage"];
 export function normalizeRoute(value: string) {
   if (value === "#/settings") return "#/manage";
   if (value === emptyRoute) return homeRoute;
-  return /^#\/(services|agents|domains)(\/[^/]+)?$/.test(value) || [homeRoute, "#/manage", "#/users", "#/settings/sessions"].includes(value) ? value : homeRoute;
+  return /^#\/(services|agents|nodes|domains)(\/[^/]+)?$/.test(value) || [homeRoute, "#/manage", "#/users", "#/settings/sessions"].includes(value) ? value : homeRoute;
 }
 export function routeInfo(route: string) {
   const module = route.split("/")[1];
-  const label = ({ home: "首页", services: "服务", agents: "设备", domains: "域名", manage: "账号设置", users: "用户管理", settings: "登录会话" } as Record<string, string>)[module] ?? "首页";
-  const detail = /^#\/(services|agents|domains)\//.test(route);
+  const label = ({ home: "首页", services: "服务", agents: "设备", nodes: "节点", domains: "域名", manage: "账号设置", users: "用户管理", settings: "登录会话" } as Record<string, string>)[module] ?? "首页";
+  const detail = /^#\/(services|agents|nodes|domains)\//.test(route);
   return { label: detail ? `${label}详情` : label, parent: detail ? `#/${module}` : route === "#/settings/sessions" ? "#/manage" : undefined };
 }
 

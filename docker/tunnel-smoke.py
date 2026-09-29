@@ -257,7 +257,7 @@ class Harness:
             web = create("http", "web", origin.server_address[1])
             secure = create("https", "secure", origin.server_address[1])
             assert tcp["public_address"] == f"127.0.0.1:{self.ports['public']}"
-            assert web["public_address"] == "http://web.nexo-smoke.localhost"
+            assert web["public_address"] == f"http://web.nexo-smoke.localhost:{self.ports['http']}"
             assert secure["public_address"] == "https://secure.nexo-smoke.localhost"
             for tunnel in [tcp, web, secure]:
                 wait_for(lambda: self.ready(tunnel["id"]), f"{tunnel['protocol']} 服务就绪")

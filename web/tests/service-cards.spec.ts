@@ -113,6 +113,21 @@ test("选择图标后取消需要放弃草稿，创建可选择图标", async ({
   expect(state.calls.find(call => call.method === "POST" && call.path === "/api/v1/tunnels")?.body.icon_id).toBe("border-radius/emby-1.png");
 });
 
+test("IPv6 直连 Agent 离线时仍能只更换图标", async ({ page }) => {
+  const state = await installApiMocks(page);
+  state.tunnels[0].ipv6_direct_enabled = true;
+  await page.route("https://cdn.jsdelivr.net/**", route => route.abort());
+  await page.goto("/#/services/t-1");
+  await page.getByRole("button", { name: "编辑服务", exact: true }).click();
+  const editor = page.getByRole("dialog", { name: "编辑服务" });
+  await editor.getByRole("button", { name: "选择应用图标" }).click();
+  await editor.getByLabel("搜索应用图标").fill("emby");
+  await editor.getByRole("button", { name: "使用 emby-1", exact: true }).click();
+  await editor.getByRole("button", { name: "保存服务" }).click();
+  await expect(editor).toBeHidden();
+  expect(state.tunnels[0].icon_id).toBe("border-radius/emby-1.png");
+});
+
 test("图标失败、服务关闭与端口服务仍有明确入口，选择模式不跳转", async ({ page }, info) => {
   const state = await installApiMocks(page);
   Object.assign(state.tunnels[0], { name: "Emby", icon_id: "border-radius/emby-1.png" });

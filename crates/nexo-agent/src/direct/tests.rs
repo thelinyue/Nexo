@@ -24,6 +24,7 @@ fn service(port: u16) -> Service {
 }
 fn desired(service: &Service) -> Desired {
     Desired {
+        nodes: vec![],
         endpoint: TunnelDataEndpoint {
             address: "127.0.0.1:9891".into(),
             server_name: "nexo-server".into(),

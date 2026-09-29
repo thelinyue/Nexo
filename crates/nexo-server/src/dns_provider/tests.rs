@@ -77,6 +77,141 @@ fn record(kind: &str, value: &str) -> Record {
 }
 
 #[tokio::test]
+async fn node_a_set_keeps_aaaa_and_protects_external_changes() {
+    let (state, _) = crate::tests::domain_fixture();
+    let (zone, dns, task) = mock().await;
+    *state.tunnel_runtime.direct.test_zone.lock().await = Some(zone);
+    let socket = tokio::net::TcpListener::bind("0.0.0.0:0").await.unwrap();
+    let port = socket.local_addr().unwrap().port();
+    let accepting = tokio::spawn(async move {
+        while let Ok((stream, _)) = socket.accept().await {
+            drop(stream);
+        }
+    });
+    {
+        let db = state.db.lock().unwrap();
+        db.execute("INSERT INTO public_domains(id,tenant_id,domain,created_at,updated_at) VALUES('d','default','direct.test',0,0)", []).unwrap();
+        db.execute("INSERT INTO devices(id,tenant_id,name,status,created_at,updated_at) VALUES('agent','default','NAS','online',0,0)", []).unwrap();
+        db.execute("INSERT INTO tunnels(id,tenant_id,device_id,name,protocol,local_address,local_port,public_port,hostname,public_domain_id,distribution_mode,created_at,updated_at) VALUES('s','default','agent','service','tcp','127.0.0.1',80,?1,'emby','d','dns',0,0)", [port]).unwrap();
+        db.execute("DELETE FROM service_nodes WHERE service_id='s'", [])
+            .unwrap();
+        for (id, address) in [("a", "127.0.0.1"), ("b", "127.0.0.2")] {
+            db.execute("INSERT INTO relay_nodes(id,name,public_ipv4,approved,last_seen,created_at) VALUES(?1,?1,?2,1,?3,0)", rusqlite::params![id,address,crate::unix_now()]).unwrap();
+            db.execute("INSERT INTO relay_node_grants VALUES(?1,'default')", [id])
+                .unwrap();
+            db.execute("INSERT INTO service_nodes VALUES('s',?1)", [id])
+                .unwrap();
+            db.execute("INSERT INTO relay_service_health(node_id,service_id,revision,healthy,checked_at) VALUES(?1,'s',1,1,?2)", rusqlite::params![id,crate::unix_now()]).unwrap();
+        }
+    }
+    dns.records
+        .lock()
+        .unwrap()
+        .push(record("AAAA", "2001:4860::1"));
+    for _ in 0..3 {
+        crate::nodes::dns::sync(&state, "s").await.unwrap();
+    }
+    assert_eq!(
+        dns.records
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|r| r.kind == "A")
+            .count(),
+        2
+    );
+    state
+        .db
+        .lock()
+        .unwrap()
+        .execute("UPDATE relay_nodes SET enabled=0 WHERE id='a'", [])
+        .unwrap();
+    crate::nodes::dns::sync(&state, "s").await.unwrap();
+    assert_eq!(
+        dns.records
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|r| r.kind == "A")
+            .count(),
+        1
+    );
+    state
+        .db
+        .lock()
+        .unwrap()
+        .execute("UPDATE relay_nodes SET enabled=0 WHERE id='b'", [])
+        .unwrap();
+    crate::nodes::dns::sync(&state, "s").await.unwrap();
+    assert_eq!(dns.records.lock().unwrap().len(), 1);
+    assert_eq!(dns.records.lock().unwrap()[0].kind, "AAAA");
+    state
+        .db
+        .lock()
+        .unwrap()
+        .execute("UPDATE relay_nodes SET enabled=1 WHERE id IN ('a','b')", [])
+        .unwrap();
+    crate::nodes::dns::sync(&state, "s").await.unwrap();
+    dns.records
+        .lock()
+        .unwrap()
+        .iter_mut()
+        .find(|r| r.kind == "A")
+        .unwrap()
+        .value = "203.0.113.99".into();
+    assert!(crate::nodes::dns::sync(&state, "s")
+        .await
+        .unwrap_err()
+        .to_string()
+        .contains("未覆盖"));
+    assert!(dns
+        .records
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|r| r.value == "203.0.113.99"));
+    task.abort();
+    accepting.abort();
+}
+
+#[tokio::test]
+async fn node_original_is_restored_after_last_owned_record_disappears() {
+    let (state, _) = crate::tests::domain_fixture();
+    let (zone, dns, task) = mock().await;
+    *state.tunnel_runtime.direct.test_zone.lock().await = Some(zone);
+    let original = record("A", "203.0.113.7");
+    {
+        let db = state.db.lock().unwrap();
+        db.execute("INSERT INTO public_domains(id,tenant_id,domain,created_at,updated_at) VALUES('d','default','direct.test',0,0)",[]).unwrap();
+        db.execute("INSERT INTO tunnels(id,tenant_id,name,protocol,local_address,local_port,public_port,hostname,public_domain_id,enabled,created_at,updated_at) VALUES('s','default','s','tcp','127.0.0.1',80,50001,'emby','d',0,0,0)",[]).unwrap();
+        db.execute(
+            "INSERT INTO relay_dns_originals VALUES('s','d','emby.direct.test',?1)",
+            [serde_json::to_string(&original).unwrap()],
+        )
+        .unwrap();
+        assert!(crate::nodes::dns::managed(&db, "s").unwrap());
+    }
+    dns.records
+        .lock()
+        .unwrap()
+        .push(record("AAAA", "2001:4860::1"));
+    crate::nodes::dns::reconcile(&state).await.unwrap();
+    let records = dns.records.lock().unwrap().clone();
+    assert_eq!(records.len(), 2);
+    assert!(records
+        .iter()
+        .any(|r| r.kind == "A" && r.value == original.value && r.ttl == 600));
+    assert!(!crate::nodes::dns::managed(&state.db.lock().unwrap(), "s").unwrap());
+    crate::nodes::dns::reconcile(&state).await.unwrap();
+    assert_eq!(
+        *dns.records.lock().unwrap(),
+        records,
+        "重复清理不能重新接管原记录"
+    );
+    task.abort();
+}
+
+#[tokio::test]
 async fn journal_restores_owned_aaaa_retains_explicit_a_and_preserves_foreign_txt() {
     use crate::direct::dns::{ensure, withdraw};
     let (mut state, _) = crate::tests::domain_fixture();

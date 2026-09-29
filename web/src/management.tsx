@@ -5,7 +5,7 @@ import { DeviceRecovery } from "./recovery";
 import { AgentEnrollment } from "./agent-enrollment";
 import { ServerSettings } from "./server-settings";
 import { DomainSettings } from "./domain-settings";
-import { ChevronRight, Settings, Trash2, Eye, EyeOff, KeyRound, Server, ShieldCheck, Users, X } from "lucide-react";
+import { ChevronRight, Settings, Trash2, Eye, EyeOff, KeyRound, Server, ShieldCheck, Users, X } from "./icons";
 import { Confirm, CopyButton, EnrollmentDevice, CreateButton, DetailField, Empty, Loading, Modal, Notice, PageHeader, RowLink, Status, UserAvatar, dateText, errorText, request, useApi, useResource } from "./ui";
 import type { Auth, Device, Domain, DomainEvent, Enrollment, IdentityCertificate, Session, TransportIdentity, Tunnel } from "./ui";
 

@@ -6,6 +6,7 @@
 
 use nexo_core::EnrollmentStatus;
 use serde::{Deserialize, Serialize};
+pub mod nodes;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentHello {
@@ -66,6 +67,24 @@ pub struct TunnelDataEndpoint {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AgentControlMessage {
+    NodeLatency {
+        node_id: String,
+        rtt_ms: u32,
+    },
+    /// 节点转发预算只授予已经授权的设备、服务和配置版本。
+    NodeBudget {
+        request_id: u64,
+        node_id: String,
+        service_id: String,
+        revision: i64,
+        bytes: u32,
+    },
+    NodeUsage {
+        grant_id: String,
+        to_origin: u64,
+        to_public: u64,
+        finished: bool,
+    },
     Hello {
         #[serde(default)]
         capabilities: Vec<String>,
@@ -94,7 +113,14 @@ pub enum AgentControlMessage {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ServerControlMessage {
+    NodeBudget {
+        request_id: u64,
+        grant_id: String,
+        bytes: u64,
+    },
     HelloAccepted {
+        #[serde(default)]
+        nodes: Vec<nodes::AgentNode>,
         #[serde(default)]
         capabilities: Vec<String>,
         server_time: i64,
@@ -105,6 +131,8 @@ pub enum ServerControlMessage {
         udp_endpoint: Option<TunnelDataEndpoint>,
     },
     HeartbeatAck {
+        #[serde(default)]
+        nodes: Vec<nodes::AgentNode>,
         #[serde(default)]
         capabilities: Vec<String>,
         server_time: i64,

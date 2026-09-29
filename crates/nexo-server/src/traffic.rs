@@ -106,6 +106,7 @@ impl<T: AsyncWrite + Unpin> AsyncWrite for Counted<T> {
 struct Record {
     meter: Arc<Meter>,
     rate: Rates,
+    remote_pending: Bytes,
 }
 #[derive(Clone, Copy, Default, Serialize)]
 pub struct Rates {
@@ -160,16 +161,31 @@ impl Collector {
             .or_insert_with(|| Record {
                 meter: Arc::new(Meter::default()),
                 rate: Rates::default(),
+                remote_pending: Bytes::default(),
             })
             .meter
             .clone()
+    }
+    /// 远端结算已经原子写入分钟和日用量；这里只补充速率采样，禁止再次持久化计数。
+    pub(super) fn remote_sample(&self, tenant: &str, tunnel: &str, bytes: Bytes) {
+        let mut snapshot = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        snapshot
+            .records
+            .entry((tenant.into(), tunnel.into()))
+            .or_insert_with(|| Record {
+                meter: Arc::new(Meter::default()),
+                rate: Rates::default(),
+                remote_pending: Bytes::default(),
+            })
+            .remote_pending
+            .add(bytes);
     }
     pub fn sample(&self, state: &AppState, flush: bool) -> Result<()> {
         self.sample_at(state, wall_seconds(), Instant::now(), flush)
     }
     fn sample_at(&self, state: &AppState, wall: f64, tick: Instant, flush: bool) -> Result<()> {
         let mut snapshot = self.0.lock().unwrap_or_else(|e| e.into_inner());
-        let quota_batch = state.tunnel_runtime.quotas.snapshot();
+        let quota_handles = state.tunnel_runtime.quotas.snapshot_handles();
         let elapsed = tick
             .duration_since(snapshot.last_tick)
             .as_secs_f64()
@@ -178,7 +194,7 @@ impl Collector {
         for ((tenant, tunnel), record) in &mut snapshot.records {
             let buckets =
                 std::mem::take(&mut *record.meter.0.lock().unwrap_or_else(|e| e.into_inner()));
-            let mut total = Bytes::default();
+            let mut total = std::mem::take(&mut record.remote_pending);
             for (minute, bytes) in buckets {
                 total.add(bytes);
                 batches.push(((tenant.clone(), tunnel.clone(), minute), bytes));
@@ -258,7 +274,7 @@ impl Collector {
             tx.execute("INSERT INTO traffic_coverage VALUES (?1,?2) ON CONFLICT(minute) DO UPDATE SET seconds=MIN(60,seconds+excluded.seconds)", params![minute, seconds.min(60.0)])?;
         }
         usage::flush(&tx, &snapshot, wall as i64)?;
-        quota::flush(&tx, &quota_batch, wall as i64)?;
+        quota::flush(&tx, &quota::Manager::snapshot(&quota_handles), wall as i64)?;
         tx.execute(
             "DELETE FROM traffic_minutes WHERE minute<?1",
             [cutoff / 60 * 60],
@@ -412,6 +428,17 @@ pub struct History {
     total: Bytes,
     points: Vec<Point>,
 }
+/// 显式空间/隧道条件让 SQLite 使用已有复合主键；保留用户存在性检查。
+/// 四个参数位置固定，空筛选只判断参数，不把 OR 加到索引列上。
+fn history_sql(scope: &Scope) -> &'static str {
+    match (scope.tenant.is_some(), scope.tunnel.is_some()) {
+        (true, true) => "SELECT minute,SUM(to_origin),SUM(to_public) FROM traffic_minutes WHERE minute>=?1 AND minute<?2 AND tenant_id=?3 AND tunnel_id=?4 AND tenant_id IN (SELECT tenant_id FROM users) GROUP BY minute",
+        (true, false) => "SELECT minute,SUM(to_origin),SUM(to_public) FROM traffic_minutes WHERE minute>=?1 AND minute<?2 AND tenant_id=?3 AND ?4 IS NULL AND tenant_id IN (SELECT tenant_id FROM users) GROUP BY minute",
+        (false, false) => "SELECT minute,SUM(to_origin),SUM(to_public) FROM traffic_minutes WHERE minute>=?1 AND minute<?2 AND ?3 IS NULL AND ?4 IS NULL AND tenant_id IN (SELECT tenant_id FROM users) GROUP BY minute",
+        (false, true) => "SELECT minute,SUM(to_origin),SUM(to_public) FROM traffic_minutes WHERE minute>=?1 AND minute<?2 AND ?3 IS NULL AND tunnel_id=?4 AND tenant_id IN (SELECT tenant_id FROM users) GROUP BY minute",
+    }
+}
+
 fn history(state: &AppState, scope: Scope, filter: &Filter) -> Result<Json<History>, ApiError> {
     let (duration, step) = match filter.range.as_deref().unwrap_or("24h") {
         "1h" => (3600, 60),
@@ -451,7 +478,7 @@ fn history(state: &AppState, scope: Scope, filter: &Filter) -> Result<Json<Histo
         .map_err(db_error)?
         .collect::<rusqlite::Result<HashSet<_>>>()
         .map_err(db_error)?;
-    let mut query = db.prepare("SELECT minute,SUM(to_origin),SUM(to_public) FROM traffic_minutes WHERE minute>=?1 AND minute<?2 AND (?3 IS NULL OR tenant_id=?3) AND (?4 IS NULL OR tunnel_id=?4) AND tenant_id IN (SELECT tenant_id FROM users) GROUP BY minute").map_err(db_error)?;
+    let mut query = db.prepare(history_sql(&scope)).map_err(db_error)?;
     for row in query
         .query_map(params![start, end, scope.tenant, scope.tunnel], |r| {
             Ok((

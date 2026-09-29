@@ -50,6 +50,49 @@ pub fn prepare(
         ));
     }
     input.https_port = Some(port);
+    let node_scope = serde_json::to_string(
+        &input
+            .node_ids
+            .clone()
+            .unwrap_or_else(|| vec!["local".into()]),
+    )
+    .map_err(db_error)?;
+    if matches!(
+        input.protocol.as_str(),
+        "http" | "https" | "tcp" | "tcp_udp"
+    ) {
+        let entry_port = if input.protocol == "https" {
+            port
+        } else if input.protocol == "http" {
+            state.config.caddy.http_port()
+        } else {
+            input.public_port.unwrap_or(0)
+        };
+        let reserved:bool=db.query_row("SELECT EXISTS(SELECT 1 FROM relay_nodes WHERE id!='local' AND id IN (SELECT value FROM json_each(?1)) AND (control_port=?2 OR ?2 IN (0,8282,8290) OR (?2 IN (80,443) OR ?2=?4) AND ?3 IN ('tcp','tcp_udp')))", params![node_scope,entry_port,input.protocol,state.config.caddy.http_port()], |r|r.get(0)).map_err(db_error)?;
+        if reserved {
+            return Err(ApiError::new(
+                StatusCode::CONFLICT,
+                "公网端口与节点的系统监听冲突",
+            ));
+        }
+    }
+    let remote = input
+        .node_ids
+        .as_ref()
+        .is_some_and(|nodes| nodes.iter().any(|n| n != "local"));
+    if remote && (input.protocol == "http" || input.http_redirect_enabled == Some(true)) {
+        let http_port = state.config.caddy.http_port();
+        let conflict: bool = db.query_row("SELECT EXISTS(SELECT 1 FROM relay_nodes WHERE id IN (SELECT value FROM json_each(?1)) AND control_port=?2) OR EXISTS(SELECT 1 FROM tunnels t JOIN service_nodes s ON s.service_id=t.id WHERE t.id!=?3 AND t.deleted_at IS NULL AND s.node_id IN (SELECT value FROM json_each(?1)) AND ((t.protocol IN ('tcp','tcp_udp') AND t.public_port=?2) OR (t.protocol='https' AND t.https_port=?2)))", params![node_scope,http_port,id], |r|r.get(0)).map_err(db_error)?;
+        if [0, 443, 8282, 8290].contains(&http_port)
+            || conflict
+            || (input.protocol == "https" && port == http_port)
+        {
+            return Err(ApiError::new(
+                StatusCode::CONFLICT,
+                "HTTP 公网端口与节点已有监听冲突",
+            ));
+        }
+    }
     if input.protocol == "https" {
         let config = &state.config;
         let caddy = &config.caddy;
@@ -62,22 +105,32 @@ pub fn prepare(
         let admin_port = reqwest::Url::parse(&caddy.admin_url)
             .ok()
             .and_then(|u| u.port_or_known_default());
-        if [
-            Some(config.http_addr.port()),
-            Some(config.control_addr.port()),
-            Some(config.tunnel_addr.port()),
-            listen_port(&caddy.http_listen),
-            admin_port,
-        ]
-        .contains(&Some(port))
-            || (port != 443 && listen_port(&caddy.https_listen) == Some(port))
+        let local = input
+            .node_ids
+            .as_ref()
+            .is_none_or(|nodes| nodes.iter().any(|n| n == "local"));
+        let remote = input
+            .node_ids
+            .as_ref()
+            .is_some_and(|nodes| nodes.iter().any(|n| n != "local"));
+        if (local
+            && ([
+                Some(config.http_addr.port()),
+                Some(config.control_addr.port()),
+                Some(config.tunnel_addr.port()),
+                listen_port(&caddy.http_listen),
+                admin_port,
+            ]
+            .contains(&Some(port))
+                || (port != 443 && listen_port(&caddy.https_listen) == Some(port))))
+            || (remote && [80, 8282, 8290, state.config.caddy.http_port()].contains(&port))
         {
             return Err(ApiError::new(
                 StatusCode::CONFLICT,
                 "HTTPS 公网端口与服务器已有监听冲突",
             ));
         }
-        let occupied: bool = db.query_row("SELECT EXISTS(SELECT 1 FROM tunnels WHERE id!=?1 AND deleted_at IS NULL AND protocol IN ('tcp','tcp_udp') AND public_port=?2)", params![id, port], |r| r.get(0)).map_err(db_error)?;
+        let occupied: bool = db.query_row("SELECT EXISTS(SELECT 1 FROM tunnels WHERE id!=?1 AND deleted_at IS NULL AND protocol IN ('tcp','tcp_udp') AND public_port=?2 AND (EXISTS(SELECT 1 FROM service_nodes sn WHERE sn.service_id=tunnels.id AND sn.node_id IN (SELECT value FROM json_each(?4))) OR (NOT EXISTS(SELECT 1 FROM service_nodes sn WHERE sn.service_id=tunnels.id) AND EXISTS(SELECT 1 FROM json_each(?4) WHERE value='local'))))", params![id, port,0,node_scope], |r| r.get(0)).map_err(db_error)?;
         if occupied {
             return Err(ApiError::new(
                 StatusCode::CONFLICT,
@@ -85,7 +138,7 @@ pub fn prepare(
             ));
         }
     } else if matches!(input.protocol.as_str(), "tcp" | "tcp_udp") {
-        let occupied: bool = db.query_row("SELECT EXISTS(SELECT 1 FROM tunnels WHERE id!=?1 AND deleted_at IS NULL AND protocol='https' AND https_port=?2)", params![id, input.public_port], |r| r.get(0)).map_err(db_error)?;
+        let occupied: bool = db.query_row("SELECT EXISTS(SELECT 1 FROM tunnels WHERE id!=?1 AND deleted_at IS NULL AND protocol='https' AND https_port=?2 AND (EXISTS(SELECT 1 FROM service_nodes sn WHERE sn.service_id=tunnels.id AND sn.node_id IN (SELECT value FROM json_each(?4))) OR (NOT EXISTS(SELECT 1 FROM service_nodes sn WHERE sn.service_id=tunnels.id) AND EXISTS(SELECT 1 FROM json_each(?4) WHERE value='local'))))", params![id, input.public_port,0,node_scope], |r| r.get(0)).map_err(db_error)?;
         if occupied {
             return Err(ApiError::new(
                 StatusCode::CONFLICT,
@@ -110,6 +163,45 @@ mod tests {
     use super::*;
     use axum::extract::Path;
     use serde_json::json;
+
+    #[test]
+    fn custom_node_http_port_is_reserved_and_https_can_use_8443() {
+        let (mut state, _) = crate::tests::domain_fixture();
+        Arc::make_mut(&mut state.config).caddy.http_listen = ":8080".into();
+        let db = state.db.lock().unwrap();
+        db.execute(
+            "INSERT INTO relay_nodes(id,name,approved,created_at) VALUES('remote','remote',1,0)",
+            [],
+        )
+        .unwrap();
+        let input = |protocol: &str, port: u16| {
+            serde_json::from_value::<TunnelInput>(json!({
+            "name":"test","protocol":protocol,"local_address":"localhost","local_port":8096,
+            "https_port":port,"public_port":port,"node_ids":["remote"],"http_redirect_enabled":true
+        })).unwrap()
+        };
+        assert!(prepare(&state, &db, "default", "new", &mut input("https", 8443)).is_ok());
+        for protocol in ["https", "tcp"] {
+            assert_eq!(
+                prepare(&state, &db, "default", "new", &mut input(protocol, 8080))
+                    .unwrap_err()
+                    .status,
+                StatusCode::CONFLICT
+            );
+        }
+        assert!(prepare(&state, &db, "default", "new", &mut input("http", 443)).is_ok());
+        db.execute(
+            "UPDATE relay_nodes SET control_port=8080 WHERE id='remote'",
+            [],
+        )
+        .unwrap();
+        assert_eq!(
+            prepare(&state, &db, "default", "new", &mut input("http", 443))
+                .unwrap_err()
+                .status,
+            StatusCode::CONFLICT
+        );
+    }
 
     #[tokio::test]
     async fn ports_roundtrip_preserve_revoke_and_reject_conflicts() {

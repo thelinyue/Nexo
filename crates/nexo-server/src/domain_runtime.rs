@@ -225,7 +225,7 @@ fn specifications(
                 .transpose()?;
             domain.token_reference = path.map(|path| format!("{{file.{}}}", path.display()));
         }
-        let mut services = connection.prepare("SELECT id,hostname,protocol,device_id,lan_redirect_enabled,local_address,local_port,origin_protocol,service_mode,http_redirect_enabled,https_port FROM tunnels WHERE public_domain_id=?1 AND tenant_id=?2 AND enabled=1 AND deleted_at IS NULL AND protocol IN ('http','https')")?;
+        let mut services = connection.prepare("SELECT id,hostname,protocol,device_id,lan_redirect_enabled,local_address,local_port,origin_protocol,service_mode,http_redirect_enabled,https_port FROM tunnels WHERE public_domain_id=?1 AND tenant_id=?2 AND enabled=1 AND deleted_at IS NULL AND protocol IN ('http','https') AND EXISTS(SELECT 1 FROM authorized_service_nodes sn WHERE sn.service_id=tunnels.id AND sn.node_id='local')")?;
         let mut rows = services.query(params![domain.id, domain.tenant_id])?;
         while let Some(row) = rows.next()? {
             let id: String = row.get(0)?;
@@ -344,7 +344,7 @@ fn proxy_handler(upstream: &str) -> Result<Value> {
 }
 
 /// 只跳到配置中的域名，保留原方法与 URI；禁止缓存以便关闭和换域名后立即恢复。
-fn https_redirect(hostname: &str, port: u16) -> Value {
+pub(crate) fn https_redirect(hostname: &str, port: u16) -> Value {
     let origin = crate::https_ports::url("https", hostname, port);
     json!({"match":[{"host":[hostname]}],"handle":[{"handler":"static_response","status_code":307,"headers":{"Location":[format!("{origin}{{http.request.uri}}")],"Cache-Control":["no-store"]}}],"terminal":true})
 }
@@ -404,25 +404,12 @@ fn build_config(settings: &CaddyRuntimeConfig, domains: &[DomainSpec]) -> Result
                 &mut http
             };
             if let Some(redirect) = &service.lan_redirect {
-                let origin = &redirect.origin;
-                // 使用真实 socket 来源而不是可伪造的转发头。只拦截页面导航，保留 API、
-                // WebSocket 和非幂等请求的穿透路径；临时跳转禁止缓存，避免跨网络复用。
-                routes.push(json!({
-                    "@id": format!("{}{}", caddy::LAN_REDIRECT_ROUTE_PREFIX, service.id),
-                    "match": [{
-                        "host": [service.hostname],
-                        "remote_ip": {"ranges": [format!("{}/32", redirect.public_ipv4)]},
-                        "method": ["GET", "HEAD"],
-                        "header": {"Sec-Fetch-Mode": ["navigate"], "Sec-Fetch-Dest": ["document"]},
-                        "not": [{"header": {"Upgrade": ["*"]}}]
-                    }],
-                    "handle": [{
-                        "handler": "static_response",
-                        "status_code": 307,
-                        "headers": {"Location": [format!("{origin}{{http.request.uri}}")], "Cache-Control": ["no-store"]}
-                    }],
-                    "terminal": true
-                }));
+                routes.push(crate::lan_redirect::route(
+                    &service.id,
+                    &service.hostname,
+                    redirect.public_ipv4,
+                    &redirect.origin,
+                ));
             }
             routes.push(json!({"match":[{"host":[service.hostname],"path":["/.nexo-access/*"]}],"handle":[access_endpoint],"terminal":true}));
             routes.push(route);
@@ -563,29 +550,34 @@ pub(crate) async fn reconcile_locked(state: &AppState) -> Result<bool> {
     let mut settings_with_access = settings.clone();
     settings_with_access.access_address = access.address.clone();
     // 新端口被其他程序占用时，只撤下该端口的服务；其他入口仍可正常应用配置。
-    let current = supervisor.current_config().await.unwrap_or(Value::Null);
-    let (available_specs, service_errors) =
-        available_ports(&settings_with_access, &specs, &current);
+    let current = supervisor.current_config().await;
+    let (available_specs, service_errors) = available_ports(
+        &settings_with_access,
+        &specs,
+        current.as_ref().unwrap_or(&Value::Null),
+    );
     let desired = build_config(&settings_with_access, &available_specs);
-    let config_result = match desired {
-        Ok(config) => match supervisor.current_config().await {
-            Ok(current)
-                if current == config && !supervisor.credentials_changed(&config).await? =>
-            {
-                Ok(())
+    // 一轮协调复用真实读取的配置；发生加载后重新读取，清理不得使用候选配置。
+    let config_result = match (desired, current) {
+        (Ok(config), Ok(current)) => {
+            if current == config && !supervisor.credentials_changed(&config).await? {
+                Ok(current)
+            } else {
+                match supervisor.apply_json(&config).await {
+                    Ok(()) => supervisor.current_config().await,
+                    Err(error) => Err(error),
+                }
             }
-            Ok(_) => supervisor.apply_json(&config).await,
-            Err(error) => Err(error),
-        },
-        Err(error) => Err(error),
+        }
+        (Err(error), _) | (_, Err(error)) => Err(error),
     };
     let config_error = config_result
+        .as_ref()
         .err()
         .map(|e| caddy::redact(&format!("{e:#}"), &settings.cloudflare_token_root));
-    let cleanup_complete = if config_error.is_none() {
-        // 再读实际配置；只有运行配置与持久化配置都不再引用时，才能删除凭据。
-        let current = supervisor.current_config().await?;
-        match cleanup_deleted_credentials(state, &current) {
+    let cleanup_complete = if let Ok(current) = &config_result {
+        // 运行配置与持久化配置都不再引用时，才能删除凭据。
+        match cleanup_deleted_credentials(state, current) {
             Ok(()) => true,
             Err(error) => {
                 tracing::warn!("已删除域名的凭据尚未清理，将自动重试：{error:#}");
@@ -1377,6 +1369,103 @@ mod tests {
         assert_eq!(cert.status, "issued");
         assert!(cert.error.is_none());
         assert!(cert.next_retry_at.is_none());
+    }
+
+    #[tokio::test]
+    async fn coordination_reuses_config_and_recovers_after_admin_failure() {
+        use axum::{
+            extract::ConnectInfo,
+            routing::{get, post},
+            Json, Router,
+        };
+        use std::{
+            net::SocketAddr,
+            sync::atomic::{AtomicBool, AtomicUsize, Ordering},
+        };
+        let root = std::env::temp_dir().join(format!("nexo-config-reuse-{}", uuid::Uuid::new_v4()));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let current = Arc::new(tokio::sync::Mutex::new(json!({})));
+        let reads = Arc::new(AtomicUsize::new(0));
+        let loads = Arc::new(AtomicUsize::new(0));
+        let failed = Arc::new(AtomicBool::new(false));
+        let peers = Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new()));
+        let app = Router::new()
+            .route(
+                "/config/",
+                get({
+                    let (current, reads, failed, peers) = (
+                        current.clone(),
+                        reads.clone(),
+                        failed.clone(),
+                        peers.clone(),
+                    );
+                    move |ConnectInfo(peer): ConnectInfo<SocketAddr>| {
+                        let (current, reads, failed, peers) = (
+                            current.clone(),
+                            reads.clone(),
+                            failed.clone(),
+                            peers.clone(),
+                        );
+                        async move {
+                            reads.fetch_add(1, Ordering::SeqCst);
+                            peers.lock().await.insert(peer);
+                            let status = if failed.load(Ordering::SeqCst) {
+                                axum::http::StatusCode::SERVICE_UNAVAILABLE
+                            } else {
+                                axum::http::StatusCode::OK
+                            };
+                            (status, Json(current.lock().await.clone()))
+                        }
+                    }
+                }),
+            )
+            .route(
+                "/load",
+                post({
+                    let (current, loads) = (current.clone(), loads.clone());
+                    move |Json(config): Json<Value>| {
+                        let (current, loads) = (current.clone(), loads.clone());
+                        async move {
+                            loads.fetch_add(1, Ordering::SeqCst);
+                            *current.lock().await = config;
+                            axum::http::StatusCode::OK
+                        }
+                    }
+                }),
+            );
+        let mut cfg = settings(&root);
+        cfg.admin_url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+            .unwrap();
+        });
+        let (mut state, _) = crate::tests::domain_fixture();
+        state.domain_runtime = Arc::new(DomainRuntimeManager::new(cfg));
+        assert!(reconcile_locked(&state).await.unwrap());
+        assert_eq!(reads.load(Ordering::SeqCst), 2, "加载后确认实际配置");
+        assert_eq!(loads.load(Ordering::SeqCst), 1);
+        assert!(reconcile_locked(&state).await.unwrap());
+        assert_eq!(reads.load(Ordering::SeqCst), 3, "稳定轮次只读一次");
+        assert_eq!(loads.load(Ordering::SeqCst), 1);
+        assert_eq!(peers.lock().await.len(), 1, "Admin 连接池复用 TCP 连接");
+        failed.store(true, Ordering::SeqCst);
+        assert!(
+            !reconcile_locked(&state).await.unwrap(),
+            "读取失败不得清理凭据"
+        );
+        failed.store(false, Ordering::SeqCst);
+        *current.lock().await = json!({});
+        assert!(reconcile_locked(&state).await.unwrap());
+        assert_eq!(loads.load(Ordering::SeqCst), 2, "外部配置丢失后重新加载");
+        server.abort();
+        let _ = server.await;
+        if root.exists() {
+            fs::remove_dir_all(root).unwrap();
+        }
     }
 
     #[tokio::test]

@@ -1,13 +1,31 @@
 import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react";
 import { VitePWA } from "vite-plugin-pwa";
-import { readFileSync } from "node:fs";
+import { readFileSync, readdirSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
+import { fileURLToPath } from "node:url";
+import { gzipSync } from "node:zlib";
 
 export default defineConfig({
   // 独立发布时沿用 Compose 中真实存在的 Agent 镜像，不借用 Server/Web 版本号。
   define: { __AGENT_COMPOSE_TEMPLATE__: JSON.stringify(readFileSync(new URL("../compose.agent.yml", import.meta.url), "utf8")) },
   plugins: [
     react(),
+    {
+      name: "nexo-static-gzip",
+      apply: "build",
+      // 构建后生成静态资源旁路文件，避免请求时占用 CPU；原文件用于不支持 gzip 的客户端。
+      closeBundle() {
+        const compress = (directory: string) => {
+          for (const item of readdirSync(directory, { withFileTypes: true })) {
+            const path = join(directory, item.name);
+            if (item.isDirectory()) compress(path);
+            else if (/\.(js|css)$/.test(item.name)) writeFileSync(`${path}.gz`, gzipSync(readFileSync(path), { level: 9 }));
+          }
+        };
+        compress(fileURLToPath(new URL("./dist/assets", import.meta.url)));
+      },
+    },
     VitePWA({
       registerType: "prompt",
       strategies: "injectManifest",

@@ -50,6 +50,25 @@ pub fn target_url(
     Ok(url.origin().ascii_serialization())
 }
 
+/// 内置及远端入口只按真实 socket 来源匹配 Agent 出口，禁止采信访客转发头。
+/// 仅跳转页面导航，保留 API、WebSocket 和非幂等请求的穿透路径，并禁用缓存。
+pub(crate) fn route(
+    id: &str,
+    host: &str,
+    public_ipv4: std::net::Ipv4Addr,
+    origin: &str,
+) -> serde_json::Value {
+    serde_json::json!({
+        "@id": format!("{}{}", crate::caddy::LAN_REDIRECT_ROUTE_PREFIX, id),
+        "match": [{"host": [host], "remote_ip": {"ranges": [format!("{public_ipv4}/32")]},
+            "method": ["GET", "HEAD"], "header": {"Sec-Fetch-Mode": ["navigate"], "Sec-Fetch-Dest": ["document"]},
+            "not": [{"header": {"Upgrade": ["*"]}}]}],
+        "handle": [{"handler": "static_response", "status_code": 307,
+            "headers": {"Location": [format!("{origin}{{http.request.uri}}")], "Cache-Control": ["no-store"]}}],
+        "terminal": true
+    })
+}
+
 /// 与服务写入共用事务和租户条件。省略开关时保留原值，开启时验证更新后的本地目标。
 pub fn prepare(
     db: &Connection,

@@ -142,7 +142,7 @@ pub fn ensure_switch(db: &rusqlite::Connection, id: &str, provider: &str) -> Res
         |r| r.get(0),
     )?;
     if current != provider {
-        let active:bool=db.query_row("SELECT EXISTS(SELECT 1 FROM direct_dns_records WHERE domain_id=?1 AND kind!='A') OR EXISTS(SELECT 1 FROM tunnels WHERE public_domain_id=?1 AND ipv6_direct_enabled=1 AND deleted_at IS NULL)",[id],|r|r.get(0))?;
+        let active:bool=db.query_row("SELECT EXISTS(SELECT 1 FROM direct_dns_records WHERE domain_id=?1 AND kind!='A') OR EXISTS(SELECT 1 FROM relay_dns_records WHERE domain_id=?1) OR EXISTS(SELECT 1 FROM relay_dns_originals WHERE domain_id=?1) OR EXISTS(SELECT 1 FROM tunnels WHERE public_domain_id=?1 AND ipv6_direct_enabled=1 AND deleted_at IS NULL)",[id],|r|r.get(0))?;
         anyhow::ensure!(!active, "请先关闭直连并完成 DNS 清理，再更换 DNS 提供商");
         // A 记录留在 DNS；提供商变更后旧 ID 无效，下次按 Server 地址重新确认归属。
         db.execute(

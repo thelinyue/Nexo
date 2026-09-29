@@ -188,6 +188,7 @@ pub fn refresh_status(state: &AppState) -> Result<()> {
             .collect::<rusqlite::Result<Vec<_>>>()?;
         rows
     };
+    let mut updates = Vec::new();
     for (
         id,
         enabled,
@@ -239,11 +240,15 @@ pub fn refresh_status(state: &AppState) -> Result<()> {
             ("ready", None)
         };
         // 状态读取期间配置可能改变；只回写仍属于本次快照且未删除的服务。
-        state.db.lock().map_err(|_| anyhow::anyhow!("数据库锁不可用"))?.execute(
-            "UPDATE tunnels SET apply_status=?1,apply_error=?2 WHERE id=?3 AND apply_revision=?4 AND deleted_at IS NULL",
-            params![status, error, id, revision],
-        )?;
+        updates.push(crate::transport::StatusUpdate {
+            id,
+            revision,
+            status: status.into(),
+            error,
+            protocols: None,
+        });
     }
+    crate::transport::save_statuses(state, updates)?;
     Ok(())
 }
 

@@ -43,6 +43,7 @@ mod enrollment;
 mod https_ports;
 mod identity_runtime;
 mod lan_redirect;
+mod nodes;
 mod reverse_proxy;
 mod security;
 mod server_settings;
@@ -66,6 +67,15 @@ struct Cli {
 }
 #[derive(Debug, Subcommand)]
 enum CliCommand {
+    /// 独立 VPS 节点；首次接入从标准输入读取一次性凭证。
+    Node {
+        #[arg(long)]
+        server_url: Option<String>,
+        #[arg(long)]
+        enroll: bool,
+        #[arg(long)]
+        enroll_only: bool,
+    },
     Admin {
         #[command(subcommand)]
         command: AdminCommand,
@@ -173,6 +183,12 @@ struct Enrollment {
 struct ApproveEnrollment {}
 #[derive(Debug, Serialize, Deserialize)]
 struct Tunnel {
+    node_group_id: Option<String>,
+    preferred_node_id: Option<String>,
+    node_selection: serde_json::Value,
+    node_ids: Vec<String>,
+    distribution_mode: String,
+    node_statuses: serde_json::Value,
     icon_id: Option<String>,
     #[serde(default)]
     protocol_statuses: std::collections::BTreeMap<String, nexo_protocol::ProtocolStatus>,
@@ -205,6 +221,10 @@ struct Tunnel {
 }
 #[derive(Deserialize)]
 struct TunnelInput {
+    node_group_id: Option<String>,
+    preferred_node_id: Option<String>,
+    node_ids: Option<Vec<String>>,
+    distribution_mode: Option<String>,
     /// 省略保留原图标，显式 null 恢复协议默认图标。
     #[serde(default, deserialize_with = "service_icons::deserialize")]
     icon_id: Option<Option<String>>,
@@ -264,6 +284,20 @@ async fn main() -> Result<()> {
         .init();
     let cli = Cli::parse();
     let data_dir = nexo_core::config::absolute(&cli.data_dir)?;
+    if let Some(CliCommand::Node {
+        server_url,
+        enroll,
+        enroll_only,
+    }) = &cli.command
+    {
+        return nodes::runtime::run(
+            data_dir,
+            server_url.clone(),
+            *enroll || *enroll_only,
+            *enroll_only,
+        )
+        .await;
+    }
     if let Some(CliCommand::Admin {
         command: AdminCommand::Recover { username },
     }) = cli.command
@@ -394,6 +428,7 @@ fn router(state: AppState) -> Router {
     // 前端使用 hash 路由，缺失文件保持 404，不能用首页掩盖未知 API 或资源错误。
     let web_dir = state.config.web_dir.clone();
     let routes = Router::new()
+        .merge(nodes::routes())
         .route("/health", get(health))
         .route("/api/v1/traffic/realtime", get(traffic::own_realtime))
         .route("/api/v1/traffic/history", get(traffic::own_history))
@@ -503,7 +538,11 @@ fn router(state: AppState) -> Router {
             put(domains::set_credential),
         )
         .route("/api/v1/public-domain-runtime-events", get(domain_events))
-        .fallback_service(tower_http::services::ServeDir::new(web_dir))
+        .fallback_service(
+            Router::new()
+                .fallback_service(tower_http::services::ServeDir::new(web_dir).precompressed_gzip())
+                .layer(middleware::from_fn(static_asset_headers)),
+        )
         .layer(middleware::from_fn_with_state(
             state.clone(),
             auth::session_middleware,
@@ -525,6 +564,16 @@ async fn health() -> Json<Health> {
     })
 }
 
+/// gzip 与原文件共用 URL，代理缓存必须按请求编码区分；API 仍由安全中间件禁止缓存。
+async fn static_asset_headers(request: axum::extract::Request, next: middleware::Next) -> Response {
+    let mut response = next.run(request).await;
+    response.headers_mut().append(
+        axum::http::header::VARY,
+        axum::http::HeaderValue::from_static("Accept-Encoding"),
+    );
+    response
+}
+
 fn initialize_database(connection: &Connection, is_new: bool) -> Result<()> {
     connection.pragma_update(None, "foreign_keys", "ON")?;
     if is_new {
@@ -538,6 +587,7 @@ fn initialize_database(connection: &Connection, is_new: bool) -> Result<()> {
     dns_provider::migrate(connection)?;
     direct::migrate(connection)?;
     service_icons::migrate(connection)?;
+    nodes::migrate(connection)?;
     server_settings::load(connection).context("无法读取服务器设置")?;
     connection.prepare("SELECT enabled FROM tenants")?;
     connection.prepare("SELECT service_mode,protocol_statuses,access_mode FROM tunnels")?;
@@ -677,9 +727,15 @@ async fn list_tunnels(
 ) -> Result<Json<Vec<Tunnel>>, ApiError> {
     let session = require_session(&state, &headers)?;
     let connection = state.db.lock().map_err(|_| db_error("数据库锁不可用"))?;
-    query_tunnels(&connection, &session.tenant_id, None, &headers)
-        .map(Json)
-        .map_err(db_error)
+    query_tunnels(
+        &connection,
+        &session.tenant_id,
+        None,
+        &headers,
+        state.config.caddy.http_port(),
+    )
+    .map(Json)
+    .map_err(db_error)
 }
 async fn create_tunnel(
     State(state): State<AppState>,
@@ -693,6 +749,7 @@ async fn create_tunnel(
         let db = state.db.lock().map_err(|_| db_error("数据库锁不可用"))?;
         let db = db.unchecked_transaction().map_err(db_error)?;
         reverse_proxy::prepare(&db, &session, &id, &mut input)?;
+        nodes::services::prepare(&db, &session.tenant_id, &id, &mut input)?;
         prepare_tunnel(&db, &session.tenant_id, &id, &mut input)?;
         https_ports::prepare(&state, &db, &session.tenant_id, &id, &mut input)?;
         direct::prepare(&db, &session.tenant_id, &id, &mut input)?;
@@ -704,6 +761,7 @@ async fn create_tunnel(
             access_hash.as_deref(),
         )?;
         db.execute("INSERT INTO tunnels (id,tenant_id,device_id,name,protocol,local_address,local_port,public_port,hostname,enabled,apply_status,apply_revision,public_domain_id,created_at,updated_at,lan_redirect_enabled,origin_protocol,service_mode,http_redirect_enabled) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,'checking',1,?11,?12,?12,?13,?14,?15,?16)",params![id,session.tenant_id,input.device_id,input.name.trim(),input.protocol,input.local_address.trim(),input.local_port,input.public_port,input.hostname,input.enabled.unwrap_or(true),input.public_domain_id,unix_now(),input.lan_redirect_enabled.unwrap_or(false),input.origin_protocol,input.service_mode,input.http_redirect_enabled.unwrap_or(false)]).map_err(db_error)?;
+        nodes::services::save(&db, &id, &input)?;
         https_ports::save(&db, &id, &input)?;
         db.execute(
             "UPDATE tunnels SET ipv6_direct_enabled=?2 WHERE id=?1",
@@ -730,14 +788,25 @@ async fn update_tunnel(
 ) -> Result<Json<Tunnel>, ApiError> {
     let session = require_write(&state, &headers)?;
     let access_hash = service_access::password_hash(&mut input).await?;
+    let runtime_changed;
     {
         let db = state.db.lock().map_err(|_| db_error("数据库锁不可用"))?;
         let db = db.unchecked_transaction().map_err(db_error)?;
         if !db.query_row("SELECT EXISTS(SELECT 1 FROM tunnels WHERE id=?1 AND tenant_id=?2 AND deleted_at IS NULL)",params![id,session.tenant_id], |r| r.get::<_,bool>(0)).map_err(db_error)? { return Err(ApiError::new(StatusCode::NOT_FOUND,"服务不存在")); }
         reverse_proxy::prepare(&db, &session, &id, &mut input)?;
+        nodes::services::prepare(&db, &session.tenant_id, &id, &mut input)?;
         prepare_tunnel(&db, &session.tenant_id, &id, &mut input)?;
         https_ports::prepare(&state, &db, &session.tenant_id, &id, &mut input)?;
-        direct::prepare(&db, &session.tenant_id, &id, &mut input)?;
+        input.ipv6_direct_enabled = Some(
+            input.ipv6_direct_enabled.unwrap_or(
+                db.query_row(
+                    "SELECT ipv6_direct_enabled FROM tunnels WHERE id=?1",
+                    [&id],
+                    |row| row.get(0),
+                )
+                .map_err(db_error)?,
+            ),
+        );
         service_access::prepare(
             &db,
             &session.tenant_id,
@@ -745,7 +814,18 @@ async fn update_tunnel(
             &mut input,
             access_hash.as_deref(),
         )?;
-        db.execute("UPDATE tunnels SET device_id=?1,name=?2,protocol=?3,local_address=?4,local_port=?5,public_port=?6,hostname=?7,enabled=?8,apply_revision=apply_revision+1,apply_status='checking',updated_at=?9,public_domain_id=?12,lan_redirect_enabled=?13,origin_protocol=?14,service_mode=?15,http_redirect_enabled=?16 WHERE id=?10 AND tenant_id=?11 AND deleted_at IS NULL",params![input.device_id,input.name.trim(),input.protocol,input.local_address.trim(),input.local_port,input.public_port,input.hostname,input.enabled.unwrap_or(true),unix_now(),id,session.tenant_id,input.public_domain_id,input.lan_redirect_enabled.unwrap_or(false),input.origin_protocol,input.service_mode,input.http_redirect_enabled.unwrap_or(false)]).map_err(db_error)?;
+        // 名称和图标不进入 Agent 或 Caddy 配置；原值重复提交也无需重置应用状态。
+        let config_unchanged: bool = db.query_row(
+            "SELECT device_id IS ?2 AND protocol=?3 AND local_address=?4 AND local_port=?5 AND public_port IS ?6 AND hostname IS ?7 AND enabled=?8 AND public_domain_id IS ?9 AND lan_redirect_enabled=?10 AND origin_protocol IS ?11 AND service_mode=?12 AND http_redirect_enabled=?13 AND https_port=?14 AND ipv6_direct_enabled=?15 AND access_mode=?16 FROM tunnels WHERE id=?1",
+            params![id,input.device_id,input.protocol,input.local_address.trim(),input.local_port,input.public_port,input.hostname,input.enabled.unwrap_or(true),input.public_domain_id,input.lan_redirect_enabled.unwrap_or(false),input.origin_protocol,input.service_mode,input.http_redirect_enabled.unwrap_or(false),input.https_port.unwrap_or(443),input.ipv6_direct_enabled.unwrap_or(false),input.access_mode],
+            |row| row.get(0),
+        ).map_err(db_error)?;
+        runtime_changed = !config_unchanged || access_hash.is_some() || db.query_row("SELECT distribution_mode IS NOT ?2 OR preferred_node_id IS NOT ?3 OR node_group_id IS NOT NULLIF(?4,'') FROM tunnels WHERE id=?1",params![id,input.distribution_mode,input.preferred_node_id,input.node_group_id],|r|r.get::<_,bool>(0)).map_err(db_error)? || nodes::services::ids(&db,&id).map_err(db_error)? != *input.node_ids.as_ref().unwrap();
+        if runtime_changed {
+            direct::prepare(&db, &session.tenant_id, &id, &mut input)?;
+        }
+        db.execute("UPDATE tunnels SET device_id=?1,name=?2,protocol=?3,local_address=?4,local_port=?5,public_port=?6,hostname=?7,enabled=?8,apply_revision=apply_revision+?17,apply_status=CASE WHEN ?17 THEN 'checking' ELSE apply_status END,updated_at=?9,public_domain_id=?12,lan_redirect_enabled=?13,origin_protocol=?14,service_mode=?15,http_redirect_enabled=?16 WHERE id=?10 AND tenant_id=?11 AND deleted_at IS NULL",params![input.device_id,input.name.trim(),input.protocol,input.local_address.trim(),input.local_port,input.public_port,input.hostname,input.enabled.unwrap_or(true),unix_now(),id,session.tenant_id,input.public_domain_id,input.lan_redirect_enabled.unwrap_or(false),input.origin_protocol,input.service_mode,input.http_redirect_enabled.unwrap_or(false),runtime_changed]).map_err(db_error)?;
+        nodes::services::save(&db, &id, &input)?;
         https_ports::save(&db, &id, &input)?;
         db.execute(
             "UPDATE tunnels SET ipv6_direct_enabled=?2 WHERE id=?1",
@@ -757,11 +837,13 @@ async fn update_tunnel(
         accounts::audit(&db, &session, "service_updated", "service", &id)?;
         db.commit().map_err(db_error)?;
     }
-    reverse_proxy::changed(
-        &state,
-        input.service_mode.as_deref() != Some(reverse_proxy::MODE),
-    )
-    .await?;
+    if runtime_changed {
+        reverse_proxy::changed(
+            &state,
+            input.service_mode.as_deref() != Some(reverse_proxy::MODE),
+        )
+        .await?;
+    }
     read_tunnel(&state, &session.tenant_id, &id, &headers).map(Json)
 }
 async fn delete_tunnel(
@@ -792,11 +874,17 @@ fn read_tunnel(
     headers: &HeaderMap,
 ) -> Result<Tunnel, ApiError> {
     let db = state.db.lock().map_err(|_| db_error("数据库锁不可用"))?;
-    query_tunnels(&db, tenant, Some(id), headers)
-        .map_err(db_error)?
-        .into_iter()
-        .next()
-        .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "服务不存在"))
+    query_tunnels(
+        &db,
+        tenant,
+        Some(id),
+        headers,
+        state.config.caddy.http_port(),
+    )
+    .map_err(db_error)?
+    .into_iter()
+    .next()
+    .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "服务不存在"))
 }
 async fn enable_tunnel(
     State(state): State<AppState>,
@@ -820,18 +908,20 @@ async fn set_tunnel_enabled(
 ) -> Result<Json<Tunnel>, ApiError> {
     let session = require_write(&state, &headers)?;
     let is_proxy;
+    let changed;
     {
         let connection = state.db.lock().map_err(|_| db_error("数据库锁不可用"))?;
         let connection = connection.unchecked_transaction().map_err(db_error)?;
         is_proxy = reverse_proxy::existing(&connection, &session, &id)?;
-        let changed = connection.execute("UPDATE tunnels SET enabled=?1,apply_status=CASE WHEN ?1=1 THEN 'checking' ELSE 'disabled' END,apply_revision=apply_revision+1,updated_at=?2 WHERE id=?3 AND tenant_id=?4 AND deleted_at IS NULL",params![enabled,unix_now(),id,session.tenant_id]).map_err(db_error)?;
-        if changed == 0 {
-            return Err(ApiError::new(StatusCode::NOT_FOUND, "服务不存在"));
+        changed = connection.execute("UPDATE tunnels SET enabled=?1,apply_status=CASE WHEN ?1=1 THEN 'checking' ELSE 'disabled' END,apply_revision=apply_revision+1,updated_at=?2 WHERE id=?3 AND tenant_id=?4 AND deleted_at IS NULL AND enabled!=?1",params![enabled,unix_now(),id,session.tenant_id]).map_err(db_error)? > 0;
+        if changed {
+            accounts::audit(&connection, &session, "service_toggled", "service", &id)?;
         }
-        accounts::audit(&connection, &session, "service_toggled", "service", &id)?;
         connection.commit().map_err(db_error)?;
     }
-    reverse_proxy::changed(&state, !is_proxy).await?;
+    if changed {
+        reverse_proxy::changed(&state, !is_proxy).await?;
+    }
     read_tunnel(&state, &session.tenant_id, &id, &headers).map(Json)
 }
 
@@ -862,26 +952,37 @@ async fn batch_set_tunnels_enabled(
 ) -> Result<Json<Vec<Tunnel>>, ApiError> {
     let session = require_write(&state, &headers)?;
     let mut has_tunnels = false;
+    let mut any_changed = false;
     {
         let db = state.db.lock().map_err(|_| db_error("数据库锁不可用"))?;
         let tx = db.unchecked_transaction().map_err(db_error)?;
         for id in &input.tunnel_ids {
-            has_tunnels |= !reverse_proxy::existing(&tx, &session, id)?;
-        }
-        for id in &input.tunnel_ids {
-            tx.execute("UPDATE tunnels SET enabled=?1,apply_status=CASE WHEN ?1=1 THEN 'checking' ELSE 'disabled' END,apply_revision=apply_revision+1,updated_at=?2 WHERE id=?3 AND tenant_id=?4 AND deleted_at IS NULL", params![enabled,unix_now(),id,session.tenant_id]).map_err(db_error)?;
-            accounts::audit(&tx, &session, "service_toggled", "service", id)?;
+            let is_proxy = reverse_proxy::existing(&tx, &session, id)?;
+            let changed = tx.execute("UPDATE tunnels SET enabled=?1,apply_status=CASE WHEN ?1=1 THEN 'checking' ELSE 'disabled' END,apply_revision=apply_revision+1,updated_at=?2 WHERE id=?3 AND tenant_id=?4 AND deleted_at IS NULL AND enabled!=?1", params![enabled,unix_now(),id,session.tenant_id]).map_err(db_error)? > 0;
+            if changed {
+                any_changed = true;
+                has_tunnels |= !is_proxy;
+                accounts::audit(&tx, &session, "service_toggled", "service", id)?;
+            }
         }
         tx.commit().map_err(db_error)?;
     }
-    reverse_proxy::changed(&state, has_tunnels).await?;
+    if any_changed {
+        reverse_proxy::changed(&state, has_tunnels).await?;
+    }
     let db = state.db.lock().map_err(|_| db_error("数据库锁不可用"))?;
     Ok(Json(
-        query_tunnels(&db, &session.tenant_id, None, &headers)
-            .map_err(db_error)?
-            .into_iter()
-            .filter(|item| input.tunnel_ids.contains(&item.id))
-            .collect(),
+        query_tunnels(
+            &db,
+            &session.tenant_id,
+            None,
+            &headers,
+            state.config.caddy.http_port(),
+        )
+        .map_err(db_error)?
+        .into_iter()
+        .filter(|item| input.tunnel_ids.contains(&item.id))
+        .collect(),
     ))
 }
 async fn batch_delete_tunnels(
@@ -1064,7 +1165,7 @@ async fn delete_domain(
     server_settings::ensure_domain_unused(&tx, &id)?;
     if tx
         .query_row(
-            "SELECT EXISTS(SELECT 1 FROM direct_dns_records WHERE domain_id=?1 AND kind!='A')",
+            "SELECT EXISTS(SELECT 1 FROM direct_dns_records WHERE domain_id=?1 AND kind!='A') OR EXISTS(SELECT 1 FROM relay_dns_records WHERE domain_id=?1) OR EXISTS(SELECT 1 FROM relay_dns_originals WHERE domain_id=?1)",
             [&id],
             |r| r.get::<_, bool>(0),
         )
@@ -1131,6 +1232,7 @@ fn query_tunnels(
     tenant: &str,
     only: Option<&str>,
     headers: &HeaderMap,
+    http_port: u16,
 ) -> rusqlite::Result<Vec<Tunnel>> {
     // Host 仅用于当前响应的地址展示，不参与监听或身份校验；不猜测 127.0.0.1 为公网地址。
     let authority = headers
@@ -1146,7 +1248,9 @@ fn query_tunnels(
             let protocol: String = row.get(5)?;
             let public_domain: Option<String> = row.get(16)?;
             let https_port: u16 = row.get(23)?;
-            let public_address = if nexo_tunnel::udp::is_port(&protocol) {
+            let public_address = if protocol=="tcp" && hostname.is_some() && public_domain.is_some() {
+                port.map(|port|format!("{}.{}:{port}",hostname.as_deref().unwrap(),public_domain.as_deref().unwrap()))
+            } else if nexo_tunnel::udp::is_port(&protocol) {
                 port.zip(authority.as_ref())
                     .map(|(port, authority)| format!("{}:{port}", authority.host()))
             } else {
@@ -1154,10 +1258,20 @@ fn query_tunnels(
                     .as_ref()
                     .zip(public_domain.as_ref())
                     .map(|(host, domain)| {
-                        https_ports::url(&protocol, &format!("{host}.{domain}"), https_port)
+                        if protocol == "http" && http_port != 80 {
+                            format!("http://{host}.{domain}:{http_port}")
+                        } else {
+                            https_ports::url(&protocol, &format!("{host}.{domain}"), https_port)
+                        }
                     })
             };
             Ok(Tunnel {
+                node_group_id:connection.query_row("SELECT node_group_id FROM tunnels WHERE id=?1",[row.get::<_,String>(0)?],|r|r.get(0))?,
+                preferred_node_id:connection.query_row("SELECT preferred_node_id FROM tunnels WHERE id=?1",[row.get::<_,String>(0)?],|r|r.get(0))?,
+                node_selection:connection.query_row("SELECT node_id,reason,selected_at FROM relay_selection WHERE service_id=?1",[row.get::<_,String>(0)?],|r|Ok(serde_json::json!({"node_id":r.get::<_,String>(0)?,"reason":r.get::<_,String>(1)?,"selected_at":r.get::<_,i64>(2)?}))).optional()?.unwrap_or(serde_json::Value::Null),
+                node_ids: nodes::services::ids(connection,&row.get::<_,String>(0)?)?,
+                distribution_mode: connection.query_row("SELECT distribution_mode FROM tunnels WHERE id=?1",[row.get::<_,String>(0)?],|r|r.get(0))?,
+                node_statuses: nodes::services::statuses(connection,&row.get::<_,String>(0)?)?,
                 icon_id: row.get(25)?,
                 protocol_statuses: serde_json::from_str(&row.get::<_, String>(21)?)
                     .unwrap_or_default(),
@@ -1229,16 +1343,29 @@ fn prepare_tunnel(
             ));
         }
     }
+    let node_scope = serde_json::to_string(
+        &input
+            .node_ids
+            .clone()
+            .unwrap_or_else(|| vec!["local".into()]),
+    )
+    .map_err(db_error)?;
     if nexo_tunnel::udp::is_port(&input.protocol) {
-        input.hostname = None;
-        input.public_domain_id = None;
+        if input
+            .node_ids
+            .as_ref()
+            .is_none_or(|nodes| nodes.iter().all(|n| n == "local"))
+        {
+            input.hostname = None;
+            input.public_domain_id = None;
+        }
         if input.public_port.is_none() {
             input.public_port = db.query_row("SELECT public_port FROM tunnels WHERE id=?1 AND tenant_id=?2 AND protocol IN ('tcp','udp','tcp_udp')",params![id,tenant],|r|r.get::<_,Option<u16>>(0)).optional().map_err(db_error)?.flatten();
         }
         if input.public_port.is_none() {
-            let mut used = db.prepare("SELECT public_port FROM tunnels WHERE public_port IS NOT NULL AND deleted_at IS NULL AND id!=?2 AND (protocol=?1 OR protocol='tcp_udp' OR ?1='tcp_udp')").map_err(db_error)?.query_map(params![input.protocol,id], |r|r.get::<_,u16>(0)).map_err(db_error)?.collect::<rusqlite::Result<std::collections::HashSet<_>>>().map_err(db_error)?;
+            let mut used = db.prepare("SELECT public_port FROM tunnels WHERE public_port IS NOT NULL AND deleted_at IS NULL AND id!=?2 AND (protocol=?1 OR protocol='tcp_udp' OR ?1='tcp_udp') AND (EXISTS(SELECT 1 FROM service_nodes sn WHERE sn.service_id=tunnels.id AND sn.node_id IN (SELECT value FROM json_each(?4))) OR (NOT EXISTS(SELECT 1 FROM service_nodes sn WHERE sn.service_id=tunnels.id) AND EXISTS(SELECT 1 FROM json_each(?4) WHERE value='local')))").map_err(db_error)?.query_map(params![input.protocol,id,0,node_scope], |r|r.get::<_,u16>(0)).map_err(db_error)?.collect::<rusqlite::Result<std::collections::HashSet<_>>>().map_err(db_error)?;
             if input.protocol != "udp" {
-                used.extend(db.prepare("SELECT https_port FROM tunnels WHERE protocol='https' AND deleted_at IS NULL AND id!=?1").map_err(db_error)?.query_map([id],|r|r.get::<_,u16>(0)).map_err(db_error)?.collect::<rusqlite::Result<Vec<_>>>().map_err(db_error)?);
+                used.extend(db.prepare("SELECT https_port FROM tunnels WHERE protocol='https' AND deleted_at IS NULL AND id!=?1 AND (EXISTS(SELECT 1 FROM service_nodes sn WHERE sn.service_id=tunnels.id AND sn.node_id IN (SELECT value FROM json_each(?4))) OR (NOT EXISTS(SELECT 1 FROM service_nodes sn WHERE sn.service_id=tunnels.id) AND EXISTS(SELECT 1 FROM json_each(?4) WHERE value='local')))").map_err(db_error)?.query_map(params![id,0,0,node_scope],|r|r.get::<_,u16>(0)).map_err(db_error)?.collect::<rusqlite::Result<Vec<_>>>().map_err(db_error)?);
             }
             input.public_port = (20000..=29999).find(|port| !used.contains(port));
         }
@@ -1248,15 +1375,23 @@ fn prepare_tunnel(
                 "没有可用公网端口，请指定有效端口",
             ));
         }
-        let occupied: bool = db.query_row("SELECT EXISTS(SELECT 1 FROM tunnels WHERE public_port=?1 AND id!=?2 AND deleted_at IS NULL AND (protocol=?3 OR protocol='tcp_udp' OR ?3='tcp_udp'))",params![input.public_port,id,input.protocol],|r|r.get(0)).map_err(db_error)?;
+        let occupied: bool = db.query_row("SELECT EXISTS(SELECT 1 FROM tunnels WHERE public_port=?1 AND id!=?2 AND deleted_at IS NULL AND (protocol=?3 OR protocol='tcp_udp' OR ?3='tcp_udp') AND (EXISTS(SELECT 1 FROM service_nodes sn WHERE sn.service_id=tunnels.id AND sn.node_id IN (SELECT value FROM json_each(?4))) OR (NOT EXISTS(SELECT 1 FROM service_nodes sn WHERE sn.service_id=tunnels.id) AND EXISTS(SELECT 1 FROM json_each(?4) WHERE value='local'))))",params![input.public_port,id,input.protocol,node_scope],|r|r.get(0)).map_err(db_error)?;
         if occupied {
             return Err(ApiError::new(
                 StatusCode::CONFLICT,
                 "公网端口已被其他服务使用",
             ));
         }
-    } else {
-        input.public_port = None;
+    }
+    if !nexo_tunnel::udp::is_port(&input.protocol)
+        || input
+            .node_ids
+            .as_ref()
+            .is_some_and(|nodes| nodes.iter().any(|n| n != "local"))
+    {
+        if !nexo_tunnel::udp::is_port(&input.protocol) {
+            input.public_port = None;
+        }
         let (domain, https): (String, bool) = db
             .query_row(
                 "SELECT domain,https_enabled FROM public_domains WHERE id=?1 AND tenant_id=?2",
@@ -1381,7 +1516,7 @@ mod tests {
             ('tcp','default','tcp','tcp','127.0.0.1',1234,20000,NULL,NULL,0,0),
             ('web','default','web','https','127.0.0.1',8080,NULL,'app','domain',0,0);").unwrap();
         headers.insert("host", "[2001:db8::1]:8280".parse().unwrap());
-        let tunnels = query_tunnels(&db, "default", None, &headers).unwrap();
+        let tunnels = query_tunnels(&db, "default", None, &headers, 80).unwrap();
         assert_eq!(
             tunnels
                 .iter()
@@ -1508,6 +1643,206 @@ mod tests {
         headers.insert("cookie", "nexo_session=domain-test".parse().unwrap());
         headers.insert("x-nexo-csrf", "csrf-test".parse().unwrap());
         (state, headers)
+    }
+
+    #[tokio::test]
+    async fn static_gzip_negotiation_varies_cache_and_keeps_api_uncached() {
+        use std::future::IntoFuture;
+        let root = std::env::temp_dir().join(format!("nexo-static-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("entry.js"), b"plain").unwrap();
+        // ServeDir 只负责编码协商，不解压；完整 gzip 内容另由浏览器验收核对。
+        fs::write(root.join("entry.js.gz"), b"compressed-fixture").unwrap();
+        fs::write(root.join("fallback.js"), b"fallback").unwrap();
+        let (mut state, _) = domain_fixture();
+        Arc::make_mut(&mut state.config).web_dir = root.clone();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(axum::serve(listener, router(state)).into_future());
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        for (encoding, body, compressed) in [
+            ("identity", "plain", false),
+            ("gzip", "compressed-fixture", true),
+            ("gzip;q=0", "plain", false),
+        ] {
+            let response = client
+                .get(format!("{url}/entry.js"))
+                .header("Accept-Encoding", encoding)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.headers()["vary"], "Accept-Encoding");
+            assert_eq!(
+                response.headers().get("content-encoding").is_some(),
+                compressed
+            );
+            assert_eq!(response.text().await.unwrap(), body);
+        }
+        let fallback = client
+            .get(format!("{url}/fallback.js"))
+            .header("Accept-Encoding", "gzip")
+            .send()
+            .await
+            .unwrap();
+        assert!(fallback.headers().get("content-encoding").is_none());
+        assert_eq!(fallback.text().await.unwrap(), "fallback");
+        let api = client
+            .get(format!("{url}/api/v1/auth/status"))
+            .send()
+            .await
+            .unwrap();
+        assert!(api.headers()["cache-control"]
+            .to_str()
+            .unwrap()
+            .contains("no-store"));
+        server.abort();
+        let _ = server.await;
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn metadata_and_unchanged_updates_keep_the_applied_revision() {
+        for mode in ["tunnel", "reverse_proxy"] {
+            let (state, headers) = domain_fixture();
+            state.db.lock().unwrap().execute_batch("INSERT INTO public_domains(id,tenant_id,domain,https_enabled,created_at,updated_at) VALUES('domain','default','example.com',0,0,0); INSERT INTO domain_settings(domain_id,verification_token,certificate_mode,verified) VALUES('domain','proof','http01',1); INSERT INTO devices(id,tenant_id,name,created_at,updated_at) VALUES('agent','default','Agent',0,0);").unwrap();
+            let make_input = |name: &str, icon: Option<&str>, port: u16| {
+                serde_json::from_value::<TunnelInput>(serde_json::json!({
+                    "service_mode": mode, "device_id": if mode == "tunnel" { Some("agent") } else { None },
+                    "name": name, "icon_id": icon, "protocol": "http", "origin_protocol": "http",
+                    "local_address": "127.0.0.1", "local_port": port, "hostname": "media", "public_domain_id": "domain"
+                })).unwrap()
+            };
+            let Json(created) = create_tunnel(
+                State(state.clone()),
+                headers.clone(),
+                Json(make_input("媒体", None, 8096)),
+            )
+            .await
+            .unwrap();
+            state
+                .db
+                .lock()
+                .unwrap()
+                .execute(
+                    "UPDATE tunnels SET apply_status='failed',apply_error='原有错误' WHERE id=?1",
+                    [&created.id],
+                )
+                .unwrap();
+
+            let Json(renamed) = update_tunnel(
+                State(state.clone()),
+                headers.clone(),
+                Path(created.id.clone()),
+                Json(make_input("新名称", Some("border-radius/emby-1.png"), 8096)),
+            )
+            .await
+            .unwrap();
+            assert_eq!(renamed.name, "新名称");
+            assert_eq!(renamed.icon_id.as_deref(), Some("border-radius/emby-1.png"));
+            assert_eq!(renamed.apply_revision, created.apply_revision);
+            assert_eq!(renamed.apply_status, "failed");
+            assert_eq!(renamed.apply_error.as_deref(), Some("原有错误"));
+
+            let Json(unchanged) = update_tunnel(
+                State(state.clone()),
+                headers.clone(),
+                Path(created.id.clone()),
+                Json(make_input("新名称", Some("border-radius/emby-1.png"), 8096)),
+            )
+            .await
+            .unwrap();
+            assert_eq!(unchanged.apply_revision, created.apply_revision);
+            assert_eq!(unchanged.apply_status, "failed");
+
+            let Json(reconfigured) = update_tunnel(
+                State(state.clone()),
+                headers,
+                Path(created.id),
+                Json(make_input("新名称", Some("border-radius/emby-1.png"), 8097)),
+            )
+            .await
+            .unwrap();
+            assert_eq!(reconfigured.apply_revision, created.apply_revision + 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn offline_direct_agent_does_not_block_icon_update() {
+        let (state, headers) = domain_fixture();
+        state.db.lock().unwrap().execute_batch("INSERT INTO public_domains(id,tenant_id,domain,https_enabled,created_at,updated_at) VALUES('domain','default','example.com',0,0,0); INSERT INTO domain_settings(domain_id,verification_token,certificate_mode,verified) VALUES('domain','proof','http01',1); INSERT INTO devices(id,tenant_id,name,created_at,updated_at) VALUES('agent','default','Agent',0,0);").unwrap();
+        let input = |icon: Option<&str>, protocol: &str| {
+            serde_json::from_value::<TunnelInput>(serde_json::json!({"service_mode":"tunnel","device_id":"agent","name":"媒体","icon_id":icon,"protocol":protocol,"origin_protocol":"http","local_address":"127.0.0.1","local_port":8096,"hostname":"media","public_domain_id":"domain"})).unwrap()
+        };
+        let Json(created) = create_tunnel(
+            State(state.clone()),
+            headers.clone(),
+            Json(input(None, "http")),
+        )
+        .await
+        .unwrap();
+        state
+            .db
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE tunnels SET protocol='https',ipv6_direct_enabled=1 WHERE id=?1",
+                [&created.id],
+            )
+            .unwrap();
+        state
+            .db
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE public_domains SET https_enabled=1 WHERE id='domain'",
+                [],
+            )
+            .unwrap();
+        let mut changed = input(Some("border-radius/emby-1.png"), "https");
+        changed.ipv6_direct_enabled = Some(true);
+        let Json(updated) = update_tunnel(State(state), headers, Path(created.id), Json(changed))
+            .await
+            .unwrap();
+        assert_eq!(updated.icon_id.as_deref(), Some("border-radius/emby-1.png"));
+        assert_eq!(updated.apply_revision, created.apply_revision);
+    }
+
+    #[tokio::test]
+    async fn repeated_enable_and_batch_disable_do_not_reapply_services() {
+        let (state, headers) = domain_fixture();
+        state.db.lock().unwrap().execute_batch("INSERT INTO public_domains(id,tenant_id,domain,https_enabled,created_at,updated_at) VALUES('domain','default','example.com',0,0,0); INSERT INTO domain_settings(domain_id,verification_token,certificate_mode,verified) VALUES('domain','proof','http01',1);").unwrap();
+        let input = || {
+            serde_json::from_value::<TunnelInput>(serde_json::json!({"service_mode":"reverse_proxy","name":"媒体","protocol":"http","origin_protocol":"http","local_address":"127.0.0.1","local_port":8096,"hostname":"media","public_domain_id":"domain"})).unwrap()
+        };
+        let Json(created) = create_tunnel(State(state.clone()), headers.clone(), Json(input()))
+            .await
+            .unwrap();
+        let Json(enabled) = enable_tunnel(
+            State(state.clone()),
+            headers.clone(),
+            Path(created.id.clone()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(enabled.apply_revision, created.apply_revision);
+        let Json(disabled) = disable_tunnel(
+            State(state.clone()),
+            headers.clone(),
+            Path(created.id.clone()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(disabled.apply_revision, created.apply_revision + 1);
+        let Json(items) = batch_disable_tunnels(
+            State(state.clone()),
+            headers,
+            Json(BatchDelete {
+                tunnel_ids: vec![created.id],
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(items[0].apply_revision, disabled.apply_revision);
     }
 
     pub(super) async fn add_test_domain(

@@ -1,4 +1,4 @@
-import { Ellipsis, Plus, Search } from "lucide-react";
+import { Ellipsis, Plus, Search } from "./icons";
 import { useEffect, useId, useRef, useState } from "react";
 import type { FormEvent, ReactNode } from "react";
 import { Brand, PasswordInput, Empty, Confirm, CopyButton, Loading, Modal, Notice, PageHeader, UserAvatar, errorText, rememberInteraction, request, useResource } from "./ui";

@@ -1,7 +1,7 @@
 import { expect, test } from "@playwright/test";
 import { installApiMocks } from "./api-mocks";
 
-test("桌面添加服务属于标题区，设备识别码可完整复制", async ({ page }, info) => {
+test("桌面添加服务属于工具栏，设备识别码可完整复制", async ({ page }, info) => {
   test.skip(info.project.name !== "desktop-dark", "桌面断点与主题集中验收");
   await installApiMocks(page);
   for (const colorScheme of ["light", "dark"] as const) {
@@ -12,11 +12,11 @@ test("桌面添加服务属于标题区，设备识别码可完整复制", async
       const button = page.getByRole("button", { name: "创建服务", exact: true });
       await expect(button).toBeInViewport();
       expect(await button.evaluate(e => getComputedStyle(e).position)).toBe("static");
-      const header = await page.locator(".page-slot:not([hidden]) .page-header").boundingBox();
+      const toolbar = await page.locator(".page-slot:not([hidden]) .page-toolbar-actions").boundingBox();
       const box = await button.boundingBox();
       expect(box!.height).toBeGreaterThanOrEqual(44);
-      expect(box!.y).toBeGreaterThanOrEqual(header!.y);
-      expect(box!.y + box!.height).toBeLessThanOrEqual(header!.y + header!.height);
+      expect(box!.y).toBeGreaterThanOrEqual(toolbar!.y);
+      expect(box!.y + box!.height).toBeLessThanOrEqual(toolbar!.y + toolbar!.height);
       const workspace = await page.locator(".page-slot:not([hidden])").boundingBox();
       if (page.viewportSize()!.height < 600) expect(workspace!.y + workspace!.height).toBeGreaterThanOrEqual(page.viewportSize()!.height - 24);
       else expect(workspace!.y + workspace!.height).toBeCloseTo(page.viewportSize()!.height - 24, 0);

@@ -1,0 +1,178 @@
+//! 服务绑定以工作空间授权为准，表单传入的节点列表不构成权限。
+use super::*;
+use nexo_protocol::nodes::AgentNode;
+pub fn ids(db: &Connection, id: &str) -> rusqlite::Result<Vec<String>> {
+    db.prepare("SELECT node_id FROM service_nodes WHERE service_id=?1 ORDER BY node_id")?
+        .query_map([id], |r| r.get(0))?
+        .collect()
+}
+pub fn prepare(
+    db: &Connection,
+    tenant: &str,
+    id: &str,
+    input: &mut TunnelInput,
+) -> Result<(), ApiError> {
+    let group = match input.node_group_id.as_deref() {
+        Some("") => None,
+        Some(value) => Some(value.to_owned()),
+        None => db
+            .query_row("SELECT node_group_id FROM tunnels WHERE id=?1", [id], |r| {
+                r.get::<_, Option<String>>(0)
+            })
+            .optional()
+            .map_err(db_error)?
+            .flatten(),
+    };
+    if let Some(group) = &group {
+        let allowed=db.query_row("SELECT EXISTS(SELECT 1 FROM relay_group_grants WHERE group_id=?1 AND tenant_id=?2)",params![group,tenant],|r|r.get::<_,bool>(0)).map_err(db_error)?;
+        if !allowed {
+            return Err(invalid("节点组不存在或未分配给当前工作空间"));
+        }
+        input.node_ids = Some(super::groups::members(db, group).map_err(db_error)?);
+    }
+    input.node_group_id = group;
+    let existing = ids(db, id).map_err(db_error)?;
+    let nodes = input.node_ids.get_or_insert_with(|| {
+        if existing.is_empty() {
+            vec!["local".into()]
+        } else {
+            existing
+        }
+    });
+    let previous: Option<String> = db
+        .query_row(
+            "SELECT distribution_mode FROM tunnels WHERE id=?1",
+            [id],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(db_error)?;
+    let mode = input.distribution_mode.get_or_insert_with(|| {
+        if let Some(previous) = previous {
+            return previous;
+        }
+        if nodes.len() > 1 {
+            "dns".into()
+        } else {
+            "single".into()
+        }
+    });
+    if !matches!(mode.as_str(), "single" | "dns" | "latency" | "manual")
+        || nodes.is_empty()
+        || nodes.len() > 16
+        || nodes.iter().collect::<std::collections::HashSet<_>>().len() != nodes.len()
+        || (matches!(mode.as_str(), "dns" | "latency" | "manual") && nodes.len() < 2)
+        || (*mode == "single" && nodes.len() != 1)
+    {
+        return Err(invalid(
+            "单节点需选择一个节点，多节点需选择 2–16 个不同节点",
+        ));
+    }
+    let remote = nodes.iter().any(|n| n != "local");
+    if (remote || *mode == "dns")
+        && (!matches!(input.protocol.as_str(), "http" | "https" | "tcp")
+            || input.service_mode.as_deref() == Some("reverse_proxy"))
+    {
+        return Err(invalid("多 VPS 仅支持 HTTP、HTTPS、TCP 内网穿透"));
+    }
+    for node in nodes.iter() {
+        let allowed=db.query_row("SELECT EXISTS(SELECT 1 FROM relay_nodes n WHERE n.id=?1 AND n.approved=1 AND n.enabled=1 AND n.removed_at IS NULL AND (n.id='local' OR EXISTS(SELECT 1 FROM relay_node_authorizations g WHERE g.node_id=n.id AND g.tenant_id=?2)))",params![node,tenant],|r|r.get::<_,bool>(0)).map_err(db_error)?;
+        if !allowed {
+            return Err(invalid("节点未审批、已停用或未分配给当前工作空间"));
+        }
+    }
+    if remote {
+        let capable=db.query_row("SELECT EXISTS(SELECT 1 FROM devices WHERE id=?1 AND tenant_id=?2 AND node_capable=1)",params![input.device_id,tenant],|r|r.get::<_,bool>(0)).map_err(db_error)?;
+        if !capable {
+            return Err(invalid("请先连接支持多节点的新版本 Agent"));
+        }
+        let domain = input
+            .public_domain_id
+            .as_deref()
+            .ok_or_else(|| invalid("VPS 节点服务需要配置受管域名"))?;
+        let ready=db.query_row("SELECT EXISTS(SELECT 1 FROM public_domains p JOIN domain_settings s ON s.domain_id=p.id WHERE p.id=?1 AND p.tenant_id=?2 AND s.verified=1 AND s.credential_file IS NOT NULL AND (?3!='https' OR s.certificate_mode='cloudflare_dns'))",params![domain,tenant,input.protocol],|r|r.get::<_,bool>(0)).map_err(db_error)?;
+        if !ready {
+            return Err(invalid("请先验证域名并配置 DNS 凭据，以便自动切换"));
+        }
+    }
+    if *mode == "manual" {
+        let previous: Option<String> = db
+            .query_row(
+                "SELECT preferred_node_id FROM tunnels WHERE id=?1",
+                [id],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(db_error)?
+            .flatten();
+        let preferred = input
+            .preferred_node_id
+            .get_or_insert_with(|| previous.unwrap_or_else(|| nodes[0].clone()));
+        if !nodes.contains(preferred) {
+            return Err(invalid("首选节点必须在候选节点中"));
+        }
+    } else {
+        input.preferred_node_id = None;
+    }
+    nodes.sort();
+    Ok(())
+}
+pub fn save(db: &Connection, id: &str, input: &TunnelInput) -> Result<(), ApiError> {
+    db.execute("DELETE FROM service_nodes WHERE service_id=?1", [id])
+        .map_err(db_error)?;
+    for node in input
+        .node_ids
+        .as_ref()
+        .ok_or_else(|| invalid("缺少节点绑定"))?
+    {
+        db.execute("INSERT INTO service_nodes VALUES(?1,?2)", params![id, node])
+            .map_err(db_error)?;
+    }
+    db.execute(
+        "UPDATE tunnels SET distribution_mode=?2,preferred_node_id=?3,node_group_id=?4 WHERE id=?1",
+        params![
+            id,
+            input.distribution_mode,
+            input.preferred_node_id,
+            input.node_group_id
+        ],
+    )
+    .map_err(db_error)?;
+    Ok(())
+}
+pub fn agent_nodes(state: &AppState, device: &str) -> Result<Vec<AgentNode>> {
+    let db = state
+        .db
+        .lock()
+        .map_err(|_| anyhow::anyhow!("数据库锁不可用"))?;
+    let mut q=db.prepare("SELECT n.id,n.public_ipv4,n.control_port,t.id FROM relay_nodes n JOIN authorized_service_nodes s ON s.node_id=n.id JOIN tunnels t ON t.id=s.service_id JOIN relay_node_authorizations g ON g.node_id=n.id AND g.tenant_id=t.tenant_id JOIN tenants w ON w.id=t.tenant_id WHERE t.device_id=?1 AND t.enabled=1 AND t.deleted_at IS NULL AND w.enabled=1 AND n.enabled=1 AND n.approved=1 AND n.removed_at IS NULL AND n.id!='local' ORDER BY n.id,t.id")?;
+    let mut result: Vec<AgentNode> = Vec::new();
+    for row in q.query_map([device], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, u16>(2)?,
+            r.get::<_, String>(3)?,
+        ))
+    })? {
+        let (id, ip, port, service) = row?;
+        if let Some(node) = result.iter_mut().find(|n| n.id == id) {
+            node.service_ids.push(service);
+        } else {
+            result.push(AgentNode {
+                id: id.clone(),
+                endpoint: TunnelDataEndpoint {
+                    address: format!("{ip}:{port}"),
+                    server_name: id,
+                },
+                service_ids: vec![service],
+            });
+        }
+    }
+    Ok(result)
+}
+pub fn statuses(db: &Connection, id: &str) -> rusqlite::Result<Value> {
+    let mut q=db.prepare("SELECT s.node_id,COALESCE(h.healthy=1 AND h.revision=t.apply_revision AND h.checked_at>?2 AND n.approved=1 AND n.enabled=1 AND n.maintenance=0 AND n.removed_at IS NULL AND (n.id='local' OR n.last_seen>?2) AND EXISTS(SELECT 1 FROM authorized_service_nodes a WHERE a.service_id=s.service_id AND a.node_id=s.node_id),0),h.error,h.checked_at FROM service_nodes s JOIN tunnels t ON t.id=s.service_id JOIN relay_nodes n ON n.id=s.node_id LEFT JOIN relay_service_health h ON h.node_id=s.node_id AND h.service_id=s.service_id WHERE s.service_id=?1 ORDER BY s.node_id")?;
+    let rows=q.query_map(params![id,unix_now()-45],|r|Ok(json!({"node_id":r.get::<_,String>(0)?,"healthy":r.get::<_,Option<bool>>(1)?.unwrap_or(false),"error":r.get::<_,Option<String>>(2)?,"checked_at":r.get::<_,Option<i64>>(3)?})))?.collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(json!(rows))
+}

@@ -61,10 +61,10 @@ button,a { transition:background-color 160ms ease,color 160ms ease,box-shadow 16
 .page-actions { display:flex; gap:8px; }
 .page-back { margin-left:-8px; }
 /* 四项悬浮玻璃导航不另铺底座；安全区和正文留白保证最后一项可以完整滚出。 */
-.bottom-nav { position:fixed; z-index:20; inset:auto auto var(--nav-gap) 50%; transform:translateX(-50%); width:min(480px,calc(100% - 32px - env(safe-area-inset-left) - env(safe-area-inset-right))); min-height:64px; display:grid; grid-template-columns:repeat(5,minmax(0,1fr)); gap:4px; padding:5px; border:1px solid var(--glass-edge); border-radius:999px; background:var(--glass); box-shadow:var(--glass-shadow); -webkit-backdrop-filter:blur(28px) saturate(180%); backdrop-filter:blur(28px) saturate(180%); }
-.bottom-nav a { display:flex; flex-direction:column; align-items:center; justify-content:center; gap:3px; min-height:52px; min-width:44px; padding:3px 0; font-size:.75rem; font-weight:600; color:var(--text); border-radius:999px; }
-.bottom-nav a.active { color:var(--primary); background:var(--nav-selected); box-shadow:inset 0 1px 0 var(--glass-highlight),0 1px 3px #00000008; }
-.bottom-nav a:active { background:var(--surface-raised); transform:scale(.97); }
+.bottom-nav { position:fixed; z-index:20; inset:auto auto var(--nav-gap) 50%; transform:translateX(-50%); width:min(480px,calc(100% - 32px - env(safe-area-inset-left) - env(safe-area-inset-right))); min-height:64px; display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:4px; padding:5px; border:1px solid var(--glass-edge); border-radius:999px; background:var(--glass); box-shadow:var(--glass-shadow); -webkit-backdrop-filter:blur(28px) saturate(180%); backdrop-filter:blur(28px) saturate(180%); }
+.bottom-nav>a,.bottom-nav>button { border:0; background:transparent; display:flex; flex-direction:column; align-items:center; justify-content:center; gap:3px; min-height:52px; min-width:44px; padding:3px 0; font-size:.75rem; font-weight:600; color:var(--text); border-radius:999px; }
+.bottom-nav>a.active,.bottom-nav>button.active { color:var(--primary); background:var(--nav-selected); box-shadow:inset 0 1px 0 var(--glass-highlight),0 1px 3px #00000008; }
+.bottom-nav>a:active,.bottom-nav>button:active { background:var(--surface-raised); transform:scale(.97); }
 /* 服务创建使用轻量玻璃圆钮，保留独立触控热区，减少对服务内容的遮挡。 */
 .page-actions .icon-button,.page-back { border:1px solid var(--glass-edge); background:var(--glass); box-shadow:0 2px 8px #00000008,inset 0 1px 0 var(--glass-highlight); -webkit-backdrop-filter:blur(20px) saturate(160%); backdrop-filter:blur(20px) saturate(160%); }
 .panel { border:1px solid color-mix(in srgb,var(--border) 45%,transparent); border-radius:24px; background:var(--surface); box-shadow:var(--card-shadow); overflow:hidden; margin-bottom:16px; min-width:0; }
@@ -445,7 +445,7 @@ dd>code { display:block; margin-bottom:10px; user-select:text; font-size:.9375re
 }
 @media (hover:hover) { .row-link:hover,.agent-row:hover { background:var(--surface-raised); } .text-button:hover,.icon-button:hover { background:var(--surface-raised); } }
 @media (min-width:901px) and (hover:hover) { .sidebar nav a:hover { background:var(--surface-raised); color:var(--text); } .sidebar nav a.active:hover { background:color-mix(in srgb,var(--primary) 18%,var(--surface)); color:var(--primary); } .sidebar nav a:active,.sidebar nav a.active:active { background:color-mix(in srgb,var(--primary) 24%,var(--surface)); } }
-@media (prefers-reduced-motion:reduce) { *,*::before,*::after { animation:none !important; transition:none !important; scroll-behavior:auto !important; } button:active:not(:disabled),a.icon-button:active,.bottom-nav a:active { transform:none; } }
+@media (prefers-reduced-motion:reduce) { *,*::before,*::after { animation:none !important; transition:none !important; scroll-behavior:auto !important; } button:active:not(:disabled),a.icon-button:active,.bottom-nav>a:active,.bottom-nav>button:active { transform:none; } }
 /* 无模糊支持和辅助功能偏好均回退为实色，确保正文经过玻璃层时仍可读。 */
 @supports not ((backdrop-filter:blur(1px)) or (-webkit-backdrop-filter:blur(1px))) { .bottom-nav,.sidebar,.batch-actions,.modal,.page-actions .icon-button,.page-back { background:var(--surface); } }
 @media (prefers-reduced-transparency:reduce) { .page-header,.bottom-nav,.sidebar,.batch-actions,.modal,.page-actions .icon-button,.page-back { background:var(--surface); -webkit-backdrop-filter:none; backdrop-filter:none; } }
@@ -963,3 +963,14 @@ dd>code { display:block; margin-bottom:10px; user-select:text; font-size:.9375re
 .domain-detail .domain-heading { align-items:flex-start; }
 .domain-detail .domain-heading h2 { align-self:center; }
 .domain-dns-reminder { overflow-wrap:anywhere; }
+
+/* 更多面板靠近触发入口；低高度横屏允许内部滚动，安全区始终留在底栏下方。 */
+.mobile-more { position:fixed; inset:auto max(16px,env(safe-area-inset-right)) calc(var(--nav-gap) + 76px) auto; margin:0; width:min(320px,calc(100vw - 32px)); max-height:calc(100dvh - var(--nav-gap) - 100px); overflow:auto; padding:8px; border:1px solid var(--glass-edge); border-radius:22px; background:var(--sheet-material); color:var(--text); box-shadow:var(--glass-shadow); -webkit-backdrop-filter:blur(28px); backdrop-filter:blur(28px); }
+.mobile-more nav { display:grid; gap:2px; }
+.mobile-more a { min-height:50px; display:flex; align-items:center; gap:12px; padding:10px 12px; border-radius:14px; font-size:.9375rem; }
+.mobile-more a span { flex:1; }
+.mobile-more a>svg:last-child { color:var(--secondary); }
+.mobile-more a[aria-current=page] { background:var(--nav-selected); color:var(--primary); }
+.mobile-more a:hover { background:var(--surface-soft); }
+@media(min-width:901px) { .mobile-more { display:none; } }
+@media(prefers-reduced-transparency:reduce),(prefers-contrast:more) { .mobile-more { background:var(--surface); border-color:var(--border); -webkit-backdrop-filter:none; backdrop-filter:none; } }

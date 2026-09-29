@@ -73,7 +73,7 @@ pub async fn request(
     })
 }
 
-async fn account(state: &AppState) -> Result<Account> {
+pub(crate) async fn account(state: &AppState) -> Result<Account> {
     let mut cached = state.tunnel_runtime.direct.account.lock().await;
     if let Some(account) = cached.as_ref() {
         return Ok(account.clone());

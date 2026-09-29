@@ -18,6 +18,8 @@ use tokio_rustls::TlsConnector;
 use tokio_util::codec::{FramedRead, LinesCodec};
 mod certificate;
 mod direct;
+mod node_budget;
+mod nodes;
 #[cfg(test)]
 mod origin_tests;
 mod udp;
@@ -87,6 +89,7 @@ struct EnrollmentKey {
 }
 #[derive(Clone, PartialEq, Eq)]
 struct Desired {
+    nodes: Vec<nexo_protocol::nodes::AgentNode>,
     udp_endpoint: Option<TunnelDataEndpoint>,
     endpoint: TunnelDataEndpoint,
     tunnels: Vec<TunnelDesiredState>,
@@ -477,7 +480,7 @@ async fn run_control(
     diagnostics.send(
         &mut write,
         &AgentControlMessage::Hello {
-            capabilities: vec![nexo_protocol::direct::CAPABILITY.into()],
+            capabilities: vec![nexo_protocol::direct::CAPABILITY.into(),nexo_protocol::nodes::CAPABILITY.into()],
             device_id: device.clone(),
             agent_version: config.agent_version.clone(),
         },
@@ -492,42 +495,62 @@ async fn run_control(
         server_name: SERVER_NAME.into(),
     };
     let (desired, receiver) = watch::channel(Desired {
+        nodes: Vec::new(),
         udp_endpoint: None,
         endpoint: fallback.clone(),
         tunnels: Vec::new(),
     });
     let mut data_tasks = JoinSet::new();
+    let (budget_requests,mut budget_queue)=tokio::sync::mpsc::channel::<node_budget::Request>(64);
+    let (budget_reports,mut usage_queue)=tokio::sync::mpsc::unbounded_channel();
+    let budgets=node_budget::Client{requests:budget_requests,reports:budget_reports};
+    let mut budget_pending=std::collections::HashMap::new(); let mut budget_sequence=0u64;
     let (connectors, connector_updates) = watch::channel(connector);
     let mut probes = JoinSet::new();
     let mut heartbeat = tokio::time::interval(Duration::from_secs(15));
+    let mut target_checks = tokio::time::interval(Duration::from_secs(10));
     let deadline = tokio::time::sleep(Duration::from_secs(45));
     tokio::pin!(deadline);
     let mut accepted = false;
+    let mut last_heartbeat:Option<tokio::time::Instant>=None;
     let mut renewal_deadline: Option<i64> = None;
     loop {
         tokio::select! {
+            Some(report)=usage_queue.recv()=>{tokio::time::timeout_at(deadline.deadline(), diagnostics.send(&mut write,&report)).await.context("管理控制通道发送超时，停止转发")??;},
+            Some(request)=budget_queue.recv()=>{
+                for _ in 0..64 { let Ok(report)=usage_queue.try_recv() else {break;}; tokio::time::timeout_at(deadline.deadline(), diagnostics.send(&mut write,&report)).await.context("管理控制通道发送超时，停止转发")??; }
+                budget_pending.retain(|_,reply:&mut tokio::sync::oneshot::Sender<(String,u64)>|!reply.is_closed());
+                if request.reply.is_closed()||budget_pending.len()>=256{continue;}
+                budget_sequence=budget_sequence.wrapping_add(1);
+                tokio::time::timeout_at(deadline.deadline(), diagnostics.send(&mut write,&AgentControlMessage::NodeBudget{request_id:budget_sequence,node_id:request.node,service_id:request.service,revision:request.revision,bytes:request.bytes})).await.context("管理控制通道发送超时，停止转发")??;
+                budget_pending.insert(budget_sequence,request.reply);
+            },
             _ = &mut deadline => anyhow::bail!("Server 控制响应超时（45 秒）"),
+            _ = target_checks.tick(), if accepted && !desired.borrow().nodes.is_empty() && probes.is_empty() => {
+                probes.spawn(probe_tunnels(desired.borrow().tunnels.clone()));
+            },
             _ = heartbeat.tick(), if accepted => {
-                diagnostics.send(&mut write,&AgentControlMessage::Heartbeat { device_id: device.clone(),agent_version:config.agent_version.clone() }).await?;
+                last_heartbeat=Some(tokio::time::Instant::now());
+                tokio::time::timeout_at(deadline.deadline(), diagnostics.send(&mut write,&AgentControlMessage::Heartbeat { device_id: device.clone(),agent_version:config.agent_version.clone() })).await.context("管理控制通道发送超时，停止转发")??;
                 let now = certificate::now();
                 if renewal_deadline.is_some_and(|deadline| deadline <= now) {
                     renewal_deadline = None;
                     let report = certificate::failed(identity,identity_path,"等待续签响应超时",None);
-                    diagnostics.send(&mut write,&report).await?;
+                    tokio::time::timeout_at(deadline.deadline(), diagnostics.send(&mut write,&report)).await.context("管理控制通道发送超时，停止转发")??;
                 }
                 if renewal_deadline.is_none() {
                     match certificate::request(identity,identity_path,now) {
-                        Ok(Some(message)) => { renewal_deadline = Some(now + 30); diagnostics.send(&mut write,&message).await?; }
+                        Ok(Some(message)) => { renewal_deadline = Some(now + 30); tokio::time::timeout_at(deadline.deadline(), diagnostics.send(&mut write,&message)).await.context("管理控制通道发送超时，停止转发")??; }
                         Ok(None) => {},
                         Err(error) => {
                             let report = certificate::failed(identity,identity_path,&format!("准备设备续签失败：{error:#}"),None);
-                            diagnostics.send(&mut write,&report).await?;
+                            tokio::time::timeout_at(deadline.deadline(), diagnostics.send(&mut write,&report)).await.context("管理控制通道发送超时，停止转发")??;
                         }
                     }
                 }
             },
             Some(result) = probes.join_next(), if !probes.is_empty() => {
-                if let Ok(results) = result { diagnostics.send(&mut write,&AgentControlMessage::TunnelApplyReport { results }).await?; }
+                if let Ok(results) = result { tokio::time::timeout_at(deadline.deadline(), diagnostics.send(&mut write,&AgentControlMessage::TunnelApplyReport { results })).await.context("管理控制通道发送超时，停止转发")??; }
             },
             Some(result) = data_tasks.join_next(), if !data_tasks.is_empty() => { result?; anyhow::bail!("数据连接任务意外停止"); },
             incoming = lines.next() => {
@@ -535,25 +558,27 @@ async fn run_control(
                 diagnostics.received();
                 deadline.as_mut().reset(tokio::time::Instant::now()+Duration::from_secs(45));
                 match serde_json::from_str::<ServerControlMessage>(&line)? {
-                    ServerControlMessage::HelloAccepted { tunnels,tunnel_endpoint,udp_endpoint,capabilities,.. } | ServerControlMessage::HeartbeatAck { tunnels,tunnel_endpoint,udp_endpoint,capabilities,.. } => {
-                        let next = Desired { udp_endpoint: udp_endpoint.map(|mut endpoint| { if endpoint.address.is_empty() { endpoint.address = if config.udp_endpoint.is_empty() { fallback.address.clone() } else { config.udp_endpoint.clone() }; } endpoint }), endpoint: tunnel_endpoint.unwrap_or_else(||fallback.clone()),tunnels:tunnels.clone() };
+                    ServerControlMessage::HelloAccepted { nodes,tunnels,tunnel_endpoint,udp_endpoint,capabilities,.. } | ServerControlMessage::HeartbeatAck { nodes,tunnels,tunnel_endpoint,udp_endpoint,capabilities,.. } => {
+                        if let Some(started)=last_heartbeat.take(){let _=budgets.reports.send(AgentControlMessage::NodeLatency{node_id:"local".into(),rtt_ms:started.elapsed().as_millis().clamp(1,30000) as u32});}
+                        let next = Desired { nodes,udp_endpoint: udp_endpoint.map(|mut endpoint| { if endpoint.address.is_empty() { endpoint.address = if config.udp_endpoint.is_empty() { fallback.address.clone() } else { config.udp_endpoint.clone() }; } endpoint }), endpoint: tunnel_endpoint.unwrap_or_else(||fallback.clone()),tunnels:tunnels.clone() };
                         if *desired.borrow() != next { desired.send_replace(next); }
-                        if !accepted { accepted=true; data_tasks.spawn(run_data(connector_updates.clone(),receiver.clone())); data_tasks.spawn(udp::run(connector_updates.clone(),receiver.clone())); if capabilities.iter().any(|c|c==nexo_protocol::direct::CAPABILITY) { data_tasks.spawn(direct::run(config.caddy_binary.clone(),identity_path.parent().context("身份目录无效")?.join("direct"),connector_updates.clone(),receiver.clone())); } }
+                        if !accepted { accepted=true; data_tasks.spawn(run_data(connector_updates.clone(),receiver.clone(),None)); data_tasks.spawn(nodes::run(connector_updates.clone(),receiver.clone(),budgets.clone())); data_tasks.spawn(udp::run(connector_updates.clone(),receiver.clone())); if capabilities.iter().any(|c|c==nexo_protocol::direct::CAPABILITY) { data_tasks.spawn(direct::run(config.caddy_binary.clone(),identity_path.parent().context("身份目录无效")?.join("direct"),connector_updates.clone(),receiver.clone())); } }
                         probes.abort_all();
                         probes.spawn(probe_tunnels(tunnels));
                     },
+                    ServerControlMessage::NodeBudget{request_id,grant_id,bytes}=>{if let Some(reply)=budget_pending.remove(&request_id){let _=reply.send((grant_id,bytes));}},
                     ServerControlMessage::TunnelApplyAccepted { .. } => {},
                     ServerControlMessage::CertificateRenewed { certificate_pem } => {
                         renewal_deadline = None;
                         match certificate::install(identity,identity_path,&certificate_pem) {
                             Ok(connector) => {
                                 connectors.send_replace(connector);
-                                diagnostics.send(&mut write,&AgentControlMessage::CertificateInstalled { certificate_pem }).await?;
+                                tokio::time::timeout_at(deadline.deadline(), diagnostics.send(&mut write,&AgentControlMessage::CertificateInstalled { certificate_pem })).await.context("管理控制通道发送超时，停止转发")??;
                                 tracing::info!("设备证书已续签并保存，设备 ID、服务绑定及现有连接保持不变");
                             }
                             Err(error) => {
                                 let report = certificate::failed(identity,identity_path,&format!("保存续签证书失败：{error:#}"),None);
-                                diagnostics.send(&mut write,&report).await?;
+                                tokio::time::timeout_at(deadline.deadline(), diagnostics.send(&mut write,&report)).await.context("管理控制通道发送超时，停止转发")??;
                             }
                         }
                     },
@@ -576,6 +601,7 @@ async fn run_control(
 async fn run_data(
     connectors: watch::Receiver<TlsConnector>,
     mut desired: watch::Receiver<Desired>,
+    budget: Option<(node_budget::Client, String)>,
 ) {
     let mut delay = 1;
     loop {
@@ -588,12 +614,29 @@ async fn run_data(
                 tracing::info!("Tunnel 数据通道已连接");
                 let mut connection = nexo_tunnel::yamux_connection(stream, yamux::Mode::Client);
                 let mut tasks = JoinSet::new();
+                let mut probe = tokio::time::interval(Duration::from_secs(10));
                 loop {
                     tokio::select! {
+                        _=probe.tick(),if budget.is_some()=>{
+                            if let Some((client,node))=&budget{
+                                if let Ok(Ok(stream))=tokio::time::timeout(Duration::from_secs(3),nexo_tunnel::new_outbound(&mut connection)).await{
+                                    let client=client.clone();let node=node.clone();
+                                    tasks.spawn(async move{
+                                        let started=tokio::time::Instant::now();let mut stream=nexo_tunnel::into_tokio_io(stream);
+                                        let result=tokio::time::timeout(Duration::from_secs(3),async{
+                                            nexo_tunnel::write_logical_header(&mut stream,&nexo_tunnel::LogicalStreamHeader::new("node-probe","probe",1)?).await?;
+                                            let mut response=[0u8;1];tokio::io::AsyncReadExt::read_exact(&mut stream,&mut response).await?;
+                                            anyhow::ensure!(response[0]==1,"节点探测响应无效");anyhow::Ok(())
+                                        }).await;
+                                        if result.is_ok_and(|v|v.is_ok()){let _=client.reports.send(AgentControlMessage::NodeLatency{node_id:node,rtt_ms:started.elapsed().as_millis().clamp(1,30000) as u32});}
+                                    });
+                                }
+                            }
+                        },
                         Some(_) = tasks.join_next(), if !tasks.is_empty() => {},
                     change = desired.changed() => { if change.is_err() { return; } else if desired.borrow().endpoint != endpoint { break; } },
                         inbound=nexo_tunnel::next_inbound(&mut connection) => match inbound {
-                            Ok(Some(stream)) => { let snapshot=desired.clone(); tasks.spawn(async move { if let Err(error)=forward(stream,snapshot).await { tracing::debug!("Tunnel 逻辑流结束：{error:#}"); } }); },
+                            Ok(Some(stream)) => { let snapshot=desired.clone(); let budget=budget.clone(); tasks.spawn(async move { if let Err(error)=forward_with_budget(stream,snapshot,budget).await { tracing::debug!("Tunnel 逻辑流结束：{error:#}"); } }); },
                             Ok(None) => break,
                             Err(error) => { tracing::warn!("Tunnel 数据通道断开：{error}"); break; }
                         }
@@ -606,7 +649,11 @@ async fn run_data(
         delay = (delay * 2).min(30);
     }
 }
-async fn forward(stream: yamux::Stream, mut desired: watch::Receiver<Desired>) -> Result<()> {
+async fn forward_with_budget(
+    stream: yamux::Stream,
+    mut desired: watch::Receiver<Desired>,
+    budget: Option<(node_budget::Client, String)>,
+) -> Result<()> {
     let mut stream = nexo_tunnel::into_tokio_io(stream);
     let header = tokio::time::timeout(
         Duration::from_secs(10),
@@ -622,7 +669,11 @@ async fn forward(stream: yamux::Stream, mut desired: watch::Receiver<Desired>) -
         .context("逻辑流不属于当前启用的配置")?;
     let transfer = async {
         let mut local = connect_origin(&tunnel).await?;
-        tokio::io::copy_bidirectional(&mut local, &mut stream).await?;
+        if let Some((client, node)) = budget {
+            node_budget::copy(&mut *local, &mut stream, client, &node, &tunnel).await?;
+        } else {
+            tokio::io::copy_bidirectional(&mut local, &mut stream).await?;
+        }
         anyhow::Ok(())
     };
     tokio::pin!(transfer);

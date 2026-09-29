@@ -398,3 +398,86 @@ async fn router_enforces_scope_csrf_updates_and_reset_independence() {
     assert_eq!(result.status(), StatusCode::NOT_FOUND);
     task.abort();
 }
+
+#[test]
+fn remote_reservations_share_local_quota_and_settle_once() {
+    let (state, _) = crate::tests::domain_fixture();
+    let quota = state.tunnel_runtime.quotas.get(&state, "default").unwrap();
+    set_limit(&quota, Some(1000));
+    let token = quota.connection().unwrap();
+    assert_eq!(quota.datagram(100, &token, || 100), Some(100));
+    let grants = std::thread::scope(|scope| {
+        let jobs = (0..8)
+            .map(|_| {
+                scope.spawn(|| {
+                    quota
+                        .reserve_remote(&state, "agent", "s", "default", 200)
+                        .unwrap()
+                })
+            })
+            .collect::<Vec<_>>();
+        jobs.into_iter()
+            .map(|job| job.join().unwrap())
+            .collect::<Vec<_>>()
+    });
+    assert_eq!(grants.iter().map(|(_, bytes)| bytes).sum::<u64>(), 900);
+    assert_eq!(quota.view(unix_now()).used_bytes, 1000);
+    assert!(quota.connection().is_none());
+    let grant = grants.iter().find(|(_, bytes)| *bytes == 200).unwrap();
+    assert!(quota
+        .settle_remote(&state, "other", &grant.0, 50, 30, true)
+        .is_err());
+    quota
+        .settle_remote(&state, "agent", &grant.0, 50, 30, false)
+        .unwrap();
+    assert_eq!(
+        quota.view(unix_now()).used_bytes,
+        1000,
+        "未确认归还不能重分配"
+    );
+    quota
+        .settle_remote(&state, "agent", &grant.0, 50, 30, true)
+        .unwrap();
+    quota
+        .settle_remote(&state, "agent", &grant.0, 50, 30, true)
+        .unwrap();
+    assert_eq!(quota.view(unix_now()).used_bytes, 880);
+    assert!(quota
+        .settle_remote(&state, "agent", &grant.0, 201, 30, true)
+        .is_err());
+    state.tunnel_runtime.traffic.sample(&state, true).unwrap();
+    assert!(
+        state.tunnel_runtime.traffic.0.lock().unwrap().records[&("default".into(), "s".into())]
+            .rate
+            .to_origin
+            > 0.0
+    );
+    let db = state.db.lock().unwrap();
+    assert_eq!(
+        db.query_row(
+            "SELECT SUM(to_origin+to_public) FROM traffic_minutes WHERE tenant_id='default'",
+            [],
+            |r| r.get::<_, u64>(0)
+        )
+        .unwrap(),
+        80
+    );
+    assert_eq!(
+        db.query_row(
+            "SELECT SUM(to_origin+to_public) FROM traffic_daily WHERE tenant_id='default'",
+            [],
+            |r| r.get::<_, u64>(0)
+        )
+        .unwrap(),
+        80
+    );
+    assert_eq!(
+        db.query_row(
+            "SELECT used_bytes FROM traffic_quota_months WHERE tenant_id='default'",
+            [],
+            |r| r.get::<_, u64>(0)
+        )
+        .unwrap(),
+        880
+    );
+}

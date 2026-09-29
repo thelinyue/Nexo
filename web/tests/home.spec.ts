@@ -91,7 +91,7 @@ test("首页概览、管理员用户与隧道筛选、时间图表和手机导�
   await page.evaluate(() => window.scrollTo(0, 0));
   await page.screenshot({ path: info.outputPath("home-overview.png"), fullPage: true });
   if (info.project.name !== "desktop-dark") {
-    await expect(page.getByRole("navigation", { name: "底部导航" }).getByRole("link")).toHaveText(["首页", "服务", "设备", "域名", "我的"]);
+    await expect(page.getByRole("navigation", { name: "底部导航" }).getByRole("link")).toHaveText(["首页", "服务", "设备"]);
   }
 });
 
@@ -168,4 +168,17 @@ test("首页空状态、零流量与缺口、窄屏主题与辅助功能", async
     expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBeTruthy();
     await page.screenshot({ path: info.outputPath(`home-${theme}-${width}.png`), fullPage: true });
   }
+});
+
+
+test("普通用户首页复用隧道列表，首载和手动刷新各请求一次", async ({ page }) => {
+  const state = await installApiMocks(page);
+  await page.route("**/api/v1/auth/status", route => route.fulfill({ json: { initialized: true, authenticated: true, user_id: "alice", username: "alice", role: "tenant", workspace_id: "alice" } }));
+  const calls = () => state.calls.filter(call => call.path === "/api/v1/tunnels" && call.method === "GET").length;
+  await page.goto("/");
+  await expect(page.getByLabel("统计隧道")).toBeVisible();
+  await expect(page.locator(".home-summaries")).toContainText("穿透运行");
+  expect(calls()).toBe(1);
+  await page.getByLabel("刷新首页").click();
+  await expect.poll(calls).toBe(2);
 });

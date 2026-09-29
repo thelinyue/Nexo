@@ -418,6 +418,28 @@ pub async fn direct_request(
     incoming: Vec<(String, String)>,
     body: Vec<u8>,
 ) -> anyhow::Result<nexo_protocol::direct::Response> {
+    remote_request(
+        state,
+        &service.tunnel.tunnel_id,
+        &service.hostname,
+        "https",
+        path,
+        incoming,
+        body,
+    )
+    .await
+}
+
+/// 节点和直连共用认证实现；调用方必须先核验服务归属，协议与域名来自控制器数据库。
+pub async fn remote_request(
+    state: &AppState,
+    id: &str,
+    hostname: &str,
+    protocol: &str,
+    path: String,
+    incoming: Vec<(String, String)>,
+    body: Vec<u8>,
+) -> anyhow::Result<nexo_protocol::direct::Response> {
     anyhow::ensure!(
         incoming.len() <= 64
             && incoming
@@ -450,15 +472,9 @@ pub async fn direct_request(
             );
         }
     }
-    headers.insert(
-        "x-nexo-access-service",
-        HeaderValue::from_str(&service.tunnel.tunnel_id)?,
-    );
-    headers.insert(
-        "x-nexo-access-host",
-        HeaderValue::from_str(&service.hostname)?,
-    );
-    headers.insert("x-nexo-access-proto", HeaderValue::from_static("https"));
+    headers.insert("x-nexo-access-service", HeaderValue::from_str(id)?);
+    headers.insert("x-nexo-access-host", HeaderValue::from_str(hostname)?);
+    headers.insert("x-nexo-access-proto", HeaderValue::from_str(protocol)?);
     let access = AccessState {
         db: state.db.clone(),
         security: state.security.clone(),

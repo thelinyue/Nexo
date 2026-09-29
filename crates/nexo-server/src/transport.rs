@@ -6,7 +6,7 @@ use anyhow::{Context, Result};
 use futures_util::StreamExt;
 use nexo_protocol::{AgentControlMessage, ServerControlMessage, TunnelApplyResult};
 use nexo_tunnel::{identity::MAX_CONTROL_FRAME, LogicalStreamHeader};
-use rusqlite::params;
+use rusqlite::{params, OptionalExtension};
 use sha2::{Digest, Sha256};
 use std::{
     collections::HashMap,
@@ -104,6 +104,7 @@ impl Runtime {
     }
 
     pub async fn run(state: AppState) {
+        let _nodes = tokio::spawn(crate::nodes::dns::run(state.clone()));
         let _dns = tokio::spawn(crate::direct::dns::run(state.clone()));
         let mut interval = tokio::time::interval(Duration::from_secs(1));
         loop {
@@ -130,7 +131,11 @@ impl Runtime {
         let connections = self.connections.lock().await;
         for (device, session) in &connections.control {
             let message = ServerControlMessage::HeartbeatAck {
-                capabilities: vec![nexo_protocol::direct::CAPABILITY.into()],
+                nodes: crate::nodes::services::agent_nodes(state, device)?,
+                capabilities: vec![
+                    nexo_protocol::direct::CAPABILITY.into(),
+                    nexo_protocol::nodes::CAPABILITY.into(),
+                ],
                 server_time: unix_now(),
                 tunnels: desired_tunnels(state, device)?,
                 tunnel_endpoint: state.tunnel_endpoint.clone(),
@@ -166,6 +171,11 @@ impl Runtime {
 
     /// 数据会话已退出后，等待其被取消的子转发任务真正释放，再保存最后一批流量。
     /// JoinSet 的 Drop 只请求取消，不等待完成，不能直接作为最终计数已经稳定的依据。
+    /// 活动业务流数量；不包含控制连接和心跳。
+    pub fn connection_count(&self) -> usize {
+        self.transfers.len()
+    }
+
     pub async fn finish_transfers(&self) {
         self.transfers.close();
         self.transfers.wait().await;
@@ -273,7 +283,7 @@ impl Runtime {
                 .db
                 .lock()
                 .map_err(|_| anyhow::anyhow!("数据库锁不可用"))?;
-            let mut query = db.prepare("SELECT t.id,t.device_id,t.apply_revision,t.protocol,t.public_port,t.tenant_id FROM tunnels t JOIN devices d ON d.id=t.device_id AND d.tenant_id=t.tenant_id JOIN tenants w ON w.id=t.tenant_id AND w.enabled=1 WHERE t.service_mode='tunnel' AND t.enabled=1 AND t.deleted_at IS NULL")?;
+            let mut query = db.prepare("SELECT t.id,t.device_id,t.apply_revision,t.protocol,t.public_port,t.tenant_id FROM tunnels t JOIN devices d ON d.id=t.device_id AND d.tenant_id=t.tenant_id JOIN tenants w ON w.id=t.tenant_id AND w.enabled=1 WHERE t.service_mode='tunnel' AND t.enabled=1 AND t.deleted_at IS NULL AND EXISTS(SELECT 1 FROM authorized_service_nodes sn WHERE sn.service_id=t.id AND sn.node_id='local')")?;
             let services = query
                 .query_map([], |r| {
                     Ok(Service {
@@ -575,6 +585,7 @@ pub async fn serve(state: AppState, listener: TcpListener, data: bool) -> Result
                     let result: Result<()> = async {
                         nexo_tunnel::configure_tunnel_tcp_keepalive(&socket)?;
                         let stream = tokio::time::timeout(Duration::from_secs(10), acceptor.accept(socket)).await.context("Agent TLS 握手超时")??;
+                        if !data { if let Some(node)=crate::nodes::control::peer_id(&stream) { return crate::nodes::control::session(state,stream,node).await; } }
                         let (device, fingerprint) = authenticated_device(&state, &stream)?;
                         if data && stream.get_ref().1.alpn_protocol()==Some(nexo_protocol::direct::ALPN) { crate::direct::session(state,stream,device,fingerprint).await } else if data { data_session(state, stream, device, fingerprint).await } else { control_session(state, stream, device, fingerprint, peer.ip()).await }
                     }.await;
@@ -625,6 +636,15 @@ async fn control_session(
             "UPDATE devices SET status='online',agent_version=?1,last_seen_at=?2 WHERE id=?3",
             params![agent_version, unix_now(), device],
         )?;
+        db.execute(
+            "UPDATE devices SET node_capable=?2 WHERE id=?1",
+            params![
+                device,
+                capabilities
+                    .iter()
+                    .any(|c| c == nexo_protocol::nodes::CAPABILITY)
+            ],
+        )?;
         if let Some(previous) = connections.control.insert(
             device.clone(),
             ControlSession {
@@ -641,7 +661,7 @@ async fn control_session(
         }
     }
     let result: Result<()> = async {
-        diagnostics.send(&mut write, &ServerControlMessage::HelloAccepted { capabilities: vec![nexo_protocol::direct::CAPABILITY.into()], server_time: unix_now(), tunnels: desired_tunnels(&state, &device)?, tunnel_endpoint: state.tunnel_endpoint.clone(), udp_endpoint: state.udp_endpoint.clone() }).await?;
+        diagnostics.send(&mut write, &ServerControlMessage::HelloAccepted { nodes: crate::nodes::services::agent_nodes(&state,&device)?, capabilities: vec![nexo_protocol::direct::CAPABILITY.into(),nexo_protocol::nodes::CAPABILITY.into()], server_time: unix_now(), tunnels: desired_tunnels(&state, &device)?, tunnel_endpoint: state.tunnel_endpoint.clone(), udp_endpoint: state.udp_endpoint.clone() }).await?;
         let deadline = tokio::time::sleep(Duration::from_secs(45)); tokio::pin!(deadline);
         loop { tokio::select! {
             _ = cancel.cancelled() => break,
@@ -652,10 +672,25 @@ async fn control_session(
                 diagnostics.received();
                 deadline.as_mut().reset(tokio::time::Instant::now() + Duration::from_secs(45));
                 match serde_json::from_str::<AgentControlMessage>(&line)? {
+                    AgentControlMessage::NodeLatency{node_id,rtt_ms}=>{
+                        if node_id=="local" || crate::nodes::services::agent_nodes(&state,&device)?.iter().any(|n|n.id==node_id) {
+                            state.db.lock().map_err(|_|anyhow::anyhow!("数据库锁不可用"))?.execute("INSERT INTO relay_latency(device_id,node_id,rtt_ms,checked_at) VALUES(?1,?2,?3,?4) ON CONFLICT(device_id,node_id) DO UPDATE SET rtt_ms=(rtt_ms*3+excluded.rtt_ms)/4,samples=samples+1,checked_at=excluded.checked_at",params![device,node_id,rtt_ms.min(30000),unix_now()])?;
+                        }
+                    },
+                    AgentControlMessage::NodeBudget{request_id,node_id,service_id,revision,bytes}=>{
+                        let tenant={let db=state.db.lock().map_err(|_|anyhow::anyhow!("数据库锁不可用"))?;
+                            db.query_row("SELECT t.tenant_id FROM tunnels t JOIN authorized_service_nodes s ON s.service_id=t.id JOIN relay_nodes n ON n.id=s.node_id JOIN relay_node_authorizations g ON g.node_id=n.id AND g.tenant_id=t.tenant_id JOIN tenants w ON w.id=t.tenant_id WHERE t.id=?1 AND t.device_id=?2 AND t.apply_revision=?3 AND s.node_id=?4 AND t.enabled=1 AND t.deleted_at IS NULL AND n.approved=1 AND n.enabled=1 AND n.removed_at IS NULL AND w.enabled=1",params![service_id,device,revision,node_id],|r|r.get::<_,String>(0)).optional()?};
+                        let (grant_id,bytes)=if let Some(tenant)=tenant {state.tunnel_runtime.quotas.get(&state,&tenant)?.reserve_remote(&state,&device,&service_id,&tenant,bytes)?}else{(String::new(),0)};
+                        diagnostics.send(&mut write,&ServerControlMessage::NodeBudget{request_id,grant_id,bytes}).await?;
+                    },
+                    AgentControlMessage::NodeUsage{grant_id,to_origin,to_public,finished}=>{
+                        let tenant:String=state.db.lock().map_err(|_|anyhow::anyhow!("数据库锁不可用"))?.query_row("SELECT tenant_id FROM relay_budgets WHERE id=?1 AND device_id=?2",params![grant_id,device],|r|r.get(0))?;
+                        state.tunnel_runtime.quotas.get(&state,&tenant)?.settle_remote(&state,&device,&grant_id,to_origin,to_public,finished)?;
+                    },
                     AgentControlMessage::Heartbeat { device_id, agent_version } => {
                         anyhow::ensure!(device_id == device, "心跳设备 ID 与证书不一致");
                         state.db.lock().map_err(|_| anyhow::anyhow!("数据库锁不可用"))?.execute("UPDATE devices SET last_seen_at=?1,agent_version=?2 WHERE id=?3", params![unix_now(),agent_version,device])?;
-                        diagnostics.send(&mut write, &ServerControlMessage::HeartbeatAck { capabilities: vec![nexo_protocol::direct::CAPABILITY.into()], server_time: unix_now(), tunnels: desired_tunnels(&state, &device)?, tunnel_endpoint: state.tunnel_endpoint.clone(), udp_endpoint: state.udp_endpoint.clone() }).await?;
+                        diagnostics.send(&mut write, &ServerControlMessage::HeartbeatAck { nodes: crate::nodes::services::agent_nodes(&state,&device)?, capabilities: vec![nexo_protocol::direct::CAPABILITY.into(),nexo_protocol::nodes::CAPABILITY.into()], server_time: unix_now(), tunnels: desired_tunnels(&state, &device)?, tunnel_endpoint: state.tunnel_endpoint.clone(), udp_endpoint: state.udp_endpoint.clone() }).await?;
                     }
                     AgentControlMessage::TunnelApplyReport { results } => {
                         let ids = apply_results(&state, &device, results)?;
@@ -829,6 +864,42 @@ async fn data_session(
 }
 
 /// 本地探测、数据会话、公网监听与 Caddy/TLS 全部满足时，才在服务页显示正常。
+/// 一轮协调的最终状态；反代不更新协议明细，组合服务只提交聚合结果。
+pub(crate) struct StatusUpdate {
+    pub id: String,
+    pub revision: i64,
+    pub status: String,
+    pub error: Option<String>,
+    pub protocols: Option<String>,
+}
+
+/// 先在数据库锁外计算，再用短事务批量提交；版本与删除条件防止迟到状态覆盖新配置。
+/// IS NOT 同时覆盖 NULL 错误恢复，稳定状态不触发行更新。
+pub(crate) fn save_statuses(state: &AppState, updates: Vec<StatusUpdate>) -> Result<()> {
+    if updates.is_empty() {
+        return Ok(());
+    }
+    let db = state
+        .db
+        .lock()
+        .map_err(|_| anyhow::anyhow!("数据库锁不可用"))?;
+    let tx = db.unchecked_transaction()?;
+    {
+        let mut statement = tx.prepare("UPDATE tunnels SET apply_status=?1,apply_error=?2,protocol_statuses=COALESCE(?3,protocol_statuses) WHERE id=?4 AND apply_revision=?5 AND deleted_at IS NULL AND (apply_status IS NOT ?1 OR apply_error IS NOT ?2 OR (?3 IS NOT NULL AND protocol_statuses IS NOT ?3))")?;
+        for update in updates {
+            statement.execute(params![
+                update.status,
+                update.error,
+                update.protocols,
+                update.id,
+                update.revision
+            ])?;
+        }
+    }
+    tx.commit()?;
+    Ok(())
+}
+
 fn refresh_status(
     state: &AppState,
     listeners: &HashMap<String, Option<String>>,
@@ -864,6 +935,7 @@ fn refresh_status(
         rows
     };
     let mut combined = HashMap::new();
+    let mut updates = Vec::new();
     for (
         id,
         device,
@@ -880,15 +952,45 @@ fn refresh_status(
         https_port,
     ) in rows
     {
-        let (status, error) = if !enabled {
-            ("disabled", None)
-        } else if state
+        let remote_status = {
+            let db = state
+                .db
+                .lock()
+                .map_err(|_| anyhow::anyhow!("数据库锁不可用"))?;
+            let remote_only:bool=db.query_row("SELECT NOT EXISTS(SELECT 1 FROM service_nodes WHERE service_id=?1 AND node_id='local')",[&id],|r|r.get(0))?;
+            let has_remote:bool=db.query_row("SELECT EXISTS(SELECT 1 FROM service_nodes WHERE service_id=?1 AND node_id!='local')",[&id],|r|r.get(0))?;
+            if remote_only || has_remote {
+                let healthy:bool=db.query_row("SELECT EXISTS(SELECT 1 FROM authorized_service_nodes s JOIN relay_nodes n ON n.id=s.node_id JOIN relay_service_health h ON h.node_id=s.node_id AND h.service_id=s.service_id WHERE s.service_id=?1 AND s.node_id!='local' AND h.healthy=1 AND h.revision=?2 AND h.checked_at>?3 AND n.approved=1 AND n.enabled=1 AND n.removed_at IS NULL AND n.maintenance=0 AND n.last_seen>?3)",params![id,revision,unix_now()-45],|r|r.get(0))?;
+                let dns_error: Option<String> = db
+                    .query_row(
+                        "SELECT error FROM relay_dns_state WHERE service_id=?1",
+                        [&id],
+                        |r| r.get(0),
+                    )
+                    .optional()?
+                    .flatten();
+                if let Some(error) = dns_error {
+                    Some(("failed", Some(format!("DNS 更新失败：{error}"))))
+                } else if healthy {
+                    Some(("ready", None))
+                } else if remote_only {
+                    Some(("checking", Some("等待健康的 VPS 服务入口".into())))
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        };
+        let quota_available = state
             .tunnel_runtime
             .quotas
             .get(state, &tenant)?
             .connection()
-            .is_none()
-        {
+            .is_some();
+        let (status, error) = if !enabled {
+            ("disabled", None)
+        } else if !quota_available {
             ("checking", Some(crate::traffic::quota::EXHAUSTED.into()))
         } else if let Some(error) = failures.get(&id) {
             ("failed", Some(error.clone()))
@@ -955,6 +1057,19 @@ fn refresh_status(
         } else {
             ("ready", None)
         };
+        if matches!(protocol.as_str(), "http" | "https" | "tcp") {
+            let db = state
+                .db
+                .lock()
+                .map_err(|_| anyhow::anyhow!("数据库锁不可用"))?;
+            // 先记录内置入口的实际状态，再合并远端状态，避免远端健康把故障的本机重新加入 DNS。
+            db.execute("INSERT INTO relay_service_health(node_id,service_id,revision,healthy,checked_at,error) SELECT 'local',t.id,t.apply_revision,?3,?4,?5 FROM tunnels t JOIN authorized_service_nodes s ON s.service_id=t.id AND s.node_id='local' WHERE t.id=?1 AND t.apply_revision=?2 AND t.deleted_at IS NULL ON CONFLICT(node_id,service_id) DO UPDATE SET revision=excluded.revision,healthy=excluded.healthy,checked_at=excluded.checked_at,error=excluded.error",params![id,revision,status=="ready",unix_now(),error])?;
+        }
+        let (status, error) = if enabled && quota_available {
+            remote_status.unwrap_or((status, error))
+        } else {
+            (status, error)
+        };
         // 组合服务只写入聚合后的状态，避免两次落库之间短暂把部分可用误报为全部可用。
         if nexo_tunnel::udp::has_udp(&protocol) {
             combined.insert(
@@ -969,8 +1084,15 @@ fn refresh_status(
             );
             continue;
         }
-        state.db.lock().map_err(|_| anyhow::anyhow!("数据库锁不可用"))?.execute("UPDATE tunnels SET apply_status=?1,apply_error=?2,protocol_statuses='{}' WHERE id=?3 AND apply_revision=?4 AND deleted_at IS NULL", params![status,error,id,revision])?;
+        updates.push(StatusUpdate {
+            id,
+            revision,
+            status: status.into(),
+            error,
+            protocols: Some("{}".into()),
+        });
     }
+    save_statuses(state, updates)?;
     Ok(combined)
 }
 
@@ -1071,6 +1193,7 @@ mod tests {
             let stream = TlsAcceptor::from(state.authority.server_config())
                 .accept(socket)
                 .await?;
+
             let (device, fingerprint) = authenticated_device(&state, &stream)?;
             control_session(state, stream, device, fingerprint, peer).await
         });
@@ -1464,6 +1587,40 @@ mod tests {
     }
 
     #[test]
+    fn healthy_remote_keeps_mixed_service_ready_without_reviving_local_health() {
+        let (state, _) = crate::tests::domain_fixture();
+        populate(&state);
+        {
+            let db = state.db.lock().unwrap();
+            db.execute("INSERT INTO relay_nodes(id,name,approved,last_seen,created_at) VALUES('remote','remote',1,?1,0)",[unix_now()]).unwrap();
+            db.execute(
+                "INSERT INTO relay_node_grants VALUES('remote','default')",
+                [],
+            )
+            .unwrap();
+            db.execute("INSERT INTO service_nodes VALUES('own','remote')", [])
+                .unwrap();
+            db.execute("INSERT INTO relay_service_health(node_id,service_id,revision,healthy,checked_at) SELECT 'remote',id,apply_revision,1,?1 FROM tunnels WHERE id='own'",[unix_now()]).unwrap();
+        }
+        refresh_status(
+            &state,
+            &HashMap::new(),
+            &["mine".into()],
+            &[],
+            &HashMap::new(),
+        )
+        .unwrap();
+        let db = state.db.lock().unwrap();
+        assert_eq!(
+            db.query_row("SELECT apply_status FROM tunnels WHERE id='own'", [], |r| r
+                .get::<_, String>(0))
+                .unwrap(),
+            "ready"
+        );
+        assert!(!db.query_row("SELECT healthy FROM relay_service_health WHERE node_id='local' AND service_id='own'",[],|r|r.get::<_,bool>(0)).unwrap());
+    }
+
+    #[test]
     fn combined_status_is_not_published_before_udp_is_aggregated() {
         let (state, _) = crate::tests::domain_fixture();
         populate(&state);
@@ -1564,6 +1721,73 @@ mod tests {
         INSERT INTO tunnels (id,tenant_id,device_id,name,protocol,local_address,local_port,enabled,apply_revision,created_at,updated_at) VALUES ('own','default','mine','own','tcp','127.0.0.1',1234,1,2,0,0),('foreign','other','foreign','foreign','tcp','127.0.0.1',1234,1,1,0,0);").unwrap();
     }
     #[test]
+    fn status_batches_skip_unchanged_rows_and_reject_stale_or_deleted_updates() {
+        let (state, _) = crate::tests::domain_fixture();
+        populate(&state);
+        let update = |revision, error: Option<&str>, protocols: Option<&str>| StatusUpdate {
+            id: "own".into(),
+            revision,
+            status: "ready".into(),
+            error: error.map(str::to_owned),
+            protocols: protocols.map(str::to_owned),
+        };
+        save_statuses(&state, vec![update(2, Some("故障"), Some("{}"))]).unwrap();
+        let count = || state.db.lock().unwrap().total_changes();
+        let before = count();
+        save_statuses(&state, vec![update(2, Some("故障"), Some("{}"))]).unwrap();
+        assert_eq!(count(), before);
+        save_statuses(&state, vec![update(2, None, Some("{}"))]).unwrap();
+        assert_eq!(count(), before + 1, "NULL 错误恢复必须落库");
+        save_statuses(
+            &state,
+            vec![update(2, None, Some(r#"{"tcp":{"status":"ready"}}"#))],
+        )
+        .unwrap();
+        assert_eq!(count(), before + 2, "协议明细变化必须落库");
+        save_statuses(
+            &state,
+            vec![update(2, None, None), update(1, Some("迟到"), Some("{}"))],
+        )
+        .unwrap();
+        assert_eq!(count(), before + 2, "反代保留明细，旧版本不覆盖");
+        state
+            .db
+            .lock()
+            .unwrap()
+            .execute("UPDATE tunnels SET deleted_at=1 WHERE id='own'", [])
+            .unwrap();
+        let before = count();
+        save_statuses(&state, vec![update(2, Some("迟到"), Some("{}"))]).unwrap();
+        assert_eq!(count(), before);
+    }
+
+    #[test]
+    fn failed_status_batch_rolls_back_earlier_rows() {
+        let (state, _) = crate::tests::domain_fixture();
+        populate(&state);
+        state.db.lock().unwrap().execute_batch("CREATE TRIGGER reject_status BEFORE UPDATE ON tunnels WHEN NEW.id='foreign' BEGIN SELECT RAISE(ABORT,'test failure'); END;").unwrap();
+        let updates = [("own", 2), ("foreign", 1)]
+            .into_iter()
+            .map(|(id, revision)| StatusUpdate {
+                id: id.into(),
+                revision,
+                status: "ready".into(),
+                error: None,
+                protocols: None,
+            })
+            .collect();
+        assert!(save_statuses(&state, updates).is_err());
+        let status: String = state
+            .db
+            .lock()
+            .unwrap()
+            .query_row("SELECT apply_status FROM tunnels WHERE id='own'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_ne!(status, "ready");
+    }
+    #[test]
     fn reports_cannot_cross_device_boundary_or_overwrite_a_newer_revision() {
         let (state, _) = crate::tests::domain_fixture();
         populate(&state);
@@ -1606,6 +1830,10 @@ mod tests {
         let occupied = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = occupied.local_addr().unwrap().port();
         let input = |device: &str| TunnelInput {
+            node_group_id: None,
+            node_ids: None,
+            distribution_mode: None,
+            preferred_node_id: None,
             icon_id: None,
             https_port: None,
             ipv6_direct_enabled: None,

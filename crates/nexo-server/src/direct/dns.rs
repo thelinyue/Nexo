@@ -53,6 +53,18 @@ pub async fn ensure(
     kind: &str,
     value: &str,
 ) -> Result<()> {
+    let managed = if kind == "A" {
+        let db = state
+            .db
+            .lock()
+            .map_err(|_| anyhow::anyhow!("数据库锁不可用"))?;
+        crate::nodes::dns::managed(&db, service_id)?
+    } else {
+        false
+    };
+    if managed {
+        return crate::nodes::dns::sync(state, service_id).await;
+    }
     let _guard = state.tunnel_runtime.direct.dns_lock.lock().await;
     let records = zone.records(host).await?;
     anyhow::ensure!(
@@ -260,10 +272,21 @@ pub async fn reconcile(state: &AppState) -> Result<()> {
         active.insert((id.clone(), service.hostname.clone()));
         let result = async {
             let domain = domain_id(state, &id)?;
-            let ipv4 = crate::server_settings::relay_ipv4(state)
-                .map_err(|e| anyhow::anyhow!(e.message))?
-                .context("请管理员在「服务器设置」中填写用于转发的公网 IPv4")?
-                .to_string();
+            let managed = {
+                let db = state
+                    .db
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("数据库锁不可用"))?;
+                crate::nodes::dns::managed(&db, &id)?
+            };
+            let ipv4 = if managed {
+                String::new()
+            } else {
+                crate::server_settings::relay_ipv4(state)
+                    .map_err(|e| anyhow::anyhow!(e.message))?
+                    .context("请管理员在「服务器设置」中填写用于转发的公网 IPv4")?
+                    .to_string()
+            };
             let zone = zone(state, &domain).await?;
             ensure(state, &zone, &id, &domain, &service.hostname, "A", &ipv4).await?;
             // 网络请求期间配置可能已被撤销；在写 AAAA 前再次核验当前版本。

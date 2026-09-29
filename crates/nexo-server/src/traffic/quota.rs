@@ -44,6 +44,102 @@ impl QuotaState {
     }
 }
 impl Quota {
+    /// 与本机写入共用额度锁。先持久化预留再回复 Agent；失联未结算预算保持占用，不能重复花费。
+    pub fn reserve_remote(
+        &self,
+        state: &AppState,
+        device: &str,
+        service: &str,
+        tenant: &str,
+        requested: u32,
+    ) -> Result<(String, u64)> {
+        let db = state
+            .db
+            .lock()
+            .map_err(|_| anyhow::anyhow!("数据库锁不可用"))?;
+        let mut current = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        current.refresh(unix_now());
+        let amount = current
+            .limit
+            .map(|limit| limit.saturating_sub(current.used()))
+            .unwrap_or(u64::MAX)
+            .min(u64::from(requested).min(1024 * 1024));
+        if amount == 0 {
+            return Ok((String::new(), 0));
+        }
+        let id = uuid::Uuid::new_v4().to_string();
+        let month = current.month;
+        let used = current.used() + amount;
+        let tx = db.unchecked_transaction()?;
+        tx.execute("INSERT INTO relay_budgets(id,device_id,service_id,tenant_id,month,reserved) VALUES(?1,?2,?3,?4,?5,?6)",params![id,device,service,tenant,month,amount])?;
+        tx.execute("INSERT INTO traffic_quota_months VALUES(?1,?2,?3) ON CONFLICT(tenant_id,month) DO UPDATE SET used_bytes=excluded.used_bytes",params![tenant,month,used])?;
+        tx.commit()?;
+        current.months.insert(month, used);
+        Ok((id, amount))
+    }
+    /// 累计报告可重复发送；仅第一次最终结算归还未用预算，流量统计只增加差值。
+    pub fn settle_remote(
+        &self,
+        state: &AppState,
+        device: &str,
+        id: &str,
+        to_origin: u64,
+        to_public: u64,
+        finished: bool,
+    ) -> Result<()> {
+        let db = state
+            .db
+            .lock()
+            .map_err(|_| anyhow::anyhow!("数据库锁不可用"))?;
+        let mut current = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        let (tenant,service,month,reserved,old_origin,old_public,done):(String,String,i64,u64,u64,u64,bool)=db.query_row("SELECT tenant_id,service_id,month,reserved,to_origin,to_public,finished FROM relay_budgets WHERE id=?1 AND device_id=?2",params![id,device],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?)))?;
+        anyhow::ensure!(
+            to_origin >= old_origin
+                && to_public >= old_public
+                && to_origin
+                    .checked_add(to_public)
+                    .is_some_and(|v| v <= reserved),
+            "节点流量结算超出预留或发生倒退"
+        );
+        if done {
+            return Ok(());
+        }
+        let delta_origin = to_origin - old_origin;
+        let delta_public = to_public - old_public;
+        let used = current
+            .months
+            .get(&month)
+            .copied()
+            .unwrap_or(0)
+            .saturating_sub(if finished {
+                reserved - to_origin - to_public
+            } else {
+                0
+            });
+        let tx = db.unchecked_transaction()?;
+        tx.execute(
+            "UPDATE relay_budgets SET to_origin=?2,to_public=?3,finished=?4 WHERE id=?1",
+            params![id, to_origin, to_public, finished],
+        )?;
+        tx.execute("INSERT INTO traffic_quota_months VALUES(?1,?2,?3) ON CONFLICT(tenant_id,month) DO UPDATE SET used_bytes=excluded.used_bytes",params![tenant,month,used])?;
+        tx.execute("INSERT INTO traffic_minutes VALUES(?1,?2,?3,?4,?5) ON CONFLICT(tenant_id,tunnel_id,minute) DO UPDATE SET to_origin=to_origin+excluded.to_origin,to_public=to_public+excluded.to_public",params![tenant,service,unix_now()/60*60,delta_origin,delta_public])?;
+        tx.execute("INSERT INTO traffic_daily VALUES(?1,?2,?3,?4) ON CONFLICT(tenant_id,day) DO UPDATE SET to_origin=to_origin+excluded.to_origin,to_public=to_public+excluded.to_public",params![tenant,super::usage::day_start(unix_now()),delta_origin,delta_public])?;
+        tx.commit()?;
+        current.months.insert(month, used);
+        current.refresh(unix_now());
+        // 采样器按统计锁 → DB → 额度锁排序，必须先释放本次持有的后两把锁。
+        drop(current);
+        drop(db);
+        state.tunnel_runtime.traffic.remote_sample(
+            &tenant,
+            &service,
+            Bytes {
+                to_origin: delta_origin,
+                to_public: delta_public,
+            },
+        );
+        Ok(())
+    }
     /// 数据报不可截断。短锁内检查整包预算并同步提交，按实际提交载荷结算；
     /// 与 TCP 写入共用锁，不需要持有跨 await 的预留额度，也不会多并发超支。
     pub fn datagram(
@@ -184,8 +280,16 @@ impl Manager {
         Ok(())
     }
 
-    pub(super) fn snapshot(&self) -> Vec<(String, i64, u64)> {
-        let entries = self.0.lock().unwrap_or_else(|e| e.into_inner());
+    pub(super) fn snapshot_handles(&self) -> Vec<(String, Arc<Quota>)> {
+        self.0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .map(|(id, q)| (id.clone(), q.clone()))
+            .collect()
+    }
+    /// 调用方先取得句柄，再持有数据库锁读取余额，防止旧快照覆盖已落盘的远端预算。
+    pub(super) fn snapshot(entries: &[(String, Arc<Quota>)]) -> Vec<(String, i64, u64)> {
         let mut batch = Vec::new();
         let cutoff = period(unix_now() - 90 * 86400).0;
         for (tenant, quota) in entries.iter() {

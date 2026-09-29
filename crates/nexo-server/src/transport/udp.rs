@@ -230,6 +230,7 @@ pub(super) async fn refresh_status(
             .collect::<rusqlite::Result<Vec<_>>>()?;
         rows
     };
+    let mut updates = Vec::new();
     for (id, device, protocol, enabled, revision, tenant, applied_revision, reports) in rows {
         let reports: BTreeMap<String, ProtocolStatus> =
             serde_json::from_str(reports.as_deref().unwrap_or("{}")).unwrap_or_default();
@@ -326,7 +327,14 @@ pub(super) async fn refresh_status(
         } else {
             Some(errors.join("；"))
         };
-        state.db.lock().unwrap().execute("UPDATE tunnels SET apply_status=?1,apply_error=?2,protocol_statuses=?3 WHERE id=?4 AND apply_revision=?5",params![status,error,serde_json::to_string(&statuses)?,id,revision])?;
+        updates.push(super::StatusUpdate {
+            id,
+            revision,
+            status: status.into(),
+            error,
+            protocols: Some(serde_json::to_string(&statuses)?),
+        });
     }
+    super::save_statuses(state, updates)?;
     Ok(())
 }

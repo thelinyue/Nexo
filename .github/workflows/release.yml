@@ -15,7 +15,38 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  node-packages:
+    strategy:
+      matrix:
+        runner: [ubuntu-24.04, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22.16.0
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - name: 判断 Server 发布范围
+        id: scope
+        run: echo "server=$(node -p "require('./release-manifest.json').components.includes('server')")" >> "$GITHUB_OUTPUT"
+      - name: 构建原生节点与配套 Caddy
+        if: steps.scope.outputs.server == 'true'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+          rustup toolchain install 1.89.0 --profile minimal
+          rustup default 1.89.0
+          bash docker/build-node.sh
+      - uses: actions/upload-artifact@v4
+        if: steps.scope.outputs.server == 'true'
+        with:
+          name: nexo-node-${{ matrix.runner }}
+          path: dist/nexo-node-*.tar.gz
+          if-no-files-found: error
   publish:
+    needs: node-packages
     runs-on: ubuntu-24.04
     timeout-minutes: 90
     steps:
@@ -104,6 +135,14 @@ jobs:
           if [[ "$PUBLISH_AGENT" == "true" ]]; then components+=(agent); fi
           python3 .github/scripts/publish_latest.py --version "$VERSION" --components "${components[@]}" --apply
 
+      - name: 取得原生节点包
+        if: steps.version.outputs.publish_server == 'true'
+        uses: actions/download-artifact@v4
+        with:
+          pattern: nexo-node-*
+          path: dist
+          merge-multiple: true
+
       - name: 生成部署包与发布说明
         env:
           VERSION: ${{ steps.version.outputs.version }}
@@ -130,7 +169,7 @@ jobs:
           fi
           cp -R licenses "dist/${bundle}/licenses"
           tar -C dist -czf "dist/${bundle}.tar.gz" "${bundle}"
-          (cd dist && sha256sum "${bundle}.tar.gz" > SHA256SUMS)
+          (cd dist && sha256sum nexo*.tar.gz > SHA256SUMS)
           cp "docs/releases/v${VERSION}.md" dist/release-notes.md
           {
             echo
@@ -151,8 +190,8 @@ jobs:
           set -euo pipefail
           if gh release view "v${VERSION}" >/dev/null 2>&1; then
             gh release edit "v${VERSION}" --title "Nexo v${VERSION}" --notes-file dist/release-notes.md
-            gh release upload "v${VERSION}" "dist/nexo-v${VERSION}-docker.tar.gz" dist/SHA256SUMS --clobber
+            gh release upload "v${VERSION}" dist/nexo*.tar.gz dist/SHA256SUMS --clobber
           else
-            gh release create "v${VERSION}" "dist/nexo-v${VERSION}-docker.tar.gz" dist/SHA256SUMS \
+            gh release create "v${VERSION}" dist/nexo*.tar.gz dist/SHA256SUMS \
               --verify-tag --title "Nexo v${VERSION}" --notes-file dist/release-notes.md
           fi

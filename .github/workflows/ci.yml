@@ -53,6 +53,11 @@ jobs:
         run: |
           python -c "import ast, pathlib; [ast.parse(pathlib.Path(path).read_text(encoding='utf-8'), filename=path) for path in ['docker/integration-terminal.py', 'docker/config-smoke.py', 'docker/image-config-smoke.py', 'docker/admin-init-smoke.py', 'docker/shared-access-smoke.py', 'docker/identity-renewal-smoke.py', 'docker/multiuser-smoke.py', 'docker/tunnel-smoke.py', 'docker/udp-smoke.py']]"
           node --check docker/recovery-smoke.mjs
+      - name: 原生节点安装和更新助手检查
+        run: |
+          bash -n docker/install-node.sh docker/build-node.sh
+          python3 -m unittest docker/test_node_updater.py
+          docker run --rm --network none -e NEXO_INSTALLER_TEST=1 -v "$PWD:/src:ro" python:3.12-bookworm python3 /src/docker/test_node_installer.py
       - name: latest 发布规则测试
         run: python3 -m unittest discover -s .github/scripts -p 'test_*.py'
       - name: 工作区差异检查

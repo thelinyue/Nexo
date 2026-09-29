@@ -37,6 +37,8 @@ pub async fn workspace_context(
         if !matches!(
             kind,
             "devices"
+                | "nodes"
+                | "node-groups"
                 | "enrollments"
                 | "agent-access-key"
                 | "tunnels"
@@ -386,6 +388,13 @@ pub async fn delete_user(
             if tx.query_row("SELECT EXISTS(SELECT 1 FROM direct_dns_records r JOIN public_domains p ON p.id=r.domain_id WHERE p.tenant_id=?1 AND r.kind!='A')",[&tenant],|r|r.get::<_,bool>(0)).map_err(db_error)? {
                 return Err(ApiError::new(StatusCode::CONFLICT,"请先关闭该空间的 IPv6 直连并完成 DNS 清理，再删除账号"));
             }
+            if tx.query_row("SELECT EXISTS(SELECT 1 FROM relay_dns_records r JOIN tunnels t ON t.id=r.service_id WHERE t.tenant_id=?1) OR EXISTS(SELECT 1 FROM relay_dns_originals r JOIN tunnels t ON t.id=r.service_id WHERE t.tenant_id=?1)",[&tenant],|r|r.get::<_,bool>(0)).map_err(db_error)? {
+                return Err(ApiError::new(StatusCode::CONFLICT,"请先停用该空间的节点服务并完成 DNS 清理，再删除账号"));
+            }
+            // 节点经管理员审批后可能服务其他空间；账号删除只解除申请归属，不能连带撤销它。
+            tx.execute("UPDATE relay_nodes SET owner_tenant=NULL,token_digest=NULL,token_expires=NULL WHERE owner_tenant=?1",[&tenant]).map_err(db_error)?;
+            tx.execute("DELETE FROM relay_certificates WHERE service_id IN (SELECT id FROM tunnels WHERE tenant_id=?1)",[&tenant]).map_err(db_error)?;
+            tx.execute("DELETE FROM relay_budgets WHERE tenant_id=?1",[&tenant]).map_err(db_error)?;
             tx.execute("DELETE FROM tenants WHERE id=?1", [&tenant])
                 .map_err(db_error)?;
             tx.commit().map_err(db_error)?;
@@ -1095,6 +1104,17 @@ pub(crate) mod tests {
             .unwrap();
             db.execute_batch("INSERT INTO devices(id,tenant_id,name,created_at,updated_at) VALUES('a','alice','Agent',0,0); INSERT INTO device_identities VALUES('a','secret',0); INSERT INTO tunnels(id,tenant_id,device_id,name,protocol,local_address,local_port,created_at,updated_at) VALUES('t','alice','a','service','tcp','127.0.0.1',80,0,0); INSERT INTO tunnel_applied_states(tunnel_id,revision,status,error_message,updated_at) VALUES('t',1,'ready',NULL,0);").unwrap();
             db.execute("INSERT INTO public_domain_runtime_events(tenant_id,public_domain_id,summary,occurred_at) VALUES('alice',?1,'loaded',0)", [&domain.id]).unwrap();
+            db.execute("INSERT INTO relay_nodes(id,owner_tenant,name,approved,created_at) VALUES('shared-node','alice','shared',1,0)",[]).unwrap();
+            db.execute(
+                "INSERT INTO relay_node_grants VALUES('shared-node','bob')",
+                [],
+            )
+            .unwrap();
+            db.execute(
+                "INSERT INTO relay_certificates(service_id,hostname) VALUES('t','old.delete.test')",
+                [],
+            )
+            .unwrap();
         }
         let (url, task) = serve(state.clone()).await;
         let client = reqwest::Client::builder().no_proxy().build().unwrap();

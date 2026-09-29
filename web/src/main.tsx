@@ -1,15 +1,17 @@
-import { useEffect, useState } from "react";
-import { InvitationScreen } from "./accounts";
+import { lazy, Suspense, useEffect, useState } from "react";
 import type { ManagedWorkspace } from "./accounts";
 import { AuthScreen, Reauthenticate } from "./auth";
 import { createRoot } from "react-dom/client";
-import { Workspace } from "./workspace";
 import { homeRoute } from "./navigation";
-import { Brand, Loading, Notice, errorText, request, resumeSession } from "./ui";
+import { Brand, Loading, PageLoadBoundary, Notice, errorText, request, resumeSession } from "./ui";
 import type { Auth } from "./ui";
 import "./styles.css";
 import "./service-cards.css";
 import "./service-detail.css";
+
+/** 按访问页面加载模块；已打开页面仍保留原实例和草稿。 */
+const InvitationScreen = lazy(() => import("./accounts").then(module => ({ default: module.InvitationScreen })));
+const Workspace = lazy(() => import("./workspace").then(module => ({ default: module.Workspace })));
 
 declare global { interface Window { __nexoLaunchTimer?: number } }
 
@@ -55,4 +57,4 @@ function App() {
 }
 
 export default App;
-createRoot(document.getElementById("root")!).render(<App />);
+createRoot(document.getElementById("root")!).render(<PageLoadBoundary><Suspense fallback={<main className="loading-screen"><Loading /></main>}><App /></Suspense></PageLoadBoundary>);

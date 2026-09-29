@@ -1,7 +1,7 @@
 {
   "name": "nexo-web",
   "private": true,
-  "version": "0.2.12",
+  "version": "0.2.13",
   "type": "module",
   "scripts": {
     "build": "vite build",
@@ -10,8 +10,9 @@
     "test:e2e": "playwright test"
   },
   "dependencies": {
+    "@iconify-icons/tabler": "^2.0.3",
+    "@iconify/react": "^6.0.2",
     "@vitejs/plugin-react": "latest",
-    "lucide-react": "^1.41.0",
     "motion": "^13.4.4",
     "react": "latest",
     "react-dom": "latest",

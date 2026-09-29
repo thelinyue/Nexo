@@ -87,6 +87,9 @@ impl AuthorityRuntime {
     pub fn server_config(&self) -> Arc<rustls::ServerConfig> {
         self.inner.lock().unwrap().tls.clone()
     }
+    pub fn issue_node(&self, csr: &str, id: &str) -> Result<String> {
+        self.inner.lock().unwrap().authority.issue_node(csr, id)
+    }
     pub fn status(&self) -> serde_json::Value {
         let inner = self.inner.lock().unwrap();
         let now = unix_now();

@@ -62,6 +62,16 @@ pub struct Caddy {
     pub http_listen: String,
     pub https_listen: String,
 }
+impl Caddy {
+    /// HTTP 服务共用管理端配置的公网端口；所有 DNS 候选节点保持同端口。
+    pub fn http_port(&self) -> u16 {
+        self.http_listen
+            .rsplit(':')
+            .next()
+            .and_then(|p| p.parse().ok())
+            .unwrap_or(80)
+    }
+}
 impl Default for Caddy {
     fn default() -> Self {
         Self {

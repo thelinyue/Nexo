@@ -31,14 +31,17 @@ test("网页类型包含 HTTP 和 HTTPS，内网 IPv6 地址单行展示并完�
   await expect(editor.getByLabel("内网地址", { exact: true })).toHaveValue(ip);
 });
 
-test("五入口导航、旧链接和不存在的详情均可返回", async ({ page }) => {
+test("导航入口、旧链接和不存在的详情均可返回", async ({ page }) => {
   await installApiMocks(page);
   await page.goto("/#/services");
-  const nav = page.locator((page.viewportSize()?.width ?? 0) <= 900 ? ".bottom-nav" : ".sidebar nav");
-  await expect(nav.getByRole("link")).toHaveCount(5);
-  await nav.getByRole("link", { name: "域名", exact: true }).click();
+  const mobile = (page.viewportSize()?.width ?? 0) <= 900;
+  const nav = page.locator(mobile ? ".bottom-nav" : ".sidebar nav");
+  await expect(nav.getByRole("link")).toHaveCount(mobile ? 3 : 6);
+  if (mobile) await nav.getByRole("button", { name: "更多功能" }).click();
+  const domains = mobile ? page.locator('.mobile-more a[href="#/domains"]') : nav.getByRole("link", { name: "域名", exact: true });
+  await domains.click();
   await expect(visiblePage(page).locator("h1")).toHaveText("域名");
-  await expect(nav.getByRole("link", { name: "域名", exact: true })).toHaveAttribute("aria-current", "page");
+  await expect(domains).toHaveAttribute("aria-current", "page");
   await page.goto("/#/settings");
   await expect(visiblePage(page).locator("h1")).toHaveText((page.viewportSize()?.width ?? 0) <= 900 ? "我的" : "账号设置");
   await page.goto("/#/services/missing");

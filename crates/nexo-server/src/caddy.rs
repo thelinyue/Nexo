@@ -331,6 +331,8 @@ impl CaddyRuntimeConfig {
 #[derive(Debug)]
 pub struct CaddySupervisor {
     config: CaddyRuntimeConfig,
+    /// 延迟创建可复用的 Admin 连接池；构建失败仍通过原有错误路径返回。
+    client: tokio::sync::OnceCell<Client>,
     child: Arc<Mutex<Option<Child>>>,
     stopping: Arc<AtomicBool>,
     notify: Arc<Notify>,
@@ -346,6 +348,7 @@ impl CaddySupervisor {
     pub fn new(config: CaddyRuntimeConfig) -> Self {
         Self {
             config,
+            client: tokio::sync::OnceCell::new(),
             child: Arc::new(Mutex::new(None)),
             stopping: Arc::new(AtomicBool::new(false)),
             notify: Arc::new(Notify::new()),
@@ -353,6 +356,18 @@ impl CaddySupervisor {
             log_events: Arc::new(Mutex::new(Vec::new())),
             process_error: Arc::new(Mutex::new(None)),
         }
+    }
+
+    async fn admin_client(&self) -> Result<&Client> {
+        self.client
+            .get_or_try_init(|| async {
+                Client::builder()
+                    .no_proxy()
+                    .timeout(Duration::from_secs(10))
+                    .build()
+                    .map_err(Into::into)
+            })
+            .await
     }
 
     pub fn config(&self) -> &CaddyRuntimeConfig {
@@ -570,17 +585,14 @@ impl CaddySupervisor {
     /// 通过 Caddy Admin API 原子加载 JSON；失败时 Applied 文件和运行配置都不变。
     pub async fn apply_json(&self, config: &Value) -> Result<()> {
         let body = serde_json::to_vec(config)?;
-        let client = Client::builder()
-            .no_proxy()
-            .timeout(Duration::from_secs(10))
-            .build()?;
+        let client = self.admin_client().await?;
         // Admin API 的加载和两个落盘文件不是同一个文件系统事务。先记住
         // 旧文件，若落盘在加载成功后失败，就把运行中的 Caddy 回滚到旧
         // 配置并恢复文件，避免重启后读取一份并未确认的 Applied 状态。
         let old_config = fs::read(&self.config.config_path).ok();
         let old_applied = fs::read(&self.config.applied_path).ok();
         post_config(
-            &client,
+            client,
             &self.config.admin_url,
             &body,
             &self.config.cloudflare_token_root,
@@ -591,7 +603,7 @@ impl CaddySupervisor {
         if let Err(error) = persist_result {
             if let Some(previous) = old_config.as_deref() {
                 if let Err(rollback_error) = post_config(
-                    &client,
+                    client,
                     &self.config.admin_url,
                     previous,
                     &self.config.cloudflare_token_root,
@@ -634,15 +646,13 @@ impl CaddySupervisor {
     /// Caddy 停止只会让公网 Web 服务受限；调用方不应
     /// 因此停止 Nexo Core 或 TCP Tunnel。
     pub async fn current_config(&self) -> Result<Value> {
-        let client = Client::builder()
-            .no_proxy()
-            .timeout(Duration::from_secs(3))
-            .build()?;
+        let client = self.admin_client().await?;
         let result = client
             .get(format!(
                 "{}/config/",
                 self.config.admin_url.trim_end_matches('/')
             ))
+            .timeout(Duration::from_secs(3))
             .send()
             .await
             .context("无法连接 Caddy 管理接口");

@@ -1,5 +1,5 @@
 import { useEffect, useId, useMemo, useRef, useState } from "react";
-import { Globe, Network, Search } from "lucide-react";
+import { Globe, Network, Search } from "./icons";
 import { isPortProtocol } from "./ui";
 
 const styles = [["border-radius", "圆角"], ["circle", "圆形"], ["svg", "SVG"]] as const;
