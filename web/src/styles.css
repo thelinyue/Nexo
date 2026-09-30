@@ -317,7 +317,7 @@ dd>code { display:block; margin-bottom:10px; user-select:text; font-size:.9375re
 @media (forced-colors:active) { .service-switch-track { background:Canvas; outline:1px solid ButtonText; forced-color-adjust:none; } .service-switch-track::after { background:ButtonText; } .service-switch input:checked+.service-switch-track { background:Highlight; } .service-switch input:checked+.service-switch-track::after { background:HighlightText; } }
 /* 两个地址组在窄屏仍按阅读顺序同行；输入只在自身内部滚动，不挤出保存栏。 */
 .service-address-input,.service-public-input { display:grid; align-items:center; gap:4px; padding:3px 10px; }
-.service-address-input { grid-template-columns:6.5rem minmax(0,1fr) auto 4rem; }
+.service-address-input { grid-template-columns:7.5rem minmax(0,1fr) auto 4rem; }
 .service-public-input { grid-template-columns:6.5rem minmax(0,.7fr) auto minmax(0,1fr); }
 .service-address-input>input,.service-public-input>input { width:100%; min-width:0; min-height:48px; padding:8px 4px; border:0; border-radius:8px; background:transparent; font-size:1rem; }
 .service-address-input>input:last-child { text-align:right; }

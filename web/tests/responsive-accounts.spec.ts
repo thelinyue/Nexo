@@ -16,9 +16,13 @@ test("用户在全部断点始终单行，更多菜单信息完整且操作可�
       const cards = page.locator(".user-card");
       await expect(cards).toHaveCount(3);
       for (const card of await cards.all()) {
+        await expect.poll(async () => {
+          const heading = await card.locator(".user-heading").boundingBox();
+          const actions = await card.locator(".user-card-actions").boundingBox();
+          return Math.abs(heading!.y + heading!.height / 2 - actions!.y - actions!.height / 2);
+        }).toBeLessThan(1);
         const heading = await card.locator(".user-heading").boundingBox();
         const actions = await card.locator(".user-card-actions").boundingBox();
-        expect(Math.abs(heading!.y + heading!.height / 2 - actions!.y - actions!.height / 2)).toBeLessThan(1);
         expect(heading!.x + heading!.width).toBeLessThanOrEqual(actions!.x);
         expect((await card.getByRole("heading").boundingBox())!.width).toBeGreaterThan(16);
         for (const button of await card.getByRole("button").all()) {
