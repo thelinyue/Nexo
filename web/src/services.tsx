@@ -14,17 +14,19 @@ import { isLanRedirectAddress } from "./lan-redirect";
 type ServiceData = { tunnels: Tunnel[]; devices: Device[]; domains: Domain[] };
 const loadServices = async (request: ReturnType<typeof useApi>): Promise<ServiceData> => { const [tunnels, devices, domains] = await Promise.all([request<Tunnel[]>("/api/v1/tunnels"), request<Device[]>("/api/v1/devices"), request<Domain[]>("/api/v1/public-domains")]); return { tunnels, devices, domains: domains.filter(domain => domain.verification_status !== "pending") }; };
 
-type ServiceSelectOption = { value: string; label: string; status?: "online" | "offline" };
+type ServiceSelectOption = { value: string; label: string; status?: "online" | "offline"; disabled?: boolean };
 
-/** 两个表单选择器共享原生顶层浮层，避免被 dialog 的滚动区裁切。焦点留在触发按钮，方向键仅移动候选项，确认后才修改草稿。 */
-function ServiceSelect({ label, name, value, placeholder, options, disabled, compact = false, onChange, ...validation }: {
-  label: string; name: string; value: string; placeholder: string; options: ServiceSelectOption[]; disabled?: boolean; compact?: boolean;
+/** 服务表单共享原生顶层浮层，避免被 dialog 的滚动区裁切。焦点留在触发按钮，键盘跳过禁用项，确认后才修改草稿。 */
+function ServiceSelect({ label, name, value, placeholder, options, disabled, compact = false, menuMinWidth = compact ? 360 : 0, onChange, ...validation }: {
+  label: string; name: string; value: string; placeholder: string; options: ServiceSelectOption[]; disabled?: boolean; compact?: boolean; menuMinWidth?: number;
   onChange: (value: string) => void; "aria-invalid"?: boolean; "aria-describedby"?: string;
 }) {
   const id = useId();
   const triggerRef = useRef<HTMLButtonElement>(null); const menuRef = useRef<HTMLDivElement>(null);
   const [open, setOpen] = useState(false); const [highlighted, setHighlighted] = useState(0);
   const selected = options.find(option => option.value === value);
+  const enabledIndexes = options.flatMap((option, index) => option.disabled ? [] : [index]);
+  const unavailable = disabled || !enabledIndexes.length;
   function close(restoreFocus = false) {
     menuRef.current?.hidePopover(); setOpen(false);
     if (restoreFocus) triggerRef.current?.focus({ preventScroll: true });
@@ -39,8 +41,8 @@ function ServiceSelect({ label, name, value, placeholder, options, disabled, com
     const left = Math.max(body.left, viewport?.offsetLeft ?? 0) + 6;
     const right = Math.min(body.right, (viewport?.offsetLeft ?? 0) + (viewport?.width ?? window.innerWidth)) - 6;
     if (row.bottom <= top || row.top >= bottom) { close(); return; }
-    // 紧凑域名触发器仍展开足够宽的列表，低高度视口下避免长域名撑高到无法完整选中。
-    const width = Math.min(compact ? Math.max(row.width, 360) : row.width, right - left);
+    // 紧凑触发器按内容保留菜单最小宽度，协议无需占满地址行，长域名仍可完整阅读。
+    const width = Math.min(Math.max(row.width, menuMinWidth), right - left);
     menu.style.width = `${width}px`; menu.style.left = `${Math.max(left, Math.min(row.left, right - width))}px`;
     const desired = Math.min(menu.scrollHeight + 2, 300);
     const below = Math.max(0, bottom - row.bottom - 6); const above = Math.max(0, row.top - top - 6);
@@ -50,17 +52,19 @@ function ServiceSelect({ label, name, value, placeholder, options, disabled, com
     menu.style.top = `${down ? row.bottom + 6 : row.top - 6 - height}px`;
   }
   function show() {
-    if (disabled || !options.length) return;
-    setHighlighted(Math.max(0, options.findIndex(option => option.value === value)));
+    if (unavailable) return;
+    const selectedIndex = options.findIndex(option => option.value === value && !option.disabled);
+    setHighlighted(selectedIndex < 0 ? enabledIndexes[0] : selectedIndex);
     triggerRef.current?.scrollIntoView({ block: compact ? "end" : "nearest" });
     triggerRef.current?.focus({ preventScroll: true });
     menuRef.current?.showPopover(); position(); setOpen(true);
   }
   function choose(index: number) {
-    if (options[index]) onChange(options[index].value);
+    if (unavailable || !options[index] || options[index].disabled) return;
+    onChange(options[index].value);
     close(true);
   }
-  useEffect(() => { if (disabled) close(); }, [disabled]);
+  useEffect(() => { if (unavailable) close(); }, [unavailable]);
   useEffect(() => {
     if (!open) return;
     // 定位以可见表单区为边界，软键盘、横竖屏和表单滚动时仍保留标题与保存栏。
@@ -79,7 +83,7 @@ function ServiceSelect({ label, name, value, placeholder, options, disabled, com
   }, [open, highlighted]);
   const status = (option: ServiceSelectOption) => option.status && <span className={`service-select-status ${option.status}`}><i aria-hidden="true" />{option.status === "online" ? "在线" : "离线"}</span>;
   return <div className={`service-field service-select-field${compact ? " service-select-compact" : ""}`}>
-    <button ref={triggerRef} type="button" role="combobox" name={name} value={value} className="service-select-trigger" aria-label={label} aria-haspopup="listbox" aria-expanded={open} aria-controls={id} aria-activedescendant={open ? `${id}-${highlighted}` : undefined} aria-required="true" {...validation} disabled={disabled || !options.length} onClick={() => open ? close() : show()} onKeyDown={event => {
+    <button ref={triggerRef} type="button" role="combobox" name={name} value={value} className="service-select-trigger" aria-label={label} aria-haspopup="listbox" aria-expanded={open} aria-controls={id} aria-activedescendant={open ? `${id}-${highlighted}` : undefined} aria-required="true" {...validation} disabled={unavailable} onClick={() => open ? close() : show()} onKeyDown={event => {
       if (event.nativeEvent.isComposing) return;
       if (event.key === "Tab") { close(); return; }
       if (event.key === "Escape" && open) { event.preventDefault(); event.stopPropagation(); close(true); return; }
@@ -87,11 +91,14 @@ function ServiceSelect({ label, name, value, placeholder, options, disabled, com
         event.preventDefault();
         if (!open) { show(); return; }
         if (event.key === "Enter" || event.key === " ") choose(highlighted);
-        else setHighlighted(current => event.key === "Home" ? 0 : event.key === "End" ? options.length - 1 : Math.max(0, Math.min(options.length - 1, current + (event.key === "ArrowDown" ? 1 : -1))));
+        else setHighlighted(current => {
+          const next = event.key === "Home" ? 0 : event.key === "End" ? enabledIndexes.length - 1 : enabledIndexes.indexOf(current) + (event.key === "ArrowDown" ? 1 : -1);
+          return enabledIndexes[Math.max(0, Math.min(enabledIndexes.length - 1, next))];
+        });
       }
     }}><span className={compact ? "sr-only" : "service-select-caption"}>{label}</span><span className={`service-select-value${selected ? "" : " placeholder"}`}><span className="service-select-name" title={selected?.label}>{selected?.label ?? placeholder}</span>{selected && status(selected)}</span><ChevronDown size={17} aria-hidden="true" /></button>
     <div ref={menuRef} id={id} popover="auto" role="listbox" aria-label={`${label}选项`} className="service-select-menu" onToggle={event => setOpen(event.currentTarget.matches(":popover-open"))} onMouseDown={event => event.preventDefault()}>
-      {options.map((option, index) => <div key={option.value} id={`${id}-${index}`} role="option" aria-selected={option.value === value} data-active={highlighted === index} className="service-select-option" onPointerMove={event => { if (event.pointerType === "mouse") setHighlighted(index); }} onClick={() => choose(index)}><span className="service-select-option-name">{option.label}</span>{status(option)}<Check size={18} className="service-select-check" aria-hidden="true" /></div>)}
+      {options.map((option, index) => <div key={option.value} id={`${id}-${index}`} role="option" aria-selected={option.value === value} aria-disabled={option.disabled || undefined} data-active={!option.disabled && highlighted === index} className="service-select-option" onPointerMove={event => { if (event.pointerType === "mouse" && !option.disabled) setHighlighted(index); }} onClick={() => choose(index)}><span className="service-select-option-name">{option.label}</span>{status(option)}<Check size={18} className="service-select-check" aria-hidden="true" /></div>)}
     </div>
   </div>;
 }
@@ -192,24 +199,27 @@ function ServiceEditor({ tunnel, mode, data, active, csrf, onClose, onSaved }: {
           {!direct && <ServiceSelect {...fieldProps("device_id")} label="Agent" value={draft.device_id} placeholder="选择 Agent" options={devices.map(item => ({ value: item.id, label: item.name, status: item.status === "online" ? "online" : "offline" }))} disabled={busy} onChange={value => update("device_id", value)} />}
         </div>{!direct && !devices.length && <div className="notice"><span>请关闭表单，到设备页添加 Agent。</span></div>}{!direct && devices.find(item => item.id === draft.device_id)?.status === "offline" && <p className="helper" role="status">Agent 当前离线，可保存配置，连接恢复后下发。</p>}</section>
         <section className="service-form-section"><h3>{direct ? "目标地址" : "内网地址"}</h3><div className="service-field-group service-address-input" role="group" aria-label={direct ? "目标连接" : "内网连接"}>
-          <select aria-label={direct ? "目标协议" : "内网协议"} {...fieldProps("origin_protocol")} value={isPortProtocol(draft.protocol) ? draft.protocol : draft.origin_protocol} onChange={e => updateOriginProtocol(e.target.value)}><option value="http" disabled={Boolean(!direct && tunnel && !tunnel.public_domain)}>HTTP</option><option value="https" disabled={Boolean(!direct && tunnel && !tunnel.public_domain)}>HTTPS</option>{!direct && <><option value="tcp">TCP</option><option value="udp">UDP</option><option value="tcp_udp">TCP+UDP</option></>}</select>
+          <ServiceSelect compact menuMinWidth={160} label={direct ? "目标协议" : "内网协议"} {...fieldProps("origin_protocol")} value={isPortProtocol(draft.protocol) ? draft.protocol : draft.origin_protocol} placeholder="选择协议" disabled={busy} options={[{ value: "http", label: "HTTP", disabled: Boolean(!direct && tunnel && !tunnel.public_domain) }, { value: "https", label: "HTTPS", disabled: Boolean(!direct && tunnel && !tunnel.public_domain) }, ...(!direct ? [{ value: "tcp", label: "TCP" }, { value: "udp", label: "UDP" }, { value: "tcp_udp", label: "TCP+UDP" }] : [])]} onChange={updateOriginProtocol} />
           <input aria-label={direct ? "目标地址" : "内网地址"} {...fieldProps("local_address")} value={draft.local_address} onChange={e => update("local_address", e.target.value)} placeholder="IP 或主机名" inputMode="url" enterKeyHint="next" autoComplete="off" autoCorrect="off" autoCapitalize="none" spellCheck={false} required />
           <span className="service-address-separator" aria-hidden="true">:</span>
           <input aria-label={direct ? "目标端口" : "内网端口"} {...fieldProps("local_port")} value={draft.local_port} onChange={e => update("local_port", e.target.value)} placeholder="端口" type="text" inputMode="numeric" enterKeyHint={isPortProtocol(draft.protocol) ? "done" : "next"} autoComplete="off" required />
         </div></section>
         {isPortProtocol(draft.protocol) ? <details className="service-advanced" open={advancedOpen} onToggle={event => setAdvancedOpen(event.currentTarget.open)}><summary><span>公网端口</span><span>{draft.public_port || "自动分配"}</span><ChevronRight size={17} /></summary><label className="service-field"><span>指定端口</span><input {...fieldProps("public_port")} aria-label="公网端口" type="text" inputMode="numeric" enterKeyHint="done" autoComplete="off" value={draft.public_port} onChange={e => update("public_port", e.target.value)} placeholder="留空自动分配" /></label><p className="helper">可用范围：20000–29999。</p></details> : <section className="service-form-section"><h3 id="service-public-label">公网入口</h3><div className="service-field-group service-public-input" role="group" aria-labelledby="service-public-label">
-          <select aria-label="公网协议" {...fieldProps("protocol")} value={draft.protocol} onChange={e => update("protocol", e.target.value)}><option value="https">HTTPS</option><option value="http">HTTP</option></select>
+          <ServiceSelect compact menuMinWidth={160} label="公网协议" {...fieldProps("protocol")} value={draft.protocol} placeholder="选择协议" disabled={busy} options={[{ value: "https", label: "HTTPS" }, { value: "http", label: "HTTP" }]} onChange={value => update("protocol", value)} />
           <input aria-label="主机名" {...fieldProps("hostname")} value={draft.hostname} onChange={e => update("hostname", e.target.value)} placeholder="主机名" enterKeyHint="done" autoComplete="off" autoCorrect="off" autoCapitalize="none" spellCheck={false} required />
           <span className="service-address-separator" aria-hidden="true">.</span>
           <ServiceSelect compact {...fieldProps("public_domain_id")} label="根域名" value={draft.public_domain_id} placeholder="选择域名" options={data.domains.map(item => ({ value: item.id, label: item.domain }))} disabled={busy || Boolean(tunnel)} onChange={value => update("public_domain_id", value)} />
         </div>{draft.protocol === "https" && <div className="service-field-group"><label className="service-field"><span>HTTPS 端口</span><input {...fieldProps("https_port")} aria-label="HTTPS 端口" type="text" inputMode="numeric" value={draft.https_port} onChange={e => update("https_port", e.target.value)} placeholder="443" /></label></div>}{!data.domains.length && <div className="notice"><span>网页服务需要域名，请关闭表单后到域名页添加。</span></div>}{tunnel && <p className="helper">现有服务保留原根域名；更换根域名请创建新服务。</p>}</section>}
-        {nodeSupported && <section className="service-form-section"><h3>公网节点</h3><label className="service-field"><span>节点来源</span><select {...fieldProps("node_group_id")} value={draft.node_group_id} onChange={e => { const group = nodeGroups.data?.find(g => g.id === e.target.value); setDraft(current => ({ ...current, node_group_id: e.target.value, ...(group ? { node_ids: group.node_ids, distribution_mode: current.distribution_mode === "single" ? "latency" : current.distribution_mode, preferred_node_id: group.node_ids.includes(current.preferred_node_id) ? current.preferred_node_id : group.node_ids[0] } : {}) })); }}><option value="">逐个选择节点</option>{nodeGroups.data?.filter(group => group.selectable !== false).map(group => <option value={group.id} key={group.id}>{group.name}（{group.node_ids.length} 个节点）</option>)}</select></label><Notice error={nodeGroups.error} /><Notice error={nodeData.error} onRetry={() => void nodeData.reload()} /><label className="service-field"><span>节点策略</span><select {...fieldProps("distribution_mode")} value={draft.distribution_mode} onChange={e => setDraft(current => ({ ...current, distribution_mode: e.target.value, node_ids: e.target.value === "single" ? current.node_ids.slice(0, 1) : current.node_ids }))}><option value="single" disabled={!!draft.node_group_id}>单节点</option><option value="dns">多节点 DNS 分流</option><option value="latency">自动选择低延迟节点</option><option value="manual">手动首选，故障时切换备用</option></select></label>
+        {nodeSupported && <section className="service-form-section service-node-section"><h3>公网节点</h3><div className="service-field-group">
+          <ServiceSelect {...fieldProps("node_group_id")} label="节点来源" value={draft.node_group_id} placeholder="选择来源" disabled={busy} options={[{ value: "", label: "手动选择" }, ...(nodeGroups.data ?? []).filter(group => group.selectable !== false).map(group => ({ value: group.id, label: `${group.name} · ${group.node_ids.length} 个节点` }))]} onChange={value => { const group = nodeGroups.data?.find(g => g.id === value); setDraft(current => ({ ...current, node_group_id: value, ...(group ? { node_ids: group.node_ids, distribution_mode: current.distribution_mode === "single" ? "latency" : current.distribution_mode, preferred_node_id: group.node_ids.includes(current.preferred_node_id) ? current.preferred_node_id : group.node_ids[0] } : {}) })); }} />
+          <ServiceSelect {...fieldProps("distribution_mode")} label="选择策略" value={draft.distribution_mode} placeholder="选择策略" disabled={busy} options={[{ value: "single", label: "单节点", disabled: Boolean(draft.node_group_id) }, { value: "dns", label: "DNS 分流" }, { value: "latency", label: "低延迟优先" }, { value: "manual", label: "主备切换" }]} onChange={value => setDraft(current => ({ ...current, distribution_mode: value, node_ids: value === "single" ? current.node_ids.slice(0, 1) : current.node_ids }))} />
+        </div><Notice error={nodeGroups.error} /><Notice error={nodeData.error} onRetry={() => void nodeData.reload()} />
           {draft.node_group_id ? <div><span className="helper">组内节点</span><ul className="node-group-members" aria-label="组内节点">{draft.node_ids.map(id => { const node = nodeData.data?.nodes.find(item => item.id === id); return <li key={id}>{node?.name ?? id}{node && (node.status !== "online" || !node.enabled) && <span className="helper"> · 当前不可用</span>}</li>; })}</ul></div> : <fieldset><legend>可用节点</legend>{(nodeData.data?.nodes ?? []).filter(node => node.approved && node.enabled && node.selectable !== false).map(node => <label className="node-check" key={node.id}><input type={draft.distribution_mode === "single" ? "radio" : "checkbox"} name="node_ids" checked={draft.node_ids.includes(node.id)} onChange={e => setDraft(current => { const ids = current.distribution_mode === "single" ? [node.id] : e.target.checked ? [...current.node_ids, node.id] : current.node_ids.filter(id => id !== node.id); return { ...current, node_ids: ids, preferred_node_id: ids.includes(current.preferred_node_id) ? current.preferred_node_id : ids[0] ?? "" }; })} />{node.name}{node.status !== "online" && " · 当前不可用"}</label>)}</fieldset>}
-          {draft.distribution_mode === "manual" && <label className="service-field"><span>首选节点</span><select {...fieldProps("preferred_node_id")} value={draft.preferred_node_id || draft.node_ids[0]} onChange={e => update("preferred_node_id", e.target.value)}>{draft.node_ids.map(id => <option key={id} value={id}>{nodeData.data?.nodes.find(n => n.id === id)?.name ?? id}</option>)}</select></label>}
-          {draft.distribution_mode === "latency" && <p className="helper">依据所选 Agent → VPS 的实测往返延迟选择健康节点，避免因短暂波动频繁切换。</p>}
-          {draft.distribution_mode === "manual" && <p className="helper">首选故障时切换到所选备用节点，恢复健康后回到首选。</p>}
-          {draft.distribution_mode !== "single" && <p className="helper">通过同一域名访问。DNS 缓存和客户端重连决定切换时间，现有长连接不会迁移。</p>}
-          {remoteTcp && <><label className="service-field"><span>主机名</span><input {...fieldProps("hostname")} value={draft.hostname} onChange={e => update("hostname", e.target.value)} /></label><ServiceSelect {...fieldProps("public_domain_id")} label="根域名" value={draft.public_domain_id} placeholder="选择域名" options={data.domains.map(item => ({ value: item.id, label: item.domain }))} onChange={value => update("public_domain_id", value)} /><p className="helper">TCP 多节点必须使用域名，直接访问 VPS IP 无法自动切换。</p></>}
+          {draft.distribution_mode === "manual" && <div className="service-field-group"><ServiceSelect {...fieldProps("preferred_node_id")} label="首选节点" value={draft.preferred_node_id || draft.node_ids[0] || ""} placeholder="选择节点" disabled={busy} options={draft.node_ids.map(id => ({ value: id, label: nodeData.data?.nodes.find(n => n.id === id)?.name ?? id }))} onChange={value => update("preferred_node_id", value)} /></div>}
+          {draft.distribution_mode === "latency" && <p className="helper">按 Agent 到节点的实测延迟择优，避免频繁切换。</p>}
+          {draft.distribution_mode === "manual" && <p className="helper">首选不可用时切换备用，恢复后自动切回。</p>}
+          {draft.distribution_mode !== "single" && <p className="helper">共用同一域名；切换受 DNS 缓存与客户端重连影响，已有连接不会迁移。</p>}
+          {remoteTcp && <><label className="service-field"><span>主机名</span><input {...fieldProps("hostname")} value={draft.hostname} onChange={e => update("hostname", e.target.value)} /></label><ServiceSelect {...fieldProps("public_domain_id")} label="根域名" value={draft.public_domain_id} placeholder="选择域名" options={data.domains.map(item => ({ value: item.id, label: item.domain }))} disabled={busy} onChange={value => update("public_domain_id", value)} /><p className="helper">TCP 多节点必须使用域名，直接访问 VPS IP 无法自动切换。</p></>}
         </section>}
         {direct && draft.protocol === "https" && <div className="service-field-group"><label className="service-field service-toggle-field"><span>强制 HTTPS</span><span className="service-switch"><input type="checkbox" role="switch" checked={draft.http_redirect_enabled} onChange={e => update("http_redirect_enabled", e.target.checked)} /><span className="service-switch-track" aria-hidden="true" /></span></label></div>}
         {!direct && draft.protocol === "https" && <section className="service-form-section"><div className="service-field-group"><label className="service-field service-toggle-field"><span>IPv6 直连</span><span className="service-switch"><input {...fieldProps("ipv6_direct_enabled")} type="checkbox" role="switch" checked={draft.ipv6_direct_enabled} disabled={busy || draft.lan_redirect_enabled} onChange={e => update("ipv6_direct_enabled", e.target.checked)} /><span className="service-switch-track" aria-hidden="true" /></span></label></div>{draft.ipv6_direct_enabled && <><Notice error={ipv6.error} onRetry={() => void ipv6.reload()} />{!ipv6.data?.supported ? <p className="helper">请连接或升级 Agent。</p> : <p className="helper" role="status">{ipv6.data.selected_address ? <>自动选择公网 IPv6：<code>{ipv6.data.selected_address}</code></> : "等待 Agent 自动检测公网 IPv6。"}</p>}<p className="helper">IPv4 转发，IPv6 直连。需配置 DNS 验证，地址变化后自动更新解析，无需另设 DDNS。</p>{draft.access_mode === "password" && <p className="helper">直连仍需访问密码。Emby 客户端建议使用自身认证。</p>}</>}{draft.lan_redirect_enabled && <p className="helper">需先关闭内网重定向。</p>}</section>}

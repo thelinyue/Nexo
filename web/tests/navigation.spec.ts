@@ -76,7 +76,7 @@ test("侧栏与历史导航保留搜索和滚动，刷新以地址栏为准", as
   await expect(page.getByRole("navigation", { name: "底部导航" })).toBeVisible();
   await expect(current(page).locator("h1")).toHaveText("首页");
   await page.setViewportSize({ width: 1440, height: 900 });
-  await expect(page.locator(".account-trigger")).toHaveCount(1);
+  await expect(page.locator(".sidebar-settings")).toHaveCount(1);
   await expect(page.getByRole("tablist")).toHaveCount(0);
 });
 
@@ -123,7 +123,7 @@ test("PWA 玻璃底栏在复杂背景和辅助功能偏好下仍可用", async (
   await expect(page.locator(".bottom-nav")).toBeVisible();
   await page.setViewportSize({ width: 901, height: 900 });
   await expect(page.locator(".bottom-nav")).toBeHidden();
-  await expect(page.locator(".account-trigger")).toBeVisible();
+  await expect(page.locator(".sidebar-settings")).toBeVisible();
 });
 
 test("手机常用入口与更多列表、详情返回与账号设置", async ({ page }, info) => {
@@ -180,27 +180,44 @@ test("空白与已修改表单锁住历史导航，跨断点保持实例", async
   await page.screenshot({ animations: "disabled", scale: "css", path: info.outputPath("mobile-full-form.png") });
   await page.setViewportSize({ width: 1440, height: 900 });
   await expect(editor.getByLabel("服务名称")).toHaveValue("跨断点草稿");
+  await page.locator(".sidebar-settings").evaluate(element => (element as HTMLAnchorElement).click());
+  await expect(page).toHaveURL(/#\/services$/);
+  await expect(editor.getByLabel("服务名称")).toHaveValue("跨断点草稿");
   await editor.locator(".modal-actions").getByRole("button", { name: "取消", exact: true }).click();
   await page.getByRole("button", { name: "放弃修改", exact: true }).click();
   await page.locator(".sidebar").getByRole("link", { name: "域名", exact: true }).click();
   await expect(page).toHaveURL(/#\/domains$/);
 });
 
-test("账号菜单键盘关闭与退出，不写入页签记录", async ({ page }, info) => {
-  test.skip(info.project.name !== "desktop-dark", "桌面账号菜单");
-  await installApiMocks(page);
+test("侧栏设置键盘直达本人设置，退出失败可重试且不写入页签记录", async ({ page }, info) => {
+  test.skip(info.project.name !== "desktop-dark", "桌面设置入口");
+  const state = await installApiMocks(page);
   await page.goto("/#/agents");
-  const trigger = page.locator(".account-trigger");
-  await trigger.click();
-  await expect(page.locator(".account-popover")).toBeVisible();
-  await page.keyboard.press("Escape");
-  await expect(page.locator(".account-popover")).toBeHidden();
-  await expect(trigger).toBeFocused();
-  await trigger.click();
-  await page.locator(".account-popover").getByRole("link", { name: "账号设置" }).click();
+  const settings = page.locator(".sidebar-settings");
+  await expect(settings).toHaveAccessibleName("账号设置");
+  await expect(settings).toHaveAttribute("title", "账号设置");
+  await settings.focus();
+  await page.keyboard.press("Enter");
   await expect(current(page).getByRole("heading", { name: "账号设置", exact: true })).toBeVisible();
-  await expect(page.locator(".account-trigger")).toHaveCount(1);
+  await expect(current(page).locator("h1")).toBeFocused();
+  await expect(settings).toHaveAttribute("aria-current", "page");
+  await current(page).getByRole("link", { name: "登录会话", exact: true }).click();
+  await expect(page).toHaveURL(/#\/settings\/sessions$/);
+  await expect(settings).toHaveAttribute("aria-current", "page");
+  await settings.click();
+  await expect(page.locator(".sidebar-settings")).toHaveCount(1);
+  await expect(page.locator(".account-trigger,.account-popover")).toHaveCount(0);
+  state.failures.set("POST /api/v1/auth/logout", "暂时无法退出，请重试");
   await current(page).getByRole("button", { name: "退出登录", exact: true }).click();
+  await expect(current(page).getByRole("alert")).toHaveText("暂时无法退出，请重试");
+  await expect(page).toHaveURL(/#\/manage$/);
+  state.failures.clear();
+  let finishLogout!: () => void;
+  const logoutReady = new Promise<void>(resolve => { finishLogout = resolve; });
+  await page.route("**/api/v1/auth/logout", async route => { await logoutReady; await route.fulfill({ json: {} }); });
+  await current(page).getByRole("button", { name: "退出登录", exact: true }).click();
+  await expect(current(page).getByRole("button", { name: "退出中…", exact: true })).toBeDisabled();
+  finishLogout();
   await expect(page.getByRole("heading", { name: "登录", exact: true })).toBeVisible();
   expect(await page.evaluate(() => Object.keys(sessionStorage).filter(key => key.startsWith("nexo:tabs:")))).toEqual([]);
 });

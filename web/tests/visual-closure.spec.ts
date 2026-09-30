@@ -46,7 +46,7 @@ test("所有页面在移动尺寸和明暗主题中无溢出，输出实际截�
       for (const route of ["services", "agents", "manage", "domains", "settings", "settings/sessions", "services/t-2", "agents/a-2", "domains/d-1"]) {
         await page.goto(`/#/${route}`);
         if (width <= 900) await expect(page.locator(".page-slot:not([hidden]) h1")).toBeVisible();
-        else { await expect(page.locator(".page-slot:not([hidden]) h1")).toBeVisible(); await expect(page.locator(".account-trigger")).toBeVisible(); }
+        else { await expect(page.locator(".page-slot:not([hidden]) h1")).toBeVisible(); await expect(page.locator(".sidebar-settings")).toBeVisible(); }
         await expect(page.locator(".page-slot:not([hidden]) .skeleton-list")).toHaveCount(0);
         await expect.poll(() => page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBeTruthy();
         if (width <= 900) {
@@ -55,16 +55,19 @@ test("所有页面在移动尺寸和明暗主题中无溢出，输出实际截�
           if (route === "services") {
             await expect(page.locator(".page-slot:not([hidden]) .service-name strong").first()).toHaveCSS("-webkit-line-clamp", "2");
             await expect(page.locator(".service-address").first()).toBeHidden();
-            const fab = await page.getByRole("button", { name: "添加", exact: true }).boundingBox();
+            const add = (await page.getByRole("button", { name: "添加", exact: true }).boundingBox())!;
+            const header = (await page.locator(".page-slot:not([hidden]) .page-header").boundingBox())!;
             const nav = await page.locator(".bottom-nav").boundingBox();
-            expect(fab!.y + fab!.height).toBeLessThanOrEqual(nav!.y);
-            expect(fab!.y).toBeGreaterThan(height / 2);
+            expect(add.width).toBe(44);
+            expect(add.height).toBe(44);
+            expect(add.x + add.width).toBeLessThanOrEqual(header.x + header.width);
+            expect(add.y + add.height / 2).toBeCloseTo(header.y + header.height / 2, 0);
             expect(nav!.x).toBeGreaterThanOrEqual(16);
             expect(nav!.x + nav!.width).toBeLessThanOrEqual(width - 16);
             expect(nav!.y + nav!.height).toBeLessThanOrEqual(height - 12);
             await page.evaluate(() => window.scrollTo(0, document.documentElement.scrollHeight));
             const lastRow = await page.locator(".page-slot:not([hidden]) .service-row").last().boundingBox();
-            expect(lastRow!.y + lastRow!.height).toBeLessThanOrEqual(fab!.y);
+            expect(lastRow!.y + lastRow!.height).toBeLessThanOrEqual(nav!.y);
             await page.evaluate(() => window.scrollTo(0, 0));
           }
           if (route === "agents") await expect(page.locator(".page-slot:not([hidden])").getByText("离线", { exact: true })).toBeVisible();

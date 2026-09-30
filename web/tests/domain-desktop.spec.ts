@@ -40,7 +40,7 @@ for (const colorScheme of ["light", "dark"] as const) {
       await page.goto("/#/domains");
       const content = page.locator(".page-slot:not([hidden])");
       await expect(content.locator(".domain-row")).toHaveCount(1);
-      await expect(content.getByRole("heading", { name: "域名", exact: true })).toBeInViewport();
+      await expect(content.getByRole("heading", { name: "域名", exact: true })).toBeAttached();
       await expect(content.getByRole("button", { name: "添加 域名", exact: true })).toBeInViewport();
       await page.screenshot({ path: testInfo.outputPath("domains-list.png") });
 

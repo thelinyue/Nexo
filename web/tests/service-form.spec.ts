@@ -1,4 +1,4 @@
-import { openServiceEditor } from "./service-actions";
+import { openServiceEditor, selectServiceOption } from "./service-actions";
 import { expect, test } from "@playwright/test";
 import { installApiMocks } from "./api-mocks";
 
@@ -12,12 +12,12 @@ for (const protocol of ["http", "https"]) for (const origin of ["http", "https"]
     await dialog.getByLabel("内网地址", { exact: true }).fill("192.168.1.10");
     await dialog.getByLabel("内网端口").fill("8443");
     await dialog.getByLabel("主机名").fill("independent");
-    await dialog.getByLabel("公网协议").selectOption(protocol);
-    await dialog.getByLabel("内网协议").selectOption(origin);
-    await dialog.getByLabel("内网协议").selectOption("tcp");
-    await dialog.getByLabel("内网协议").selectOption(origin);
-    await expect(dialog.getByLabel("公网协议")).toHaveValue(protocol);
-    await expect(dialog.getByLabel("内网协议")).toHaveValue(origin);
+    await selectServiceOption(dialog.getByRole("combobox", { name: "公网协议", exact: true }), (protocol).toUpperCase().replace("_", "+"));
+    await selectServiceOption(dialog.getByRole("combobox", { name: "内网协议", exact: true }), (origin).toUpperCase().replace("_", "+"));
+    await selectServiceOption(dialog.getByRole("combobox", { name: "内网协议", exact: true }), "TCP");
+    await selectServiceOption(dialog.getByRole("combobox", { name: "内网协议", exact: true }), (origin).toUpperCase().replace("_", "+"));
+    await expect(dialog.getByRole("combobox", { name: "公网协议", exact: true })).toHaveAttribute("value", protocol);
+    await expect(dialog.getByRole("combobox", { name: "内网协议", exact: true })).toHaveAttribute("value", origin);
     await expect(dialog.getByLabel("内网端口")).toHaveValue("8443");
     await dialog.getByRole("button", { name: "保存服务" }).click();
     await expect(dialog).toBeHidden();
@@ -26,10 +26,10 @@ for (const protocol of ["http", "https"]) for (const origin of ["http", "https"]
     await expect(page.locator(".detail-field", { has: page.getByText("内网地址", { exact: true }) })).toContainText(`${origin}://192.168.1.10:8443`);
     await page.getByRole("button", { name: "编辑服务" }).click();
     const editor = page.getByRole("dialog", { name: "编辑服务" });
-    await expect(editor.getByLabel("公网协议")).toHaveValue(protocol);
-    await expect(editor.getByLabel("内网协议")).toHaveValue(origin);
+    await expect(editor.getByRole("combobox", { name: "公网协议", exact: true })).toHaveAttribute("value", protocol);
+    await expect(editor.getByRole("combobox", { name: "内网协议", exact: true })).toHaveAttribute("value", origin);
     const next = origin === "http" ? "https" : "http";
-    await editor.getByLabel("内网协议").selectOption(next);
+    await selectServiceOption(editor.getByRole("combobox", { name: "内网协议", exact: true }), (next).toUpperCase().replace("_", "+"));
     await editor.getByRole("button", { name: "保存服务" }).click();
     await expect(editor).toBeHidden();
     expect(state.calls.find(call => call.method === "PUT")?.body).toMatchObject({ protocol, origin_protocol: next, local_port: 8443 });
@@ -43,11 +43,11 @@ for (const protocol of ["tcp", "udp", "tcp_udp"]) {
     await page.goto("/#/services");
     await openServiceEditor(page);
     const dialog = page.getByRole("dialog", { name: "创建服务" });
-    await dialog.getByLabel("内网协议").selectOption(protocol);
+    await selectServiceOption(dialog.getByRole("combobox", { name: "内网协议", exact: true }), (protocol).toUpperCase().replace("_", "+"));
     await dialog.getByLabel("服务名称").fill(`测试 ${protocol}`);
     await dialog.getByLabel("内网地址", { exact: true }).fill("192.168.1.10");
     await dialog.getByLabel("内网端口").fill("8080");
-    await expect(dialog.getByLabel("公网协议")).toHaveCount(0);
+    await expect(dialog.getByRole("combobox", { name: "公网协议", exact: true })).toHaveCount(0);
     await expect(dialog.getByText("高级设置", { exact: true })).toHaveCount(0);
     await dialog.getByRole("button", { name: "保存服务" }).click();
     await expect(dialog).toBeHidden();
@@ -55,10 +55,20 @@ for (const protocol of ["tcp", "udp", "tcp_udp"]) {
     await page.getByRole("link", { name: `测试 ${protocol}`, exact: true }).click();
     await page.getByRole("button", { name: "编辑服务" }).click();
     const editor = page.getByRole("dialog", { name: "编辑服务" });
-    const select = editor.getByLabel("内网协议");
-    await expect(select).toHaveValue(protocol);
-    await expect(select.locator('option[value="http"]')).toBeDisabled();
-    await expect(select.locator('option[value="https"]')).toBeDisabled();
+    const select = editor.getByRole("combobox", { name: "内网协议", exact: true });
+    await expect(select).toHaveAttribute("value", protocol);
+    await select.click();
+    const list = editor.getByRole("listbox", { name: "内网协议选项" });
+    await expect(list.getByRole("option", { name: "HTTP", exact: true })).toBeDisabled();
+    await expect(list.getByRole("option", { name: "HTTPS", exact: true })).toBeDisabled();
+    await select.press("Home");
+    await expect(list.getByRole("option", { name: "TCP", exact: true })).toHaveAttribute("data-active", "true");
+    await select.press("ArrowUp");
+    await expect(list.getByRole("option", { name: "TCP", exact: true })).toHaveAttribute("data-active", "true");
+    await select.press("End");
+    await expect(list.getByRole("option", { name: "TCP+UDP", exact: true })).toHaveAttribute("data-active", "true");
+    await select.press("Escape");
+    await expect(select).toHaveAttribute("value", protocol);
     await editor.getByLabel("内网端口").fill("9090");
     await editor.getByRole("button", { name: "保存服务" }).click();
     await expect(editor).toBeHidden();
@@ -92,23 +102,18 @@ test("窄屏两个地址组保持同行，长地址仍可编辑且保存按钮�
     await expect(dialog.getByRole("button", { name: "保存服务" })).toBeInViewport();
     expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBeTruthy();
     await page.screenshot({ path: info.outputPath(`compact-web-${width}.png`), animations: "disabled" });
-    await dialog.getByLabel("内网协议").selectOption("tcp_udp");
-    const protocol = dialog.getByLabel("内网协议");
+    await selectServiceOption(dialog.getByRole("combobox", { name: "内网协议", exact: true }), "TCP+UDP");
+    const protocol = dialog.getByRole("combobox", { name: "内网协议", exact: true });
     await protocol.focus();
     await expect(protocol).toBeFocused();
     await page.keyboard.press("Tab");
     await expect(dialog.getByLabel("内网地址", { exact: true })).toBeFocused();
-    const fits = await protocol.evaluate((element: HTMLSelectElement) => {
-      const style = getComputedStyle(element);
-      const context = document.createElement("canvas").getContext("2d")!;
-      context.font = style.font;
-      return context.measureText("TCP+UDP").width + parseFloat(style.paddingLeft) + parseFloat(style.paddingRight) <= element.clientWidth;
-    });
+    const fits = await protocol.locator(".service-select-name").evaluate(element => element.scrollWidth <= element.clientWidth);
     expect(fits).toBeTruthy();
     expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBeTruthy();
     await expect(dialog.getByRole("button", { name: "保存服务" })).toBeInViewport();
     await page.screenshot({ path: info.outputPath(`compact-tcp-udp-${width}.png`), animations: "disabled" });
-    await protocol.selectOption("http");
+    await selectServiceOption(protocol, "HTTP");
   }
   const address = dialog.getByLabel("内网地址", { exact: true });
   await address.fill("fd12:3456:789a:bcde:1234:5678:90ab:cdef");
@@ -124,13 +129,15 @@ test("协议融入内网地址且单域名自动填入，打开表单不抢占�
   const dialog = page.getByRole("dialog", { name: "创建服务" });
   await expect(dialog).toBeVisible();
   expect(await page.evaluate(() => document.activeElement instanceof HTMLInputElement)).toBeFalsy();
-  await expect(dialog.getByLabel("内网协议")).toHaveValue("http");
-  await expect(dialog.getByLabel("内网协议").locator("option")).toHaveText(["HTTP", "HTTPS", "TCP", "UDP", "TCP+UDP"]);
+  await expect(dialog.getByRole("combobox", { name: "内网协议", exact: true })).toHaveAttribute("value", "http");
+  await dialog.getByRole("combobox", { name: "内网协议", exact: true }).click();
+  await expect(dialog.getByRole("listbox", { name: "内网协议选项" }).getByRole("option")).toHaveText(["HTTP", "HTTPS", "TCP", "UDP", "TCP+UDP"]);
+  await dialog.getByRole("combobox", { name: "内网协议", exact: true }).press("Escape");
   await expect(dialog.getByRole("group", { name: "服务类型", exact: true })).toHaveCount(0);
-  await expect(dialog.getByLabel("公网协议")).toHaveValue("https");
-  await expect(dialog.getByLabel("内网协议")).toHaveValue("http");
+  await expect(dialog.getByRole("combobox", { name: "公网协议", exact: true })).toHaveAttribute("value", "https");
+  await expect(dialog.getByRole("combobox", { name: "内网协议", exact: true })).toHaveAttribute("value", "http");
   await expect(dialog.getByLabel("公网端口", { exact: true })).toBeHidden();
-  await dialog.getByLabel("内网协议").selectOption("http");
+  await selectServiceOption(dialog.getByRole("combobox", { name: "内网协议", exact: true }), "HTTP");
   await expect(dialog.getByRole("combobox", { name: "根域名", exact: true })).toContainText("example.com");
   await dialog.getByLabel("主机名").fill("nas");
   await expect(dialog.locator(".service-submit-preview code")).toHaveText("https://nas.example.com");
@@ -144,7 +151,7 @@ test("错误定位到具体字段，折叠的无效端口自动展开，未通�
   await page.goto("/#/services");
   await openServiceEditor(page);
   const dialog = page.getByRole("dialog", { name: "创建服务" });
-  await dialog.getByLabel("内网协议").selectOption("tcp");
+  await selectServiceOption(dialog.getByRole("combobox", { name: "内网协议", exact: true }), "TCP");
   const save = dialog.getByRole("button", { name: "保存服务" });
   await save.click();
   await expect(dialog.getByLabel("服务名称")).toBeFocused();
@@ -201,19 +208,19 @@ test("协议切换保留输入，但不提交其他协议的端口；多域名�
   await page.goto("/#/services");
   await openServiceEditor(page);
   const dialog = page.getByRole("dialog", { name: "创建服务" });
-  await dialog.getByLabel("内网协议").selectOption("tcp");
+  await selectServiceOption(dialog.getByRole("combobox", { name: "内网协议", exact: true }), "TCP");
   await dialog.getByLabel("服务名称").fill("Web 服务");
   await dialog.getByLabel("内网端口").fill("8080");
   await dialog.locator("summary").click();
   await dialog.getByLabel("公网端口", { exact: true }).fill("21000");
-  await dialog.getByLabel("内网协议").selectOption("http");
+  await selectServiceOption(dialog.getByRole("combobox", { name: "内网协议", exact: true }), "HTTP");
   await expect(dialog.getByRole("combobox", { name: "根域名", exact: true })).toContainText("选择域名");
   await dialog.getByLabel("主机名").fill("nas");
   await dialog.getByRole("combobox", { name: "根域名", exact: true }).click();
   await dialog.getByRole("option", { name: "second.example.com", exact: true }).click();
-  await dialog.getByLabel("内网协议").selectOption("tcp");
+  await selectServiceOption(dialog.getByRole("combobox", { name: "内网协议", exact: true }), "TCP");
   await expect(dialog.getByLabel("公网端口", { exact: true })).toHaveValue("21000");
-  await dialog.getByLabel("内网协议").selectOption("http");
+  await selectServiceOption(dialog.getByRole("combobox", { name: "内网协议", exact: true }), "HTTP");
   await expect(dialog.getByLabel("主机名")).toHaveValue("nas");
   await dialog.getByRole("button", { name: "保存服务" }).click();
   await expect(dialog).not.toBeVisible();
@@ -255,7 +262,7 @@ test("两个选择框互斥，键盘确认和取消不误提交或关闭表单",
   await openServiceEditor(page);
   const dialog = page.getByRole("dialog", { name: "创建服务" });
   const agent = dialog.getByRole("combobox", { name: "Agent", exact: true });
-  await dialog.getByLabel("内网协议").selectOption("http");
+  await selectServiceOption(dialog.getByRole("combobox", { name: "内网协议", exact: true }), "HTTP");
   await dialog.getByLabel("服务名称").fill("键盘选择");
   await dialog.getByLabel("内网端口").fill("8080");
   await dialog.getByLabel("主机名").fill("nas");
@@ -297,7 +304,7 @@ test("两个选择框互斥，键盘确认和取消不误提交或关闭表单",
   await agent.press("ArrowDown");
   await agent.press("Tab");
   await expect(agent).toHaveAttribute("aria-expanded", "false");
-  await expect(dialog.getByLabel("内网协议")).toBeFocused();
+  await expect(dialog.getByRole("combobox", { name: "内网协议", exact: true })).toBeFocused();
   await agent.click();
   await dialog.getByLabel("服务名称").click();
   await expect(agent).toHaveAttribute("aria-expanded", "false");
@@ -312,7 +319,7 @@ test("长名称和长域名浮层在窄屏、横屏及低高度视口内可滚�
   await page.goto("/#/services");
   await openServiceEditor(page);
   const dialog = page.getByRole("dialog", { name: "创建服务" });
-  await dialog.getByLabel("内网协议").selectOption("http");
+  await selectServiceOption(dialog.getByRole("combobox", { name: "内网协议", exact: true }), "HTTP");
   for (const viewport of [{ width: 320, height: 568 }, { width: 390, height: 420 }, { width: 812, height: 375 }]) {
     await page.setViewportSize(viewport);
     for (const label of ["Agent", "根域名"]) {
@@ -343,7 +350,7 @@ test("无 Agent 或域名时指引先取消表单，选择框和保存禁用", a
   const dialog = page.getByRole("dialog", { name: "创建服务" });
   await expect(dialog.getByRole("combobox", { name: "Agent", exact: true })).toBeDisabled();
   await expect(dialog.getByText("请关闭表单，到设备页添加 Agent。", { exact: true })).toBeVisible();
-  await dialog.getByLabel("内网协议").selectOption("http");
+  await selectServiceOption(dialog.getByRole("combobox", { name: "内网协议", exact: true }), "HTTP");
   await expect(dialog.getByRole("combobox", { name: "根域名", exact: true })).toBeDisabled();
   await expect(dialog.getByText("网页服务需要域名，请关闭表单后到域名页添加。", { exact: true })).toBeVisible();
   await expect(dialog.getByRole("button", { name: "保存服务" })).toBeDisabled();
@@ -356,7 +363,7 @@ test("展开中的浮层跟随表单滚动和视口变化", async ({ page }) => 
   await page.goto("/#/services");
   await openServiceEditor(page);
   const dialog = page.getByRole("dialog", { name: "创建服务" });
-  await dialog.getByLabel("内网协议").selectOption("http");
+  await selectServiceOption(dialog.getByRole("combobox", { name: "内网协议", exact: true }), "HTTP");
   const agent = dialog.getByRole("combobox", { name: "Agent", exact: true });
   const list = dialog.getByRole("listbox", { name: "Agent选项" });
   await agent.click();
@@ -372,12 +379,12 @@ test("展开中的浮层跟随表单滚动和视口变化", async ({ page }) => 
   await expect(dialog).toBeVisible();
 });
 
-test("保存期间禁用两个选择框，失败后恢复选择和草稿", async ({ page }) => {
+test("保存期间关闭浮层并禁用所有选择框，失败后恢复选择和草稿", async ({ page }) => {
   await installApiMocks(page);
   await page.goto("/#/services");
   await openServiceEditor(page);
   const dialog = page.getByRole("dialog", { name: "创建服务" });
-  await dialog.getByLabel("内网协议").selectOption("http");
+  await selectServiceOption(dialog.getByRole("combobox", { name: "内网协议", exact: true }), "HTTP");
   await dialog.getByLabel("服务名称").fill("保存期间");
   await dialog.getByLabel("内网端口").fill("8080");
   await dialog.getByLabel("主机名").fill("nas");
@@ -386,9 +393,11 @@ test("保存期间禁用两个选择框，失败后恢复选择和草稿", async
     await new Promise(resolve => setTimeout(resolve, 600));
     await route.fulfill({ status: 503, json: { error: "暂时无法保存" } });
   });
+  await dialog.getByRole("combobox", { name: "选择策略", exact: true }).click();
+  await expect(dialog.getByRole("listbox", { name: "选择策略选项" })).toBeVisible();
   await dialog.getByRole("button", { name: "保存服务" }).click();
-  await expect(dialog.getByRole("combobox", { name: "Agent", exact: true })).toBeDisabled();
-  await expect(dialog.getByRole("combobox", { name: "根域名", exact: true })).toBeDisabled();
+  await expect(dialog.getByRole("listbox")).toHaveCount(0);
+  for (const select of await dialog.getByRole("combobox").all()) await expect(select).toBeDisabled();
   await expect(dialog.getByRole("alert")).toContainText("暂时无法保存");
   await expect(dialog.getByRole("combobox", { name: "Agent", exact: true })).toBeEnabled();
   await expect(dialog.getByRole("combobox", { name: "根域名", exact: true })).toBeEnabled();

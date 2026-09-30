@@ -798,6 +798,12 @@ async fn data_session(
     device: String,
     fingerprint: String,
 ) -> Result<()> {
+    // 仅普通 Yamux 数据连接禁用 Nagle，避免小帧等待；控制及其他 ALPN 路径不受影响。
+    stream
+        .get_ref()
+        .0
+        .set_nodelay(true)
+        .context("设置 Tunnel 数据连接 TCP_NODELAY 失败")?;
     let (sender, mut receiver) = mpsc::channel::<OpenStream>(nexo_tunnel::DEFAULT_MAX_STREAMS);
     let cancel = state.tunnel_runtime.stop.child_token();
     {

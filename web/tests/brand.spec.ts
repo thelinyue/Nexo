@@ -148,7 +148,7 @@ test.describe("品牌素材离线加载", () => {
   });
 });
 
-test("桌面横幅和账号头像按真实角色显示且列表保持单行", async ({ page }, info) => {
+test("桌面设置入口无身份信息，代管空间保留本人身份且列表保持单行", async ({ page }, info) => {
   test.skip(info.project.name !== "desktop-dark", "桌面品牌入口集中验收");
   const state = await installApiMocks(page);
   state.users[1].username = "alice-with-a-very-long-account-name-for-layout";
@@ -158,7 +158,8 @@ test("桌面横幅和账号头像按真实角色显示且列表保持单行", as
   await expect(banner).toBeVisible();
   await expect(banner).toHaveAttribute("src", "/brand/nexo-banner-light.webp");
   await expect.poll(() => banner.evaluate(image => (image as HTMLImageElement).naturalWidth)).toBe(600);
-  await expect(page.locator(".account-trigger .user-avatar")).toHaveAttribute("data-avatar-role", "admin");
+  await expect(page.locator(".sidebar-settings")).toBeVisible();
+  await expect(page.locator(".sidebar-settings img,.account-trigger")).toHaveCount(0);
   await expect(active(page).locator(".user-card > .user-heading .user-avatar[data-avatar-role=admin]")).toHaveCount(1);
   await expect(active(page).locator(".user-card > .user-heading .user-avatar[data-avatar-role=user]")).toHaveCount(1);
   await expect.poll(() => active(page).locator(".user-card").evaluateAll(rows => rows.every(row => row.getBoundingClientRect().height <= 57))).toBeTruthy();
@@ -167,14 +168,17 @@ test("桌面横幅和账号头像按真实角色显示且列表保持单行", as
 
   await page.getByRole("button", { name: /管理 alice-with/ }).click();
   await expect(page.locator(".workspace-banner")).toContainText("alice 的工作空间");
-  await expect(page.locator(".account-trigger .user-avatar")).toHaveAttribute("data-avatar-role", "admin");
+  await page.locator(".sidebar-settings").click();
+  await expect(active(page).locator(".account-summary .user-avatar")).toHaveAttribute("data-avatar-role", "admin");
+  await expect(active(page).locator(".account-summary strong")).toHaveText("admin");
 });
 
-test("普通用户账号入口和设置摘要使用无帽头像", async ({ page }, info) => {
+test("普通用户设置入口不展示头像，设置摘要保留本人身份", async ({ page }, info) => {
   test.skip(info.project.name !== "desktop-dark", "角色切换集中验收");
   const state = await installApiMocks(page);
   state.authRole = "tenant";
   await page.goto("/#/manage");
-  await expect(page.locator(".account-trigger .user-avatar")).toHaveAttribute("data-avatar-role", "user");
+  await expect(page.locator(".sidebar-settings")).toBeVisible();
+  await expect(page.locator(".sidebar-settings img,.account-trigger")).toHaveCount(0);
   await expect(active(page).locator(".account-summary .user-avatar")).toHaveAttribute("data-avatar-role", "user");
 });

@@ -8,7 +8,7 @@ type WorkspaceUser = { workspace_id: string; workspace_name: string; enabled: bo
 /** 用空间名称选择分配对象；组的节点与分配名单一次保存，避免界面形成半成品授权。 */
 export function WorkspaceChoices({ value, onChange }: { value: string[]; onChange: (ids: string[]) => void }) {
   const api = useApi(); const users = useResource(() => api<WorkspaceUser[]>("/api/v1/admin/users"), true, false);
-  return <fieldset className="node-choice-list"><legend>分配工作空间</legend><Notice error={users.error} onRetry={() => void users.reload()} />{users.data?.map(user => <label className="node-check" key={user.workspace_id}><input type="checkbox" checked={value.includes(user.workspace_id)} disabled={!user.enabled && !value.includes(user.workspace_id)} onChange={e => onChange(e.target.checked ? [...value, user.workspace_id] : value.filter(id => id !== user.workspace_id))} />{user.workspace_name}{!user.enabled && " · 已停用"}</label>)}</fieldset>;
+  return <fieldset className="node-choice-list"><legend>分配工作空间</legend><Notice error={users.error} onRetry={() => void users.reload()} />{users.data?.map(user => <label className="node-check" key={user.workspace_id}><input type="checkbox" checked={value.includes(user.workspace_id)} disabled={!user.enabled && !value.includes(user.workspace_id)} onChange={e => onChange(e.target.checked ? [...value, user.workspace_id] : value.filter(id => id !== user.workspace_id))} /><span>{user.workspace_name}{!user.enabled && <small>已停用</small>}</span></label>)}</fieldset>;
 }
 
 /** 首次直接建组，已有分组先展示列表；成员与分配一次提交，删除仍需明确确认。 */
@@ -23,11 +23,11 @@ export function NodeGroupsDialog({ groups, nodes, csrf, onClose }: { groups: Nod
     try { await api(`/api/v1/node-groups${editing ? `/${encodeURIComponent(editing.id)}` : ""}`, { method: remove ? "DELETE" : editing ? "PUT" : "POST", body: remove ? undefined : JSON.stringify({ name, node_ids: ids, workspace_ids: workspaces }) }, csrf); onClose(); }
     catch (e) { setError(errorText(e)); } finally { setBusy(false); }
   }
-  return <Modal title={form ? editing ? "编辑节点组" : "创建节点组" : "节点组"} onClose={onClose} busy={busy} dirty={!!form && (name !== (editing?.name ?? "") || JSON.stringify(ids) !== JSON.stringify(editing?.node_ids ?? []) || JSON.stringify(workspaces) !== JSON.stringify(editing?.workspace_ids ?? []))}>
+  return <Modal className="node-modal" title={form ? editing ? "编辑节点组" : "创建节点组" : "节点组"} onClose={onClose} busy={busy} dirty={!!form && (name !== (editing?.name ?? "") || JSON.stringify(ids) !== JSON.stringify(editing?.node_ids ?? []) || JSON.stringify(workspaces) !== JSON.stringify(editing?.workspace_ids ?? []))}>
     {form ? <form className="modal-form" onSubmit={e => { e.preventDefault(); if (!deleting) void save(); }}>
       <div className="modal-body node-group-form">
         <label>名称<input required maxLength={80} value={name} onChange={e => setName(e.target.value)} placeholder="例如：亚洲入口" /></label>
-        <fieldset className="node-choice-list"><legend>节点（2–16 个）</legend>{nodes.filter(node => node.approved).map(node => <label className="node-check" key={node.id}><input type="checkbox" checked={ids.includes(node.id)} onChange={e => setIds(e.target.checked ? [...ids, node.id] : ids.filter(id => id !== node.id))} />{node.name}<span className="helper">{node.public_ipv4}</span></label>)}{nodes.filter(node => node.approved).length < 2 && <p className="helper">需先接入并批准至少两个节点。</p>}</fieldset>
+        <fieldset className="node-choice-list"><legend>节点（2–16 个） · 已选 {ids.length}</legend>{nodes.filter(node => node.approved).map(node => <label className="node-check" key={node.id}><input type="checkbox" checked={ids.includes(node.id)} onChange={e => setIds(e.target.checked ? [...ids, node.id] : ids.filter(id => id !== node.id))} /><span>{node.name}<small>{node.public_ipv4 || "本地节点"}</small></span></label>)}{nodes.filter(node => node.approved).length < 2 && <p className="helper">需先接入并批准至少两个节点。</p>}</fieldset>
         <WorkspaceChoices value={workspaces} onChange={setWorkspaces} />
         {!workspaces.length && <p className="helper">分配工作空间后，服务才能选择此组。</p>}
         {editing && <p className="helper">成员变更会同步到关联服务。</p>}

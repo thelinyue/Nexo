@@ -11,9 +11,8 @@ export function bytes(value: number, rate = false) {
 const calendarDate = (at: number) => new Date(at * 1000).toLocaleString("zh-CN", { timeZone: "Asia/Shanghai", year: "numeric", month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit", hour12: false });
 
 /** 额度独立于可重置统计，单用户组件随筛选重新挂载，迟到结果不能串用。 */
-export function QuotaSummary({ active, admin, userId, refresh }: { active: boolean; admin: boolean; userId?: string; refresh: number }) {
+export function QuotaSummary({ active, admin, userId }: { active: boolean; admin: boolean; userId?: string }) {
   const resource = useResource(() => request<Quota>(admin ? `/api/v1/admin/traffic/quota?user_id=${encodeURIComponent(userId!)}` : "/api/v1/traffic/quota"), active);
-  useEffect(() => { if (refresh && active) void resource.reload(); }, [refresh]);
   const data = resource.data;
   return <section className="traffic-quota" aria-label="本月流量额度" data-exhausted={data?.exhausted}>
     <div className="quota-heading"><h3>本月流量额度</h3>{data && <span>{data.monthly_limit_bytes === null ? "未设置限制" : `已用 ${bytes(data.used_bytes)} / ${bytes(data.monthly_limit_bytes)}`}</span>}</div>

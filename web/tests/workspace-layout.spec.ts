@@ -3,7 +3,7 @@ import { installApiMocks } from "./api-mocks";
 
 const activePage = (page: import("@playwright/test").Page) => page.locator(".page-slot:not([hidden])");
 
-test("页面工具栏在桌面各宽度与主题中对齐，账号只出现一次", async ({ page }, info) => {
+test("页面工具栏从首行开始，桌面设置入口只出现一次", async ({ page }, info) => {
   test.skip(info.project.name !== "desktop-dark", "桌面布局矩阵");
   const state = await installApiMocks(page);
   const names = ["bit2", "emby", "dockge", "qb", "dc", "lucky", "danmu", "tag", "flowlink", "mp", "ik", "music", "siyuan", "paper", "clash", "onenav", "sing", "v", "ck", "huddletab", "emby2", "bit"];
@@ -15,17 +15,23 @@ test("页面工具栏在桌面各宽度与主题中对齐，账号只出现一�
       await page.goto("/#/services");
       await expect(activePage(page).locator(".service-row")).toHaveCount(names.length);
       await expect(page.getByRole("tablist")).toHaveCount(0);
-      await expect(page.locator(".account-trigger")).toHaveCount(1);
-      const heading = (await activePage(page).locator("h1").boundingBox())!;
-      const header = (await activePage(page).locator(".page-header").boundingBox())!;
-      const account = (await page.locator(".account-trigger").boundingBox())!;
+      await expect(page.locator(".sidebar-settings")).toHaveCount(1);
+      await expect(activePage(page).locator("h1")).toHaveCSS("clip-path", "inset(50%)");
+      await expect(activePage(page).locator(".page-header")).toHaveCSS("height", "0px");
+      const settings = (await page.locator(".sidebar-settings").boundingBox())!;
       const search = (await page.getByLabel("搜索服务").boundingBox())!;
       const filter = (await page.getByLabel("服务筛选").boundingBox())!;
       const create = (await page.getByRole("button", { name: "创建服务", exact: true }).boundingBox())!;
-      expect(Math.abs(header.y + header.height / 2 - account.y - account.height / 2)).toBeLessThan(1);
-      expect(search.y).toBeGreaterThanOrEqual(header.y + header.height + 12);
+      const navigationRow = (await page.getByRole("navigation", { name: "主导航" }).getByRole("link").first().boundingBox())!;
+      const navigationIcon = (await page.getByRole("navigation", { name: "主导航" }).getByRole("link").first().locator("svg").boundingBox())!;
+      const settingsIcon = (await page.locator(".sidebar-settings svg").boundingBox())!;
+      expect(settings.x).toBe(navigationRow.x); expect(settings.width).toBe(navigationRow.width);
+      expect(settings.height).toBe(navigationRow.height);
+      expect(settingsIcon.x).toBe(navigationIcon.x); expect(settingsIcon.width).toBe(navigationIcon.width);
+      expect(settings.y + settings.height).toBe(876);
       const searchControl = (await page.locator(".service-toolbar .search").boundingBox())!;
-      expect(Math.abs(heading.x - searchControl.x)).toBeLessThan(1);
+      const contentTop = await activePage(page).evaluate(element => element.getBoundingClientRect().top + parseFloat(getComputedStyle(element).borderTopWidth) + parseFloat(getComputedStyle(element).paddingTop));
+      expect(Math.abs(contentTop - searchControl.y)).toBeLessThan(1);
       expect(Math.abs(searchControl.y - create.y)).toBeLessThan(1);
       if (width >= 1200) expect(Math.abs(filter.y - searchControl.y)).toBeLessThan(1);
       else expect(filter.y).toBeGreaterThanOrEqual(search.y + search.height);
@@ -42,22 +48,25 @@ test("页面工具栏在桌面各宽度与主题中对齐，账号只出现一�
       await page.screenshot({ path: info.outputPath(`services-${theme}-${width}.png`), animations: "disabled" });
     }
   }
-  // 切换多个缓存页面后，各页仍只有一个标题和账号入口，DOM 中没有重复的 popover。
+  // 页面缓存保留读屏标题；设置入口属于侧栏，业务页面不再挂载账号菜单。
   for (const width of [901, 1440]) {
     await page.setViewportSize({ width, height: 900 });
-    for (const [route, title] of [["home", "首页"], ["agents", "设备"], ["domains", "域名"], ["users", "用户管理"], ["manage", "账号设置"], ["settings/sessions", "登录会话"]]) {
+    for (const [route, title] of [["home", "首页"], ["agents", "设备"], ["nodes", "节点"], ["domains", "域名"], ["users", "用户管理"], ["manage", "账号设置"], ["settings/sessions", "登录会话"]]) {
       await page.evaluate(route => { location.hash = `#/${route}`; }, route);
       await expect(activePage(page).getByRole("heading", { level: 1 })).toHaveText(title);
-      await expect(page.locator(".account-trigger")).toHaveCount(1);
-      await expect(page.locator("#account-menu")).toHaveCount(1);
+      await expect(activePage(page).locator("h1")).toHaveCSS("clip-path", route === "settings/sessions" ? "none" : "inset(50%)");
+      await expect(activePage(page).locator("h1")).toBeFocused();
+      await expect(page.locator(".sidebar-settings")).toHaveCount(1);
+      await expect(page.locator("#account-menu,.account-trigger")).toHaveCount(0);
+      if (route !== "settings/sessions") await expect(activePage(page).locator(".page-header")).toHaveCSS("height", "0px");
       await page.screenshot({ path: info.outputPath(`${route.replaceAll("/", "-")}-${width}.png`), animations: "disabled" });
       await expect.poll(() => page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBeTruthy();
     }
   }
 });
 
-test("长标题和账号不挤出操作，账号菜单跟随入口且滚动时关闭", async ({ page }, info) => {
-  test.skip(info.project.name !== "desktop-dark", "桌面账号定位");
+test("长标题保持可读，矮窗口导航独立滚动且设置始终可达", async ({ page }, info) => {
+  test.skip(info.project.name !== "desktop-dark", "桌面侧栏定位");
   const state = await installApiMocks(page);
   state.devices[0].name = "一个非常长的家庭存储设备名称".repeat(8);
   state.tunnels = Array.from({ length: 100 }, (_, index) => ({ ...state.tunnels[0], id: `t-${index}` }));
@@ -65,27 +74,31 @@ test("长标题和账号不挤出操作，账号菜单跟随入口且滚动时�
   await page.setViewportSize({ width: 901, height: 900 });
   await page.goto("/#/agents/a-1");
   await expect(activePage(page).getByRole("heading", { level: 1 })).toHaveText(state.devices[0].name);
+  await expect(activePage(page).locator("h1")).toHaveCSS("clip-path", "none");
   await expect.poll(() => page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBeTruthy();
   await page.locator(".sidebar").getByRole("link", { name: "服务", exact: true }).click();
-  const trigger = page.locator(".account-trigger");
-  await trigger.click();
-  const menu = page.locator(".account-popover");
-  await expect(menu).toBeVisible();
-  const triggerBox = (await trigger.boundingBox())!;
-  const menuBox = (await menu.boundingBox())!;
-  expect(Math.abs(menuBox.x + menuBox.width - triggerBox.x - triggerBox.width)).toBeLessThan(1);
-  expect(menuBox.y).toBeGreaterThanOrEqual(triggerBox.y + triggerBox.height);
-  await page.evaluate(() => window.scrollTo(0, 200));
-  await expect(menu).toBeHidden();
-  await page.evaluate(() => window.scrollTo(0, 0));
-  await trigger.click();
-  await page.setViewportSize({ width: 1199, height: 900 });
-  await expect(menu).toBeHidden();
+  const settings = page.locator(".sidebar-settings");
+  await expect(settings.locator("img,span")).toHaveCount(0);
+  await page.setViewportSize({ width: 901, height: 375 });
   await page.emulateMedia({ contrast: "more", reducedMotion: "reduce" });
-  await trigger.click();
-  await expect(menu).toHaveCSS("backdrop-filter", "none");
-  await page.keyboard.press("Escape");
-  await expect(trigger).toBeFocused();
+  await page.evaluate(() => { document.documentElement.style.fontSize = "24px"; });
+  const before = (await settings.boundingBox())!;
+  const nav = page.getByRole("navigation", { name: "主导航" });
+  expect(await nav.evaluate(element => element.scrollHeight > element.clientHeight)).toBe(true);
+  await nav.evaluate(element => { element.scrollTop = element.scrollHeight; });
+  await page.evaluate(() => window.scrollTo(0, 200));
+  await expect(settings).toBeInViewport({ ratio: 1 });
+  expect(await settings.boundingBox()).toEqual(before);
+  await nav.getByRole("link").last().focus();
+  await page.keyboard.press("Tab");
+  await expect(settings).toBeFocused();
+  await expect(settings).toHaveCSS("outline-style", "solid");
+  await page.keyboard.press("Enter");
+  await expect(page).toHaveURL(/#\/manage$/);
+  await expect(settings).toHaveAttribute("aria-current", "page");
+  await expect(activePage(page).locator(".account-summary strong")).toHaveText("很长的管理员用户名".repeat(12));
+  await expect.poll(() => page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBeTruthy();
+  await page.screenshot({ path: info.outputPath("settings-short-large-text.png"), animations: "disabled" });
 });
 
 test("工具栏覆盖空状态、错误、无搜索结果和批量选择", async ({ page }, info) => {
@@ -98,7 +111,7 @@ test("工具栏覆盖空状态、错误、无搜索结果和批量选择", async
   state.failures.set("GET /api/v1/tunnels", "无法连接服务，请稍后重试");
   await page.reload();
   await expect(activePage(page).getByText("无法连接服务，请稍后重试", { exact: true })).toBeVisible();
-  await expect(page.locator(".account-trigger")).toBeVisible();
+  await expect(page.locator(".sidebar-settings")).toBeVisible();
   state.failures.clear();
   state.tunnels = [{ id: "t-1", name: "家庭媒体服务", protocol: "https", local_address: "localhost", local_port: 8096, enabled: true, apply_status: "ready", lan_redirect_enabled: false }];
   await page.reload();
@@ -118,7 +131,7 @@ test("普通账号直达管理页时仍有标题和账号入口，但不能访�
   await page.goto("/#/users");
   await expect(activePage(page).getByRole("heading", { level: 1 })).toHaveText("用户管理");
   await expect(activePage(page).getByRole("alert")).toHaveText("此页面需要管理员权限");
-  await expect(page.locator(".account-trigger")).toHaveCount(1);
+  await expect(page.locator(".sidebar-settings")).toHaveCount(1);
   await expect(page.locator(".sidebar").getByRole("link", { name: "用户管理", exact: true })).toHaveCount(0);
   expect(state.calls.some(call => call.path === "/api/v1/admin/users")).toBe(false);
 });

@@ -4,6 +4,7 @@ import { installApiMocks } from "./api-mocks";
 test("管理员单用户重置可取消、失败可重试且保留趋势", async ({ page }, info) => {
   const state = await installApiMocks(page);
   await page.goto("/");
+  await page.getByRole("button", { name: "流量筛选", exact: true }).click();
   await page.getByLabel("统计用户", { exact: true }).selectOption("alice");
   await expect(page.locator(".traffic-usage strong")).toHaveText(["2 KiB", "20 KiB", "200 KiB"]);
   const trend = await page.locator(".traffic-total").innerText();
@@ -45,6 +46,7 @@ test("用量切换用户隔离迟到结果，采集不完整明确提示", async
     await route.fulfill({ json: { timezone: "Asia/Shanghai", sampled_at: 1000, started_at: 500, reset_at: null, reset_users: 0, today: period, week: period, month: period } });
   });
   await page.goto("/");
+  await page.getByRole("button", { name: "流量筛选", exact: true }).click();
   const requested = page.waitForRequest("**/api/v1/admin/traffic/usage?user_id=alice");
   await page.getByLabel("统计用户", { exact: true }).selectOption("alice");
   await requested;
@@ -62,6 +64,7 @@ test("首页概览、管理员用户与隧道筛选、时间图表和手机导�
   const queries: URL[] = [];
   page.on("request", req => { if (req.url().includes("/traffic/")) queries.push(new URL(req.url())); });
   await page.goto("/");
+  await page.getByRole("button", { name: "流量筛选", exact: true }).click();
   await expect(page).toHaveURL(/#\/home$/);
   const panel = page.getByRole("region", { name: "流量监控", exact: true });
   await expect(panel.getByLabel("统计用户", { exact: true })).toHaveValue("");
@@ -102,6 +105,7 @@ test("普通用户只请求个人统计，未知数据不显示零，刷新失�
   state.failures.set("GET /api/v1/traffic/history", "历史暂不可用");
   state.failures.set("GET /api/v1/traffic/usage", "用量暂不可用");
   await page.goto("/");
+  await page.getByRole("button", { name: "流量筛选", exact: true }).click();
   await expect(page.getByLabel("统计用户", { exact: true })).toHaveCount(0);
   await expect(page.getByLabel("统计隧道")).toBeVisible();
   await expect(page.locator(".traffic-numbers strong")).toHaveText(["—", "—"]);
@@ -110,11 +114,11 @@ test("普通用户只请求个人统计，未知数据不显示零，刷新失�
   await expect(page.getByRole("button", { name: "重置统计", exact: true })).toHaveCount(0);
   expect(state.calls.some(call => call.path.startsWith("/api/v1/admin/"))).toBeFalsy();
   state.failures.clear();
-  await page.getByLabel("刷新首页").click();
+  await page.evaluate(() => window.dispatchEvent(new Event("focus")));
   await expect(page.locator(".traffic-total")).toContainText("时段累计");
   state.failures.set("GET /api/v1/traffic/history", "刷新失败");
   state.failures.set("GET /api/v1/traffic/usage", "用量刷新失败");
-  await page.getByLabel("刷新首页").click();
+  await page.evaluate(() => window.dispatchEvent(new Event("focus")));
   await expect(page.getByText("刷新失败", { exact: true })).toBeVisible();
   await expect(page.locator(".traffic-usage strong")).toHaveText(["2 KiB", "20 KiB", "200 KiB"]);
   await expect(page.locator(".traffic-total")).toContainText("时段累计");
@@ -132,6 +136,7 @@ test("切换用户丢弃迟到统计，切走首页停止统计请求", async ({
     await route.fulfill({ json: { sampled_at: Date.now() / 1000, status: "ready", rates: { to_origin: 999999, to_public: 999999 } } });
   });
   await page.goto("/");
+  await page.getByRole("button", { name: "流量筛选", exact: true }).click();
   await expect(page.locator(".traffic-numbers")).toContainText("2 KiB/s");
   const requested = page.waitForRequest(req => req.url().includes("/traffic/realtime?") && new URL(req.url()).searchParams.get("user_id") === "alice");
   await page.getByLabel("统计用户", { exact: true }).selectOption("alice");
@@ -157,10 +162,11 @@ test("首页空状态、零流量与缺口、窄屏主题与辅助功能", async
   const state = await installApiMocks(page, { empty: true }); state.devices = [];
   await page.route("**/api/v1/admin/traffic/history?**", route => route.fulfill({ json: { start: 100, end: 280, step: 60, sampled_at: 280, total: { to_origin: 0, to_public: 0 }, points: [{ at: 100, seconds: 60, covered_seconds: 60, bytes: { to_origin: 0, to_public: 0 }, rates: { to_origin: 0, to_public: 0 } }, { at: 160, seconds: 60, covered_seconds: 0, bytes: { to_origin: 0, to_public: 0 }, rates: null }, { at: 220, seconds: 60, covered_seconds: 60, bytes: { to_origin: 0, to_public: 0 }, rates: { to_origin: 0, to_public: 0 } }] } }));
   await page.goto("/");
+  await page.getByRole("button", { name: "流量筛选", exact: true }).click();
   await expect(page.getByRole("link", { name: "创建服务", exact: true })).toBeVisible();
-  await page.getByRole("slider").fill("1");
+  await page.getByRole("slider").focus(); await page.getByRole("slider").press("Home"); await page.getByRole("slider").press("ArrowRight");
   await expect(page.locator(".chart-reading")).toContainText("此时段未采集");
-  await page.getByRole("slider").fill("0");
+  await page.getByRole("slider").press("Home");
   await expect(page.locator(".chart-reading")).toContainText("0 B/s");
   for (const theme of ["light", "dark"] as const) for (const [width, height] of [[320, 568], [390, 844], [812, 375], [1440, 900]]) {
     await page.emulateMedia({ colorScheme: theme, reducedMotion: "reduce", contrast: "more" });
@@ -171,14 +177,15 @@ test("首页空状态、零流量与缺口、窄屏主题与辅助功能", async
 });
 
 
-test("普通用户首页复用隧道列表，首载和手动刷新各请求一次", async ({ page }) => {
+test("普通用户首页复用隧道列表，首载和恢复焦点各请求一次", async ({ page }) => {
   const state = await installApiMocks(page);
   await page.route("**/api/v1/auth/status", route => route.fulfill({ json: { initialized: true, authenticated: true, user_id: "alice", username: "alice", role: "tenant", workspace_id: "alice" } }));
   const calls = () => state.calls.filter(call => call.path === "/api/v1/tunnels" && call.method === "GET").length;
   await page.goto("/");
+  await page.getByRole("button", { name: "流量筛选", exact: true }).click();
   await expect(page.getByLabel("统计隧道")).toBeVisible();
   await expect(page.locator(".home-summaries")).toContainText("穿透运行");
   expect(calls()).toBe(1);
-  await page.getByLabel("刷新首页").click();
+  await page.evaluate(() => window.dispatchEvent(new Event("focus")));
   await expect.poll(calls).toBe(2);
 });

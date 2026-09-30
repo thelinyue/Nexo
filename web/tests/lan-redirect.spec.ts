@@ -1,4 +1,4 @@
-import { openServiceEditor } from "./service-actions";
+import { openServiceEditor, selectServiceOption } from "./service-actions";
 import { expect, test } from "@playwright/test";
 import type { Page } from "@playwright/test";
 import { isLanRedirectAddress } from "../src/lan-redirect";
@@ -9,7 +9,7 @@ async function createWebService(page: Page) {
   await page.goto("/#/services");
   await openServiceEditor(page);
   const dialog = page.getByRole("dialog", { name: "创建服务" });
-  await dialog.getByLabel("内网协议").selectOption("http");
+  await selectServiceOption(dialog.getByRole("combobox", { name: "内网协议", exact: true }), "HTTP");
   await dialog.getByLabel("服务名称").fill("内网相册");
   await dialog.getByLabel("内网端口").fill("8080");
   await dialog.getByLabel("主机名").fill("photos");
@@ -61,9 +61,9 @@ test("重定向仅使用本地目标，修改内网地址和端口后继续启�
   await expect(dialog.getByLabel("内网地址", { exact: true })).toHaveCount(1);
   const httpNotice = dialog.getByText("部分浏览器访问 HTTP 域名时无法触发重定向，建议使用 HTTPS。", { exact: true });
   await expect(httpNotice).toHaveCount(0);
-  await dialog.getByLabel("公网协议").selectOption("http");
+  await selectServiceOption(dialog.getByRole("combobox", { name: "公网协议", exact: true }), "HTTP");
   await expect(httpNotice).toBeVisible();
-  await dialog.getByLabel("公网协议").selectOption("https");
+  await selectServiceOption(dialog.getByRole("combobox", { name: "公网协议", exact: true }), "HTTPS");
   await expect(httpNotice).toHaveCount(0);
   await dialog.getByLabel("主机名").press("Enter");
   await expect(dialog.getByLabel("主机名")).not.toBeFocused();
@@ -152,14 +152,14 @@ test("切换 TCP 清除内网重定向，重新切回 Web 保持关闭", async (
   await page.getByRole("button", { name: "编辑服务" }).click();
   const dialog = page.getByRole("dialog", { name: "编辑服务" });
   await dialog.locator("summary", { hasText: "高级设置" }).click();
-  await dialog.getByLabel("内网协议").selectOption("tcp");
+  await selectServiceOption(dialog.getByRole("combobox", { name: "内网协议", exact: true }), "TCP");
   await expect(dialog.getByRole("switch", { name: "内网重定向" })).toHaveCount(0);
-  await dialog.getByLabel("内网协议").selectOption("http");
+  await selectServiceOption(dialog.getByRole("combobox", { name: "内网协议", exact: true }), "HTTP");
   await dialog.locator("summary", { hasText: "高级设置" }).click();
   await expect(dialog.getByRole("switch", { name: "内网重定向" })).not.toBeChecked();
   await dialog.getByRole("switch", { name: "内网重定向" }).check();
   await expect(dialog.getByLabel("内网地址", { exact: true })).toHaveCount(1);
-  await dialog.getByLabel("内网协议").selectOption("tcp");
+  await selectServiceOption(dialog.getByRole("combobox", { name: "内网协议", exact: true }), "TCP");
   await dialog.getByRole("button", { name: "保存服务" }).click();
   await expect(dialog).not.toBeVisible();
   expect(state.tunnels[0].lan_redirect_enabled).toBe(false);

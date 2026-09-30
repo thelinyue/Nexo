@@ -38,8 +38,10 @@ export function NodeEnrollmentPanel({ initial, nodeId, csrf }: { initial?: NodeE
     finally { setBusy(false); }
   }
   return <div className="node-enrollment">
+    <p className="node-step-label">{node.data?.registered ? "第三步 · 确认接入状态" : "第二步 · 安装并接入"}</p>
     <Notice error={node.error} onRetry={() => void node.reload()} />
     {node.data?.registered && <NodeSetupStatus node={node.data} />}
+    {node.data?.registered && node.data.approved && node.data.assigned !== false && node.data.selectable !== false && node.data.status === "online" && <p className="action-status" role="status">节点已接入，可以为服务选择此入口。</p>}
     {node.data?.registered ? null : <>
       <Notice error={releases.error} onRetry={() => void releases.reload()} />
       {!releases.data && releases.busy && <Loading />}
@@ -49,6 +51,7 @@ export function NodeEnrollmentPanel({ initial, nodeId, csrf }: { initial?: NodeE
         {node.data?.can_enroll && <button className="secondary-button" disabled={busy} onClick={() => void renew()}>{busy ? "正在生成…" : "生成新凭证"}</button>}
       </>}
       {!!releases.data?.length && enrollment && !expired && <>
+        {command && <section className="node-install-step" aria-label="执行安装命令"><h3>在 VPS 执行即可接入</h3><p className="helper">复制命令，在节点终端执行。安装完成后，这里会自动更新接入状态。</p><CopyButton value={command} label="复制命令" /><p className="helper">已包含接入凭证，有效至 {dateText(enrollment.expires_at)}。请勿分享命令。</p><details><summary>查看命令</summary><pre className="node-command">{command}</pre></details></section>}
         <details className="node-install-options">
           <summary>安装选项 · HTTPS {httpsPort || "未填写"}</summary>
           <div className="node-install-fields">
@@ -60,9 +63,6 @@ export function NodeEnrollmentPanel({ initial, nodeId, csrf }: { initial?: NodeE
           </div>
         </details>
         {!validPort && <p className="form-error" role="alert">请输入 1–65535 的 HTTPS 端口，避免与其他端口冲突。</p>}
-        {command && <>
-          <section className="node-install-step" aria-label="执行安装命令"><h3>在 VPS 执行即可接入</h3><CopyButton value={command} label="复制命令" /><p className="helper">已包含接入凭证，有效至 {dateText(enrollment.expires_at)}。请勿分享命令。</p><details><summary>查看命令</summary><pre className="node-command">{command}</pre></details></section>
-        </>}
       </>}
     </>}
     <Notice error={error} />

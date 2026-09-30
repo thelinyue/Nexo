@@ -223,7 +223,7 @@ def run_load(h, addr, row):
             if "caddy" in Path(f"/proc/{child}/comm").read_text(): h.resources["caddy"] = int(child)
     argv = [args.load_bin, "-addr", addr, "-ca", args.ca, "-protocol", row["protocol"], "-workload", row["workload"],
             "-mode", row["mode"], "-concurrency", str(row["concurrency"]), "-warm", str(args.warm), "-duration", str(args.duration),
-            "-bulk-mib", str(args.bulk_mib)]
+            "-bulk-mib", str(args.bulk_mib), "-request-timeout", f"{args.request_timeout}s"]
     with (h.root / "load.json").open("wb") as output, (h.root / "load.log").open("wb") as errors:
         before = {k: usage(pid)[0] for k, pid in h.resources.items()}
         idle = {k: usage(pid)[1] for k, pid in h.resources.items()}
@@ -232,7 +232,7 @@ def run_load(h, addr, row):
         p = subprocess.Popen([str(a) for a in argv], stdout=output, stderr=errors, start_new_session=True)
         h.processes.append(p)
         h.resources["load"] = p.pid; before["load"] = 0; peaks["load"] = 0
-        deadline = time.monotonic() + args.warm + args.duration + 90
+        deadline = time.monotonic() + args.warm + args.duration + args.drain_timeout
         while True:
             exited = os.waitid(os.P_PID, p.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT)
             for name, pid in h.resources.items():
@@ -291,6 +291,19 @@ def certificates(args):
 
 
 def cases(args):
+    if getattr(args, "nodelay_server_bin", None):
+        # 固定的配对实验，避免多个选择参数意外展开成笛卡尔积。
+        rows = []
+        rng = random.Random(20260930)
+        for condition, concurrency, workload in (("unlimited", 1, "bulk"), ("unlimited", 8, "mixed"), ("rtt100", 8, "mixed")):
+            for repetition in range(3):
+                for topology in ("tcp", "domain"):
+                    variants = ["default", "nodelay"]; rng.shuffle(variants)
+                    for variant in variants:
+                        rows.append(dict(topology=topology, condition=condition, concurrency=concurrency,
+                                         protocol="tcp" if topology == "tcp" else "h1", mode="keepalive",
+                                         workload=workload, repetition=repetition, path="nexo", variant=variant))
+        return rows
     rows = []
     for topology in args.topologies.split(","):
         for condition in args.conditions.split(","):
@@ -313,7 +326,7 @@ def cases(args):
     return rows
 
 
-def verify_recovery(args, cert, key):
+def verify_recovery(args, cert, key, include_frp=True):
     """在计时前验证身份复用、重连和持久化；不让恢复等待时间混入稳态性能。"""
     target = args.output / "recovery.json"
     if target.exists(): return
@@ -350,6 +363,9 @@ def verify_recovery(args, cert, key):
         smoke.wait_for(probe, "重启后 HTTPS 数据通道恢复")
         checks.append("重启 Server 后额度持久化及 HTTPS 恢复")
     finally: h.close()
+    if not include_frp:
+        write_json(target, {"passed": checks})
+        return
     h = Harness(check_args, args.output / "recovery-frp")
     try:
         h.spawn("origin", ["ip", "netns", "exec", args.client_ns, args.load_bin, "-role", "origin", "-cert", cert, "-key", key])
@@ -370,7 +386,8 @@ def verify_recovery(args, cert, key):
 def inside(args):
     if os.readlink("/proc/self/ns/net") == os.readlink("/proc/1/ns/net"):
         raise RuntimeError("内部测试进程必须运行在专属 network namespace")
-    for binary in (args.frps_bin, args.frpc_bin):
+    comparison = bool(args.nodelay_server_bin)
+    for binary in (() if comparison else (args.frps_bin, args.frpc_bin)):
         if command(binary, "--version", capture_output=True, text=True).stdout.strip() != "0.71.0":
             raise ValueError("本对照固定使用 frp 0.71.0")
     cert, key, frpcerts = certificates(args)
@@ -383,20 +400,35 @@ def inside(args):
             write_json(template_path, get_json(f"http://127.0.0.1:{bootstrap.ports['admin']}/config/"))
         finally: bootstrap.close()
     template = json.loads(template_path.read_text())
-    verify_recovery(args, cert, key)
+    if comparison:
+        # 两端同时更新及两种混搭都做真实恢复验收，不纳入性能轮数。
+        for server, agent, name in ((args.server_bin, args.agent_bin, "default"),
+                                   (args.nodelay_server_bin, args.nodelay_agent_bin, "nodelay"),
+                                   (args.server_bin, args.nodelay_agent_bin, "old-server"),
+                                   (args.nodelay_server_bin, args.agent_bin, "old-agent")):
+            check_args = copy.copy(args)
+            check_args.server_bin = server; check_args.agent_bin = agent
+            check_args.output = args.output / "compatibility" / name
+            check_args.output.mkdir(parents=True, exist_ok=True)
+            verify_recovery(check_args, cert, key, include_frp=False)
+            print(f"COMPATIBILITY {name} passed", flush=True)
+    else:
+        verify_recovery(args, cert, key)
     matrix = cases(args)
     matrix_path = args.output / "matrix.json"
     if matrix_path.exists() and json.loads(matrix_path.read_text()) != matrix:
         raise ValueError("输出目录已有不同测试矩阵，请使用新的输出目录")
     write_json(matrix_path, matrix)
     metadata = {"kernel": os.uname().release, "cpu_count": os.cpu_count(), "warm_seconds": args.warm, "duration_seconds": args.duration,
-                "total_rounds": len(matrix), "frp_version": command(args.frps_bin, "--version", capture_output=True, text=True).stdout.strip(),
+                "total_rounds": len(matrix), "frp_version": None if comparison else command(args.frps_bin, "--version", capture_output=True, text=True).stdout.strip(),
                 "caddy_version": command(args.caddy_bin, "version", capture_output=True, text=True).stdout.strip(),
                 "load_version": command("go", "version", capture_output=True, text=True).stdout.strip() if shutil.which("go") else "see build command",
-                "conditions": CONDITIONS, "binary_paths": {k: getattr(args, k) for k in ("server_bin", "agent_bin", "frps_bin", "frpc_bin", "caddy_bin", "load_bin")}}
+                "conditions": CONDITIONS, "binary_paths": {k: getattr(args, k) for k in ("server_bin", "agent_bin", "frps_bin", "frpc_bin", "caddy_bin", "load_bin", "nodelay_server_bin", "nodelay_agent_bin")}}
     metadata["offloads_disabled"] = ["tso", "gso", "gro"]
     metadata["bulk_mib"] = args.bulk_mib
-    metadata["selected_conditions"] = args.conditions.split(",")
+    metadata["request_timeout_seconds"] = args.request_timeout
+    metadata["drain_timeout_seconds"] = args.drain_timeout
+    metadata["selected_conditions"] = sorted({r["condition"] for r in matrix})
     metadata["selected_topologies"] = args.topologies.split(",")
     metadata["repetitions"] = args.repetitions
     metadata["concurrency"] = list(map(int, args.concurrency.split(",")))
@@ -404,7 +436,7 @@ def inside(args):
     metadata_path = args.output / "metadata.json"
     if metadata_path.exists():
         previous = json.loads(metadata_path.read_text())
-        for field in ("warm_seconds", "duration_seconds", "binary_paths", "frp_version", "caddy_version", "bulk_mib"):
+        for field in ("warm_seconds", "duration_seconds", "binary_paths", "frp_version", "caddy_version", "bulk_mib", "request_timeout_seconds", "drain_timeout_seconds"):
             if previous.get(field) != metadata[field]: raise ValueError(f"已有结果的 {field} 不同，请使用新的输出目录")
     write_json(metadata_path, metadata)
     for index, row in enumerate(matrix):
@@ -415,7 +447,10 @@ def inside(args):
             target.rename(target.with_name(f"{target.stem}.failed-{time.time_ns()}.gz"))
         print(f"START {index+1}/{len(matrix)} {json.dumps(row)}", flush=True)
         root = args.output / "rounds" / f"{index:04d}"
-        h = Harness(args, root)
+        round_args = copy.copy(args)
+        if row.get("variant") == "nodelay":
+            round_args.server_bin = args.nodelay_server_bin; round_args.agent_bin = args.nodelay_agent_bin
+        h = Harness(round_args, root)
         try:
             shape(args, "unlimited")
             h.spawn("origin", ["ip", "netns", "exec", args.client_ns, args.load_bin, "-role", "origin", "-cert", cert, "-key", key])
@@ -475,7 +510,8 @@ def inside(args):
             partial.replace(target)
         print(f"DONE {index+1}/{len(matrix)} {row['status']}", flush=True)
         if (index+1) % 30 == 0 or index+1 == len(matrix):
-            command(sys.executable, Path(__file__).with_name("performance-report.py"), args.output, "--report", args.output / "REPORT.md")
+            report = "performance-nodelay-report.py" if comparison else "performance-report.py"
+            command(sys.executable, Path(__file__).with_name(report), args.output, "--report", args.output / "REPORT.md")
         if row["status"] == "failed": raise RuntimeError(row["error"])
 
 
@@ -483,7 +519,12 @@ def main():
     def interrupted(signum, frame): raise KeyboardInterrupt("测试被中断，清理专属进程和网络")
     signal.signal(signal.SIGTERM, interrupted)
     p = argparse.ArgumentParser(description=__doc__)
-    for name in ("server", "agent", "caddy", "frps", "frpc", "load"): p.add_argument(f"--{name}-bin", required=True)
+    for name in ("server", "agent", "caddy", "frps", "frpc", "load"):
+        p.add_argument(f"--{name}-bin", required=name not in ("frps", "frpc"))
+    p.add_argument("--nodelay-server-bin", help="与当前版本进行固定 36 轮 NODELAY 对照")
+    p.add_argument("--nodelay-agent-bin")
+    p.add_argument("--request-timeout", type=float, default=30)
+    p.add_argument("--drain-timeout", type=float, default=90)
     p.add_argument("--output", type=Path, required=True)
     p.add_argument("--warm", type=float, default=5); p.add_argument("--duration", type=float, default=15)
     p.add_argument("--repetitions", type=int, default=3); p.add_argument("--concurrency", default="1,8")
@@ -492,6 +533,11 @@ def main():
     p.add_argument("--bulk-mib", type=int, default=64)
     p.add_argument("--special", action="store_true"); p.add_argument("--client-ns", help=argparse.SUPPRESS)
     args = p.parse_args()
+    if bool(args.nodelay_server_bin) != bool(args.nodelay_agent_bin): p.error("候选 Server/Agent 必须同时提供")
+    if not args.nodelay_server_bin and not (args.frps_bin and args.frpc_bin): p.error("frp 对照必须提供 frps/frpc")
+    if args.request_timeout <= 0 or args.drain_timeout <= 0: p.error("请求及收尾超时必须为正")
+    if args.nodelay_server_bin and (args.warm, args.duration, args.repetitions, args.bulk_mib, args.request_timeout, args.drain_timeout) != (5, 15, 3, 64, 120, 150):
+        p.error("NODELAY 对照固定预热 5 秒、测量 15 秒、3 次重复、64 MiB、请求超时 120 秒、收尾 150 秒")
     if os.name != "posix" or os.geteuid() != 0: p.error("要求 Linux root，以创建本测试专属网络 namespace")
     for executable in ("ip", "tc", "ss", "ethtool", "openssl"):
         if not shutil.which(executable): p.error(f"缺少测试工具：{executable}")
@@ -502,8 +548,9 @@ def main():
     if any(w not in ("bulk", "short", "mixed") for w in args.workloads.split(",")): p.error("未知负载")
     if any(int(c) < 1 for c in args.concurrency.split(",")): p.error("并发必须为正")
     args.output = args.output.resolve(); args.output.mkdir(parents=True, exist_ok=True)
-    for name in ("server", "agent", "caddy", "frps", "frpc", "load"):
-        setattr(args, f"{name}_bin", str(Path(getattr(args, f"{name}_bin")).resolve()))
+    for name in ("server", "agent", "caddy", "frps", "frpc", "load", "nodelay_server", "nodelay_agent"):
+        value = getattr(args, f"{name}_bin")
+        if value: setattr(args, f"{name}_bin", str(Path(value).resolve()))
     if args.client_ns: return inside(args)
     namespaces = [f"nexo-frp-{os.getpid()}-{side}" for side in ("s", "c")]
     created = []

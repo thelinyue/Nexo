@@ -1,7 +1,7 @@
 import { Component, createContext, useCallback, useContext, useEffect, useRef, useState } from "react";
 import type { InputHTMLAttributes, ReactNode, RefObject } from "react";
 import { ArrowLeft, Check, ChevronRight, CircleAlert, CircleHelp, Clock, Copy, Pause, Plus, TriangleAlert, Users, X } from "./icons";
-import { PageNavigationContext } from "./navigation";
+import { PageNavigationContext, rootRoutes } from "./navigation";
 
 export type Auth = { initialized: boolean; authenticated: boolean; user_id?: string; username?: string; role?: "system_admin" | "tenant"; workspace_id?: string; csrf_token?: string | null; local_http_warning?: boolean };
 export type Tunnel = { node_group_id?: string | null; node_ids?: string[]; distribution_mode?: string; preferred_node_id?: string | null; node_selection?: { node_id: string; reason: string }; icon_id?: string | null; ipv6_direct_enabled?: boolean; direct_status?: { status: string; address?: string; error?: string; dns_error?: string; certificate_error?: string; certificate_expires_at?: number; public_reachability?: string; probe_error?: string }; https_port?: number; http_redirect_enabled?: boolean; protocol_statuses?: Record<string, { status: string; error_message?: string | null }>; access_mode?: "public" | "password"; service_mode?: "tunnel" | "reverse_proxy"; id: string; name: string; protocol: string; origin_protocol?: "http" | "https" | null; local_address: string; local_port: number; public_port?: number | null; public_address?: string | null; device_id?: string | null; device_name?: string | null; hostname?: string | null; enabled: boolean; apply_status: string; apply_error?: string | null; public_domain?: string | null; lan_redirect_enabled: boolean };
@@ -82,16 +82,14 @@ export function Status({ value, kind = "service", badge = false }: { value: stri
   return badge ? <span className={`status application-status ${tone}`} title={label}><Icon size={14} aria-hidden="true" /><span className="sr-only">{label}</span></span> : <span className={`status ${tone}`}><i />{label}</span>;
 }
 
-/** 账号入口只注入活动桌面页面，保留页面实例时不会复制 popover 或登录状态。 */
-export const PageAccountContext = createContext<ReactNode>(null);
-
-/** 同一标题服务于桌面内容面板和手机导航；桌面业务操作与账号分层，手机保留原有操作入口。 */
+/** 导航已有的页面名称仅供读屏和切页焦点使用；详情标题、返回和操作入口继续显示。 */
 export function PageHeader({ title, back, action }: { title: string; back?: string; action?: ReactNode }) {
   const navigation = useContext(PageNavigationContext);
-  const account = useContext(PageAccountContext);
   const toolbarAction = navigation?.desktop && navigation.route !== "#/home";
   const showBack = back && !(navigation?.desktop && navigation.route === "#/users");
-  return <><header className="page-header" data-has-action={Boolean(action && !toolbarAction)} data-has-back={Boolean(showBack)}>{showBack && <a className="icon-button page-back" href={back} aria-label="返回"><ArrowLeft size={21} /></a>}<div><h1 id={navigation ? `heading-${encodeURIComponent(navigation.route)}` : undefined} className="mobile-page-title" title={title} tabIndex={-1}>{title}</h1></div>{action && !toolbarAction && <div className="page-actions">{action}</div>}{account}</header>{action && toolbarAction && <div className="page-toolbar-actions">{action}</div>}</>;
+  const hideTitle = Boolean(navigation && (rootRoutes.includes(navigation.route) || navigation.route === "#/users"));
+  const empty = hideTitle && !showBack && !(action && !toolbarAction);
+  return <><header className="page-header" data-title-hidden={hideTitle} data-empty={empty} data-has-action={Boolean(action && !toolbarAction)} data-has-back={Boolean(showBack)}>{showBack && <a className="icon-button page-back" href={back} aria-label="返回"><ArrowLeft size={21} /></a>}<div><h1 id={navigation ? `heading-${encodeURIComponent(navigation.route)}` : undefined} className="mobile-page-title" title={title} tabIndex={-1}>{title}</h1></div>{action && !toolbarAction && <div className="page-actions">{action}</div>}</header>{action && toolbarAction && <div className="page-toolbar-actions">{action}</div>}</>;
 }
 export function CreateButton({ label, onClick, disabled }: { label: string; onClick: () => void; disabled?: boolean }) {
   return <button className="primary-button page-create" data-resource={label} aria-label={label === "服务" ? "创建服务" : `添加 ${label}`} title={label === "服务" ? "添加服务" : `添加${label}`} onClick={onClick} disabled={disabled}><Plus size={20} /><span>{label === "服务" ? "添加服务" : `添加${label}`}</span></button>;

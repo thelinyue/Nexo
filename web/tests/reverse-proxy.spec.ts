@@ -1,4 +1,4 @@
-import { openServiceEditor } from "./service-actions";
+import { openServiceEditor, selectServiceOption } from "./service-actions";
 import { expect, test } from "@playwright/test";
 import { installApiMocks } from "./api-mocks";
 import type { Tunnel } from "../src/ui";
@@ -18,7 +18,9 @@ test("独立反代入口无需 Agent，创建服务入口保持内网穿透", as
   await expect(dialog.getByLabel("目标端口")).toHaveValue("3000");
   await expect(dialog.getByRole("combobox", { name: "Agent", exact: true })).toHaveCount(0);
   await expect(dialog.getByLabel("内网重定向")).toHaveCount(0);
-  await expect(dialog.getByLabel("目标协议").locator("option")).toHaveText(["HTTP", "HTTPS"]);
+  await dialog.getByRole("combobox", { name: "目标协议", exact: true }).click();
+  await expect(dialog.getByRole("listbox", { name: "目标协议选项" }).getByRole("option")).toHaveText(["HTTP", "HTTPS"]);
+  await dialog.getByRole("combobox", { name: "目标协议", exact: true }).press("Escape");
   await dialog.getByLabel("主机名").fill("app");
   await page.screenshot({ path: info.outputPath("reverse-proxy-form.png"), animations: "disabled" });
   await dialog.getByRole("button", { name: "保存服务" }).click();
@@ -37,16 +39,19 @@ test("独立反代入口无需 Agent，创建服务入口保持内网穿透", as
 
 });
 
-test("手机添加入口集中到底部，选择类型后进入独立表单", async ({ page }, info) => {
+test("手机添加入口位于标题右侧，选择类型后进入独立表单", async ({ page }, info) => {
   test.skip(info.project.name === "desktop-dark", "手机操作面板");
   await installApiMocks(page);
   await page.goto("/#/services");
   const add = page.getByRole("button", { name: "添加", exact: true });
   await expect(add).toBeInViewport();
   await expect(page.getByRole("button", { name: "添加反向代理", exact: true })).toHaveCount(0);
-  const fab = await add.boundingBox();
-  const nav = await page.locator(".bottom-nav").boundingBox();
-  expect(fab!.y + fab!.height).toBeLessThanOrEqual(nav!.y);
+  const button = (await add.boundingBox())!;
+  const heading = (await page.getByRole("heading", { name: "服务", exact: true }).boundingBox())!;
+  expect(button.width).toBe(44);
+  expect(button.height).toBe(44);
+  expect(button.x).toBeGreaterThanOrEqual(heading.x + heading.width);
+  expect(Math.abs(button.y + button.height / 2 - heading.y - heading.height / 2)).toBeLessThanOrEqual(1);
   await add.click();
   const sheet = page.getByRole("dialog", { name: "添加", exact: true });
   for (const name of ["创建服务", "添加反向代理"]) {
@@ -113,6 +118,7 @@ test("纯反代首页不要求接入设备且反代不出现在穿透统计筛�
   await page.goto("/#/home");
   await expect(page.locator(".home-summaries")).toContainText("穿透运行 0 · 反代生效 1");
   await expect(page.getByText("接入第一台设备", { exact: true })).toHaveCount(0);
+  await page.getByRole("button", { name: "流量筛选", exact: true }).click();
   await page.getByLabel("统计用户", { exact: true }).selectOption("admin");
   await expect(page.getByLabel("统计隧道").locator("option")).toHaveCount(1);
   await expect(page.locator(".traffic-help")).toContainText("不含反向代理");
@@ -141,9 +147,9 @@ test("反向代理默认强制 HTTPS，切换协议保留选择，编辑读取�
   const force = dialog.getByRole("switch", { name: "强制 HTTPS" });
   await expect(force).toBeChecked();
   await force.uncheck();
-  await dialog.getByLabel("公网协议", { exact: true }).selectOption("http");
+  await selectServiceOption(dialog.getByRole("combobox", { name: "公网协议", exact: true }), "HTTP");
   await expect(force).toHaveCount(0);
-  await dialog.getByLabel("公网协议", { exact: true }).selectOption("https");
+  await selectServiceOption(dialog.getByRole("combobox", { name: "公网协议", exact: true }), "HTTPS");
   await expect(force).not.toBeChecked();
   await dialog.getByLabel("服务名称").fill("跳转应用");
   await dialog.getByLabel("目标端口").fill("3000");

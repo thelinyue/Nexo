@@ -1,6 +1,6 @@
 import { expect, test } from "@playwright/test";
 import { installApiMocks } from "./api-mocks";
-import { openServiceEditor } from "./service-actions";
+import { openServiceEditor, selectServiceOption } from "./service-actions";
 
 test("HTTPS 公网端口预览、验证、保存与切换保留", async ({ page }) => {
   const state = await installApiMocks(page);
@@ -15,10 +15,10 @@ test("HTTPS 公网端口预览、验证、保存与切换保留", async ({ page 
   await expect(port).toHaveValue("443");
   await port.fill("9443");
   await expect(dialog.locator(".service-submit-preview")).toContainText(":9443");
-  await dialog.getByLabel("公网协议").selectOption("http");
+  await selectServiceOption(dialog.getByRole("combobox", { name: "公网协议", exact: true }), "HTTP");
   await expect(port).toHaveCount(0);
   await expect(dialog.locator(".service-submit-preview")).not.toContainText(":9443");
-  await dialog.getByLabel("公网协议").selectOption("https");
+  await selectServiceOption(dialog.getByRole("combobox", { name: "公网协议", exact: true }), "HTTPS");
   await expect(port).toHaveValue("9443");
   await port.fill("0");
   await dialog.getByRole("button", { name: "保存服务" }).click();

@@ -607,7 +607,15 @@ async fn run_data(
     loop {
         let endpoint = desired.borrow_and_update().endpoint.clone();
         let connector = connectors.borrow().clone();
-        let connected = connect_tls(&connector, &endpoint).await;
+        // 每次数据重连都重新设置；失败进入现有重试流程，不影响控制连接。
+        let connected = connect_tls(&connector, &endpoint).await.and_then(|stream| {
+            stream
+                .get_ref()
+                .0
+                .set_nodelay(true)
+                .context("设置 Tunnel 数据连接 TCP_NODELAY 失败")?;
+            Ok(stream)
+        });
         match connected {
             Ok(stream) => {
                 delay = 1;

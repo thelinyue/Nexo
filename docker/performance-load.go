@@ -189,7 +189,7 @@ func readPayload(r io.Reader, n int64, buf []byte, begin, end time.Time, out *re
 	return nil
 }
 
-func load(addr, host, ca, protocol, workload, mode string, concurrency, bulkMiB int, warm, duration float64) {
+func load(addr, host, ca, protocol, workload, mode string, concurrency, bulkMiB int, warm, duration float64, requestTimeout time.Duration) {
 	caPEM, e := os.ReadFile(ca)
 	must(e)
 	roots := x509.NewCertPool()
@@ -224,7 +224,7 @@ func load(addr, host, ca, protocol, workload, mode string, concurrency, bulkMiB 
 		shared = newTransport()
 		defer shared.CloseIdleConnections()
 		// 先建立唯一 H2 连接，后续 worker 只复用它，避免并发首次拨号产生多条连接。
-		client := &http.Client{Transport: shared, Timeout: 30 * time.Second}
+		client := &http.Client{Transport: shared, Timeout: requestTimeout}
 		r, e := client.Get("https://" + host + "/1024")
 		must(e)
 		_, e = io.Copy(io.Discard, r.Body)
@@ -263,7 +263,7 @@ func load(addr, host, ca, protocol, workload, mode string, concurrency, bulkMiB 
 				transport = newTransport()
 				defer transport.CloseIdleConnections()
 			}
-			client := &http.Client{Transport: transport, Timeout: 30 * time.Second}
+			client := &http.Client{Transport: transport, Timeout: requestTimeout}
 			defer func() {
 				if raw != nil {
 					raw.Close()
@@ -284,7 +284,7 @@ func load(addr, host, ca, protocol, workload, mode string, concurrency, bulkMiB 
 						}
 					}
 					if err == nil {
-						raw.SetDeadline(time.Now().Add(30 * time.Second))
+						raw.SetDeadline(time.Now().Add(requestTimeout))
 						var h [8]byte
 						binary.BigEndian.PutUint64(h[:], uint64(n))
 						_, err = raw.Write(h[:])
@@ -382,7 +382,7 @@ func load(addr, host, ca, protocol, workload, mode string, concurrency, bulkMiB 
 	if protocol == "h2" {
 		setupBytes = 1024
 	}
-	must(json.NewEncoder(os.Stdout).Encode(map[string]any{"warm_seconds": warm, "measure_seconds": duration, "drain_seconds": time.Since(end).Seconds(), "workers": results, "histogram_resolution_us": 10, "client_connections": clientConnections.Load(), "wire_read": wireRead.Load(), "wire_written": wireWritten.Load(), "setup_payload_bytes": setupBytes, "bulk_mib": bulkMiB}))
+	must(json.NewEncoder(os.Stdout).Encode(map[string]any{"warm_seconds": warm, "measure_seconds": duration, "drain_seconds": time.Since(end).Seconds(), "workers": results, "histogram_resolution_us": 10, "client_connections": clientConnections.Load(), "wire_read": wireRead.Load(), "wire_written": wireWritten.Load(), "setup_payload_bytes": setupBytes, "bulk_mib": bulkMiB, "request_timeout_seconds": requestTimeout.Seconds()}))
 }
 
 func main() {
@@ -399,6 +399,7 @@ func main() {
 	bulkMiB := flag.Int("bulk-mib", 64, "每个大文件响应的 MiB，避免小对象请求往返主导吞吐")
 	warm := flag.Float64("warm", 5, "预热秒数")
 	duration := flag.Float64("duration", 15, "测量秒数")
+	requestTimeout := flag.Duration("request-timeout", 30*time.Second, "单次完整响应超时；慢链路收尾独立于吞吐测量窗口")
 	flag.Parse()
 	if *role == "origin" {
 		origin(*cert, *key)
@@ -406,6 +407,9 @@ func main() {
 		if *bulkMiB < 1 || *bulkMiB > 1024 {
 			panic("bulk-mib 必须介于 1 和 1024")
 		}
-		load(*addr, *host, *ca, *protocol, *workload, *mode, *concurrency, *bulkMiB, *warm, *duration)
+		if *requestTimeout <= 0 {
+			panic("request-timeout 必须为正")
+		}
+		load(*addr, *host, *ca, *protocol, *workload, *mode, *concurrency, *bulkMiB, *warm, *duration, *requestTimeout)
 	}
 }

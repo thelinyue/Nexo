@@ -1,4 +1,4 @@
-import { openServiceEditor } from "./service-actions";
+import { openServiceEditor, selectServiceOption } from "./service-actions";
 import { expect, test } from "@playwright/test";
 import { installApiMocks } from "./api-mocks";
 import { readFileSync } from "node:fs";
@@ -20,7 +20,7 @@ test("访问规则默认公开，校验密码并保留内网重定向", async ({
   await form.getByRole("radio", { name: "认证访问", exact: true }).check();
   await form.getByRole("switch", { name: "内网重定向" }).check();
   await expect(form.getByText("内网直达免认证，公网访问需密码", { exact: true })).toBeVisible();
-  await form.getByLabel("公网协议").selectOption("http");
+  await selectServiceOption(form.getByRole("combobox", { name: "公网协议", exact: true }), "HTTP");
   await expect(form.getByText("HTTP 不加密，建议使用 HTTPS", { exact: true })).toBeVisible();
   for (const invalid of ["abc", "12345678901234567", "ab c", "中文密码"]) {
     await form.getByLabel("访问密码", { exact: true }).fill(invalid);
@@ -59,9 +59,9 @@ test("切换 TCP 清除认证草稿，反向代理支持认证", async ({ page }
   await form.locator("summary", { hasText: "高级设置" }).click();
   await form.getByRole("radio", { name: "认证访问", exact: true }).check();
   await form.getByLabel("访问密码", { exact: true }).fill("1234");
-  await form.getByLabel("内网协议").selectOption("tcp");
+  await selectServiceOption(form.getByRole("combobox", { name: "内网协议", exact: true }), "TCP");
   await expect(form.getByRole("radio", { name: "认证访问", exact: true })).toHaveCount(0);
-  await form.getByLabel("内网协议").selectOption("http");
+  await selectServiceOption(form.getByRole("combobox", { name: "内网协议", exact: true }), "HTTP");
   await form.locator("summary", { hasText: "高级设置" }).click();
   await expect(form.getByRole("radio", { name: "公开访问", exact: true })).toBeChecked();
   await form.getByRole("button", { name: "取消", exact: true }).click();

@@ -44,6 +44,7 @@ test("首页额度独立于重置统计，切换用户及全局不串用", async
   const state = await installApiMocks(page);
   state.quotas.set("alice", { monthly_limit_bytes: 100 * 1024 ** 3, used_bytes: 80 * 1024 ** 3 });
   await page.goto("/");
+  await page.getByRole("button", { name: "流量筛选", exact: true }).click();
   await expect(page.getByRole("region", { name: "本月流量额度", exact: true })).toHaveCount(0);
   await page.getByLabel("统计用户", { exact: true }).selectOption("alice");
   const quota = page.getByRole("region", { name: "本月流量额度", exact: true });
@@ -68,16 +69,17 @@ test("普通用户额度只读，失败保留数据，页面不可见暂停请�
   await page.route("**/api/v1/auth/status", route => route.fulfill({ json: { initialized: true, authenticated: true, user_id: "alice", username: "alice", role: "tenant", workspace_id: "alice" } }));
   state.failures.set("GET /api/v1/traffic/quota", "额度读取失败");
   await page.goto("/");
+  await page.getByRole("button", { name: "流量筛选", exact: true }).click();
   const quota = page.getByRole("region", { name: "本月流量额度", exact: true });
   await expect(quota).toContainText("暂时无法获取额度");
   await expect(quota).not.toContainText("未设置限制");
   await expect(page.getByRole("button", { name: "流量限制", exact: true })).toHaveCount(0);
   expect(state.calls.some(call => call.path.startsWith("/api/v1/admin/"))).toBeFalsy();
   state.failures.clear();
-  await page.getByLabel("刷新首页").click();
+  await page.evaluate(() => window.dispatchEvent(new Event("focus")));
   await expect(quota).toContainText("本月额度消耗 80 GiB");
   state.failures.set("GET /api/v1/traffic/quota", "额度读取失败");
-  await page.getByLabel("刷新首页").click();
+  await page.evaluate(() => window.dispatchEvent(new Event("focus")));
   await expect(quota).toContainText("保留上次数据");
   await expect(quota).toContainText("本月额度消耗 80 GiB");
   await page.clock.install();
@@ -93,6 +95,7 @@ test("额度迟到响应不能覆盖新用户", async ({ page }) => {
   const pending = new Promise<void>(resolve => { release = resolve; });
   await page.route("**/api/v1/admin/traffic/quota?user_id=alice", async route => { await pending; await route.fulfill({ json: { monthly_limit_bytes: 100, used_bytes: 100, remaining_bytes: 0, exhausted: true, started_at: 100, period_start: 100, period_end: 200 } }); });
   await page.goto("/");
+  await page.getByRole("button", { name: "流量筛选", exact: true }).click();
   const requested = page.waitForRequest("**/api/v1/admin/traffic/quota?user_id=alice");
   await page.getByLabel("统计用户", { exact: true }).selectOption("alice");
   await requested;

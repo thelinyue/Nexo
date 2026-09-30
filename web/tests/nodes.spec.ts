@@ -1,3 +1,4 @@
+import { selectServiceOption } from "./service-actions";
 import { expect, test } from "@playwright/test";
 import { writeFile } from "node:fs/promises";
 import { installApiMocks } from "./api-mocks";
@@ -29,15 +30,19 @@ test("节点卡片展示实测范围、历史延迟和待测速，筛选及窄�
   await detail.getByRole("button", { name: "关闭", exact: true }).click();
   await expect(page.getByRole("article", { name: "日本 VPS" })).toContainText("已过期");
   await expect(page.getByRole("article", { name: "美国 VPS" })).toContainText("待测速");
-  await expect(page.getByRole("button", { name: "批量更新", exact: true })).toBeDisabled();
+  await expect(page.getByRole("checkbox")).toHaveCount(0);
+  await page.getByRole("button", { name: "批量更新", exact: true }).click();
+  await expect(page.getByRole("button", { name: "继续", exact: true })).toBeDisabled();
   await page.getByLabel("选择 香港 VPS").check();
-  await expect(page.getByRole("button", { name: "批量更新（1）" })).toBeEnabled();
+  await expect(page.getByRole("button", { name: "继续", exact: true })).toBeEnabled();
   await page.getByLabel("搜索节点名称或 IP").fill("203.0.113.11");
   await expect(page.getByRole("article")).toHaveCount(1);
   await page.getByLabel("搜索节点名称或 IP").clear();
   await page.getByLabel("筛选节点", { exact: true }).selectOption("offline");
   await expect(page.getByRole("article")).toHaveCount(1);
   await page.getByLabel("筛选节点", { exact: true }).selectOption("");
+  await expect(page.getByLabel("选择 香港 VPS")).not.toBeChecked();
+  await page.getByRole("region", { name: "批量更新选择" }).getByRole("button", { name: "取消", exact: true }).click();
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
   await page.screenshot({ path: info.outputPath("node-latency-cards.png"), fullPage: true });
 });
@@ -63,11 +68,11 @@ test("自动低延迟与手动首选可编辑，IPv6 开关独立保留", async 
   await page.goto("/#/services/t-1");
   await page.getByRole("button", { name: "编辑服务", exact: true }).click();
   const dialog = page.getByRole("dialog", { name: "编辑服务" });
-  await expect(dialog.getByLabel("节点策略")).toHaveValue("latency");
+  await expect(dialog.getByRole("combobox", { name: "选择策略", exact: true })).toHaveAttribute("value", "latency");
   await expect(dialog.getByRole("switch", { name: "IPv6 直连" })).toBeEnabled();
-  await dialog.getByLabel("节点策略").selectOption("manual");
-  await dialog.getByLabel("首选节点").selectOption("hk");
-  await expect(dialog).toContainText("恢复健康后回到首选");
+  await selectServiceOption(dialog.getByRole("combobox", { name: "选择策略", exact: true }), "主备切换");
+  await selectServiceOption(dialog.getByRole("combobox", { name: "首选节点", exact: true }), "香港 VPS");
+  await expect(dialog).toContainText("恢复后自动切回");
 });
 
 test("节点组过滤、服务选择及管理员维护入口", async ({ page }, info) => {
@@ -89,8 +94,28 @@ test("节点组过滤、服务选择及管理员维护入口", async ({ page }, 
   await page.goto("/#/services/t-1");
   await page.getByRole("button", { name: "编辑服务", exact: true }).click();
   const service = page.getByRole("dialog", { name: "编辑服务" });
-  await service.getByLabel("节点来源").selectOption("asia");
-  await expect(service.getByLabel("节点策略")).toHaveValue("latency");
+  await selectServiceOption(service.getByRole("combobox", { name: "节点来源", exact: true }), "亚洲入口 · 2 个节点");
+  await expect(service.getByRole("combobox", { name: "选择策略", exact: true })).toHaveAttribute("value", "latency");
+  const strategy = service.getByRole("combobox", { name: "选择策略", exact: true });
+  await strategy.click();
+  const strategies = service.getByRole("listbox", { name: "选择策略选项" });
+  const single = strategies.getByRole("option", { name: "单节点", exact: true });
+  await expect(single).toBeDisabled();
+  // 使用真实指针坐标尝试点击禁用项，不能改变草稿或关闭菜单。
+  await single.scrollIntoViewIfNeeded();
+  await expect(single).toBeInViewport({ ratio: 1 });
+  const box = (await single.boundingBox())!;
+  await page.mouse.click(box.x + box.width / 2, box.y + box.height / 2);
+  await expect(strategy).toHaveAttribute("value", "latency");
+  await expect(strategies).toBeVisible();
+  await strategy.press("Home");
+  await expect(strategies.getByRole("option", { name: "DNS 分流", exact: true })).toHaveAttribute("data-active", "true");
+  await strategy.press("ArrowUp");
+  await expect(strategies.getByRole("option", { name: "DNS 分流", exact: true })).toHaveAttribute("data-active", "true");
+  await strategy.press("End");
+  await expect(strategies.getByRole("option", { name: "主备切换", exact: true })).toHaveAttribute("data-active", "true");
+  await strategy.press("Escape");
+  await expect(strategy).toBeFocused();
   const members = service.getByRole("list", { name: "组内节点" });
   await expect(members.getByRole("listitem")).toHaveCount(2);
   await expect(members).toContainText("香港 VPS");
@@ -98,7 +123,7 @@ test("节点组过滤、服务选择及管理员维护入口", async ({ page }, 
   await expect(members).not.toContainText("美国 VPS");
   await expect(service.getByRole("checkbox", { name: "香港 VPS", exact: true })).toHaveCount(0);
   await page.screenshot({ path: info.outputPath("service-node-group.png"), fullPage: true });
-  await service.getByLabel("节点来源").selectOption("");
+  await selectServiceOption(service.getByRole("combobox", { name: "节点来源", exact: true }), "手动选择");
   await expect(service.getByRole("checkbox", { name: "香港 VPS", exact: true })).toBeChecked();
   await expect(service.getByRole("checkbox", { name: "香港 VPS", exact: true })).toBeEnabled();
 });
@@ -262,6 +287,7 @@ test("管理员审批保存当前工作空间分配，未授权节点不进入�
   await page.goto("/#/nodes");
   await page.getByRole("article", { name: "香港 VPS", exact: true }).getByRole("button", { name: "管理" }).click();
   const dialog = page.getByRole("dialog", { name: "香港 VPS" });
+  await dialog.getByRole("tab", { name: "配置", exact: true }).click();
   await dialog.getByLabel("admin的工作空间").check();
   await dialog.getByRole("button", { name: "批准并保存配置" }).click();
   await expect(dialog).toBeHidden();
@@ -272,4 +298,83 @@ test("管理员审批保存当前工作空间分配，未授权节点不进入�
   const service = page.getByRole("dialog", { name: "编辑服务" });
   await expect(service.getByLabel("香港 VPS", { exact: true })).toBeVisible();
   await expect(service.getByLabel(/日本 VPS/)).toHaveCount(0);
+});
+
+for (const [mode, label] of [["single", "单节点"], ["dns", "DNS 分流"], ["latency", "低延迟优先"], ["manual", "主备切换"]]) {
+  test(`服务节点策略 ${label} 保存后正确回填`, async ({ page }, info) => {
+    const { state } = await setup(page);
+    Object.assign(state.tunnels[0], { node_ids: ["hk", "us"], distribution_mode: "latency", preferred_node_id: "hk" });
+    await page.goto("/#/services/t-1");
+    await page.getByRole("button", { name: "编辑服务", exact: true }).click();
+    const editor = page.getByRole("dialog", { name: "编辑服务" });
+    const source = editor.getByRole("combobox", { name: "节点来源", exact: true });
+    await expect(source).toContainText("手动选择");
+    await expect(source.locator(".placeholder")).toHaveCount(0);
+    await selectServiceOption(editor.getByRole("combobox", { name: "选择策略", exact: true }), label);
+    if (mode === "manual") {
+      await selectServiceOption(editor.getByRole("combobox", { name: "首选节点", exact: true }), "美国 VPS");
+      await editor.locator(".service-node-section").scrollIntoViewIfNeeded();
+      await page.screenshot({ path: info.outputPath("service-node-form.png"), animations: "disabled" });
+      await editor.getByRole("combobox", { name: "选择策略", exact: true }).click();
+      await page.screenshot({ path: info.outputPath("service-strategy-menu.png"), animations: "disabled" });
+      await editor.getByRole("combobox", { name: "选择策略", exact: true }).press("Escape");
+    }
+    await editor.getByRole("button", { name: "保存服务" }).click();
+    await expect(editor).toBeHidden();
+    expect(state.calls.find(call => call.method === "PUT" && call.path === "/api/v1/tunnels/t-1")?.body).toMatchObject({
+      distribution_mode: mode, node_group_id: "", node_ids: mode === "single" ? ["hk"] : ["hk", "us"], preferred_node_id: mode === "manual" ? "us" : "hk",
+    });
+    await page.getByRole("button", { name: "编辑服务", exact: true }).click();
+    await expect(editor.getByRole("combobox", { name: "选择策略", exact: true })).toContainText(label);
+    if (mode === "manual") await expect(editor.getByRole("combobox", { name: "首选节点", exact: true })).toContainText("美国 VPS");
+    else await expect(editor.getByRole("combobox", { name: "首选节点", exact: true })).toHaveCount(0);
+  });
+}
+
+test("节点菜单长名称在窄屏和低高度视口内可滚动选择", async ({ page }, info) => {
+  await setup(page);
+  const groups = Array.from({ length: 12 }, (_, i) => ({ id: `group-${i}`, name: `家庭与办公室的亚洲公网入口长名称节点组 ${i}`, node_ids: ["hk", "us"], selectable: true }));
+  await page.route("**/api/v1/node-groups", route => route.fulfill({ json: groups }));
+  await page.goto("/#/services/t-1");
+  await page.getByRole("button", { name: "编辑服务", exact: true }).click();
+  const editor = page.getByRole("dialog", { name: "编辑服务" });
+  for (const viewport of [{ width: 320, height: 568 }, { width: 390, height: 420 }, { width: 812, height: 375 }]) {
+    await page.setViewportSize(viewport);
+    for (const label of ["节点来源", "选择策略", "内网协议"]) {
+      const trigger = editor.getByRole("combobox", { name: label, exact: true });
+      await trigger.click();
+      const list = editor.getByRole("listbox", { name: `${label}选项` });
+      await expect(list).toBeVisible();
+      await expect.poll(async () => {
+        const box = await list.boundingBox(); const body = await editor.locator(".modal-body").boundingBox();
+        return Boolean(box && body && box.x >= 0 && box.x + box.width <= viewport.width && box.y >= body.y && box.y + box.height <= body.y + body.height && box.height >= 48);
+      }).toBeTruthy();
+      expect(await list.evaluate(element => element.scrollWidth <= element.clientWidth)).toBeTruthy();
+      await trigger.press("End");
+      await expect(list.getByRole("option").last()).toBeInViewport({ ratio: 1 });
+      await expect(editor.getByRole("button", { name: "保存服务" })).toBeInViewport();
+      await page.screenshot({ path: info.outputPath(`${label}-${viewport.width}x${viewport.height}.png`), animations: "disabled" });
+      if (label === "节点来源") {
+        await trigger.press("Enter");
+        await expect(trigger).toContainText(groups[11].name);
+      } else await trigger.press("Escape");
+      await expect(list).toBeHidden();
+      expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBeTruthy();
+    }
+  }
+});
+
+test("主备模式未选择节点时首选下拉禁用，补选后恢复", async ({ page }) => {
+  const { state } = await setup(page);
+  Object.assign(state.tunnels[0], { node_ids: ["hk", "us"], distribution_mode: "manual", preferred_node_id: "hk" });
+  await page.goto("/#/services/t-1");
+  await page.getByRole("button", { name: "编辑服务", exact: true }).click();
+  const editor = page.getByRole("dialog", { name: "编辑服务" });
+  for (const name of ["香港 VPS", "美国 VPS"]) await editor.getByRole("checkbox", { name, exact: true }).uncheck();
+  const preferred = editor.getByRole("combobox", { name: "首选节点", exact: true });
+  await expect(preferred).toBeDisabled();
+  await expect(preferred).toContainText("选择节点");
+  await editor.getByRole("checkbox", { name: "美国 VPS", exact: true }).check();
+  await expect(preferred).toBeEnabled();
+  await expect(preferred).toContainText("美国 VPS");
 });
