@@ -48,6 +48,9 @@ pub struct ServiceHealth {
     pub revision: i64,
     pub ready: bool,
     pub error: Option<String>,
+    /// 旧节点省略此字段时继续使用 TCP 检查，支持后不得因 HTTP/TLS 失败降级。
+    #[serde(default)]
+    pub public_probe_supported: bool,
 }
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct UpdateReport {

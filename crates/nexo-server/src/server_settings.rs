@@ -241,15 +241,19 @@ pub async fn get(
 /// 页面保存后立即生效；未填写时兼容已有 TOML 与旧公网地址清单，不主动探测公网。
 pub(crate) fn relay_ipv4(state: &AppState) -> Result<Option<Ipv4Addr>, ApiError> {
     let settings = state.security.settings()?;
-    Ok(settings
-        .relay_ipv4
-        .or(state.config.direct.relay_ipv4)
-        .or_else(|| {
-            settings.public_ips.iter().find_map(|ip| match ip {
-                IpAddr::V4(ip) => Some(*ip),
-                _ => None,
-            })
-        }))
+    Ok(effective_relay_ipv4(
+        &settings,
+        state.config.direct.relay_ipv4,
+    ))
+}
+
+fn effective_relay_ipv4(settings: &Settings, fallback: Option<Ipv4Addr>) -> Option<Ipv4Addr> {
+    settings.relay_ipv4.or(fallback).or_else(|| {
+        settings.public_ips.iter().find_map(|ip| match ip {
+            IpAddr::V4(ip) => Some(*ip),
+            _ => None,
+        })
+    })
 }
 
 /// 可从 HTTP 原入口保存。配置落库与内存发布保持一致，证书和路由由现有 Caddy 协调器异步收敛。
@@ -266,7 +270,14 @@ pub async fn update(
             "设置格式不正确；公网 IP 必须是 IPv4/IPv6 地址列表",
         )
     })?;
+    let _dns_guard = state.tunnel_runtime.direct.dns_lock.lock().await;
     let _guard = state.domain_runtime.reconcile_lock.lock().await;
+    // DNS 操作可能等待网络响应；取得写锁后重新核对会话和管理员权限。
+    let session_now = accounts::require_admin(&state, &headers)?;
+    auth::require_csrf(&state, &headers)?;
+    if session_now.tenant_id != session.tenant_id {
+        return Err(ApiError::session_expired());
+    }
     {
         // 和旧实现保持相同锁顺序：运行设置写锁先于数据库锁。
         let mut current = state.security.configuration.write().map_err(db_error)?;
@@ -295,10 +306,8 @@ pub async fn update(
             }
             let domain: String = tx.query_row("SELECT p.domain FROM public_domains p JOIN domain_settings s ON s.domain_id=p.id WHERE p.id=?1 AND p.tenant_id=?2 AND p.https_enabled=1 AND s.verified=1", params![entry.domain_id, session.tenant_id], |r| r.get(0)).optional().map_err(db_error)?.ok_or_else(|| bad_input("请选择自己空间内已验证并启用 HTTPS 的域名"))?;
             let options = crate::domains::load(&tx, &entry.domain_id, &domain)?;
-            if options.certificate_mode == "cloudflare_dns" && !options.credential_configured {
-                return Err(bad_input(
-                    "请先配置域名的 Cloudflare 凭据，或选择 HTTP 验证",
-                ));
+            if !options.credential_configured {
+                return Err(bad_input("请先验证并保存域名的 DNS 凭据"));
             }
             entry.hostname = entry.hostname.trim().to_ascii_lowercase();
             if entry.hostname.is_empty() || entry.hostname.contains('.') {
@@ -323,6 +332,13 @@ pub async fn update(
             settings.trusted_proxies = vec![upstream(state.config.http_addr).ip()];
         }
         let settings = settings.normalize()?;
+        if effective_relay_ipv4(&settings, state.config.direct.relay_ipv4)
+            != effective_relay_ipv4(&current, state.config.direct.relay_ipv4)
+        {
+            // 内置节点地址来自运行设置，变更后诊断与维护均不能继续使用旧地址的样本。
+            tx.execute("DELETE FROM relay_public_health WHERE node_id='local'", [])
+                .map_err(db_error)?;
+        }
         tx.execute("INSERT INTO server_settings(id,value) VALUES(1,?1) ON CONFLICT(id) DO UPDATE SET value=excluded.value", [serde_json::to_string(&settings).map_err(db_error)?]).map_err(db_error)?;
         accounts::audit(&tx, &session, "server_settings_updated", "server", "1")?;
         tx.commit().map_err(db_error)?;

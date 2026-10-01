@@ -152,7 +152,7 @@ pub async fn run(
     let mut tasks = JoinSet::new();
     tasks.spawn(control(runtime.clone(), identity.clone()));
     tasks.spawn(data(runtime.clone(), identity.clone()));
-    tasks.spawn(listeners(runtime.clone(), directory));
+    tasks.spawn(listeners(runtime.clone(), directory, identity.id.clone()));
     let health = runtime.clone();
     let instance = uuid::Uuid::new_v4().to_string();
     tasks.spawn(async move {
@@ -383,7 +383,7 @@ async fn data_session(
     }
     result
 }
-async fn listeners(runtime: Arc<Runtime>, directory: PathBuf) -> Result<()> {
+async fn listeners(runtime: Arc<Runtime>, directory: PathBuf, node_id: String) -> Result<()> {
     let access_listener = TcpListener::bind("127.0.0.1:0").await?;
     let access_address = access_listener.local_addr()?.to_string();
     let app = Router::new()
@@ -497,6 +497,12 @@ async fn listeners(runtime: Arc<Runtime>, directory: PathBuf) -> Result<()> {
                         let (endpoint, check) =
                             crate::service_access::handlers(&access_address, &service.id);
                         let routes = server["routes"].as_array_mut().unwrap();
+                        routes.push(super::health::route(
+                            &host,
+                            &node_id,
+                            &service.id,
+                            service.revision,
+                        ));
                         if let Some(origin) = &service.lan_redirect_url {
                             if let Some(ip) = runtime
                                 .sessions
@@ -535,6 +541,7 @@ async fn listeners(runtime: Arc<Runtime>, directory: PathBuf) -> Result<()> {
                 error = Some("等待 Agent 数据连接".into());
             }
             health.push(wire::ServiceHealth {
+                public_probe_supported: matches!(service.protocol.as_str(), "http" | "https"),
                 id: service.id.clone(),
                 revision: service.revision,
                 ready: error.is_none(),

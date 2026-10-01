@@ -958,36 +958,6 @@ fn refresh_status(
         https_port,
     ) in rows
     {
-        let remote_status = {
-            let db = state
-                .db
-                .lock()
-                .map_err(|_| anyhow::anyhow!("数据库锁不可用"))?;
-            let remote_only:bool=db.query_row("SELECT NOT EXISTS(SELECT 1 FROM service_nodes WHERE service_id=?1 AND node_id='local')",[&id],|r|r.get(0))?;
-            let has_remote:bool=db.query_row("SELECT EXISTS(SELECT 1 FROM service_nodes WHERE service_id=?1 AND node_id!='local')",[&id],|r|r.get(0))?;
-            if remote_only || has_remote {
-                let healthy:bool=db.query_row("SELECT EXISTS(SELECT 1 FROM authorized_service_nodes s JOIN relay_nodes n ON n.id=s.node_id JOIN relay_service_health h ON h.node_id=s.node_id AND h.service_id=s.service_id WHERE s.service_id=?1 AND s.node_id!='local' AND h.healthy=1 AND h.revision=?2 AND h.checked_at>?3 AND n.approved=1 AND n.enabled=1 AND n.removed_at IS NULL AND n.maintenance=0 AND n.last_seen>?3)",params![id,revision,unix_now()-45],|r|r.get(0))?;
-                let dns_error: Option<String> = db
-                    .query_row(
-                        "SELECT error FROM relay_dns_state WHERE service_id=?1",
-                        [&id],
-                        |r| r.get(0),
-                    )
-                    .optional()?
-                    .flatten();
-                if let Some(error) = dns_error {
-                    Some(("failed", Some(format!("DNS 更新失败：{error}"))))
-                } else if healthy {
-                    Some(("ready", None))
-                } else if remote_only {
-                    Some(("checking", Some("等待健康的 VPS 服务入口".into())))
-                } else {
-                    None
-                }
-            } else {
-                None
-            }
-        };
         let quota_available = state
             .tunnel_runtime
             .quotas
@@ -1069,10 +1039,36 @@ fn refresh_status(
                 .lock()
                 .map_err(|_| anyhow::anyhow!("数据库锁不可用"))?;
             // 先记录内置入口的实际状态，再合并远端状态，避免远端健康把故障的本机重新加入 DNS。
-            db.execute("INSERT INTO relay_service_health(node_id,service_id,revision,healthy,checked_at,error) SELECT 'local',t.id,t.apply_revision,?3,?4,?5 FROM tunnels t JOIN authorized_service_nodes s ON s.service_id=t.id AND s.node_id='local' WHERE t.id=?1 AND t.apply_revision=?2 AND t.deleted_at IS NULL ON CONFLICT(node_id,service_id) DO UPDATE SET revision=excluded.revision,healthy=excluded.healthy,checked_at=excluded.checked_at,error=excluded.error",params![id,revision,status=="ready",unix_now(),error])?;
+            db.execute("INSERT INTO relay_service_health(node_id,service_id,revision,healthy,checked_at,error,public_probe_supported) SELECT 'local',t.id,t.apply_revision,?3,?4,?5,1 FROM tunnels t JOIN authorized_service_nodes s ON s.service_id=t.id AND s.node_id='local' WHERE t.id=?1 AND t.apply_revision=?2 AND t.deleted_at IS NULL ON CONFLICT(node_id,service_id) DO UPDATE SET revision=excluded.revision,healthy=excluded.healthy,checked_at=excluded.checked_at,error=excluded.error,public_probe_supported=1",params![id,revision,status=="ready",unix_now(),error])?;
         }
+        let entry_status = {
+            let db = state
+                .db
+                .lock()
+                .map_err(|_| anyhow::anyhow!("数据库锁不可用"))?;
+            if crate::nodes::dns::managed(&db, &id)? {
+                let healthy:bool=db.query_row("SELECT EXISTS(SELECT 1 FROM relay_healthy_service_nodes WHERE service_id=?1 AND revision=?2)",params![id,revision],|r|r.get(0))?;
+                let dns_error: Option<String> = db
+                    .query_row(
+                        "SELECT error FROM relay_dns_state WHERE service_id=?1",
+                        [&id],
+                        |r| r.get(0),
+                    )
+                    .optional()?
+                    .flatten();
+                if let Some(error) = dns_error {
+                    Some(("failed", Some(format!("DNS 更新失败：{error}"))))
+                } else if healthy {
+                    Some(("ready", None))
+                } else {
+                    Some(("checking", Some("暂无可用 IPv4 入口".into())))
+                }
+            } else {
+                None
+            }
+        };
         let (status, error) = if enabled && quota_available {
-            remote_status.unwrap_or((status, error))
+            entry_status.unwrap_or((status, error))
         } else {
             (status, error)
         };
@@ -1607,6 +1603,8 @@ mod tests {
             db.execute("INSERT INTO service_nodes VALUES('own','remote')", [])
                 .unwrap();
             db.execute("INSERT INTO relay_service_health(node_id,service_id,revision,healthy,checked_at) SELECT 'remote',id,apply_revision,1,?1 FROM tunnels WHERE id='own'",[unix_now()]).unwrap();
+            db.execute("INSERT INTO relay_public_health(node_id,service_id,revision,healthy,checked_at) SELECT 'remote',id,apply_revision,1,?1 FROM tunnels WHERE id='own'",[unix_now()]).unwrap();
+            db.execute("INSERT INTO tunnel_applied_states(tunnel_id,revision,status,updated_at) VALUES('own',2,'ready',?1)",[unix_now()]).unwrap();
         }
         refresh_status(
             &state,
@@ -1624,6 +1622,40 @@ mod tests {
             "ready"
         );
         assert!(!db.query_row("SELECT healthy FROM relay_service_health WHERE node_id='local' AND service_id='own'",[],|r|r.get::<_,bool>(0)).unwrap());
+        // 远端撤出且本机刚失效时，不能先读本机上一轮健康再发布整体 ready。
+        db.execute(
+            "UPDATE relay_public_health SET healthy=0 WHERE node_id='remote'",
+            [],
+        )
+        .unwrap();
+        db.execute(
+            "UPDATE relay_service_health SET healthy=1 WHERE node_id='local'",
+            [],
+        )
+        .unwrap();
+        db.execute("INSERT INTO relay_public_health(node_id,service_id,revision,healthy,checked_at) VALUES('local','own',2,1,?1)",[unix_now()]).unwrap();
+        drop(db);
+        refresh_status(
+            &state,
+            &HashMap::new(),
+            &["mine".into()],
+            &[],
+            &HashMap::new(),
+        )
+        .unwrap();
+        assert_eq!(
+            state
+                .db
+                .lock()
+                .unwrap()
+                .query_row(
+                    "SELECT apply_status,apply_error FROM tunnels WHERE id='own'",
+                    [],
+                    |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?))
+                )
+                .unwrap(),
+            ("checking".into(), Some("暂无可用 IPv4 入口".into()))
+        );
     }
 
     #[test]

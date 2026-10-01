@@ -36,7 +36,7 @@ export function NodeLatencyView({ node, compact = false, onDetails }: { node: Re
     <span className="node-latency-caption"><span>延迟</span>{!fresh.length && !!samples.length && <small>已过期</small>}</span>
     <span className="node-latency-reading"><strong className={values.length ? "" : "node-measurement-pending"}>{values.length ? <>{low === high ? low : `${low}–${high}`}<small> ms</small></> : "待测速"}</strong><ChevronRight size={14} aria-hidden="true" /></span>
   </button>;
-  return <div className="node-latency" aria-label="延迟"><strong>{label}</strong>{!fresh.length && !!samples.length && <small>上次测量 · 已过期</small>}
+  return <div className="node-latency" aria-label="设备到节点延迟"><span className="helper">设备到节点</span><strong>{label}</strong>{!fresh.length && !!samples.length && <small>上次测量 · 已过期</small>}
     {!!node.latencies.length && <details><summary>逐设备延迟（{node.latencies.length}）</summary><ul>{node.latencies.map(sample => <li key={sample.device_id}><span>{sample.device_name}</span><strong>{sample.rtt_ms} ms</strong><small>{!fresh.includes(sample) && "上次测量 "}{dateText(sample.checked_at)}</small></li>)}</ul></details>}
   </div>;
 }

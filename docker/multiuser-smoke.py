@@ -127,7 +127,7 @@ class MultiuserHarness(smoke.Harness):
         smoke.wait_for(lambda: any(row["status"] == "online" for row in alice.api("devices")), "Alice Agent 上线")
         assert len(self.api(prefix + "/devices")) == 1
         domain = alice.api("public-domains", "POST", {"domain": "alice-smoke.localhost", "https_enabled": False})
-        assert domain["certificate_mode"] == "http01" and domain["verification_status"] == "pending"
+        assert domain["certificate_mode"] == "cloudflare_dns" and domain["verification_status"] == "pending"
         web_input = {"name": "alice-web", "protocol": "http", "device_id": alice_device, "local_address": "127.0.0.1", "local_port": secure["local_port"], "hostname": "web", "public_domain_id": domain["id"]}
         denied(lambda: alice.api("tunnels", "POST", web_input), 400)
         denied(lambda: bob.api(f"public-domains/{domain['id']}/cloudflare-credential", "PUT", {"token": "a"*40}), 404)

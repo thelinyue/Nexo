@@ -61,14 +61,14 @@ async fn real_caddy_access_password_cookie_proxy_and_lan_priority() {
         tenant_id: "default".into(),
         name: "access.localhost".into(),
         https: true,
-        token_reference: None,
+        token_reference: Some("{file./test-token}".into()),
         dns_provider: None,
-        certificate_mode: "http01".into(),
         dns: Default::default(),
         services: Vec::new(),
     };
     for (id, protocol) in [("web", "https"), ("plain", "http"), ("public", "https")] {
         domain.services.push(WebService {
+            relay_probe_revision: Some(1),
             https_port: https.port(),
             management: false,
             http_redirect_enabled: false,
@@ -91,7 +91,7 @@ async fn real_caddy_access_password_cookie_proxy_and_lan_priority() {
         .unwrap();
     supervisor.clone().start().await.unwrap();
     let deadline = tokio::time::Instant::now() + Duration::from_secs(25);
-    while read_certificates(&cfg.storage_root).len() < 3
+    while read_certificates(&cfg.storage_root).len() < 2
         || supervisor.current_config().await.is_err()
     {
         assert!(
@@ -134,6 +134,65 @@ async fn real_caddy_access_password_cookie_proxy_and_lan_priority() {
         ("plain", "http", http.port()),
     ] {
         let base = format!("{protocol}://{id}.access.localhost:{port}");
+        let target = crate::nodes::health::Target {
+            node: "local".into(),
+            address: "127.0.0.1".into(),
+            kind: protocol.into(),
+        };
+        crate::nodes::health::probe_with_roots(
+            &target,
+            &format!("{id}.access.localhost"),
+            port,
+            id,
+            1,
+            &[reqwest::Certificate::from_pem(&cert).unwrap()],
+        )
+        .await
+        .unwrap();
+        assert!(crate::nodes::health::probe_with_roots(
+            &target,
+            &format!("{id}.access.localhost"),
+            port,
+            id,
+            2,
+            &[reqwest::Certificate::from_pem(&cert).unwrap()]
+        )
+        .await
+        .is_err());
+        if protocol == "https" {
+            assert!(
+                crate::nodes::health::probe(
+                    &target,
+                    &format!("{id}.access.localhost"),
+                    port,
+                    id,
+                    1
+                )
+                .await
+                .is_err(),
+                "未受信任的本机 CA 不能通过生产检查"
+            );
+        }
+        let probe = client
+            .get(format!("{base}{}", crate::nodes::health::PROBE_PATH))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(probe.status(), StatusCode::OK);
+        assert_eq!(probe.headers()["cache-control"], "no-store");
+        assert_eq!(
+            probe.json::<Value>().await.unwrap(),
+            json!({"node_id":"local","service_id":id,"revision":1})
+        );
+        assert_eq!(
+            client
+                .post(format!("{base}{}", crate::nodes::health::PROBE_PATH))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
         let url = format!("{base}/photos/a%2Fb?q=%2F");
         let unauth = client
             .get(&url)
@@ -302,6 +361,23 @@ async fn real_caddy_access_password_cookie_proxy_and_lan_priority() {
         StatusCode::UNAUTHORIZED
     );
     drop(access);
+    // 认证回调不可用和同出口跳转都不能改写只读探测；业务请求仍执行原认证规则。
+    let probe = client
+        .get(format!(
+            "https://web.access.localhost:{}{}",
+            https.port(),
+            crate::nodes::health::PROBE_PATH
+        ))
+        .header("Sec-Fetch-Mode", "navigate")
+        .header("Sec-Fetch-Dest", "document")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(probe.status(), StatusCode::OK);
+    assert_eq!(
+        probe.json::<Value>().await.unwrap(),
+        json!({"node_id":"local","service_id":"web","revision":1})
+    );
     assert_eq!(
         nav().send().await.unwrap().status(),
         StatusCode::TEMPORARY_REDIRECT

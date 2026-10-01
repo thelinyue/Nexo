@@ -145,7 +145,9 @@ fn record_health(
     }
     let valid: bool = db.query_row("SELECT EXISTS(SELECT 1 FROM authorized_service_nodes s JOIN tunnels t ON t.id=s.service_id WHERE s.node_id=?1 AND s.service_id=?2 AND t.apply_revision=?3 AND t.enabled=1 AND t.deleted_at IS NULL)", params![node,report.id,report.revision], |r|r.get(0))?;
     if valid {
-        db.execute("INSERT INTO relay_service_health(node_id,service_id,revision,successes,failures,checked_at,error) VALUES(?1,?2,?3,?4,?5,?6,?7) ON CONFLICT(node_id,service_id) DO UPDATE SET revision=excluded.revision,healthy=CASE WHEN revision!=excluded.revision OR checked_at<=excluded.checked_at-45 THEN 0 ELSE healthy END,successes=CASE WHEN excluded.successes=1 THEN CASE WHEN revision=excluded.revision AND checked_at>excluded.checked_at-45 THEN MIN(successes+1,3) ELSE 1 END ELSE 0 END,failures=CASE WHEN excluded.failures=1 THEN CASE WHEN revision=excluded.revision AND checked_at>excluded.checked_at-45 THEN MIN(failures+1,3) ELSE 1 END ELSE 0 END,checked_at=excluded.checked_at,error=excluded.error",params![node,report.id,report.revision,report.ready as i64,(!report.ready) as i64,now,report.error.map(|s|s.chars().take(500).collect::<String>())])?;
+        // 支持声明变化即丢弃公网旧样本，升级后不能继承 TCP 的连续成功次数。
+        db.execute("DELETE FROM relay_public_health WHERE node_id=?1 AND service_id=?2 AND EXISTS(SELECT 1 FROM relay_service_health h WHERE h.node_id=?1 AND h.service_id=?2 AND h.public_probe_supported!=?3)",params![node,report.id,report.public_probe_supported])?;
+        db.execute("INSERT INTO relay_service_health(node_id,service_id,revision,successes,failures,checked_at,error,public_probe_supported) VALUES(?1,?2,?3,?4,?5,?6,?7,?8) ON CONFLICT(node_id,service_id) DO UPDATE SET revision=excluded.revision,healthy=CASE WHEN revision!=excluded.revision OR checked_at<=excluded.checked_at-45 THEN 0 ELSE healthy END,successes=CASE WHEN excluded.successes=1 THEN CASE WHEN revision=excluded.revision AND checked_at>excluded.checked_at-45 THEN MIN(successes+1,3) ELSE 1 END ELSE 0 END,failures=CASE WHEN excluded.failures=1 THEN CASE WHEN revision=excluded.revision AND checked_at>excluded.checked_at-45 THEN MIN(failures+1,3) ELSE 1 END ELSE 0 END,checked_at=excluded.checked_at,error=excluded.error,public_probe_supported=excluded.public_probe_supported",params![node,report.id,report.revision,report.ready as i64,(!report.ready) as i64,now,report.error.map(|s|s.chars().take(500).collect::<String>()),report.public_probe_supported])?;
         db.execute("UPDATE relay_service_health SET healthy=CASE WHEN successes>=3 THEN 1 WHEN failures>=3 THEN 0 ELSE healthy END WHERE node_id=?1 AND service_id=?2",params![node,report.id])?;
     }
     Ok(())
@@ -239,6 +241,56 @@ pub fn snapshot(state: &AppState, node: &str) -> Result<Snapshot> {
 mod tests {
     use super::*;
     #[test]
+    fn capability_changes_clear_public_samples_without_changing_identity() {
+        let (state, _) = crate::tests::domain_fixture();
+        let db = state.db.lock().unwrap();
+        db.execute_batch("INSERT INTO tunnels(id,tenant_id,name,protocol,local_address,local_port,created_at,updated_at) VALUES('s','default','s','http','127.0.0.1',80,0,0);
+            UPDATE relay_nodes SET certificate_pem='same-identity' WHERE id='local';").unwrap();
+        db.execute("INSERT INTO tunnel_applied_states(tunnel_id,revision,status,updated_at) VALUES('s',1,'ready',?1)",[unix_now()]).unwrap();
+        for supported in [false, true, false] {
+            if !supported {
+                db.execute("INSERT OR REPLACE INTO relay_public_health(node_id,service_id,revision,healthy,successes,checked_at) VALUES('local','s',1,1,3,?1)",[unix_now()]).unwrap();
+            }
+            record_health(
+                &db,
+                "local",
+                wire::ServiceHealth {
+                    id: "s".into(),
+                    revision: 1,
+                    ready: true,
+                    error: None,
+                    public_probe_supported: supported,
+                },
+                unix_now(),
+            )
+            .unwrap();
+            if supported {
+                assert_eq!(
+                    db.query_row("SELECT COUNT(*) FROM relay_public_health", [], |r| r
+                        .get::<_, i64>(0))
+                        .unwrap(),
+                    0
+                );
+            }
+        }
+        assert_eq!(
+            db.query_row("SELECT COUNT(*) FROM relay_public_health", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            db.query_row(
+                "SELECT certificate_pem FROM relay_nodes WHERE id='local'",
+                [],
+                |r| r.get::<_, String>(0)
+            )
+            .unwrap(),
+            "same-identity"
+        );
+    }
+
+    #[test]
     fn health_requires_three_samples_after_revision_change_or_expiry() {
         let (state, _) = crate::tests::domain_fixture();
         let db = state.db.lock().unwrap();
@@ -250,6 +302,7 @@ mod tests {
                 &db,
                 "local",
                 wire::ServiceHealth {
+                    public_probe_supported: false,
                     id: "s".into(),
                     revision,
                     ready,

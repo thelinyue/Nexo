@@ -1,14 +1,15 @@
 use super::*;
 use serde_json::json;
+const DOMAIN: &str = "00000000-0000-4000-8000-000000000001";
 
 fn input(host: &str) -> TunnelInput {
-    serde_json::from_value(json!({"service_mode":"reverse_proxy","name":"VPS 应用","protocol":"http","origin_protocol":"http","local_address":"127.0.0.1","local_port":3000,"hostname":host,"public_domain_id":"domain"})).unwrap()
+    serde_json::from_value(json!({"service_mode":"reverse_proxy","name":"VPS 应用","protocol":"http","origin_protocol":"http","local_address":"127.0.0.1","local_port":3000,"hostname":host,"public_domain_id":DOMAIN})).unwrap()
 }
 
 fn fixture() -> (AppState, HeaderMap) {
     let (state, headers) = crate::tests::domain_fixture();
-    state.db.lock().unwrap().execute("INSERT INTO public_domains(id,tenant_id,domain,https_enabled,created_at,updated_at) VALUES('domain','default','example.com',1,0,0)", []).unwrap();
-    state.db.lock().unwrap().execute("INSERT INTO domain_settings(domain_id,verification_token,certificate_mode,verified) VALUES('domain','test-proof','http01',1)", []).unwrap();
+    state.db.lock().unwrap().execute("INSERT INTO public_domains(id,tenant_id,domain,https_enabled,created_at,updated_at) VALUES(?1,'default','example.com',1,0,0)", [DOMAIN]).unwrap();
+    state.db.lock().unwrap().execute("INSERT INTO domain_settings(domain_id,verification_token,certificate_mode,verified,credential_file) VALUES(?1,'test-proof','cloudflare_dns',1,'credential-00000000-0000-4000-8000-000000000002.token')", [DOMAIN]).unwrap();
     (state, headers)
 }
 
@@ -296,7 +297,7 @@ async fn invalid_direct_combinations_targets_and_foreign_domains_are_rejected() 
         json!({"lan_redirect_enabled":true}),
         json!({"service_mode":"unknown"}),
     ] {
-        let mut value = json!({"service_mode":"reverse_proxy","name":"test","protocol":"http","local_address":"127.0.0.1","local_port":3000,"hostname":"app","public_domain_id":"domain"});
+        let mut value = json!({"service_mode":"reverse_proxy","name":"test","protocol":"http","local_address":"127.0.0.1","local_port":3000,"hostname":"app","public_domain_id":DOMAIN});
         value
             .as_object_mut()
             .unwrap()
@@ -407,7 +408,7 @@ async fn force_https_defaults_for_new_proxy_and_preserves_edits() {
         .lock()
         .unwrap()
         .execute(
-            "UPDATE domain_settings SET verified=1 WHERE domain_id=?1",
+            "UPDATE domain_settings SET verified=1,credential_file='credential-00000000-0000-4000-8000-000000000002.token' WHERE domain_id=?1",
             [&domain.id],
         )
         .unwrap();

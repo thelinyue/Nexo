@@ -22,6 +22,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
+import uuid
 
 
 TAIL = b"\x00half-close-complete"
@@ -155,8 +156,7 @@ class Harness:
         return process
 
     def prepare_local_certificates(self):
-        # HTTP-01 仍按产品默认规则生成；测试提前放入内部 CA 证书，避免借用已删除的旧 DNS 凭据回退。
-        # 此夹具只使用 .localhost，Caddy 不会向公共 CA 申请这些名字。
+        # 提前准备主域、泛域及旧具体服务证书，DNS 模式从已有缓存加载，不访问公共 CA。
         storage = self.root / "server/caddy-storage"
         if storage.exists():
             return
@@ -164,19 +164,30 @@ class Harness:
         config.write_text(json.dumps({"admin": {"listen": f"127.0.0.1:{self.ports['admin']}"},
             "storage": {"module": "file_system", "root": str(storage)},
             "apps": {"pki": {"certificate_authorities": {"local": {"install_trust": False}}},
-                "tls": {"certificates": {"automate": ["nexo-smoke.localhost", "secure.nexo-smoke.localhost"]},
+                "tls": {"certificates": {"automate": ["nexo-smoke.localhost", "*.nexo-smoke.localhost", "secure.nexo-smoke.localhost"]},
                     "automation": {"policies": [{"issuers": [{"module": "internal"}]}]}}}}), encoding="utf-8")
         log = open(self.root / "local-ca.log", "wb")
         process = subprocess.Popen([str(Path(self.args.caddy_bin).resolve()), "run", "--config", str(config)], stdout=log, stderr=subprocess.STDOUT,
             creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0)
         try:
-            wait_for(lambda: len(list((storage / "certificates/local").glob("*/*.crt"))) == 2, "生成内部 CA 测试证书")
+            wait_for(lambda: len(list((storage / "certificates/local").glob("*/*.crt"))) == 3, "生成内部 CA 测试证书")
         finally:
             process.terminate()
             process.wait(timeout=10)
             log.close()
         # ACME 模式读取它的存储命名空间；仅在测试目录准备已有证书，不修改生产凭据或签发策略。
         shutil.copytree(storage / "certificates/local", storage / "certificates/acme-v02.api.letsencrypt.org-directory")
+
+    def configure_local_domain(self, domain):
+        """仅在隔离数据库设置归属和假凭据，配合预置证书验证 DNS 模式的转发路径。"""
+        directory = self.root / "server/secrets/public-domains" / domain["id"]
+        directory.mkdir(parents=True, mode=0o700, exist_ok=True)
+        credential = f"credential-{uuid.uuid4()}.token"
+        path = directory / credential
+        path.write_text("cfat_" + "a" * 128, encoding="utf-8")
+        path.chmod(0o600)
+        with sqlite3.connect(self.root / "server/nexo.db") as db:
+            db.execute("UPDATE domain_settings SET verified=1,certificate_mode='cloudflare_dns',credential_file=? WHERE domain_id=?", (credential, domain["id"]))
 
     def start_server(self):
         self.prepare_local_certificates()
@@ -249,8 +260,7 @@ class Harness:
             self.check("共享密钥注册与 mTLS 控制连接")
             domain = self.api("public-domains", "POST", {"domain": "nexo-smoke.localhost", "https_enabled": True})
             # 归属验证由独立测试覆盖；本地固定夹具不查询公网 DNS、不触发公网 ACME。
-            with sqlite3.connect(self.root / "server/nexo.db") as db:
-                db.execute("UPDATE domain_settings SET verified=1,certificate_mode='http01' WHERE domain_id=?", (domain["id"],))
+            self.configure_local_domain(domain)
             def create(protocol, name, local_port, public_port=None):
                 return self.api("tunnels", "POST", {"name": name, "protocol": protocol, "device_id": device, "local_address": "127.0.0.1", "local_port": local_port, "enabled": True, "public_port": public_port, "hostname": name if protocol != "tcp" else None, "public_domain_id": domain["id"] if protocol != "tcp" else None})
             tcp = create("tcp", "echo", echo.server_address[1], self.ports["public"])

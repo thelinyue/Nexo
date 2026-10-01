@@ -7,6 +7,7 @@ test("列表状态只反映证书和配置，不受服务告警影响", async ({
   const cases = [
     { label: "证书有效", change: { service_warning: "转发尚未就绪" } },
     { label: "待配置", change: { config_status: "disabled" } },
+    { label: "待配置", domain: { credential_configured: false }, change: { config_status: "failed", config_error: "缺少 DNS 凭据" } },
     { label: "配置失败", change: { config_status: "failed", config_error: "配置失败的具体原因" } },
     { label: "签发中", change: { certificates: [] } },
     { label: "续期失败", certificate: { error: "续期失败的具体原因", status: "retry_wait" } },
@@ -17,6 +18,7 @@ test("列表状态只反映证书和配置，不受服务告警影响", async ({
   state.domains = cases.map((item, index) => {
     const domain = structuredClone(original);
     domain.id = `status-${index}`; domain.domain = `status-${index}.example.com`;
+    if (item.domain) Object.assign(domain, item.domain);
     Object.assign(domain.runtime!, item.change);
     if (item.certificate) Object.assign(domain.runtime!.certificates[0], item.certificate);
     return domain;
@@ -67,30 +69,52 @@ test("单行域名列表支持直接操作，详情按需读取当前域名日�
   await page.screenshot({ path: info.outputPath("domain-detail.png") });
 });
 
-test("添加后的解析提醒与 HTTP 验证，Cloudflare 不要求手动 TXT", async ({ page }) => {
+test("添加后直接打开 DNS 配置，空凭据有明确反馈，保存凭据不写访问解析", async ({ page }, info) => {
   const state = await installApiMocks(page);
-  await page.route("**/api/v1/public-domains/d-2/verification", async route => {
-    Object.assign(state.domains.find(domain => domain.id === "d-2")!, { verification_status: "verified", verification_record: null });
-    await route.fulfill({ json: state.domains.find(domain => domain.id === "d-2") });
-  });
   await page.goto("/#/domains");
   await page.getByRole("button", { name: "添加 域名", exact: true }).click();
   const add = page.getByRole("dialog", { name: "添加域名" });
+  expect((await add.boundingBox())!.height).toBeLessThan(300);
   await add.getByLabel("域名", { exact: true }).fill("new.example.com");
   await add.getByRole("button", { name: "添加域名", exact: true }).click();
   const config = page.getByRole("dialog", { name: "配置 new.example.com" });
   await expect(config).toBeVisible();
-  await expect(config.getByText("请为 new.example.com 和 *.new.example.com 添加 DNS 解析，指向服务器公网 IP。", { exact: true })).toBeVisible();
-  await config.getByLabel("证书方式").selectOption("cloudflare_dns");
+  await expect(config.getByLabel("证书方式")).toHaveCount(0);
   await expect(config.getByRole("region", { name: "域名归属" })).toHaveCount(0);
   await expect(config.getByLabel("API Token")).toBeVisible();
-  await config.getByLabel("证书方式").selectOption("http01");
-  await config.getByRole("button", { name: "验证", exact: true }).click();
-  await expect(config.getByRole("region", { name: "域名归属" })).toHaveCount(0);
+  await expect(config.getByRole("button", { name: "配置解析" })).toBeDisabled();
+  await page.screenshot({ path: info.outputPath("dns-credential-form.png") });
+  await config.getByRole("button", { name: "验证并启用" }).click();
+  await expect(config.getByRole("alert")).toHaveText("请输入 API Token。");
+  await expect(config.getByRole("alert")).toBeInViewport();
+  await expect(config.getByLabel("API Token")).toBeFocused();
+  await config.getByLabel("API Token").fill("cfat_" + "a".repeat(120));
+  await config.getByRole("button", { name: "验证并启用" }).click();
+  await expect(config.locator(".domain-submit-feedback")).toHaveText("已保存");
+  await expect(config.getByRole("button", { name: "配置解析" })).toBeEnabled();
+  await expect(config.locator('input[type="password"]')).toHaveCount(0);
+  const credentials = (await config.locator(".credential-summary").boundingBox())!;
+  const dns = (await config.getByLabel("DNS 解析", { exact: true }).boundingBox())!;
+  const advanced = (await config.getByText("高级设置", { exact: true }).boundingBox())!;
+  const remove = (await config.getByRole("button", { name: "删除", exact: true }).boundingBox())!;
+  const save = (await config.locator(".modal-actions").getByRole("button", { name: "保存", exact: true }).boundingBox())!;
+  expect(dns.y - credentials.y - credentials.height).toBeLessThanOrEqual(32);
+  expect(advanced.y - dns.y - dns.height).toBeLessThanOrEqual(24);
+  expect(Math.abs(remove.y - save.y)).toBeLessThanOrEqual(1);
+  expect(remove.x + remove.width).toBeLessThan(save.x);
+  await expect(config.getByRole("button", { name: "删除", exact: true })).toBeInViewport();
+  expect(remove.width).toBeLessThan(120);
+  expect(remove.height).toBeGreaterThanOrEqual(44);
+  if ((page.viewportSize()?.width ?? 1440) <= 900 && (page.viewportSize()?.height ?? 900) >= 700) {
+    expect((await config.boundingBox())!.height).toBeLessThan(620);
+  }
+  expect(state.calls.some(call => call.path.endsWith("/dns-records"))).toBeFalsy();
+  expect(state.dnsRecords.size).toBe(0);
+  await page.screenshot({ path: info.outputPath("dns-credential-saved.png") });
   expect(state.calls.some(call => call.path.endsWith("/access"))).toBeFalsy();
   await config.getByRole("button", { name: "取消", exact: true }).click();
   await page.locator(".page-slot:not([hidden])").getByRole("button", { name: "配置 new.example.com", exact: true }).click();
-  await expect(config.locator(".domain-dns-reminder")).toHaveCount(0);
+  await expect(config.getByRole("button", { name: "配置解析" })).toBeEnabled();
 });
 
 test("未验证域名列表直接删除，取消、使用中和重试均保留正确状态", async ({ page }) => {

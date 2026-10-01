@@ -68,8 +68,7 @@ class NodeHarness(smoke.Harness):
             self.start_agent(invitation["token"])
             device = smoke.wait_for(lambda: next((d["id"] for d in self.api("devices") if d["status"] == "online"), None), "Agent 上线")
             domain = self.api("public-domains", "POST", {"domain":"nexo-smoke.localhost", "https_enabled":True})
-            with sqlite3.connect(self.root / "server/nexo.db") as db:
-                db.execute("UPDATE domain_settings SET verified=1,certificate_mode='http01' WHERE domain_id=?", (domain["id"],))
+            self.configure_local_domain(domain)
             services = []
             for protocol, host in [("http", "web"), ("https", "secure")]:
                 services.append(self.api("tunnels", "POST", {"name":host, "protocol":protocol, "device_id":device, "local_address":"127.0.0.1", "local_port":origin.server_address[1], "hostname":host, "public_domain_id":domain["id"], "https_port":self.args.https_port}))

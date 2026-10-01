@@ -1,6 +1,7 @@
 use super::*;
 use crate::{reverse_proxy, *};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+const DOMAIN: &str = "00000000-0000-4000-8000-000000000001";
 
 #[test]
 fn direct_tls_keeps_host_and_verifies_target_while_tunnels_keep_socket_transport() {
@@ -69,7 +70,7 @@ pub(super) async fn echo_origin<S: AsyncRead + AsyncWrite + Unpin>(
 }
 
 fn input(port: u16, origin: &str) -> TunnelInput {
-    serde_json::from_value(json!({"service_mode":"reverse_proxy","name":"VPS 应用","protocol":"https","origin_protocol":origin,"local_address":"127.0.0.1","local_port":port,"hostname":"app","public_domain_id":"domain"})).unwrap()
+    serde_json::from_value(json!({"service_mode":"reverse_proxy","name":"VPS 应用","protocol":"https","origin_protocol":origin,"local_address":"127.0.0.1","local_port":port,"hostname":"app","public_domain_id":DOMAIN})).unwrap()
 }
 
 #[tokio::test]
@@ -120,8 +121,14 @@ async fn real_caddy_direct_proxy_lifecycle_tls_websocket_and_quota_isolation() {
         )
         .unwrap();
     // localhost 由 Caddy 内部 CA 管理，无公网 DNS 或 ACME 副作用。
-    state.db.lock().unwrap().execute("INSERT INTO public_domains(id,tenant_id,domain,https_enabled,created_at,updated_at) VALUES('domain','default','reverse.localhost',1,0,0)", []).unwrap();
-    state.db.lock().unwrap().execute("INSERT INTO domain_settings(domain_id,certificate_mode,verified,verification_token) VALUES('domain','http01',1,'test-proof')", []).unwrap();
+    let credential = crate::domains::write_credential(
+        &cfg.cloudflare_token_root,
+        DOMAIN,
+        &format!("cfat_{}", "a".repeat(100)),
+    )
+    .unwrap();
+    state.db.lock().unwrap().execute("INSERT INTO public_domains(id,tenant_id,domain,https_enabled,created_at,updated_at) VALUES(?1,'default','reverse.localhost',1,0,0)", [DOMAIN]).unwrap();
+    state.db.lock().unwrap().execute("INSERT INTO domain_settings(domain_id,certificate_mode,verified,verification_token,credential_file) VALUES(?1,'cloudflare_dns',1,'test-proof',?2)", params![DOMAIN,credential]).unwrap();
     let supervisor = state.domain_runtime.supervisor.clone();
     supervisor
         .write_startup_config(&build_config(&cfg, &[]).unwrap())
@@ -132,26 +139,22 @@ async fn real_caddy_direct_proxy_lifecycle_tls_websocket_and_quota_isolation() {
         assert!(tokio::time::Instant::now() < deadline);
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    // 独立测试预置内部 CA 证书；生产仍使用正常 HTTP-01 设置，不依赖缺失凭据的回退。
+    // 独立测试预置根域和泛域证书；正常 DNS 配置使用已有证书，不访问公共 CA。
     let mut local_ca = build_config(&cfg, &[]).unwrap();
-    local_ca["apps"]["tls"] = json!({"certificates":{"automate":["reverse.localhost","app.reverse.localhost","manage.reverse.localhost"]},"automation":{"policies":[{"issuers":[{"module":"internal"}]}]}});
+    local_ca["apps"]["tls"] = json!({"certificates":{"automate":["reverse.localhost","*.reverse.localhost"]},"automation":{"policies":[{"issuers":[{"module":"internal"}]}]}});
     supervisor.apply_json(&local_ca).await.unwrap();
     let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
-    while read_certificates(&cfg.storage_root).len() < 3 {
+    while read_certificates(&cfg.storage_root).len() < 2 {
         assert!(tokio::time::Instant::now() < deadline);
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    // HTTP-01 从 ACME 的存储命名空间加载已有证书；夹具复制内部 CA 证书，避免访问公共 CA。
-    for host in [
-        "reverse.localhost",
-        "app.reverse.localhost",
-        "manage.reverse.localhost",
-    ] {
-        let source = cfg.storage_root.join("certificates/local").join(host);
+    // DNS issuer 从 ACME 存储读取已有证书；保留 Caddy 的泛域文件命名。
+    for directory in fs::read_dir(cfg.storage_root.join("certificates/local")).unwrap() {
+        let source = directory.unwrap().path();
         let target = cfg
             .storage_root
             .join("certificates/acme-v02.api.letsencrypt.org-directory")
-            .join(host);
+            .join(source.file_name().unwrap());
         fs::create_dir_all(&target).unwrap();
         for entry in fs::read_dir(source).unwrap() {
             let entry = entry.unwrap();
@@ -205,6 +208,24 @@ async fn real_caddy_direct_proxy_lifecycle_tls_websocket_and_quota_isolation() {
         .build()
         .unwrap();
     let url = format!("https://app.reverse.localhost:{}", https_address.port());
+    // 配置已加载不代表 Caddy 已完成证书缓存切换，等待真实 TLS 入口后再检查代理请求。
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        if client
+            .get(&url)
+            .send()
+            .await
+            .is_ok_and(|r| r.status() == 200)
+        {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "HTTPS 测试入口未就绪：{:?}",
+            supervisor.drain_log_events().await
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
     let response = client
         .post(format!("{url}/a%2Fb?x=a+b&y=%2F"))
         .header("X-Forwarded-For", "6.6.6.6")
@@ -275,7 +296,7 @@ async fn real_caddy_direct_proxy_lifecycle_tls_websocket_and_quota_isolation() {
     // 真实 HTTP 原入口保存管理配置，再经过真实 Caddy TLS 验证登录、安全 Cookie 和双入口写入。
     let settings_url = format!("http://{api_address}/api/v1/admin/server-settings");
     let management_body =
-        json!({"management_entry":{"domain_id":"domain","hostname":"manage"},"public_ips":[]});
+        json!({"management_entry":{"domain_id":DOMAIN,"hostname":"manage"},"public_ips":[]});
     let saved = no_redirect
         .put(&settings_url)
         .headers(headers.clone())
@@ -304,24 +325,6 @@ async fn real_caddy_direct_proxy_lifecycle_tls_websocket_and_quota_isolation() {
         );
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    // 预置 CertMagic 分布式 challenge，验证真实 HTTP 验证处理优先于管理重定向；不访问公共 CA。
-    let challenge_dir = cfg
-        .storage_root
-        .join("acme/acme-v02.api.letsencrypt.org-directory/challenge_tokens");
-    fs::create_dir_all(&challenge_dir).unwrap();
-    let challenge_file = challenge_dir.join("manage.reverse.localhost.json");
-    fs::write(&challenge_file, serde_json::to_vec(&json!({"type":"http-01","token":"nexo-test-token","keyAuthorization":"nexo-test-token.proof","identifier":{"type":"dns","value":"manage.reverse.localhost"}})).unwrap()).unwrap();
-    let challenge = no_redirect
-        .get(format!(
-            "http://{http_address}/.well-known/acme-challenge/nexo-test-token"
-        ))
-        .header("Host", "manage.reverse.localhost")
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(challenge.status(), 200);
-    assert_eq!(challenge.text().await.unwrap(), "nexo-test-token.proof");
-    fs::remove_file(challenge_file).unwrap();
     let login = client
         .post(format!("{management_url}/api/v1/auth/login"))
         .header("Host", "manage.reverse.localhost")
@@ -489,7 +492,7 @@ async fn real_caddy_direct_proxy_lifecycle_tls_websocket_and_quota_isolation() {
     )
     .await
     .unwrap();
-    // HTTP-01 的停用服务不会继续自动管理该主机证书；通过 HTTP 入口验证路由已撤销。
+    // 服务停用后通过 HTTP 入口验证路由已撤销，共享泛域证书仍保留。
     let removed = reqwest::Client::builder()
         .no_proxy()
         .build()
@@ -531,7 +534,7 @@ async fn real_caddy_direct_proxy_lifecycle_tls_websocket_and_quota_isolation() {
     let _ = delete_tunnel(State(state.clone()), headers.clone(), Path(proxy.id))
         .await
         .unwrap();
-    // HTTP-01 的停用服务不会继续自动管理该主机证书；通过 HTTP 入口验证路由已撤销。
+    // 删除服务只撤销路由，共享泛域证书仍保留。
     let removed = reqwest::Client::builder()
         .no_proxy()
         .build()

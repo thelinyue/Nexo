@@ -1,6 +1,25 @@
 import { expect, test } from "@playwright/test";
 import { installApiMocks } from "./api-mocks";
 
+test("旧域名缺少 DNS 凭据时首页给出配置入口，不读取访问解析", async ({ page }) => {
+  const state = await installApiMocks(page);
+  state.domains[0].credential_configured = false;
+  state.domains[0].runtime!.certificates = [];
+  await page.goto("/");
+  const attention = page.getByRole("region", { name: "当前空间待处理", exact: true });
+  const expand = attention.getByRole("button", { name: "展开", exact: true });
+  if ((page.viewportSize()?.width ?? 1440) <= 900) {
+    await expect(expand).toBeVisible();
+    await expand.click();
+  }
+  const domain = attention.getByRole("link", { name: /example\.com/ });
+  await expect(domain).toContainText("待配置 DNS 凭据");
+  expect(state.calls.some(call => call.path.endsWith("/dns-records") || call.path.endsWith("/access"))).toBeFalsy();
+  await domain.click();
+  await expect(page).toHaveURL(/#\/domains\/d-1$/);
+  await expect(page.locator(".page-slot:not([hidden]) .domain-state")).toHaveText("待配置");
+});
+
 test("管理员单用户重置可取消、失败可重试且保留趋势", async ({ page }, info) => {
   const state = await installApiMocks(page);
   await page.goto("/");

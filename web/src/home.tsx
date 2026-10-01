@@ -216,14 +216,13 @@ function attentionItems(tunnels: Tunnel[], devices: Device[], domains: Domain[])
   for (const item of devices) if (item.status === "offline") items.push({ id: `a-${item.id}`, name: item.name, href: `#/agents/${encodeURIComponent(item.id)}`, reasons: ["设备离线"], priority: 0 });
   for (const item of domains) {
     const reasons: string[] = []; let priority = 2;
-    if (item.verification_status === "pending") reasons.push("待验证域名归属");
+    if (item.credential_configured === false) reasons.push("待配置 DNS 凭据");
+    else if (item.verification_status === "pending") reasons.push("待验证域名归属");
     if (item.runtime?.config_status === "failed") { reasons.push(item.runtime.config_error || "配置加载失败"); priority = 0; }
     else if (item.verification_status !== "pending" && (!item.runtime || item.runtime.config_status === "pending" || item.runtime.config_status === "unverified")) reasons.push("等待配置运行状态");
     if (item.https_enabled && item.runtime?.config_status === "disabled") { reasons.push("证书管理已暂停"); priority = Math.min(priority, 1); }
     if (item.https_enabled && !item.runtime?.certificates.length && item.verification_status !== "pending") reasons.push("等待证书状态");
     if (item.runtime?.service_warning) { reasons.push(item.runtime.service_warning); priority = Math.min(priority, 1); }
-    if (item.access?.records.some(record => record.status === "unresolved")) { reasons.push("DNS 解析异常"); priority = 0; }
-    else if (item.access?.records.some(record => record.matches_server === false)) { reasons.push("DNS 解析地址需核对"); priority = Math.min(priority, 1); }
     if (item.https_enabled) for (const cert of item.runtime?.certificates ?? []) {
       const now = Date.now() / 1000;
       if (cert.status === "expired" || cert.expires_at && cert.expires_at <= now) { reasons.push("证书已过期"); priority = 0; }

@@ -172,7 +172,17 @@ pub fn agent_nodes(state: &AppState, device: &str) -> Result<Vec<AgentNode>> {
     Ok(result)
 }
 pub fn statuses(db: &Connection, id: &str) -> rusqlite::Result<Value> {
-    let mut q=db.prepare("SELECT s.node_id,COALESCE(h.healthy=1 AND h.revision=t.apply_revision AND h.checked_at>?2 AND n.approved=1 AND n.enabled=1 AND n.maintenance=0 AND n.removed_at IS NULL AND (n.id='local' OR n.last_seen>?2) AND EXISTS(SELECT 1 FROM authorized_service_nodes a WHERE a.service_id=s.service_id AND a.node_id=s.node_id),0),h.error,h.checked_at FROM service_nodes s JOIN tunnels t ON t.id=s.service_id JOIN relay_nodes n ON n.id=s.node_id LEFT JOIN relay_service_health h ON h.node_id=s.node_id AND h.service_id=s.service_id WHERE s.service_id=?1 ORDER BY s.node_id")?;
-    let rows=q.query_map(params![id,unix_now()-45],|r|Ok(json!({"node_id":r.get::<_,String>(0)?,"healthy":r.get::<_,Option<bool>>(1)?.unwrap_or(false),"error":r.get::<_,Option<String>>(2)?,"checked_at":r.get::<_,Option<i64>>(3)?})))?.collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut q=db.prepare("SELECT s.node_id,CASE WHEN ?3 THEN EXISTS(SELECT 1 FROM relay_healthy_service_nodes v WHERE v.service_id=s.service_id AND v.node_id=s.node_id)
+        ELSE COALESCE(h.healthy=1 AND h.revision=t.apply_revision AND h.checked_at>?2 AND n.approved=1 AND n.enabled=1 AND n.maintenance=0 AND n.removed_at IS NULL AND (n.id='local' OR n.last_seen>?2) AND EXISTS(SELECT 1 FROM authorized_service_nodes a WHERE a.service_id=s.service_id AND a.node_id=s.node_id),0) END,h.error,h.checked_at,n.name,
+        CASE WHEN t.protocol IN ('http','https') AND (n.id='local' OR h.public_probe_supported=1) THEN t.protocol ELSE 'tcp' END,
+        p.probe_kind,p.revision=t.apply_revision AND (n.id='local' OR p.address=n.public_ipv4),p.healthy=1 AND p.checked_at>?2,p.checked_at,p.error
+        FROM service_nodes s JOIN tunnels t ON t.id=s.service_id JOIN relay_nodes n ON n.id=s.node_id
+        LEFT JOIN relay_service_health h ON h.node_id=s.node_id AND h.service_id=s.service_id
+        LEFT JOIN relay_public_health p ON p.node_id=s.node_id AND p.service_id=s.service_id WHERE s.service_id=?1 ORDER BY s.node_id")?;
+    let rows=q.query_map(params![id,unix_now()-45,super::dns::managed(db,id)?],|r| {
+        let kind:String=r.get(5)?;
+        let current=r.get::<_,Option<String>>(6)?.as_deref()==Some(kind.as_str()) && r.get::<_,Option<bool>>(7)?.unwrap_or(false);
+        Ok(json!({"node_id":r.get::<_,String>(0)?,"node_name":r.get::<_,String>(4)?,"healthy":r.get::<_,bool>(1)?,"error":r.get::<_,Option<String>>(2)?,"checked_at":r.get::<_,Option<i64>>(3)?,"public_probe":{"kind":kind,"healthy":current && r.get::<_,Option<bool>>(8)?.unwrap_or(false),"checked_at":if current { r.get::<_,Option<i64>>(9)? } else { None },"error":if current { r.get::<_,Option<String>>(10)? } else { None }}}))
+    })?.collect::<rusqlite::Result<Vec<_>>>()?;
     Ok(json!(rows))
 }

@@ -24,6 +24,7 @@ test("节点卡片展示实测范围、历史延迟和待测速，筛选及窄�
   await expect(hk).toContainText("32–68 ms");
   await hk.getByRole("button", { name: "查看 香港 VPS 逐设备延迟" }).click();
   const detail = page.getByRole("dialog", { name: "香港 VPS" });
+  await expect(detail).toContainText("设备到节点");
   await detail.getByText("逐设备延迟（2）").click();
   await expect(detail).toContainText("设备 NAS");
   await expect(detail).toContainText("32 ms");
@@ -61,7 +62,7 @@ test("普通用户可读延迟和申请节点，不能操作维护", async ({ pa
   await expect(dialog.getByRole("button", { name: "移除节点" })).toHaveCount(0);
 });
 
-test("自动低延迟与手动首选可编辑，IPv6 开关独立保留", async ({ page }) => {
+test("回源延迟优先与手动首选可编辑，IPv6 开关独立保留", async ({ page }) => {
   const { state } = await setup(page);
   state.tunnels[0].node_ids = ["hk", "jp"];
   state.tunnels[0].distribution_mode = "latency";
@@ -69,6 +70,7 @@ test("自动低延迟与手动首选可编辑，IPv6 开关独立保留", async 
   await page.getByRole("button", { name: "编辑服务", exact: true }).click();
   const dialog = page.getByRole("dialog", { name: "编辑服务" });
   await expect(dialog.getByRole("combobox", { name: "选择策略", exact: true })).toHaveAttribute("value", "latency");
+  await expect(dialog.getByRole("combobox", { name: "选择策略", exact: true })).toContainText("回源延迟优先");
   await expect(dialog.getByRole("switch", { name: "IPv6 直连" })).toBeEnabled();
   await selectServiceOption(dialog.getByRole("combobox", { name: "选择策略", exact: true }), "主备切换");
   await selectServiceOption(dialog.getByRole("combobox", { name: "首选节点", exact: true }), "香港 VPS");
@@ -300,7 +302,7 @@ test("管理员审批保存当前工作空间分配，未授权节点不进入�
   await expect(service.getByLabel(/日本 VPS/)).toHaveCount(0);
 });
 
-for (const [mode, label] of [["single", "单节点"], ["dns", "DNS 分流"], ["latency", "低延迟优先"], ["manual", "主备切换"]]) {
+for (const [mode, label] of [["single", "单节点"], ["dns", "DNS 分流"], ["latency", "回源延迟优先"], ["manual", "主备切换"]]) {
   test(`服务节点策略 ${label} 保存后正确回填`, async ({ page }, info) => {
     const { state } = await setup(page);
     Object.assign(state.tunnels[0], { node_ids: ["hk", "us"], distribution_mode: "latency", preferred_node_id: "hk" });

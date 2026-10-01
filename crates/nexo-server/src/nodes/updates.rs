@@ -129,7 +129,7 @@ pub async fn create(
 }
 /// IPv6 直连不计入替代入口；逐服务核对，避免只有部分服务有备用节点时误判可维护。
 pub fn alternatives(db: &Connection, node: &str, service: &str) -> rusqlite::Result<Vec<Value>> {
-    db.prepare("SELECT n.id,n.name FROM authorized_service_nodes a JOIN tunnels t ON t.id=a.service_id JOIN relay_nodes n ON n.id=a.node_id JOIN relay_service_health h ON h.node_id=n.id AND h.service_id=t.id JOIN relay_public_health p ON p.node_id=n.id AND p.service_id=t.id WHERE t.id=?1 AND n.id!=?2 AND n.approved=1 AND n.enabled=1 AND n.maintenance=0 AND n.removed_at IS NULL AND h.healthy=1 AND h.revision=t.apply_revision AND h.checked_at>?3 AND p.healthy=1 AND p.revision=t.apply_revision AND p.checked_at>?3 AND (n.id='local' OR n.last_seen>?3) ORDER BY n.name,n.id")?.query_map(params![service,node,unix_now()-45],|r|Ok(json!({"id":r.get::<_,String>(0)?,"name":r.get::<_,String>(1)?})))?.collect()
+    db.prepare("SELECT n.id,n.name FROM relay_healthy_service_nodes h JOIN relay_nodes n ON n.id=h.node_id WHERE h.service_id=?1 AND n.id!=?2 ORDER BY n.name,n.id")?.query_map(params![service,node],|r|Ok(json!({"id":r.get::<_,String>(0)?,"name":r.get::<_,String>(1)?})))?.collect()
 }
 pub fn has_alternatives(db: &Connection, node: &str) -> rusqlite::Result<bool> {
     let ids=db.prepare("SELECT t.id FROM service_nodes s JOIN tunnels t ON t.id=s.service_id WHERE s.node_id=?1 AND t.enabled=1 AND t.deleted_at IS NULL")?.query_map([node],|r|r.get::<_,String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
@@ -449,7 +449,8 @@ pub fn advance(
 
 /// 维护后的验证必须同时包含配置版本、Agent 通道及公网探测，旧统计不能视为恢复。
 fn verified(db: &Connection, node: &str) -> rusqlite::Result<bool> {
-    db.query_row("SELECT NOT EXISTS(SELECT 1 FROM authorized_service_nodes s JOIN tunnels t ON t.id=s.service_id LEFT JOIN relay_service_health h ON h.node_id=s.node_id AND h.service_id=s.service_id LEFT JOIN relay_public_health p ON p.node_id=s.node_id AND p.service_id=s.service_id WHERE s.node_id=?1 AND t.enabled=1 AND t.deleted_at IS NULL AND (COALESCE(h.healthy,0)=0 OR h.revision!=t.apply_revision OR h.checked_at<?2 OR COALESCE(p.healthy,0)=0 OR p.revision!=t.apply_revision OR p.checked_at<?2))",params![node,unix_now()-45],|r|r.get(0))
+    // 维护节点继续接受检查，但恢复前不能作为 DNS 候选或其他节点的备用入口。
+    db.query_row("SELECT NOT EXISTS(SELECT 1 FROM authorized_service_nodes s JOIN tunnels t ON t.id=s.service_id JOIN tenants w ON w.id=t.tenant_id WHERE s.node_id=?1 AND t.enabled=1 AND t.deleted_at IS NULL AND w.enabled=1 AND NOT EXISTS(SELECT 1 FROM relay_ready_service_nodes h WHERE h.service_id=s.service_id AND h.node_id=s.node_id))",[node],|r|r.get(0))
 }
 
 /// 节点停止轮询时也要暂停持久任务，重启后根据同一任务状态核对，不能把失联算作成功。
@@ -493,6 +494,8 @@ mod tests {
         for table in ["relay_service_health", "relay_public_health"] {
             db.execute(&format!("INSERT OR REPLACE INTO {table}(node_id,service_id,revision,healthy,checked_at) VALUES(?1,'s',1,1,?2)"),params![node,unix_now()]).unwrap();
         }
+        db.execute("UPDATE relay_public_health SET address=(SELECT public_ipv4 FROM relay_nodes WHERE id=?1) WHERE node_id=?1",[node]).unwrap();
+        db.execute("INSERT INTO tunnel_applied_states(tunnel_id,revision,status,updated_at) VALUES('s',1,'ready',?1) ON CONFLICT(tunnel_id) DO UPDATE SET updated_at=excluded.updated_at",[unix_now()]).unwrap();
     }
     fn job(state: &AppState) {
         state.db.lock().unwrap().execute_batch("INSERT INTO node_update_jobs(id,actor,target_version,created_at) VALUES('job','u','0.2.11',0); INSERT INTO node_update_items(job_id,node_id,position) VALUES('job','a',0),('job','b',1);").unwrap();
@@ -689,6 +692,50 @@ mod tests {
                 |r| r.get::<_, bool>(0)
             )
             .unwrap());
+    }
+
+    #[test]
+    fn maintenance_verification_requires_current_method_address_and_origin() {
+        let (state, _) = fixture();
+        let db = state.db.lock().unwrap();
+        db.execute_batch(
+            "UPDATE tunnels SET protocol='http'; UPDATE relay_nodes SET maintenance=1 WHERE id='a'",
+        )
+        .unwrap();
+        assert!(verified(&db, "a").unwrap(), "旧节点仍允许 TCP 兼容检查");
+        db.execute(
+            "UPDATE relay_service_health SET public_probe_supported=1 WHERE node_id='a'",
+            [],
+        )
+        .unwrap();
+        assert!(!verified(&db, "a").unwrap(), "旧 TCP 样本不能验证新节点");
+        db.execute(
+            "UPDATE relay_public_health SET probe_kind='http' WHERE node_id='a'",
+            [],
+        )
+        .unwrap();
+        assert!(verified(&db, "a").unwrap(), "维护状态不阻止恢复前验证");
+        db.execute(
+            "UPDATE relay_nodes SET public_ipv4='203.0.113.20' WHERE id='a'",
+            [],
+        )
+        .unwrap();
+        assert!(!verified(&db, "a").unwrap());
+        db.execute(
+            "UPDATE relay_public_health SET address='203.0.113.20' WHERE node_id='a'",
+            [],
+        )
+        .unwrap();
+        assert!(verified(&db, "a").unwrap());
+        db.execute("UPDATE tunnel_applied_states SET status='failed'", [])
+            .unwrap();
+        assert!(!verified(&db, "a").unwrap());
+        db.execute(
+            "UPDATE tunnel_applied_states SET status='ready',updated_at=unixepoch()-46",
+            [],
+        )
+        .unwrap();
+        assert!(!verified(&db, "a").unwrap());
     }
 
     #[test]

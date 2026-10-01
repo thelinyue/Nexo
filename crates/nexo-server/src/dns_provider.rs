@@ -197,6 +197,7 @@ pub async fn set_credential(
             "DNS 权限已验证，但临时 TXT 清理失败，请清理 _nexo-verification 记录后重试",
         )
     })?;
+    let _dns_guard = state.tunnel_runtime.direct.dns_lock.lock().await;
     let session = require_write(&state, &headers)?;
     let db = state.db.lock().map_err(|_| db_error("数据库锁不可用"))?;
     domains::owned(&db, &session.tenant_id, &id)?;
@@ -505,8 +506,15 @@ impl Zone {
         Ok(result)
     }
     pub async fn write(&self, record: &Record) -> Result<Record> {
+        anyhow::ensure!(!record.proxied, "访问记录必须使用直接解析");
+        self.write_record(record).await
+    }
+    /// 仅供一次性解析失败时恢复服务商读取的原值；正常写入仍禁止启用代理。
+    pub async fn restore(&self, record: &Record) -> Result<Record> {
+        self.write_record(record).await
+    }
+    async fn write_record(&self, record: &Record) -> Result<Record> {
         let relative = self.relative(&record.name)?;
-        anyhow::ensure!(!record.proxied, "IPv6 直连要求关闭 DNS 代理");
         let create = record.id.is_empty();
         let id = match &self.credential {
             Credential::Cloudflare { token } => {
@@ -525,7 +533,7 @@ impl Zone {
                 } else {
                     self.client.put(url)
                 };
-                let r = builder.bearer_auth(token).json(&json!({"name":record.name,"type":record.kind,"content":record.value,"ttl":record.ttl,"proxied":false})).send().await.context("Cloudflare DNS 写入失败")?;
+                let r = builder.bearer_auth(token).json(&json!({"name":record.name,"type":record.kind,"content":record.value,"ttl":record.ttl,"proxied":record.proxied})).send().await.context("Cloudflare DNS 写入失败")?;
                 Self::cloudflare(r).await?["id"]
                     .as_str()
                     .context("DNS 写入未返回 ID")?

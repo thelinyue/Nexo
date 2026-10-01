@@ -7,11 +7,23 @@ use axum::{
 };
 use std::sync::{Arc, Mutex};
 
+type ReadGate = (Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>);
+
 #[derive(Clone, Default)]
 struct Dns {
     records: Arc<Mutex<Vec<Record>>>,
+    read_gate: Arc<Mutex<Option<ReadGate>>>,
 }
 async fn cloudflare(State(dns): State<Dns>, method: Method, uri: Uri, body: Bytes) -> Json<Value> {
+    let gate = if method == Method::GET {
+        dns.read_gate.lock().unwrap().take()
+    } else {
+        None
+    };
+    if let Some((started, release)) = gate {
+        started.notify_one();
+        release.notified().await;
+    }
     let mut records = dns.records.lock().unwrap();
     let id = uri.path().rsplit('/').next().unwrap();
     let result = if method == Method::GET {
@@ -76,6 +88,264 @@ fn record(kind: &str, value: &str) -> Record {
     }
 }
 
+#[path = "node_health_tests.rs"]
+mod node_health;
+
+#[tokio::test]
+async fn builtin_only_dns_publishes_without_history_and_preserves_other_hosts() {
+    let (mut state, _) = crate::tests::domain_fixture();
+    let (zone, dns, dns_task) = mock().await;
+    *state.tunnel_runtime.direct.test_zone.lock().await = Some(zone);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    Arc::make_mut(&mut state.config).direct.relay_ipv4 = Some("127.0.0.1".parse().unwrap());
+    Arc::make_mut(&mut state.config).caddy.http_listen = format!(":{port}");
+    let app = Router::new().route(
+        crate::nodes::health::PROBE_PATH,
+        axum::routing::get(move |headers: axum::http::HeaderMap| async move {
+            assert_eq!(headers["host"], format!("emby.direct.test:{port}"));
+            Json(json!({"node_id":"local","service_id":"s","revision":1}))
+        }),
+    );
+    let probe_task = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    {
+        let db = state.db.lock().unwrap();
+        db.execute_batch("INSERT INTO public_domains(id,tenant_id,domain,created_at,updated_at) VALUES('d','default','direct.test',0,0);
+            INSERT INTO domain_settings(domain_id,verification_token,certificate_mode,verified,credential_file) VALUES('d','proof','cloudflare_dns',1,'test.token');
+            INSERT INTO devices(id,tenant_id,name,status,created_at,updated_at) VALUES('agent','default','NAS','online',0,0);
+            INSERT INTO tunnels(id,tenant_id,device_id,name,protocol,local_address,local_port,hostname,public_domain_id,created_at,updated_at) VALUES('s','default','agent','service','http','127.0.0.1',8096,'emby','d',0,0);
+            INSERT INTO tunnel_applied_states(tunnel_id,revision,status,updated_at) VALUES('s',1,'ready',unixepoch());
+            INSERT INTO relay_service_health(node_id,service_id,revision,healthy,checked_at) VALUES('local','s',1,1,unixepoch());").unwrap();
+    }
+    // 泛域名指向其他节点时，独立 A 必须指向所选内置节点，且不能改动泛域名和 AAAA。
+    let mut root = record("A", "127.0.0.2");
+    root.name = "direct.test".into();
+    let mut wildcard = record("A", "127.0.0.2");
+    wildcard.name = "*.direct.test".into();
+    let preserved = vec![root, wildcard, record("AAAA", "2001:4860::1")];
+    dns.records.lock().unwrap().extend(preserved.clone());
+    for _ in 0..3 {
+        crate::nodes::dns::reconcile(&state).await.unwrap();
+    }
+    let records = dns.records.lock().unwrap().clone();
+    assert_eq!(records.len(), preserved.len() + 1);
+    assert!(preserved.iter().all(|r| records.contains(r)));
+    let published = records
+        .iter()
+        .find(|r| r.name == "emby.direct.test" && r.kind == "A")
+        .unwrap();
+    assert_eq!(published.value, "127.0.0.1");
+    assert_eq!(published.ttl, 60);
+    assert!(!published.proxied);
+    assert_eq!(
+        state
+            .db
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT revision,error FROM relay_dns_state WHERE service_id='s'",
+                [],
+                |r| Ok((r.get::<_, i64>(0)?, r.get::<_, Option<String>>(1)?))
+            )
+            .unwrap(),
+        (1, None)
+    );
+    // 服务停用仅撤销本次创建的独立 A，保留用户原有解析。
+    state
+        .db
+        .lock()
+        .unwrap()
+        .execute("UPDATE tunnels SET enabled=0 WHERE id='s'", [])
+        .unwrap();
+    crate::nodes::dns::reconcile(&state).await.unwrap();
+    assert_eq!(*dns.records.lock().unwrap(), preserved);
+    probe_task.abort();
+    dns_task.abort();
+}
+
+#[test]
+fn builtin_dns_requires_verified_owned_domain_and_credentials() {
+    let (state, _) = crate::tests::domain_fixture();
+    let db = state.db.lock().unwrap();
+    db.execute_batch("INSERT INTO public_domains(id,tenant_id,domain,created_at,updated_at) VALUES('d','default','direct.test',0,0);
+        INSERT INTO domain_settings(domain_id,verification_token,certificate_mode,verified,credential_file) VALUES('d','proof','cloudflare_dns',1,'test.token');
+        INSERT INTO tunnels(id,tenant_id,name,protocol,local_address,local_port,hostname,public_domain_id,created_at,updated_at) VALUES('s','default','service','https','127.0.0.1',8096,'emby','d',0,0);
+        INSERT INTO tenants(id,name,created_at) VALUES('other','other',0);").unwrap();
+    for protocol in ["http", "https", "tcp"] {
+        db.execute("UPDATE tunnels SET protocol=?1 WHERE id='s'", [protocol])
+            .unwrap();
+        assert!(crate::nodes::dns::managed(&db, "s").unwrap());
+    }
+    db.execute("UPDATE tunnels SET protocol='https' WHERE id='s'", [])
+        .unwrap();
+    for change in [
+        "UPDATE domain_settings SET verified=0",
+        "UPDATE domain_settings SET credential_file=NULL",
+        "UPDATE public_domains SET tenant_id='other'",
+        "UPDATE tunnels SET service_mode='reverse_proxy'",
+        "UPDATE tunnels SET ipv6_direct_enabled=1",
+        "UPDATE tunnels SET enabled=0",
+        "UPDATE tenants SET enabled=0 WHERE id='default'",
+        "DELETE FROM service_nodes WHERE service_id='s'",
+    ] {
+        db.execute_batch("SAVEPOINT eligibility").unwrap();
+        db.execute_batch(change).unwrap();
+        assert!(!crate::nodes::dns::managed(&db, "s").unwrap(), "{change}");
+        db.execute_batch("ROLLBACK TO eligibility; RELEASE eligibility")
+            .unwrap();
+    }
+}
+
+#[tokio::test]
+async fn node_dns_returns_to_local_after_withdrawal_and_restart() {
+    let (mut state, _) = crate::tests::domain_fixture();
+    Arc::make_mut(&mut state.config).direct.relay_ipv4 = Some("127.0.0.1".parse().unwrap());
+    let (zone, dns, dns_task) = mock().await;
+    *state.tunnel_runtime.direct.test_zone.lock().await = Some(zone.clone());
+    let listener = tokio::net::TcpListener::bind("0.0.0.0:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let accepting = tokio::spawn(async move {
+        while let Ok((stream, _)) = listener.accept().await {
+            drop(stream);
+        }
+    });
+    {
+        let db = state.db.lock().unwrap();
+        db.execute("INSERT INTO public_domains(id,tenant_id,domain,created_at,updated_at) VALUES('d','default','direct.test',0,0)", []).unwrap();
+        db.execute("INSERT INTO devices(id,tenant_id,name,status,created_at,updated_at) VALUES('agent','default','NAS','online',0,0)", []).unwrap();
+        db.execute("INSERT INTO tunnels(id,tenant_id,device_id,name,protocol,local_address,local_port,public_port,hostname,public_domain_id,created_at,updated_at) VALUES('s','default','agent','service','tcp','127.0.0.1',80,?1,'emby','d',0,0)", [port]).unwrap();
+        db.execute("INSERT INTO relay_nodes(id,name,public_ipv4,approved,last_seen,created_at) VALUES('remote','remote','127.0.0.2',1,?1,0)", [crate::unix_now()]).unwrap();
+        db.execute_batch("INSERT INTO relay_node_grants VALUES('remote','default'); DELETE FROM service_nodes WHERE service_id='s'; INSERT INTO service_nodes VALUES('s','remote');").unwrap();
+        db.execute("INSERT INTO tunnel_applied_states(tunnel_id,revision,status,updated_at) VALUES('s',1,'ready',?1)", [crate::unix_now()]).unwrap();
+        db.execute("INSERT INTO relay_service_health(node_id,service_id,revision,healthy,checked_at) VALUES('remote','s',1,1,?1)", [crate::unix_now()]).unwrap();
+    }
+    let mut root = record("A", "127.0.0.2");
+    root.name = "direct.test".into();
+    let mut wildcard = root.clone();
+    wildcard.id = uuid::Uuid::new_v4().to_string();
+    wildcard.name = "*.direct.test".into();
+    let preserved = vec![root, wildcard, record("AAAA", "2001:4860::1")];
+    dns.records.lock().unwrap().extend(preserved.clone());
+    for _ in 0..3 {
+        crate::nodes::dns::reconcile(&state).await.unwrap();
+    }
+    assert!(dns
+        .records
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|r| { r.name == "emby.direct.test" && r.kind == "A" && r.value == "127.0.0.2" }));
+    {
+        let db = state.db.lock().unwrap();
+        db.execute_batch("DELETE FROM service_nodes WHERE service_id='s'; INSERT INTO service_nodes VALUES('s','local'); UPDATE tunnels SET apply_revision=2 WHERE id='s'; UPDATE tunnel_applied_states SET revision=2,status='checking' WHERE tunnel_id='s';").unwrap();
+    }
+    crate::nodes::dns::reconcile(&state).await.unwrap();
+    assert_eq!(*dns.records.lock().unwrap(), preserved);
+    assert!(
+        crate::nodes::dns::managed(&state.db.lock().unwrap(), "s").unwrap(),
+        "撤回最后一条 A 后仍须保留切回内置节点的 DNS 管理意图"
+    );
+    // 用持久数据库及全新运行状态模拟重启，恢复不能依赖内存中的节点任务。
+    let database =
+        std::env::temp_dir().join(format!("nexo-node-dns-restart-{}.db", uuid::Uuid::new_v4()));
+    state
+        .db
+        .lock()
+        .unwrap()
+        .execute("VACUUM INTO ?1", [database.to_str().unwrap()])
+        .unwrap();
+    let (mut restarted, _) = crate::tests::domain_fixture();
+    restarted.config = state.config.clone();
+    let db = rusqlite::Connection::open(&database).unwrap();
+    crate::initialize_database(&db, false).unwrap();
+    restarted.db = Arc::new(Mutex::new(db));
+    *restarted.tunnel_runtime.direct.test_zone.lock().await = Some(zone);
+    {
+        let db = restarted.db.lock().unwrap();
+        db.execute(
+            "UPDATE tunnel_applied_states SET status='ready',updated_at=?1 WHERE tunnel_id='s'",
+            [crate::unix_now()],
+        )
+        .unwrap();
+        db.execute("INSERT INTO relay_service_health(node_id,service_id,revision,healthy,checked_at) VALUES('local','s',2,1,?1)", [crate::unix_now()]).unwrap();
+    }
+    for _ in 0..3 {
+        crate::nodes::dns::reconcile(&restarted).await.unwrap();
+    }
+    let records = dns.records.lock().unwrap().clone();
+    let addresses: Vec<_> = records
+        .iter()
+        .filter(|r| r.name == "emby.direct.test" && r.kind == "A")
+        .collect();
+    assert_eq!(addresses.len(), 1);
+    assert_eq!(addresses[0].value, "127.0.0.1");
+    assert!(preserved.iter().all(|record| records.contains(record)));
+    {
+        let db = restarted.db.lock().unwrap();
+        assert_eq!(
+            db.query_row(
+                "SELECT revision FROM relay_dns_state WHERE service_id='s'",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            2
+        );
+        db.execute("UPDATE tunnels SET enabled=0 WHERE id='s'", [])
+            .unwrap();
+    }
+    crate::nodes::dns::reconcile(&restarted).await.unwrap();
+    assert_eq!(*dns.records.lock().unwrap(), preserved);
+    assert!(!crate::nodes::dns::managed(&restarted.db.lock().unwrap(), "s").unwrap());
+    crate::nodes::dns::reconcile(&restarted).await.unwrap();
+    assert_eq!(*dns.records.lock().unwrap(), preserved);
+    dns_task.abort();
+    accepting.abort();
+    drop(restarted);
+    std::fs::remove_file(database).unwrap();
+}
+
+#[tokio::test]
+async fn node_dns_history_does_not_take_over_plain_local_services() {
+    let (state, _) = crate::tests::domain_fixture();
+    let (zone, dns, task) = mock().await;
+    *state.tunnel_runtime.direct.test_zone.lock().await = Some(zone);
+    {
+        let db = state.db.lock().unwrap();
+        db.execute("INSERT INTO public_domains(id,tenant_id,domain,created_at,updated_at) VALUES('d','default','direct.test',0,0)", []).unwrap();
+        db.execute("INSERT INTO tunnels(id,tenant_id,name,protocol,local_address,local_port,hostname,public_domain_id,created_at,updated_at) VALUES('s','default','service','http','127.0.0.1',80,'emby','d',0,0)", []).unwrap();
+        assert!(!crate::nodes::dns::managed(&db, "s").unwrap());
+    }
+    let original = record("A", "203.0.113.7");
+    dns.records.lock().unwrap().push(original.clone());
+    crate::nodes::dns::reconcile(&state).await.unwrap();
+    assert_eq!(*dns.records.lock().unwrap(), vec![original.clone()]);
+    {
+        let db = state.db.lock().unwrap();
+        db.execute("INSERT INTO relay_dns_state VALUES('s',1,0,NULL)", [])
+            .unwrap();
+        assert!(crate::nodes::dns::managed(&db, "s").unwrap());
+        db.execute(
+            "UPDATE tunnels SET service_mode='reverse_proxy' WHERE id='s'",
+            [],
+        )
+        .unwrap();
+        assert!(!crate::nodes::dns::managed(&db, "s").unwrap());
+    }
+    crate::nodes::dns::reconcile(&state).await.unwrap();
+    assert_eq!(*dns.records.lock().unwrap(), vec![original.clone()]);
+    {
+        let db = state.db.lock().unwrap();
+        db.execute("UPDATE tunnels SET service_mode='tunnel',protocol='tcp',public_port=50001,hostname=NULL,public_domain_id=NULL WHERE id='s'", []).unwrap();
+        assert!(!crate::nodes::dns::managed(&db, "s").unwrap());
+    }
+    crate::nodes::dns::reconcile(&state).await.unwrap();
+    assert_eq!(*dns.records.lock().unwrap(), vec![original]);
+    task.abort();
+}
+
 #[tokio::test]
 async fn node_a_set_keeps_aaaa_and_protects_external_changes() {
     let (state, _) = crate::tests::domain_fixture();
@@ -95,6 +365,7 @@ async fn node_a_set_keeps_aaaa_and_protects_external_changes() {
         db.execute("INSERT INTO tunnels(id,tenant_id,device_id,name,protocol,local_address,local_port,public_port,hostname,public_domain_id,distribution_mode,created_at,updated_at) VALUES('s','default','agent','service','tcp','127.0.0.1',80,?1,'emby','d','dns',0,0)", [port]).unwrap();
         db.execute("DELETE FROM service_nodes WHERE service_id='s'", [])
             .unwrap();
+        db.execute("INSERT INTO tunnel_applied_states(tunnel_id,revision,status,updated_at) VALUES('s',1,'ready',?1)",[crate::unix_now()]).unwrap();
         for (id, address) in [("a", "127.0.0.1"), ("b", "127.0.0.2")] {
             db.execute("INSERT INTO relay_nodes(id,name,public_ipv4,approved,last_seen,created_at) VALUES(?1,?1,?2,1,?3,0)", rusqlite::params![id,address,crate::unix_now()]).unwrap();
             db.execute("INSERT INTO relay_node_grants VALUES(?1,'default')", [id])

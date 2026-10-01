@@ -78,7 +78,7 @@ for (const provider of ["alidns", "tencentcloud"]) test(`${provider} 凭据字�
   });
   await page.goto("/#/domains"); await page.getByRole("button", { name: "配置 example.com", exact: true }).click();
   const form = page.getByRole("dialog", { name: "配置 example.com" });
-  await form.getByLabel("证书方式").selectOption("cloudflare_dns"); await form.getByLabel("DNS 服务商").selectOption(provider);
+  await form.getByLabel("DNS 服务商").selectOption(provider);
   await form.getByLabel(provider === "alidns" ? "AccessKeyId" : "SecretId", { exact: true }).fill("test-id");
   await form.getByLabel(provider === "alidns" ? "AccessKeySecret" : "SecretKey", { exact: true }).fill("test-secret");
   await form.getByRole("button", { name: "验证并启用" }).click(); await expect(form.getByText(/· 已配置/)).toBeVisible();

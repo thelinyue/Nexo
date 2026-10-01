@@ -98,20 +98,25 @@ function domainFromUrl(value: string) {
 }
 
 /** 单字段短表单：错误紧邻输入，底部保留提交按钮；清空和网址修正均不提交，失败保留原文。 */
-function DomainForm({ onClose, onSave }: { onClose: () => void; onSave: (domain: string) => Promise<void> }) {
+function DomainForm({ onClose, onSave }: { onClose: () => void; onSave: (domain: string, signal: AbortSignal) => Promise<void> }) {
   const [value, setValue] = useState(""); const [busy, setBusy] = useState(false); const [error, setError] = useState<string | null>(null); const [invalid, setInvalid] = useState(false);
   const input = useRef<HTMLInputElement>(null);
+  const submitting = useRef(false);
   const normalized = normalizeDomain(value); const suggested = domainFromUrl(value);
   function updateValue(next: string) { setValue(next); setInvalid(false); setError(null); }
   async function submit(event: FormEvent) {
     event.preventDefault();
-    if (busy) return;
+    if (submitting.current) return;
     const domain = normalizeDomain(value);
     if (!domain) { setError(value.trim() ? "请输入域名，不要包含网址前缀、端口或路径。" : "请输入域名。"); setInvalid(true); input.current?.focus(); return; }
-    setBusy(true); setError(null); setInvalid(false);
-    try { await onSave(domain); onClose(); } catch (e) { setError(errorText(e)); } finally { setBusy(false); }
+    submitting.current = true; setBusy(true); setError(null); setInvalid(false);
+    const controller = new AbortController();
+    const timer = window.setTimeout(() => controller.abort(), 15000);
+    try { await onSave(domain, controller.signal); onClose(); }
+    catch (e) { setError(controller.signal.aborted ? "添加请求超时，请刷新域名列表确认是否已添加，再重试。" : errorText(e)); }
+    finally { window.clearTimeout(timer); submitting.current = false; setBusy(false); }
   }
-  return <Modal title="添加域名" full dirty={Boolean(value.trim())} busy={busy} onClose={onClose}>{close =>
+  return <Modal title="添加域名" className="domain-form-modal" full dirty={Boolean(value.trim())} busy={busy} onClose={onClose}>{close =>
     <form className="modal-form domain-form" onSubmit={submit} noValidate>
       <div className="modal-body">
         <label className="sr-only" htmlFor="domain-input">域名</label>
@@ -123,7 +128,7 @@ function DomainForm({ onClose, onSave }: { onClose: () => void; onSave: (domain:
         {suggested && <div className="domain-url-suggestion"><button type="button" className="text-button" disabled={busy} onClick={() => { updateValue(suggested); input.current?.focus(); }}><span>仅使用</span><code>{suggested}</code></button></div>}
         {normalized && normalized !== value.trim() && <p className="helper domain-normalized">将保存为 <code>{normalized}</code></p>}
       </div>
-      <footer className="modal-actions"><button type="button" className="secondary-button desktop-modal-cancel" onClick={close} disabled={busy}>取消</button><button className="primary-button" disabled={busy}>{busy ? "添加中…" : "添加域名"}</button></footer>
+      <footer className="modal-actions"><button type="button" className="secondary-button desktop-modal-cancel" onClick={close} disabled={busy}>取消</button><button type="submit" className="primary-button" disabled={busy}>{busy ? "添加中…" : "添加域名"}</button></footer>
     </form>}
   </Modal>;
 }
@@ -133,6 +138,7 @@ function certificateSummary(item: Domain) {
   const runtime = item.runtime;
   const certificates = runtime?.certificates ?? [];
   const now = Date.now() / 1000;
+  if (item.credential_configured === false) return "待配置";
   if (runtime?.config_status === "failed" || runtime?.config_error) return "配置失败";
   if (item.verification_status === "pending" || !item.https_enabled || runtime?.config_status === "disabled") return "待配置";
   if (certificates.some(cert => cert.status === "expired" || (cert.expires_at != null && cert.expires_at <= now))) return "已过期";
@@ -183,7 +189,6 @@ export function DomainsPage({ active, csrf, route, back, initialConfiguration }:
   const request = useApi();
   const resource = useResource(() => request<Domain[]>("/api/v1/public-domains"), active, true, false, initialConfiguration ? [initialConfiguration] : undefined);
   const [configuring, setConfiguring] = useState<Domain | null>(initialConfiguration ?? null);
-  const [showDnsReminder, setShowDnsReminder] = useState(Boolean(initialConfiguration));
   const [adding, setAdding] = useState(false); const [deleting, setDeleting] = useState<Domain | null>(null); const [saved, setSaved] = useState<string | null>(initialConfiguration ? "已添加" : null);
   useResourceDeletions(routes => {
     if (!routes.some(route => route.startsWith("#/domains/"))) return;
@@ -200,8 +205,8 @@ export function DomainsPage({ active, csrf, route, back, initialConfiguration }:
       <div className="list-caption"><span>{resource.data.length} 个域名</span></div>
       <section className="domain-list" aria-label="域名列表">{resource.data.map(item => <DomainCard key={item.id} item={item} onConfigure={() => setConfiguring(item)} onDelete={() => setDeleting(item)} />)}</section>
     </>)}
-    {adding && active && <DomainForm onClose={() => setAdding(false)} onSave={async domain => { const created = await request<Domain>("/api/v1/public-domains", { method: "POST", body: JSON.stringify({ domain, https_enabled: true }) }, csrf); resource.setData(previous => [...(previous ?? []).filter(item => item.id !== created.id), created].sort((a, b) => a.domain.localeCompare(b.domain))); setSaved("已添加"); setAdding(false); navigation?.openDomainConfiguration(created); }} />}
-    {configuring && active && <DomainSettings domain={configuring} csrf={csrf} showDnsReminder={showDnsReminder} onDelete={() => setDeleting(configuring)} onClose={() => { setConfiguring(null); setShowDnsReminder(false); }} onSaved={value => { resource.setData(previous => (previous ?? []).map(item => item.id === configuring.id ? { ...item, ...value } : item)); }} />}
+    {adding && active && <DomainForm onClose={() => setAdding(false)} onSave={async (domain, signal) => { const created = await request<Domain>("/api/v1/public-domains", { method: "POST", signal, body: JSON.stringify({ domain, https_enabled: true }) }, csrf); resource.setData(previous => [...(previous ?? []).filter(item => item.id !== created.id), created].sort((a, b) => a.domain.localeCompare(b.domain))); setSaved("已添加"); setAdding(false); if (navigation) navigation.openDomainConfiguration(created); else setConfiguring(created); }} />}
+    {configuring && active && <DomainSettings domain={configuring} csrf={csrf} onDelete={() => setDeleting(configuring)} onClose={() => setConfiguring(null)} onSaved={value => { resource.setData(previous => (previous ?? []).map(item => item.id === configuring.id ? { ...item, ...value } : item)); }} />}
     {deleting && active && <Confirm title={`删除 ${deleting.domain}？`} description="删除后无法恢复。" label="删除" onClose={() => setDeleting(null)} onConfirm={async () => { await request(`/api/v1/public-domains/${encodeURIComponent(deleting.id)}`, { method: "DELETE" }, csrf); resource.setData(previous => (previous ?? []).filter(item => item.id !== deleting.id)); setSaved("已删除"); setConfiguring(null); navigation?.removePages([`#/domains/${encodeURIComponent(deleting.id)}`], "#/domains"); void resource.reload(); }} />}
   </div>;
 }

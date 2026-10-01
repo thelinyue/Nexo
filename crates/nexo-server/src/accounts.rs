@@ -747,7 +747,7 @@ pub(crate) mod tests {
             client
                 .patch(format!("{url}/api/v1/public-domains/{foreign_id}"))
                 .headers(alice)
-                .json(&json!({"certificate_mode":"http01"}))
+                .json(&json!({"certificate_mode":"cloudflare_dns"}))
                 .send()
                 .await
                 .unwrap()

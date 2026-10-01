@@ -550,11 +550,12 @@ impl CaddySupervisor {
     /// 如果上一份 Applied 配置存在，优先用它启动 Caddy，再由协调器把
     /// SQLite 中的 Desired State 通过 Admin API 应用。这样 Server 重启时
     /// 不会因为一次尚未验证的新配置覆盖掉上一份可用边缘配置。
-    /// 内网重定向等待 Agent 重新连接；代理暂时关闭，等待本次认证监听和数据库规则重建。
+    /// 旧 HTTP 签发策略不能恢复；内网重定向和代理等待本次认证监听及数据库规则重建。
     pub fn write_startup_config(&self, config: &Value) -> Result<()> {
         let body = match fs::read(&self.config.applied_path) {
             Ok(applied) => match serde_json::from_slice::<Value>(&applied) {
                 Ok(mut config) => {
+                    remove_legacy_http_issuance(&mut config);
                     strip_lan_redirect_routes(&mut config);
                     close_restored_proxies(&mut config);
                     serde_json::to_vec(&config)?
@@ -685,6 +686,59 @@ impl CaddySupervisor {
         }
         *child = None;
         Ok(())
+    }
+}
+
+/// 旧 Applied 仍可能包含 HTTP issuer；重启恢复时只保留 DNS 或内部 CA 的显式策略。
+/// 同时移除失去策略的 automate 主机名，防止 Caddy 使用默认 ACME issuer 隐式签发。
+fn remove_legacy_http_issuance(config: &mut Value) {
+    let mut allowed = Vec::new();
+    let mut all_subjects = false;
+    if let Some(policies) = config
+        .pointer_mut("/apps/tls/automation/policies")
+        .and_then(Value::as_array_mut)
+    {
+        policies.retain_mut(|policy| {
+            let Some(issuers) = policy.get_mut("issuers").and_then(Value::as_array_mut) else {
+                return false;
+            };
+            issuers.retain_mut(|issuer| {
+                if issuer["module"] == "internal" {
+                    return true;
+                }
+                if issuer["module"] != "acme"
+                    || !issuer
+                        .pointer("/challenges/dns/provider/name")
+                        .and_then(Value::as_str)
+                        .is_some_and(|name| !name.is_empty())
+                {
+                    return false;
+                }
+                issuer["challenges"]["http"] = serde_json::json!({"disabled":true});
+                issuer["challenges"]["tls-alpn"] = serde_json::json!({"disabled":true});
+                true
+            });
+            if issuers.is_empty() {
+                return false;
+            }
+            if let Some(subjects) = policy.get("subjects").and_then(Value::as_array) {
+                allowed.extend(subjects.iter().filter_map(Value::as_str).map(str::to_owned));
+            } else {
+                all_subjects = true;
+            }
+            true
+        });
+    }
+    if let Some(automate) = config
+        .pointer_mut("/apps/tls/certificates/automate")
+        .and_then(Value::as_array_mut)
+    {
+        automate.retain(|subject| {
+            all_subjects
+                || subject
+                    .as_str()
+                    .is_some_and(|subject| allowed.iter().any(|allowed| allowed == subject))
+        });
     }
 }
 
@@ -931,6 +985,65 @@ pub fn redact(message: &str, token_root: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn startup_drops_legacy_http_and_default_issuance_but_keeps_dns_credentials() {
+        let root = std::env::temp_dir().join(format!("nexo-dns-startup-{}", uuid::Uuid::new_v4()));
+        let supervisor = CaddySupervisor::new(CaddyRuntimeConfig::new(
+            &root,
+            &crate::config::Caddy::default(),
+        ));
+        let mut applied = serde_json::json!({"apps":{"tls":{
+            "certificates":{"automate":["http.test","dns.test","default.test"]},
+            "automation":{"policies":[
+                {"subjects":["http.test"],"issuers":[{"module":"acme","challenges":{"tls-alpn":{"disabled":true}}}]},
+                {"subjects":["dns.test"],"issuers":[{"module":"acme","challenges":{"dns":{"provider":{"name":"cloudflare","api_token":"{file./saved.token}"}}}}]}
+            ]}
+        },"http":{"servers":{"http":{"listen":[":80"],"automatic_https":{"disable":true},"routes":[{"handle":[{"handler":"static_response","status_code":200}]}]}}}}});
+        fs::create_dir_all(supervisor.config.applied_path.parent().unwrap()).unwrap();
+        fs::write(
+            &supervisor.config.applied_path,
+            serde_json::to_vec(&applied).unwrap(),
+        )
+        .unwrap();
+        supervisor
+            .write_startup_config(&serde_json::json!({}))
+            .unwrap();
+        let restored: Value =
+            serde_json::from_slice(&fs::read(&supervisor.config.config_path).unwrap()).unwrap();
+        assert_eq!(
+            restored["apps"]["tls"]["certificates"]["automate"],
+            serde_json::json!(["dns.test"])
+        );
+        let policies = restored["apps"]["tls"]["automation"]["policies"]
+            .as_array()
+            .unwrap();
+        assert_eq!(policies.len(), 1);
+        assert_eq!(
+            policies[0]["issuers"][0]["challenges"]["dns"]["provider"]["api_token"],
+            "{file./saved.token}"
+        );
+        assert_eq!(
+            policies[0]["issuers"][0]["challenges"]["http"]["disabled"],
+            true
+        );
+        assert_eq!(
+            policies[0]["issuers"][0]["challenges"]["tls-alpn"]["disabled"],
+            true
+        );
+        assert_eq!(restored["apps"]["http"], applied["apps"]["http"]);
+        remove_legacy_http_issuance(&mut applied);
+        assert_eq!(applied, restored);
+        // 默认 issuer 也不能在没有策略时接管剩余 automate 名称。
+        let mut default =
+            serde_json::json!({"apps":{"tls":{"certificates":{"automate":["default.test"]}}}});
+        remove_legacy_http_issuance(&mut default);
+        assert!(default["apps"]["tls"]["certificates"]["automate"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+        fs::remove_dir_all(root).unwrap();
+    }
 
     #[tokio::test]
     async fn admin_readiness_retries_startup_and_preserves_real_failure() {

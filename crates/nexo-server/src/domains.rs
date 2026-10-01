@@ -7,6 +7,40 @@ use std::{
     time::Duration,
 };
 
+pub mod dns_records;
+
+/// 升级只调整证书方式，不重新验证归属或清空凭据；整表替换在事务内完成。
+pub fn migrate(db: &Connection) -> Result<()> {
+    let tx = db.unchecked_transaction()?;
+    let schema: String = tx.query_row(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='domain_settings'",
+        [],
+        |row| row.get(0),
+    )?;
+    if schema.contains("http01") {
+        tx.execute_batch(
+            "CREATE TABLE domain_settings_dns (
+            domain_id TEXT PRIMARY KEY REFERENCES public_domains(id) ON DELETE CASCADE,
+            certificate_mode TEXT NOT NULL CHECK(certificate_mode='cloudflare_dns'),
+            verified INTEGER NOT NULL DEFAULT 0, verification_token TEXT NOT NULL,
+            credential_file TEXT, dns_resolvers TEXT NOT NULL DEFAULT '[]',
+            propagation_delay INTEGER, propagation_timeout INTEGER,
+            dns_provider TEXT NOT NULL DEFAULT 'cloudflare');
+            INSERT INTO domain_settings_dns SELECT domain_id,'cloudflare_dns',verified,
+                verification_token,credential_file,dns_resolvers,propagation_delay,
+                propagation_timeout,dns_provider FROM domain_settings;
+            DROP TABLE domain_settings;
+            ALTER TABLE domain_settings_dns RENAME TO domain_settings;",
+        )?;
+    }
+    tx.execute_batch("CREATE TABLE IF NOT EXISTS domain_dns_operations (
+        id TEXT PRIMARY KEY, domain_id TEXT NOT NULL REFERENCES public_domains(id) ON DELETE CASCADE,
+        hostname TEXT NOT NULL, original TEXT NOT NULL, changes TEXT NOT NULL DEFAULT '[]',
+        status TEXT NOT NULL DEFAULT 'writing', error TEXT, created_at INTEGER NOT NULL);")?;
+    tx.commit()?;
+    Ok(())
+}
+
 /// 每域名独立的证书验证参数；空解析器列表使用 Caddy 默认，不影响归属验证。
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct DnsSettings {
@@ -115,7 +149,7 @@ pub fn load(db: &Connection, id: &str, domain: &str) -> Result<Settings, ApiErro
 
 pub fn create_settings(db: &Connection, id: &str) -> Result<(), ApiError> {
     let proof = EnrollmentToken::generate(unix_now(), 3600).map_err(db_error)?;
-    db.execute("INSERT INTO domain_settings(domain_id,certificate_mode,verified,verification_token) VALUES (?1,'http01',0,?2)",params![id,proof.secret]).map_err(db_error)?;
+    db.execute("INSERT INTO domain_settings(domain_id,certificate_mode,verified,verification_token) VALUES (?1,'cloudflare_dns',0,?2)",params![id,proof.secret]).map_err(db_error)?;
     Ok(())
 }
 pub(crate) fn owned(db: &Connection, tenant: &str, id: &str) -> Result<String, ApiError> {
@@ -171,20 +205,17 @@ pub async fn update(
     Json(mut input): Json<SettingsInput>,
 ) -> Result<Json<Settings>, ApiError> {
     let session = require_write(&state, &headers)?;
-    if !matches!(input.certificate_mode.as_str(), "http01" | "cloudflare_dns") {
+    if input.certificate_mode != "cloudflare_dns" {
         return Err(ApiError::new(
             StatusCode::BAD_REQUEST,
-            "请选择 HTTP 验证或 DNS 验证",
+            "证书仅支持 DNS 验证，HTTP 验证已移除",
         ));
     }
     input.dns.validate()?;
     let db = state.db.lock().map_err(|_| db_error("数据库锁不可用"))?;
     let domain = owned(&db, &session.tenant_id, &id)?;
     let current = load(&db, &id, &domain)?;
-    if input.certificate_mode == "http01" && db.query_row("SELECT EXISTS(SELECT 1 FROM tunnels WHERE public_domain_id=?1 AND ipv6_direct_enabled=1 AND deleted_at IS NULL)",[&id],|r|r.get::<_,bool>(0)).map_err(db_error)? {
-        return Err(ApiError::new(StatusCode::CONFLICT,"请先关闭该域名下服务的 IPv6 直连，再切换 HTTP 验证"));
-    }
-    if input.certificate_mode == "cloudflare_dns" && !current.credential_configured {
+    if !current.credential_configured {
         return Err(ApiError::new(
             StatusCode::BAD_REQUEST,
             "请先验证并保存 DNS 凭据，再保存 DNS 证书配置",
@@ -382,6 +413,7 @@ pub async fn set_credential(
         proof
     };
     verify_cloudflare(token, &domain, &proof).await?;
+    let _dns_guard = state.tunnel_runtime.direct.dns_lock.lock().await;
     // 网络检查之后重新鉴权：管理员可能在检查期间停用了该账号。
     let session_now = require_write(&state, &headers)?;
     if session_now.tenant_id != session.tenant_id {
@@ -490,8 +522,74 @@ mod tests {
             load(&state.db.lock().unwrap(), &domain.id, &domain.domain)
                 .unwrap()
                 .certificate_mode,
-            "http01"
+            "cloudflare_dns"
         );
+    }
+    #[tokio::test]
+    async fn http_certificate_mode_is_rejected() {
+        let (state, headers) = crate::tests::domain_fixture();
+        let domain = crate::tests::add_test_domain(&state, &headers, "dns-only.test")
+            .await
+            .unwrap();
+        let error = update(
+            State(state.clone()),
+            headers,
+            Path(domain.id.clone()),
+            Json(SettingsInput {
+                certificate_mode: "http01".into(),
+                dns: DnsSettings::default(),
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.status, StatusCode::BAD_REQUEST);
+        assert!(error.message.contains("已移除"));
+        assert_eq!(
+            load(&state.db.lock().unwrap(), &domain.id, &domain.domain)
+                .unwrap()
+                .certificate_mode,
+            "cloudflare_dns"
+        );
+    }
+    #[test]
+    fn migration_preserves_domain_settings_and_is_repeatable() {
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch("PRAGMA foreign_keys=ON;
+            CREATE TABLE public_domains(id TEXT PRIMARY KEY);
+            INSERT INTO public_domains VALUES('old');
+            CREATE TABLE domain_settings (
+                domain_id TEXT PRIMARY KEY REFERENCES public_domains(id) ON DELETE CASCADE,
+                certificate_mode TEXT NOT NULL CHECK(certificate_mode IN ('http01','cloudflare_dns')),
+                verified INTEGER NOT NULL DEFAULT 0, verification_token TEXT NOT NULL,
+                credential_file TEXT, dns_resolvers TEXT NOT NULL DEFAULT '[]',
+                propagation_delay INTEGER, propagation_timeout INTEGER,
+                dns_provider TEXT NOT NULL DEFAULT 'cloudflare');
+            INSERT INTO domain_settings VALUES('old','http01',1,'proof','saved.token','[\"1.1.1.1:53\"]',12,90,'alidns');").unwrap();
+        migrate(&db).unwrap();
+        migrate(&db).unwrap();
+        let value = load(&db, "old", "old.test").unwrap();
+        assert_eq!(value.certificate_mode, "cloudflare_dns");
+        assert_eq!(value.verification_status, "verified");
+        assert_eq!(value.dns_provider, "alidns");
+        assert_eq!(value.credential_file.as_deref(), Some("saved.token"));
+        assert_eq!(value.dns.dns_resolvers, ["1.1.1.1:53"]);
+        assert_eq!(value.dns.dns_propagation_delay_seconds, Some(12));
+        assert_eq!(value.dns.dns_propagation_timeout_seconds, Some(90));
+        assert_eq!(
+            db.query_row("SELECT verification_token FROM domain_settings", [], |r| {
+                r.get::<_, String>(0)
+            })
+            .unwrap(),
+            "proof"
+        );
+        assert!(db
+            .execute("UPDATE domain_settings SET certificate_mode='http01'", [])
+            .is_err());
+        assert!(!db
+            .prepare("PRAGMA foreign_key_check")
+            .unwrap()
+            .exists([])
+            .unwrap());
     }
     #[tokio::test]
     async fn empty_resolvers_round_trip_without_overriding_saved_addresses() {
@@ -499,9 +597,18 @@ mod tests {
         let domain = crate::tests::add_test_domain(&state, &headers, "defaults.test")
             .await
             .unwrap();
+        state
+            .db
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE domain_settings SET credential_file='saved' WHERE domain_id=?1",
+                [&domain.id],
+            )
+            .unwrap();
         for resolvers in [vec!["223.5.5.5:53", "223.6.6.6:53"], vec![]] {
             let input: SettingsInput = serde_json::from_value(
-                json!({"certificate_mode":"http01", "dns_resolvers":resolvers}),
+                json!({"certificate_mode":"cloudflare_dns", "dns_resolvers":resolvers}),
             )
             .unwrap();
             let saved = update(
@@ -523,7 +630,7 @@ mod tests {
             );
         }
         let input: SettingsInput =
-            serde_json::from_value(json!({"certificate_mode":"http01"})).unwrap();
+            serde_json::from_value(json!({"certificate_mode":"cloudflare_dns"})).unwrap();
         assert!(input.dns.dns_resolvers.is_empty());
     }
 
@@ -613,7 +720,7 @@ mod tests {
             StatusCode::CONFLICT
         );
         let settings = load(&db, &first.id, &first.domain).unwrap();
-        assert_eq!(settings.certificate_mode, "http01");
+        assert_eq!(settings.certificate_mode, "cloudflare_dns");
         assert_eq!(settings.verification_status, "pending");
     }
     #[test]

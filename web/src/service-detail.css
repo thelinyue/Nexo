@@ -29,6 +29,10 @@
 .application-modal .service-detail-connections .detail-field>dd { display:grid; gap:6px; }
 .application-modal .service-detail-connections code { white-space:normal; overflow-wrap:anywhere; }
 .application-modal .service-protocol-state { align-items:flex-start; flex-wrap:wrap; }
+.application-modal .service-node-state { display:flex; align-items:center; flex-wrap:wrap; gap:6px 10px; min-width:0; }
+.application-modal .service-node-state time,.application-modal .service-node-state .form-error { flex-basis:100%; margin:0; overflow-wrap:anywhere; }
+.application-modal .service-node-error { flex-basis:100%; min-width:0; overflow-wrap:anywhere; }
+.application-modal .service-node-error summary { display:list-item; min-height:44px; align-content:center; cursor:pointer; }
 .application-modal .notice { display:block; margin:0; flex:none; }
 .application-modal .notice p { margin:6px 0; }
 .application-modal .notice summary,.application-modal .service-state-explanation summary { min-height:44px; align-content:center; cursor:pointer; }

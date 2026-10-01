@@ -134,7 +134,7 @@ CREATE TABLE server_settings (
 
 CREATE TABLE domain_settings (
         domain_id TEXT PRIMARY KEY REFERENCES public_domains(id) ON DELETE CASCADE,
-        certificate_mode TEXT NOT NULL CHECK(certificate_mode IN ('http01','cloudflare_dns')),
+        certificate_mode TEXT NOT NULL CHECK(certificate_mode = 'cloudflare_dns'),
         verified INTEGER NOT NULL DEFAULT 0, verification_token TEXT NOT NULL,
         credential_file TEXT, dns_resolvers TEXT NOT NULL DEFAULT '[]',
         propagation_delay INTEGER, propagation_timeout INTEGER

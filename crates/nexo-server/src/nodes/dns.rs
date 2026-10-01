@@ -4,11 +4,133 @@ use super::*;
 use crate::dns_provider::Record;
 use std::{collections::HashSet, time::Duration};
 
+// 已配置 DNS 凭据的内置服务也维护独立 A，避免沿用指向其他节点的泛域名。
+// DNS 状态记录保存管理意图；新接管和历史恢复只处理启用中的域名穿透，已有记录仍独立进入停用清理。
+// 首次接管不包含 IPv6 直连服务，其 A/AAAA 继续由直连协调器管理。
+const MANAGED_SERVICES: &str = "SELECT t.id FROM tunnels t WHERE
+    EXISTS(SELECT 1 FROM service_nodes s WHERE s.service_id=t.id AND s.node_id!='local')
+    OR EXISTS(SELECT 1 FROM relay_dns_records r WHERE r.service_id=t.id)
+    OR EXISTS(SELECT 1 FROM relay_dns_originals r WHERE r.service_id=t.id)
+    OR (t.enabled=1 AND t.deleted_at IS NULL AND t.service_mode='tunnel'
+        AND t.protocol IN ('http','https','tcp') AND t.public_domain_id IS NOT NULL
+        AND t.hostname IS NOT NULL AND t.hostname!=''
+        AND EXISTS(SELECT 1 FROM tenants w WHERE w.id=t.tenant_id AND w.enabled=1)
+        AND (EXISTS(SELECT 1 FROM relay_dns_state d WHERE d.service_id=t.id)
+            OR (t.ipv6_direct_enabled=0
+                AND EXISTS(SELECT 1 FROM authorized_service_nodes s WHERE s.service_id=t.id AND s.node_id='local')
+                AND EXISTS(SELECT 1 FROM public_domains p JOIN domain_settings d ON d.domain_id=p.id
+                    WHERE p.id=t.public_domain_id AND p.tenant_id=t.tenant_id
+                        AND d.verified=1 AND d.credential_file IS NOT NULL))))";
+
 pub fn managed(db: &Connection, id: &str) -> rusqlite::Result<bool> {
-    db.query_row("SELECT EXISTS(SELECT 1 FROM service_nodes WHERE service_id=?1 AND node_id!='local') OR EXISTS(SELECT 1 FROM relay_dns_records WHERE service_id=?1) OR EXISTS(SELECT 1 FROM relay_dns_originals WHERE service_id=?1)",[id],|r|r.get(0))
+    db.query_row(
+        &format!("SELECT EXISTS(SELECT 1 FROM ({MANAGED_SERVICES}) WHERE id=?1)"),
+        [id],
+        |r| r.get(0),
+    )
 }
+
+/// 快照只保留决定入口资格的配置与状态，不比较每次心跳都会更新的时间戳。
+#[derive(PartialEq, Eq)]
+struct Entry {
+    target: super::health::Target,
+    eligible: bool,
+    maintenance: bool,
+}
+
+#[derive(PartialEq, Eq)]
+struct Snapshot {
+    domain: String,
+    host: String,
+    enabled: bool,
+    revision: i64,
+    protocol: String,
+    port: u16,
+    entries: Vec<Entry>,
+}
+
+fn snapshot(state: &AppState, id: &str) -> Result<Snapshot> {
+    let local = local_address(state)?;
+    let db = state
+        .db
+        .lock()
+        .map_err(|_| anyhow::anyhow!("数据库锁不可用"))?;
+    snapshot_from_db(state, id, &local, &db)
+}
+
+fn local_address(state: &AppState) -> Result<String> {
+    Ok(crate::server_settings::relay_ipv4(state)
+        .map_err(|e| anyhow::anyhow!(e.message))?
+        .map(|ip| ip.to_string())
+        .unwrap_or_default())
+}
+
+fn snapshot_from_db(state: &AppState, id: &str, local: &str, db: &Connection) -> Result<Snapshot> {
+    let (domain,host,enabled,revision,protocol,port):(String,String,bool,i64,String,u16)=db.query_row("SELECT p.id,t.hostname||'.'||p.domain,t.enabled=1 AND t.deleted_at IS NULL AND w.enabled=1,t.apply_revision,t.protocol,CASE WHEN t.protocol='tcp' THEN t.public_port WHEN t.protocol='https' THEN t.https_port ELSE ?2 END FROM tunnels t JOIN public_domains p ON p.id=t.public_domain_id JOIN tenants w ON w.id=t.tenant_id WHERE t.id=?1",params![id,state.config.caddy.http_port()],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?)))?;
+    let mut q=db.prepare("SELECT n.id,n.public_ipv4,COALESCE(n.approved=1 AND n.enabled=1 AND n.removed_at IS NULL AND (n.id='local' OR n.last_seen>?2) AND h.healthy=1 AND h.revision=t.apply_revision AND h.checked_at>?2 AND a.revision=t.apply_revision AND a.status='ready' AND a.updated_at>?2,0),COALESCE(h.public_probe_supported,0),n.maintenance FROM authorized_service_nodes s JOIN relay_nodes n ON n.id=s.node_id JOIN tunnels t ON t.id=s.service_id LEFT JOIN relay_service_health h ON h.node_id=n.id AND h.service_id=s.service_id LEFT JOIN tunnel_applied_states a ON a.tunnel_id=t.id WHERE s.service_id=?1 ORDER BY n.id")?;
+    let entries = q
+        .query_map(params![id, unix_now() - 45], |r| {
+            let node: String = r.get(0)?;
+            let supported: bool = r.get(3)?;
+            Ok(Entry {
+                target: super::health::Target {
+                    address: if node == "local" {
+                        local.to_owned()
+                    } else {
+                        r.get(1)?
+                    },
+                    kind: if matches!(protocol.as_str(), "http" | "https")
+                        && (node == "local" || supported)
+                    {
+                        protocol.clone()
+                    } else {
+                        "tcp".into()
+                    },
+                    node,
+                },
+                eligible: r.get(2)?,
+                maintenance: r.get(4)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(Snapshot {
+        domain,
+        host,
+        enabled,
+        revision,
+        protocol,
+        port,
+        entries,
+    })
+}
+
+/// DNS 网络等待后同时复核配置与所选入口的综合健康，过期或被清除的样本不能继续发布。
+fn publication_current(
+    state: &AppState,
+    id: &str,
+    observed: &Snapshot,
+    selected: &[super::selection::Candidate],
+) -> Result<bool> {
+    let local = local_address(state)?;
+    let db = state
+        .db
+        .lock()
+        .map_err(|_| anyhow::anyhow!("数据库锁不可用"))?;
+    if snapshot_from_db(state, id, &local, &db)? != *observed {
+        return Ok(false);
+    }
+    let mut query = db.prepare("SELECT EXISTS(SELECT 1 FROM relay_healthy_service_nodes WHERE service_id=?1 AND node_id=?2)")?;
+    for node in selected {
+        if !query.query_row(params![id, node.id], |r| r.get::<_, bool>(0))? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
 pub async fn run(state: AppState) {
     let mut tick = tokio::time::interval(Duration::from_secs(10));
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         tokio::select! {_=state.tunnel_runtime.stop.cancelled()=>break,_=tick.tick()=>{if let Err(error)=reconcile(&state).await{tracing::warn!("多节点 DNS 协调未完成：{error}");}}}
     }
@@ -20,7 +142,7 @@ pub async fn reconcile(state: &AppState) -> Result<()> {
             .db
             .lock()
             .map_err(|_| anyhow::anyhow!("数据库锁不可用"))?;
-        let mut q=db.prepare("SELECT DISTINCT t.id FROM tunnels t WHERE EXISTS(SELECT 1 FROM service_nodes s WHERE s.service_id=t.id AND s.node_id!='local') OR EXISTS(SELECT 1 FROM relay_dns_records r WHERE r.service_id=t.id) OR EXISTS(SELECT 1 FROM relay_dns_originals r WHERE r.service_id=t.id)")?;
+        let mut q = db.prepare(MANAGED_SERVICES)?;
         let v = q
             .query_map([], |r| r.get::<_, String>(0))?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -46,101 +168,75 @@ pub async fn reconcile(state: &AppState) -> Result<()> {
 }
 pub async fn sync(state: &AppState, id: &str) -> Result<()> {
     cleanup_obsolete(state, id).await?;
-    let (domain, host, enabled, revision, protocol, port, entries) = {
-        let db = state
-            .db
-            .lock()
-            .map_err(|_| anyhow::anyhow!("数据库锁不可用"))?;
-        let (domain,host,enabled,revision,protocol,port):(String,String,bool,i64,String,u16)=db.query_row("SELECT p.id,t.hostname||'.'||p.domain,t.enabled=1 AND t.deleted_at IS NULL AND w.enabled=1,t.apply_revision,t.protocol,CASE WHEN t.protocol='tcp' THEN t.public_port WHEN t.protocol='https' THEN t.https_port ELSE ?2 END FROM tunnels t JOIN public_domains p ON p.id=t.public_domain_id JOIN tenants w ON w.id=t.tenant_id WHERE t.id=?1",params![id,state.config.caddy.http_port()],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?)))?;
-        let mut q=db.prepare("SELECT n.id,n.public_ipv4,n.approved=1 AND n.enabled=1 AND n.removed_at IS NULL AND (n.id='local' OR (n.last_seen>?2 AND EXISTS(SELECT 1 FROM relay_node_authorizations g WHERE g.node_id=n.id AND g.tenant_id=t.tenant_id))),COALESCE(h.healthy=1 AND h.revision=t.apply_revision AND h.checked_at>?2,0),n.maintenance FROM authorized_service_nodes s JOIN relay_nodes n ON n.id=s.node_id JOIN tunnels t ON t.id=s.service_id LEFT JOIN relay_service_health h ON h.node_id=n.id AND h.service_id=s.service_id WHERE s.service_id=?1")?;
-        let entries = q
-            .query_map(params![id, unix_now() - 45], |r| {
-                Ok((
-                    r.get::<_, String>(0)?,
-                    r.get::<_, String>(1)?,
-                    r.get::<_, bool>(2)?,
-                    r.get::<_, bool>(3)?,
-                    r.get::<_, bool>(4)?,
-                ))
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        (domain, host, enabled, revision, protocol, port, entries)
-    };
-    if !enabled {
+    let observed = snapshot(state, id)?;
+    if !observed.enabled {
         return Ok(());
     }
-    let mut probes = Vec::new();
-    for (node, mut ip, available, reported, maintenance) in entries {
-        if !available || !reported {
-            continue;
-        }
-        if node == "local" {
-            ip = crate::server_settings::relay_ipv4(state)
-                .map_err(|e| anyhow::anyhow!(e.message))?
-                .context("请配置内置节点公网 IPv4")?
-                .to_string();
-        }
-        // 单服务最多 16 个节点并发探测，避免多个故障节点串行超时拖慢健康入口。
-        probes.push(async move {
-            let ready = tokio::time::timeout(
-                Duration::from_secs(3),
-                tokio::net::TcpStream::connect(format!("{ip}:{port}")),
+    // 最多 16 个入口并发探测；网络等待期间不占用 DNS 或数据库写锁。
+    let probes = observed
+        .entries
+        .iter()
+        .filter(|e| e.eligible)
+        .map(|entry| async {
+            let error = super::health::probe(
+                &entry.target,
+                &observed.host,
+                observed.port,
+                id,
+                observed.revision,
             )
             .await
-            .is_ok_and(|v| v.is_ok());
-            (node, ip, maintenance, ready)
+            .err()
+            .map(|e| format!("{e:#}"));
+            (&entry.target, error)
         });
-    }
-    let mut candidates = Vec::new();
-    for (node, ip, maintenance, ready) in futures_util::future::join_all(probes).await {
-        let healthy = {
-            let db = state
-                .db
-                .lock()
-                .map_err(|_| anyhow::anyhow!("数据库锁不可用"))?;
-            db.execute("INSERT INTO relay_public_health(node_id,service_id,revision,successes,failures,checked_at) VALUES(?1,?2,?3,?4,?5,?6) ON CONFLICT(node_id,service_id) DO UPDATE SET healthy=CASE WHEN revision!=excluded.revision OR checked_at<=excluded.checked_at-45 THEN 0 ELSE healthy END,successes=CASE WHEN excluded.successes=1 THEN CASE WHEN revision=excluded.revision AND checked_at>excluded.checked_at-45 THEN MIN(successes+1,3) ELSE 1 END ELSE 0 END,failures=CASE WHEN excluded.failures=1 THEN CASE WHEN revision=excluded.revision AND checked_at>excluded.checked_at-45 THEN MIN(failures+1,3) ELSE 1 END ELSE 0 END,revision=excluded.revision,checked_at=excluded.checked_at",params![node,id,revision,ready as i64,(!ready) as i64,unix_now()])?;
-            db.execute("UPDATE relay_public_health SET healthy=CASE WHEN successes>=3 THEN 1 WHEN failures>=3 THEN 0 ELSE healthy END WHERE node_id=?1 AND service_id=?2",params![node,id])?;
-            db.query_row(
-                "SELECT healthy FROM relay_public_health WHERE node_id=?1 AND service_id=?2",
-                params![node, id],
-                |r| r.get::<_, bool>(0),
-            )?
-        };
-        if healthy && !maintenance {
-            let latency = {
-                let db = state
-                    .db
-                    .lock()
-                    .map_err(|_| anyhow::anyhow!("数据库锁不可用"))?;
-                db.query_row("SELECT l.rtt_ms FROM relay_latency l JOIN tunnels t ON t.device_id=l.device_id WHERE t.id=?1 AND l.node_id=?2 AND l.checked_at>?3 AND l.samples>=3",params![id,node,unix_now()-45],|r|r.get::<_,u32>(0)).optional()?
-            };
-            candidates.push(super::selection::Candidate {
-                id: node,
-                address: ip,
-                latency,
-            });
-        }
-    }
-    let desired = super::selection::select(state, id, candidates)?
-        .into_iter()
-        .map(|n| n.address)
-        .collect::<HashSet<_>>();
-    let zone = crate::direct::dns::zone(state, &domain).await?;
+    let results = futures_util::future::join_all(probes).await;
     let _guard = state.tunnel_runtime.direct.dns_lock.lock().await;
-    // 取锁和网络探测期间可能发生编辑；旧协调结果不能写入新服务配置。
-    {
+    let local = local_address(state)?;
+    let domain = &observed.domain;
+    let host = &observed.host;
+    let revision = observed.revision;
+    let candidates = {
         let db = state
             .db
             .lock()
             .map_err(|_| anyhow::anyhow!("数据库锁不可用"))?;
-        let current: i64 = db.query_row(
-            "SELECT apply_revision FROM tunnels WHERE id=?1",
-            [id],
-            |r| r.get(0),
-        )?;
-        anyhow::ensure!(current == revision, "服务已修改，稍后重试 DNS");
+        // 复核与探测结果落库共用数据库锁，撤权或新报告不能插入两者之间。
+        if snapshot_from_db(state, id, &local, &db)? != observed {
+            return Ok(());
+        }
+        let mut candidates = Vec::new();
+        for (target, error) in results {
+            super::health::record(&db, target, id, revision, error.as_deref(), unix_now())?;
+            let healthy = db.query_row(
+                "SELECT EXISTS(SELECT 1 FROM relay_healthy_service_nodes WHERE node_id=?1 AND service_id=?2)",
+                params![target.node, id],
+                |r| r.get::<_, bool>(0),
+            )?;
+            if healthy {
+                let latency = db.query_row("SELECT l.rtt_ms FROM relay_latency l JOIN tunnels t ON t.device_id=l.device_id WHERE t.id=?1 AND l.node_id=?2 AND l.checked_at>?3 AND l.samples>=3",params![id,target.node,unix_now()-45],|r|r.get::<_,u32>(0)).optional()?;
+                candidates.push(super::selection::Candidate {
+                    id: target.node.clone(),
+                    address: target.address.clone(),
+                    latency,
+                });
+            }
+        }
+        candidates
+    };
+    let selected = super::selection::select(state, id, candidates)?;
+    let desired = selected
+        .iter()
+        .map(|n| n.address.clone())
+        .collect::<HashSet<_>>();
+    let zone = crate::direct::dns::zone(state, domain).await?;
+    if !publication_current(state, id, &observed, &selected)? {
+        return Ok(());
     }
-    let records = zone.records(&host).await?;
+    let records = zone.records(host).await?;
+    if !publication_current(state, id, &observed, &selected)? {
+        return Ok(());
+    }
     anyhow::ensure!(
         !records.iter().any(|r| r.kind == "CNAME" || r.proxied),
         "域名存在 CNAME 或代理记录，请先整理 DNS"
@@ -199,6 +295,9 @@ pub async fn sync(state: &AppState, id: &str) -> Result<()> {
         anyhow::ensure!(owned, "存在非 Nexo 管理的 A 记录，请先核对后移除，未覆盖");
     }
     for address in &desired {
+        if !publication_current(state, id, &observed, &selected)? {
+            return Ok(());
+        }
         let saved = journals
             .iter()
             .find(|(a, _)| a == address)
@@ -223,7 +322,7 @@ pub async fn sync(state: &AppState, id: &str) -> Result<()> {
         } else {
             zone.write(&Record {
                 id: String::new(),
-                name: host.clone(),
+                name: host.to_owned(),
                 kind: "A".into(),
                 value: address.clone(),
                 ttl: 60,
@@ -236,6 +335,9 @@ pub async fn sync(state: &AppState, id: &str) -> Result<()> {
     for (address, written) in journals {
         if desired.contains(&address) {
             continue;
+        }
+        if !publication_current(state, id, &observed, &selected)? {
+            return Ok(());
         }
         if let Some(written) = written {
             let written: Record = serde_json::from_str(&written)?;
@@ -262,28 +364,31 @@ pub async fn sync(state: &AppState, id: &str) -> Result<()> {
         "UPDATE tunnels SET apply_error=NULL WHERE id=?1 AND apply_error LIKE 'DNS 更新失败：%'",
         [id],
     )?;
-    let _ = protocol;
     Ok(())
+}
+
+fn obsolete_hosts(state: &AppState, id: &str) -> Result<Vec<(String, String)>> {
+    let db = state
+        .db
+        .lock()
+        .map_err(|_| anyhow::anyhow!("数据库锁不可用"))?;
+    let mut q=db.prepare("SELECT DISTINCT r.domain_id,r.hostname FROM (SELECT service_id,domain_id,hostname FROM relay_dns_records UNION SELECT service_id,domain_id,hostname FROM relay_dns_originals) r JOIN tunnels t ON t.id=r.service_id LEFT JOIN public_domains p ON p.id=t.public_domain_id WHERE r.service_id=?1 AND (t.deleted_at IS NOT NULL OR t.enabled=0 OR NOT EXISTS(SELECT 1 FROM tenants w WHERE w.id=t.tenant_id AND w.enabled=1) OR r.hostname IS NOT t.hostname||'.'||p.domain OR r.domain_id IS NOT t.public_domain_id)")?;
+    let rows = q
+        .query_map([id], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
 }
 
 /// 旧主机名与停用服务必须先清理归属；仅恢复曾接管的原值，外部修改保持不动并报错。
 async fn cleanup_obsolete(state: &AppState, id: &str) -> Result<()> {
-    let obsolete = {
-        let db = state
-            .db
-            .lock()
-            .map_err(|_| anyhow::anyhow!("数据库锁不可用"))?;
-        let mut q=db.prepare("SELECT DISTINCT r.domain_id,r.hostname FROM (SELECT service_id,domain_id,hostname FROM relay_dns_records UNION SELECT service_id,domain_id,hostname FROM relay_dns_originals) r JOIN tunnels t ON t.id=r.service_id LEFT JOIN public_domains p ON p.id=t.public_domain_id WHERE r.service_id=?1 AND (t.deleted_at IS NOT NULL OR t.enabled=0 OR NOT EXISTS(SELECT 1 FROM tenants w WHERE w.id=t.tenant_id AND w.enabled=1) OR r.hostname IS NOT t.hostname||'.'||p.domain OR r.domain_id IS NOT t.public_domain_id)")?;
-        let rows = q
-            .query_map([id], |r| {
-                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        rows
-    };
-    for (domain, host) in obsolete {
+    for (domain, host) in obsolete_hosts(state, id)? {
         let zone = crate::direct::dns::zone(state, &domain).await?;
         let _guard = state.tunnel_runtime.direct.dns_lock.lock().await;
+        if !obsolete_hosts(state, id)?.contains(&(domain.clone(), host.clone())) {
+            continue;
+        }
         let journals = {
             let db = state
                 .db
@@ -300,6 +405,9 @@ async fn cleanup_obsolete(state: &AppState, id: &str) -> Result<()> {
             rows
         };
         let records = zone.records(&host).await?;
+        if !obsolete_hosts(state, id)?.contains(&(domain.clone(), host.clone())) {
+            continue;
+        }
         for (address, written) in &journals {
             let saved = written
                 .as_ref()
@@ -338,6 +446,9 @@ async fn cleanup_obsolete(state: &AppState, id: &str) -> Result<()> {
         if let Some(original) = original {
             let original: Record = serde_json::from_str(&original)?;
             let now = zone.records(&host).await?;
+            if !obsolete_hosts(state, id)?.contains(&(domain.clone(), host.clone())) {
+                continue;
+            }
             if !now.iter().any(|r| {
                 r.kind == original.kind
                     && r.name == original.name

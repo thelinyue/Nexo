@@ -116,12 +116,12 @@ struct DomainSpec {
     https: bool,
     token_reference: Option<String>,
     dns_provider: Option<Value>,
-    certificate_mode: String,
     dns: crate::domains::DnsSettings,
     services: Vec<WebService>,
 }
 #[derive(Debug, Clone)]
 struct WebService {
+    relay_probe_revision: Option<i64>,
     https_port: u16,
     management: bool,
     http_redirect_enabled: bool,
@@ -141,18 +141,6 @@ impl DomainSpec {
     fn subjects(&self) -> Vec<String> {
         if !self.https {
             return Vec::new();
-        }
-        if self.certificate_mode == "http01" {
-            let mut hosts = vec![self.name.clone()];
-            hosts.extend(
-                self.services
-                    .iter()
-                    .filter(|s| s.protocol == "https")
-                    .map(|s| s.hostname.clone()),
-            );
-            hosts.sort();
-            hosts.dedup();
-            return hosts;
         }
         // 根域名不能由泛域名覆盖；子域名按父域共享证书，缺少 DNS 凭据也不回退单域名签发。
         let mut hosts = vec![self.name.clone(), format!("*.{}", self.name)];
@@ -191,7 +179,6 @@ fn specifications(
                 https: row.get::<_, i64>(3)? != 0,
                 token_reference: None,
                 dns_provider: None,
-                certificate_mode: "cloudflare_dns".into(),
                 dns: crate::domains::DnsSettings::default(),
                 services: Vec::new(),
             })
@@ -210,22 +197,15 @@ fn specifications(
             } else {
                 None
             };
-        domain.certificate_mode = options.certificate_mode;
         domain.dns = options.dns;
-        if domain.certificate_mode == "cloudflare_dns" {
-            let path = options
-                .credential_file
-                .map(|file| {
-                    crate::domains::credential_path(
-                        &settings.cloudflare_token_root,
-                        &domain.id,
-                        &file,
-                    )
-                })
-                .transpose()?;
-            domain.token_reference = path.map(|path| format!("{{file.{}}}", path.display()));
-        }
-        let mut services = connection.prepare("SELECT id,hostname,protocol,device_id,lan_redirect_enabled,local_address,local_port,origin_protocol,service_mode,http_redirect_enabled,https_port FROM tunnels WHERE public_domain_id=?1 AND tenant_id=?2 AND enabled=1 AND deleted_at IS NULL AND protocol IN ('http','https') AND EXISTS(SELECT 1 FROM authorized_service_nodes sn WHERE sn.service_id=tunnels.id AND sn.node_id='local')")?;
+        let path = options
+            .credential_file
+            .map(|file| {
+                crate::domains::credential_path(&settings.cloudflare_token_root, &domain.id, &file)
+            })
+            .transpose()?;
+        domain.token_reference = path.map(|path| format!("{{file.{}}}", path.display()));
+        let mut services = connection.prepare("SELECT id,hostname,protocol,device_id,lan_redirect_enabled,local_address,local_port,origin_protocol,service_mode,http_redirect_enabled,https_port,apply_revision FROM tunnels WHERE public_domain_id=?1 AND tenant_id=?2 AND enabled=1 AND deleted_at IS NULL AND protocol IN ('http','https') AND EXISTS(SELECT 1 FROM authorized_service_nodes sn WHERE sn.service_id=tunnels.id AND sn.node_id='local')")?;
         let mut rows = services.query(params![domain.id, domain.tenant_id])?;
         while let Some(row) = rows.next()? {
             let id: String = row.get(0)?;
@@ -257,6 +237,11 @@ fn specifications(
                 None
             };
             domain.services.push(WebService {
+                relay_probe_revision: if !direct && crate::nodes::dns::managed(&connection, &id)? {
+                    Some(row.get(11)?)
+                } else {
+                    None
+                },
                 https_port: row.get(10)?,
                 management: false,
                 http_redirect_enabled: direct && row.get(9)?,
@@ -286,6 +271,7 @@ fn specifications(
             .find(|domain| domain.id == entry.domain_id)
         {
             domain.services.push(WebService {
+                relay_probe_revision: None,
                 https_port: 443,
                 management: true,
                 http_redirect_enabled: true,
@@ -403,6 +389,14 @@ fn build_config(settings: &CaddyRuntimeConfig, domains: &[DomainSpec]) -> Result
             } else {
                 &mut http
             };
+            if let Some(revision) = service.relay_probe_revision {
+                routes.push(crate::nodes::health::route(
+                    &service.hostname,
+                    "local",
+                    &service.id,
+                    revision,
+                ));
+            }
             if let Some(redirect) = &service.lan_redirect {
                 routes.push(crate::lan_redirect::route(
                     &service.id,
@@ -416,9 +410,7 @@ fn build_config(settings: &CaddyRuntimeConfig, domains: &[DomainSpec]) -> Result
         }
         let domain_subjects = domain.subjects();
         if !domain_subjects.is_empty() {
-            if domain.certificate_mode == "http01" {
-                policies.push(json!({"subjects":domain_subjects,"issuers":[{"module":"acme","challenges":{"tls-alpn":{"disabled":true}}}]}));
-            } else if let Some(token) = &domain.token_reference {
+            if let Some(token) = &domain.token_reference {
                 let mut dns = json!({"provider":domain.dns_provider.clone().unwrap_or_else(||json!({"name":"cloudflare","api_token":token}))});
                 if !domain.dns.dns_resolvers.is_empty() {
                     dns["resolvers"] = json!(domain.dns.dns_resolvers);
@@ -429,9 +421,10 @@ fn build_config(settings: &CaddyRuntimeConfig, domains: &[DomainSpec]) -> Result
                 if let Some(seconds) = domain.dns.dns_propagation_timeout_seconds {
                     dns["propagation_timeout"] = json!(u64::from(seconds) * 1_000_000_000);
                 }
-                policies.push(json!({"subjects":domain_subjects,"issuers":[{"module":"acme","challenges":{"dns":dns}}]}));
+                policies.push(json!({"subjects":domain_subjects,"issuers":[{"module":"acme","challenges":{"dns":dns,"http":{"disabled":true},"tls-alpn":{"disabled":true}}}]}));
+                // 没有 DNS 凭据的域名不加入 automate，避免 Caddy 使用默认 ACME issuer。
+                subjects.extend(domain_subjects);
             }
-            subjects.extend(domain_subjects);
         }
     }
     // Caddy 无匹配路由时默认返回空的 200；显式兜底，避免未知域名被误认为服务正常。
@@ -712,6 +705,14 @@ pub(crate) async fn reconcile_locked(state: &AppState) -> Result<bool> {
             )?;
         }
         for cert in &mut runtime.certificates {
+            if domain.token_reference.is_none() {
+                cert.status = "pending".into();
+                cert.error = Some("请先验证并保存域名的 DNS 凭据".into());
+                cert.not_before = None;
+                cert.expires_at = None;
+                cert.next_retry_at = None;
+                continue;
+            }
             let found = metadata
                 .iter()
                 .filter(|m| m.subjects.iter().any(|s| covers(s, &cert.hostname)))
@@ -1003,10 +1004,10 @@ mod tests {
             tenant_id: "default".into(),
             name: "example.com".into(),
             https: true,
-            token_reference: None,
-            certificate_mode: "cloudflare_dns".into(),
+            token_reference: Some("{file./test/token}".into()),
             dns: crate::domains::DnsSettings::default(),
             services: vec![WebService {
+                relay_probe_revision: None,
                 https_port: 443,
                 management: false,
                 http_redirect_enabled: false,
@@ -1042,16 +1043,10 @@ mod tests {
             cfg["apps"]["tls"]["certificates"]["automate"],
             json!(["*.example.com", "example.com"])
         );
-        domain.certificate_mode = "http01".into();
-        let cfg = build_config(&settings(Path::new("test")), &[domain]).unwrap();
-        assert_eq!(
-            cfg["apps"]["tls"]["certificates"]["automate"],
-            json!(["example.com", "nas.example.com"])
-        );
     }
 
     #[test]
-    fn routes_share_wildcard_without_dns_credentials_and_do_not_fake_a_working_tunnel() {
+    fn routes_share_wildcard_and_do_not_fake_a_working_tunnel() {
         let cfg = build_config(&settings(Path::new("test")), &[domain()]).unwrap();
         assert_eq!(cfg["admin"]["listen"], "127.0.0.1:8290");
         assert_eq!(
@@ -1248,6 +1243,7 @@ mod tests {
         let mut d = domain();
         d.services.extend([
             WebService {
+                relay_probe_revision: None,
                 https_port: 443,
                 management: false,
                 http_redirect_enabled: false,
@@ -1258,6 +1254,7 @@ mod tests {
                 lan_redirect: None,
             },
             WebService {
+                relay_probe_revision: None,
                 https_port: 443,
                 management: false,
                 http_redirect_enabled: false,
@@ -1268,6 +1265,7 @@ mod tests {
                 lan_redirect: None,
             },
             WebService {
+                relay_probe_revision: None,
                 https_port: 443,
                 management: false,
                 http_redirect_enabled: false,
@@ -1278,6 +1276,7 @@ mod tests {
                 lan_redirect: None,
             },
             WebService {
+                relay_probe_revision: None,
                 https_port: 443,
                 management: false,
                 http_redirect_enabled: false,
@@ -1288,13 +1287,17 @@ mod tests {
                 lan_redirect: None,
             },
         ]);
-        // 无凭据和有凭据的证书范围一致，不能回退为逐个服务签发。
+        // 无凭据保持待配置；有凭据时共享各层级泛域证书，不逐个服务签发。
         for token in [None, Some("{file./credential-test.token}".into())] {
             d.token_reference = token;
             let cfg = build_config(&settings(Path::new("test")), &[d.clone()]).unwrap();
             assert_eq!(
                 cfg["apps"]["tls"]["certificates"]["automate"],
-                json!(["*.example.com", "*.team.example.com", "example.com"])
+                if d.token_reference.is_some() {
+                    json!(["*.example.com", "*.team.example.com", "example.com"])
+                } else {
+                    Value::Null
+                }
             );
             for service in d
                 .services
@@ -1309,6 +1312,7 @@ mod tests {
             }
             let subjects = d.subjects();
             d.services.push(WebService {
+                relay_probe_revision: None,
                 https_port: 443,
                 management: false,
                 http_redirect_enabled: false,
@@ -1859,8 +1863,42 @@ mod tests {
         let domain = crate::tests::add_test_domain(&state, &headers, "caddy-integration.localhost")
             .await
             .unwrap();
-        // 本机夹具显式验证域名；localhost 仅由 Caddy 内部 CA 签发。
-        state.db.lock().unwrap().execute("UPDATE domain_settings SET verified=1,certificate_mode='cloudflare_dns' WHERE domain_id=?1",[&domain.id]).unwrap();
+        // 本机夹具预置内部 CA 证书和合法私有文件引用，不依赖缺少凭据的签发回退。
+        let credential = crate::domains::write_credential(
+            &cfg.cloudflare_token_root,
+            &domain.id,
+            &format!("cfat_{}", "a".repeat(100)),
+        )
+        .unwrap();
+        state
+            .db
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE domain_settings SET verified=1,credential_file=?2 WHERE domain_id=?1",
+                params![domain.id, credential],
+            )
+            .unwrap();
+        let mut seed = build_config(&cfg, &[]).unwrap();
+        seed["apps"]["tls"] = json!({"certificates":{"automate":["caddy-integration.localhost","nas.caddy-integration.localhost","a.team.caddy-integration.localhost","*.caddy-integration.localhost","*.team.caddy-integration.localhost"]},"automation":{"policies":[{"issuers":[{"module":"internal"}]}]}});
+        supervisor.apply_json(&seed).await.unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(25);
+        while read_certificates(&cfg.storage_root).len() < 5 {
+            assert!(tokio::time::Instant::now() < deadline, "内部测试证书未就绪");
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        for directory in fs::read_dir(cfg.storage_root.join("certificates/local")).unwrap() {
+            let source = directory.unwrap().path();
+            let target = cfg
+                .storage_root
+                .join("certificates/acme-v02.api.letsencrypt.org-directory")
+                .join(source.file_name().unwrap());
+            fs::create_dir_all(&target).unwrap();
+            for entry in fs::read_dir(source).unwrap() {
+                let entry = entry.unwrap();
+                fs::copy(entry.path(), target.join(entry.file_name())).unwrap();
+            }
+        }
         let add_service = |hostname: &str| {
             state.db.lock().unwrap().execute(
                 "INSERT INTO tunnels (id,tenant_id,name,protocol,local_address,local_port,hostname,public_domain_id,created_at,updated_at) VALUES (?1,'default',?1,'https','127.0.0.1',8080,?1,?2,0,0)",
@@ -2040,7 +2078,7 @@ mod tests {
     }
 
     #[test]
-    fn certificate_modes_and_dns_options_stay_per_domain() {
+    fn dns_options_stay_per_domain_and_missing_credentials_never_fall_back() {
         let mut dns = domain();
         dns.token_reference = Some("{file./private/token}".into());
         dns.dns = crate::domains::DnsSettings {
@@ -2049,22 +2087,34 @@ mod tests {
             dns_propagation_timeout_seconds: Some(90),
         };
         dns.services[0].upstream = Some("127.0.0.1:18080".into());
-        let mut http = domain();
-        http.name = "other.test".into();
-        http.certificate_mode = "http01".into();
-        http.services[0].hostname = "nas.other.test".into();
-        let config = build_config(&settings(Path::new("test")), &[dns, http]).unwrap();
+        let mut missing = domain();
+        missing.name = "other.test".into();
+        missing.token_reference = None;
+        missing.services[0].hostname = "nas.other.test".into();
+        let config = build_config(&settings(Path::new("test")), &[dns, missing.clone()]).unwrap();
         let policies = &config["apps"]["tls"]["automation"]["policies"];
         let challenge = &policies[0]["issuers"][0]["challenges"]["dns"];
         assert_eq!(challenge["provider"]["api_token"], "{file./private/token}");
         assert_eq!(challenge["resolvers"], json!(["1.1.1.1:53"]));
         assert_eq!(challenge["propagation_delay"], 15_000_000_000_u64);
         assert_eq!(challenge["propagation_timeout"], 90_000_000_000_u64);
+        assert_eq!(policies.as_array().unwrap().len(), 1);
         assert_eq!(
-            policies[1]["subjects"],
-            json!(["nas.other.test", "other.test"])
+            config["apps"]["tls"]["certificates"]["automate"],
+            json!(["*.example.com", "example.com"])
         );
-        assert!(policies[1]["issuers"][0]["challenges"]["dns"].is_null());
+        assert_eq!(
+            policies[0]["issuers"][0]["challenges"]["http"]["disabled"],
+            true
+        );
+        assert_eq!(
+            policies[0]["issuers"][0]["challenges"]["tls-alpn"]["disabled"],
+            true
+        );
+        assert!(
+            build_config(&settings(Path::new("test")), &[missing]).unwrap()["apps"]["tls"]
+                .is_null()
+        );
         assert_eq!(
             config["apps"]["http"]["servers"]["https"]["routes"][2]["handle"][1]
                 ["stream_close_delay"],
@@ -2103,7 +2153,7 @@ mod tests {
         let path =
             crate::domains::credential_path(&cfg.cloudflare_token_root, &id, &original).unwrap();
         // 只装配 provider，不配置 automate 或 HTTPS 路由，因此不会访问 Cloudflare/ACME。
-        config["apps"]["tls"] = json!({"automation":{"policies":[{"subjects":["hot-reload.example.test"],"issuers":[{"module":"acme","challenges":{"dns":{"provider":{"name":"cloudflare","api_token":format!("{{file.{}}}",path.display())}}}}]}]}});
+        config["apps"]["tls"] = json!({"automation":{"policies":[{"subjects":["hot-reload.example.test"],"issuers":[{"module":"acme","challenges":{"http":{"disabled":true},"tls-alpn":{"disabled":true},"dns":{"provider":{"name":"cloudflare","api_token":format!("{{file.{}}}",path.display())}}}}]}]}});
         supervisor.apply_json(&config).await.unwrap();
         assert!(!supervisor.credentials_changed(&config).await.unwrap());
         fs::write(&path, format!("cfat_{}", "b".repeat(128))).unwrap();

@@ -27,6 +27,7 @@ CREATE TABLE IF NOT EXISTS relay_service_health (
  node_id TEXT NOT NULL REFERENCES relay_nodes(id), service_id TEXT NOT NULL REFERENCES tunnels(id) ON DELETE CASCADE,
  revision INTEGER NOT NULL, successes INTEGER NOT NULL DEFAULT 0, failures INTEGER NOT NULL DEFAULT 0,
  healthy INTEGER NOT NULL DEFAULT 0, checked_at INTEGER NOT NULL DEFAULT 0, error TEXT,
+ public_probe_supported INTEGER NOT NULL DEFAULT 0,
  PRIMARY KEY(node_id,service_id)
 );
 CREATE TABLE IF NOT EXISTS node_update_jobs (
@@ -79,7 +80,7 @@ CREATE VIEW IF NOT EXISTS authorized_service_nodes AS
 
 CREATE TRIGGER IF NOT EXISTS bind_builtin_node AFTER INSERT ON tunnels BEGIN INSERT OR IGNORE INTO service_nodes(service_id,node_id) VALUES(NEW.id,'local'); END;
 
-CREATE TABLE IF NOT EXISTS relay_public_health(node_id TEXT NOT NULL,service_id TEXT NOT NULL REFERENCES tunnels(id) ON DELETE CASCADE,revision INTEGER NOT NULL,successes INTEGER NOT NULL DEFAULT 0,failures INTEGER NOT NULL DEFAULT 0,healthy INTEGER NOT NULL DEFAULT 0,checked_at INTEGER NOT NULL,PRIMARY KEY(node_id,service_id));
+CREATE TABLE IF NOT EXISTS relay_public_health(node_id TEXT NOT NULL,service_id TEXT NOT NULL REFERENCES tunnels(id) ON DELETE CASCADE,revision INTEGER NOT NULL,successes INTEGER NOT NULL DEFAULT 0,failures INTEGER NOT NULL DEFAULT 0,healthy INTEGER NOT NULL DEFAULT 0,checked_at INTEGER NOT NULL,probe_kind TEXT NOT NULL DEFAULT 'tcp',address TEXT NOT NULL DEFAULT '',error TEXT,PRIMARY KEY(node_id,service_id));
 CREATE TABLE IF NOT EXISTS relay_dns_state(service_id TEXT PRIMARY KEY REFERENCES tunnels(id) ON DELETE CASCADE,revision INTEGER NOT NULL,synced_at INTEGER NOT NULL,error TEXT);
 
 CREATE TABLE IF NOT EXISTS relay_dns_originals(service_id TEXT NOT NULL REFERENCES tunnels(id),domain_id TEXT NOT NULL REFERENCES public_domains(id),hostname TEXT NOT NULL,record TEXT NOT NULL,PRIMARY KEY(service_id,hostname));

@@ -8,6 +8,7 @@ pub mod certificates;
 pub mod control;
 pub mod dns;
 pub mod groups;
+pub mod health;
 pub mod releases;
 pub mod runtime;
 pub mod selection;
@@ -70,6 +71,18 @@ pub fn migrate(db: &Connection) -> Result<()> {
         ),
         ("node_update_items", "attempt", "INTEGER NOT NULL DEFAULT 0"),
         (
+            "relay_service_health",
+            "public_probe_supported",
+            "INTEGER NOT NULL DEFAULT 0",
+        ),
+        (
+            "relay_public_health",
+            "probe_kind",
+            "TEXT NOT NULL DEFAULT 'tcp'",
+        ),
+        ("relay_public_health", "address", "TEXT NOT NULL DEFAULT ''"),
+        ("relay_public_health", "error", "TEXT"),
+        (
             "node_update_items",
             "ttl_seconds",
             "INTEGER NOT NULL DEFAULT 60",
@@ -86,6 +99,26 @@ pub fn migrate(db: &Connection) -> Result<()> {
             )?;
         }
     }
+    // DNS、服务诊断和节点维护共用同一综合健康定义，避免只看在线或旧探测样本。
+    tx.execute_batch("CREATE VIEW IF NOT EXISTS relay_ready_service_nodes AS
+        SELECT s.service_id,s.node_id,t.apply_revision AS revision,n.maintenance
+        FROM authorized_service_nodes s
+        JOIN tunnels t ON t.id=s.service_id
+        JOIN tenants w ON w.id=t.tenant_id
+        JOIN relay_nodes n ON n.id=s.node_id
+        JOIN relay_service_health h ON h.node_id=s.node_id AND h.service_id=s.service_id
+        JOIN relay_public_health p ON p.node_id=s.node_id AND p.service_id=s.service_id
+        JOIN tunnel_applied_states a ON a.tunnel_id=t.id
+        WHERE t.enabled=1 AND t.deleted_at IS NULL AND w.enabled=1
+          AND n.approved=1 AND n.enabled=1 AND n.removed_at IS NULL
+          AND (n.id='local' OR n.last_seen>unixepoch()-45)
+          AND a.revision=t.apply_revision AND a.status='ready' AND a.updated_at>unixepoch()-45
+          AND h.healthy=1 AND h.revision=t.apply_revision AND h.checked_at>unixepoch()-45
+          AND p.healthy=1 AND p.revision=t.apply_revision AND p.checked_at>unixepoch()-45
+          AND (n.id='local' OR p.address=n.public_ipv4)
+          AND p.probe_kind=CASE WHEN t.protocol IN ('http','https') AND (n.id='local' OR h.public_probe_supported=1) THEN t.protocol ELSE 'tcp' END;
+        CREATE VIEW IF NOT EXISTS relay_healthy_service_nodes AS
+        SELECT service_id,node_id,revision FROM relay_ready_service_nodes WHERE maintenance=0;")?;
     tx.commit()?;
     Ok(())
 }
@@ -434,6 +467,7 @@ async fn update(
         return Err(invalid("内置节点请通过服务器设置管理"));
     }
     validate(&state, &input)?;
+    let _dns_guard = state.tunnel_runtime.direct.dns_lock.lock().await;
     let db = state.db.lock().map_err(db_error)?;
     let tx = db.unchecked_transaction().map_err(db_error)?;
     if !visible(&tx, &id, &actor.tenant_id, true)? {
@@ -475,6 +509,7 @@ async fn remove(
     if id == "local" {
         return Err(invalid("内置节点不能移除"));
     }
+    let _dns_guard = state.tunnel_runtime.direct.dns_lock.lock().await;
     let db = state.db.lock().map_err(db_error)?;
     let tx = db.unchecked_transaction().map_err(db_error)?;
     if updates::busy(&tx, &id).map_err(db_error)? {

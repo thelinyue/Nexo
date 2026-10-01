@@ -126,7 +126,7 @@ mod tests {
             .lock()
             .unwrap()
             .execute(
-                "UPDATE domain_settings SET verified=1 WHERE domain_id=?1",
+                "UPDATE domain_settings SET verified=1,credential_file='credential-00000000-0000-4000-8000-000000000002.token' WHERE domain_id=?1",
                 [&domain.id],
             )
             .unwrap();

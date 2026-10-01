@@ -330,6 +330,8 @@ async fn main() -> Result<()> {
         identity_path,
     )?);
     connection.execute("UPDATE devices SET status='offline'", [])?;
+    // 启动配置可能改变内置节点公网地址或监听端口，不能沿用重启前的入口探测。
+    connection.execute("DELETE FROM relay_public_health WHERE node_id='local'", [])?;
     let state = AppState {
         security: Arc::new(security::Security::new(server_settings::load_for_runtime(
             &connection,
@@ -534,6 +536,10 @@ fn router(state: AppState) -> Router {
             put(dns_provider::set_credential),
         )
         .route(
+            "/api/v1/public-domains/{id}/dns-records",
+            get(domains::dns_records::preview).post(domains::dns_records::apply),
+        )
+        .route(
             "/api/v1/public-domains/{id}/cloudflare-credential",
             put(domains::set_credential),
         )
@@ -585,6 +591,7 @@ fn initialize_database(connection: &Connection, is_new: bool) -> Result<()> {
     // 先验证当前业务结构，再为现有版本添加强制 HTTPS 字段；不转换旧版 mesh 数据。
     https_ports::migrate(connection)?;
     dns_provider::migrate(connection)?;
+    domains::migrate(connection)?;
     direct::migrate(connection)?;
     service_icons::migrate(connection)?;
     nodes::migrate(connection)?;
@@ -790,6 +797,7 @@ async fn update_tunnel(
     let access_hash = service_access::password_hash(&mut input).await?;
     let runtime_changed;
     {
+        let _dns_guard = state.tunnel_runtime.direct.dns_lock.lock().await;
         let db = state.db.lock().map_err(|_| db_error("数据库锁不可用"))?;
         let db = db.unchecked_transaction().map_err(db_error)?;
         if !db.query_row("SELECT EXISTS(SELECT 1 FROM tunnels WHERE id=?1 AND tenant_id=?2 AND deleted_at IS NULL)",params![id,session.tenant_id], |r| r.get::<_,bool>(0)).map_err(db_error)? { return Err(ApiError::new(StatusCode::NOT_FOUND,"服务不存在")); }
@@ -854,6 +862,7 @@ async fn delete_tunnel(
     let session = require_write(&state, &headers)?;
     let is_proxy;
     {
+        let _dns_guard = state.tunnel_runtime.direct.dns_lock.lock().await;
         let db = state.db.lock().map_err(|_| db_error("数据库锁不可用"))?;
         let db = db.unchecked_transaction().map_err(db_error)?;
         is_proxy = reverse_proxy::existing(&db, &session, &id)?;
@@ -1147,6 +1156,11 @@ async fn delete_domain(
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let session = require_write(&state, &headers)?;
+    let _dns_guard = state.tunnel_runtime.direct.dns_lock.lock().await;
+    let session_now = require_write(&state, &headers)?;
+    if session_now.tenant_id != session.tenant_id {
+        return Err(ApiError::session_expired());
+    }
     let mut connection = state.db.lock().map_err(|_| db_error("数据库锁不可用"))?;
     // 在同一写事务内核对归属和引用，避免检查后有服务绑定，导致删除时引用被置空。
     let tx = connection
@@ -1412,13 +1426,10 @@ fn prepare_tunnel(
                 "请先完成域名归属验证",
             ));
         }
-        if input.protocol == "https"
-            && settings.certificate_mode == "cloudflare_dns"
-            && !settings.credential_configured
-        {
+        if input.protocol == "https" && !settings.credential_configured {
             return Err(ApiError::new(
                 StatusCode::BAD_REQUEST,
-                "请先配置 Cloudflare 凭据，或选择 HTTP 验证",
+                "请先验证并保存域名的 DNS 凭据",
             ));
         }
         if input.protocol == "https" && !https {
@@ -1704,7 +1715,7 @@ mod tests {
     async fn metadata_and_unchanged_updates_keep_the_applied_revision() {
         for mode in ["tunnel", "reverse_proxy"] {
             let (state, headers) = domain_fixture();
-            state.db.lock().unwrap().execute_batch("INSERT INTO public_domains(id,tenant_id,domain,https_enabled,created_at,updated_at) VALUES('domain','default','example.com',0,0,0); INSERT INTO domain_settings(domain_id,verification_token,certificate_mode,verified) VALUES('domain','proof','http01',1); INSERT INTO devices(id,tenant_id,name,created_at,updated_at) VALUES('agent','default','Agent',0,0);").unwrap();
+            state.db.lock().unwrap().execute_batch("INSERT INTO public_domains(id,tenant_id,domain,https_enabled,created_at,updated_at) VALUES('domain','default','example.com',0,0,0); INSERT INTO domain_settings(domain_id,verification_token,certificate_mode,verified) VALUES('domain','proof','cloudflare_dns',1); INSERT INTO devices(id,tenant_id,name,created_at,updated_at) VALUES('agent','default','Agent',0,0);").unwrap();
             let make_input = |name: &str, icon: Option<&str>, port: u16| {
                 serde_json::from_value::<TunnelInput>(serde_json::json!({
                     "service_mode": mode, "device_id": if mode == "tunnel" { Some("agent") } else { None },
@@ -1769,9 +1780,13 @@ mod tests {
     #[tokio::test]
     async fn offline_direct_agent_does_not_block_icon_update() {
         let (state, headers) = domain_fixture();
-        state.db.lock().unwrap().execute_batch("INSERT INTO public_domains(id,tenant_id,domain,https_enabled,created_at,updated_at) VALUES('domain','default','example.com',0,0,0); INSERT INTO domain_settings(domain_id,verification_token,certificate_mode,verified) VALUES('domain','proof','http01',1); INSERT INTO devices(id,tenant_id,name,created_at,updated_at) VALUES('agent','default','Agent',0,0);").unwrap();
+        let domain = add_test_domain(&state, &headers, "example.com")
+            .await
+            .unwrap();
+        state.db.lock().unwrap().execute("UPDATE domain_settings SET verified=1,credential_file='credential-00000000-0000-4000-8000-000000000002.token' WHERE domain_id=?1", [&domain.id]).unwrap();
+        state.db.lock().unwrap().execute("INSERT INTO devices(id,tenant_id,name,created_at,updated_at) VALUES('agent','default','Agent',0,0)", []).unwrap();
         let input = |icon: Option<&str>, protocol: &str| {
-            serde_json::from_value::<TunnelInput>(serde_json::json!({"service_mode":"tunnel","device_id":"agent","name":"媒体","icon_id":icon,"protocol":protocol,"origin_protocol":"http","local_address":"127.0.0.1","local_port":8096,"hostname":"media","public_domain_id":"domain"})).unwrap()
+            serde_json::from_value::<TunnelInput>(serde_json::json!({"service_mode":"tunnel","device_id":"agent","name":"媒体","icon_id":icon,"protocol":protocol,"origin_protocol":"http","local_address":"127.0.0.1","local_port":8096,"hostname":"media","public_domain_id":domain.id})).unwrap()
         };
         let Json(created) = create_tunnel(
             State(state.clone()),
@@ -1794,8 +1809,8 @@ mod tests {
             .lock()
             .unwrap()
             .execute(
-                "UPDATE public_domains SET https_enabled=1 WHERE id='domain'",
-                [],
+                "UPDATE public_domains SET https_enabled=1 WHERE id=?1",
+                [&domain.id],
             )
             .unwrap();
         let mut changed = input(Some("border-radius/emby-1.png"), "https");
@@ -1810,7 +1825,7 @@ mod tests {
     #[tokio::test]
     async fn repeated_enable_and_batch_disable_do_not_reapply_services() {
         let (state, headers) = domain_fixture();
-        state.db.lock().unwrap().execute_batch("INSERT INTO public_domains(id,tenant_id,domain,https_enabled,created_at,updated_at) VALUES('domain','default','example.com',0,0,0); INSERT INTO domain_settings(domain_id,verification_token,certificate_mode,verified) VALUES('domain','proof','http01',1);").unwrap();
+        state.db.lock().unwrap().execute_batch("INSERT INTO public_domains(id,tenant_id,domain,https_enabled,created_at,updated_at) VALUES('domain','default','example.com',0,0,0); INSERT INTO domain_settings(domain_id,verification_token,certificate_mode,verified) VALUES('domain','proof','cloudflare_dns',1);").unwrap();
         let input = || {
             serde_json::from_value::<TunnelInput>(serde_json::json!({"service_mode":"reverse_proxy","name":"媒体","protocol":"http","origin_protocol":"http","local_address":"127.0.0.1","local_port":8096,"hostname":"media","public_domain_id":"domain"})).unwrap()
         };

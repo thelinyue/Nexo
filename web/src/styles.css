@@ -590,12 +590,48 @@ dd>code { display:block; margin-bottom:10px; user-select:text; font-size:.9375re
 .user-account-actions .user-delete { color:var(--danger); }
 .user-target { margin-top:0; font-weight:600; overflow-wrap:anywhere; }
 .invitation-row { padding: 16px; gap: 12px; }
-.domain-settings { display: grid; gap: 24px; }
-.domain-settings form, .domain-settings fieldset { display: grid; gap: 16px; }
+/* 内容从顶部自然排列，避免全屏 Grid 把多余高度分散到每个设置区。 */
+.domain-settings { display:grid; align-content:start; gap:20px; }
+.domain-settings form,.domain-settings fieldset { display:grid; align-content:start; gap:12px; }
 .domain-settings h3 { margin-top: 0; }
 .domain-settings dd { margin: 8px 0 16px; overflow-wrap: anywhere; }
 .domain-settings code { user-select: text; overflow-wrap: anywhere; }
 .domain-settings select { width: 100%; }
+.domain-settings :is(input,select) { border-radius:10px; }
+/* 保留原生选择交互，仅统一箭头外观；图标以控件本身为基准居中。 */
+.domain-provider-select { display:block; position:relative; }
+.domain-provider-select select { display:block; appearance:none; -webkit-appearance:none; padding-inline-end:40px; }
+.domain-provider-select>svg { position:absolute; inset-inline-end:12px; top:50%; transform:translateY(-50%); pointer-events:none; color:var(--secondary); }
+.domain-provider-select select:disabled+svg { opacity:.65; }
+.domain-settings .recovery-help { margin:0; }
+.domain-settings form>button { justify-self:end; }
+.domain-settings-form :is(.primary-button,.secondary-button,.danger-button),.domain-form .modal-actions>button { min-height:44px; border-radius:10px; box-shadow:none; font-size:.875rem; }
+.domain-settings-form .secondary-button { background:var(--surface); }
+.domain-settings-form .domain-settings-remove { width:auto; padding-inline:10px; background:transparent; font-weight:500; }
+.domain-settings-form .domain-settings-remove:active { background:var(--danger-soft); }
+@media (hover:hover) { .domain-settings-form .domain-settings-remove:hover { background:var(--danger-soft); } }
+/* 删除与保存同排，反馈有内容时才占位；桌面成功提示放在两侧操作之间。 */
+.domain-settings-actions { display:grid; grid-auto-flow:row dense; grid-template-columns:auto minmax(0,1fr); align-items:center; }
+.domain-settings-actions>.domain-settings-remove { grid-column:1; justify-self:start; }
+.domain-settings-actions>.primary-button { grid-column:2; }
+.domain-submit-feedback { grid-column:1 / -1; min-width:0; max-height:4.5em; overflow-y:auto; }
+.domain-submit-feedback .notice,.domain-submit-feedback .action-status { margin:0; }
+.domain-dns-heading,.domain-dns-actions { display:flex; align-items:center; justify-content:space-between; gap:12px; }
+.domain-settings .domain-dns-heading h3 { margin:0; }
+.domain-dns-heading button { display:flex; align-items:center; gap:8px; }
+.domain-dns-preview,.domain-dns-result { margin-top:12px; padding:12px; border:1px solid var(--border); border-radius:12px; background:var(--surface); }
+.domain-dns-hosts { margin:0; padding:0; list-style:none; }
+.domain-dns-hosts>li { padding:12px 0; border-bottom:1px solid var(--border); }
+.domain-dns-hosts>li:last-child { border-bottom:0; }
+.domain-dns-host-heading { display:flex; flex-wrap:wrap; align-items:baseline; gap:8px 12px; font-size:.875rem; }
+.domain-dns-host-heading strong { flex:1 1 160px; min-width:0; overflow-wrap:anywhere; }
+.domain-dns-host-heading span { color:var(--secondary); }
+.domain-dns-target,.domain-dns-record { display:flex; flex-wrap:wrap; gap:8px; margin:8px 0; font-size:.875rem; }
+.domain-dns-target { margin:0 0 4px; }
+.domain-dns-result>.helper { margin-top:4px; }
+.domain-dns-record code { min-width:0; overflow-wrap:anywhere; }
+.domain-dns-warning { color:var(--danger); font-size:.875rem; line-height:1.6; }
+.domain-dns-actions { justify-content:flex-end; flex-wrap:wrap; padding-top:12px; border-top:1px solid var(--border); }
 @media (max-width: 600px) {
   .workspace-banner { align-items: flex-start; flex-direction: column; }
   .users-filter { grid-template-columns:minmax(0,1fr) 116px; gap:8px; }
@@ -728,6 +764,11 @@ dd>code { display:block; margin-bottom:10px; user-select:text; font-size:.9375re
   .modal .modal-actions>button { min-width:88px; min-height:44px; border-radius:10px; font-size:.875rem; }
   .modal .management-form .modal-actions { flex-direction:row; }
   .modal .modal-actions>.notice { flex-basis:100%; }
+  .domain-settings-actions { grid-template-columns:auto minmax(0,1fr) auto auto; }
+  .modal .domain-settings-actions>.domain-settings-remove { min-width:0; }
+  .domain-settings-actions>.desktop-modal-cancel { grid-column:3; }
+  .domain-settings-actions>.primary-button { grid-column:4; }
+  .domain-settings-actions>.domain-submit-feedback:not([data-error=true]) { grid-column:2; }
   /* 域名页有独立容器：让空状态填满内容区，避免面板内再嵌套一张空卡片。 */
   .page-slot:has(>.domains-page) { display:flex; flex-direction:column; }
   .domains-page { display:flex; flex-direction:column; flex:1; min-width:0; }
@@ -844,6 +885,10 @@ dd>code { display:block; margin-bottom:10px; user-select:text; font-size:.9375re
   .full-form .modal-actions { padding-bottom:12px; }
   body:has(.full-form[open]) .bottom-nav { display:none; }
   @media (prefers-contrast:more) { .page-header .page-create:is([data-resource="服务"],[data-resource="Agent"]) { border-color:var(--text); } }
+}
+/* 手机短表单随内容展开，长内容在可见视口内滚动，底部操作仍避开软键盘。 */
+@media (max-width:900px) {
+  .modal.full-form:is(.domain-form-modal,.domain-settings-modal) { inset:calc(var(--visual-top,0px) + var(--visible-height,100dvh)) 0 auto; transform:translateY(-100%); margin:0 auto; height:fit-content; max-height:calc(var(--visible-height,100dvh) - max(12px,env(safe-area-inset-top))); border-radius:20px 20px 0 0; padding-top:0; }
 }
 @supports not ((backdrop-filter:blur(1px)) or (-webkit-backdrop-filter:blur(1px))) { .user-menu { background:var(--surface); } }
 @media (prefers-reduced-transparency:reduce), (prefers-contrast:more) { .user-menu { background:var(--surface); -webkit-backdrop-filter:none; backdrop-filter:none; } }

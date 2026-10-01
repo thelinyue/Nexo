@@ -9,6 +9,86 @@ fn candidate() -> Result<Json<Input>, axum::extract::rejection::JsonRejection> {
 }
 
 #[tokio::test]
+async fn waiting_for_dns_write_rechecks_session_and_admin_permission() {
+    for (revoke, status) in [
+        ("DELETE FROM auth_sessions", StatusCode::UNAUTHORIZED),
+        ("UPDATE users SET role='tenant'", StatusCode::FORBIDDEN),
+    ] {
+        let (state, headers) = crate::tests::domain_fixture();
+        let guard = state.tunnel_runtime.direct.dns_lock.lock().await;
+        let pending = update(State(state.clone()), headers, candidate());
+        tokio::pin!(pending);
+        // 先让请求完成鉴权并停在 DNS 锁上，再模拟等待期间的权限撤销。
+        tokio::select! {
+            biased;
+            _ = &mut pending => panic!("DNS 写锁被持有时不能保存服务器设置"),
+            _ = tokio::task::yield_now() => {}
+        }
+        state.db.lock().unwrap().execute_batch(revoke).unwrap();
+        drop(guard);
+        assert_eq!(pending.await.unwrap_err().status, status);
+        assert!(!load(&state.db.lock().unwrap()).unwrap().managed);
+    }
+}
+
+#[tokio::test]
+async fn changing_effective_local_address_invalidates_only_local_probe_samples() {
+    let (state, headers) = crate::tests::domain_fixture();
+    {
+        let db = state.db.lock().unwrap();
+        db.execute_batch("INSERT INTO tunnels(id,tenant_id,name,protocol,local_address,local_port,created_at,updated_at) VALUES('s','default','s','tcp','127.0.0.1',80,0,0);
+            INSERT INTO relay_public_health(node_id,service_id,revision,checked_at) VALUES('local','s',1,0),('remote','s',1,0);").unwrap();
+    }
+    let _ = update(State(state.clone()), headers.clone(), candidate())
+        .await
+        .unwrap();
+    assert_eq!(
+        state
+            .db
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM relay_public_health WHERE node_id='local'",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        state
+            .db
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM relay_public_health WHERE node_id='remote'",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+        1
+    );
+    state.db.lock().unwrap().execute("INSERT INTO relay_public_health(node_id,service_id,revision,checked_at) VALUES('local','s',1,0)",[]).unwrap();
+    let _ = update(State(state.clone()), headers, candidate())
+        .await
+        .unwrap();
+    assert_eq!(
+        state
+            .db
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM relay_public_health WHERE node_id='local'",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+        1,
+        "仅无关设置保存不应重置样本"
+    );
+}
+
+#[tokio::test]
 async fn commit_before_publish_preserves_limits_and_requires_admin_csrf() {
     let (state, headers) = crate::tests::domain_fixture();
     assert!(state
@@ -81,7 +161,7 @@ async fn http_can_configure_management_with_conflict_and_ownership_checks() {
         .lock()
         .unwrap()
         .execute(
-            "UPDATE domain_settings SET verified=1 WHERE domain_id=?1",
+            "UPDATE domain_settings SET verified=1,credential_file='credential-00000000-0000-4000-8000-000000000002.token' WHERE domain_id=?1",
             [&domain.id],
         )
         .unwrap();

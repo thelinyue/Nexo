@@ -76,7 +76,7 @@ test("邀请链接清除地址栏凭据，注册失败保留输入且成功进�
 
 test("域名自助配置保留失败输入，兼容长 Token 并按域名保存 DNS 选项", async ({ page }, info) => {
   const state = await installApiMocks(page); const domain=state.domains[0];
-  Object.assign(domain, { certificate_mode: "http01", verification_status: "pending", credential_configured: false, dns_resolvers: ["223.5.5.5:53", "223.6.6.6:53"], verification_record: { name: "_nexo-verification.example.com", value: "proof-for-this-workspace" } });
+  Object.assign(domain, { certificate_mode: "cloudflare_dns", verification_status: "pending", credential_configured: false, dns_resolvers: ["223.5.5.5:53", "223.6.6.6:53"], verification_record: { name: "_nexo-verification.example.com", value: "proof-for-this-workspace" } });
   let fail=true; const writes: any[]=[];
   await page.route("**/api/v1/public-domains/d-1**", async route => {
     const body=route.request().postDataJSON(); writes.push(body);
@@ -88,8 +88,8 @@ test("域名自助配置保留失败输入，兼容长 Token 并按域名保存 
   });
   await page.goto("/#/domains");await page.getByRole("button",{name:/^配置 /}).click();
   const dialog=page.getByRole("dialog",{name:"配置 example.com"});
-  await expect(dialog.getByText("proof-for-this-workspace",{exact:true})).toBeVisible();
-  await dialog.getByLabel("证书方式").selectOption("cloudflare_dns");
+  await expect(dialog.getByText("proof-for-this-workspace",{exact:true})).toHaveCount(0);
+  await expect(dialog.getByLabel("证书方式")).toHaveCount(0);
   const token="cfat_"+"a".repeat(220);await dialog.getByLabel("API Token").fill(token);
   await dialog.getByRole("button",{name:"验证并启用"}).click();
   await expect(dialog.getByRole("alert")).toContainText("检查 Token 权限");

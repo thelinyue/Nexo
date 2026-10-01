@@ -1,15 +1,16 @@
 use super::*;
 use crate::{create_tunnel, update_tunnel};
 use axum::extract::Path;
+const DOMAIN: &str = "00000000-0000-4000-8000-000000000001";
 
 fn fixture() -> (AppState, HeaderMap) {
     let (state, headers) = crate::tests::domain_fixture();
-    state.db.lock().unwrap().execute("INSERT INTO public_domains(id,tenant_id,domain,https_enabled,created_at,updated_at) VALUES('domain','default','example.com',1,0,0)", []).unwrap();
-    state.db.lock().unwrap().execute("INSERT INTO domain_settings(domain_id,verification_token,certificate_mode,verified) VALUES('domain','test-proof','http01',1)", []).unwrap();
+    state.db.lock().unwrap().execute("INSERT INTO public_domains(id,tenant_id,domain,https_enabled,created_at,updated_at) VALUES(?1,'default','example.com',1,0,0)", [DOMAIN]).unwrap();
+    state.db.lock().unwrap().execute("INSERT INTO domain_settings(domain_id,verification_token,certificate_mode,verified,credential_file) VALUES(?1,'test-proof','cloudflare_dns',1,'credential-00000000-0000-4000-8000-000000000002.token')", [DOMAIN]).unwrap();
     (state, headers)
 }
 fn input(mode: Option<&str>, password: Option<&str>) -> TunnelInput {
-    serde_json::from_value(json!({"service_mode":"reverse_proxy","name":"家庭应用","protocol":"http","local_address":"127.0.0.1","local_port":3000,"hostname":"app","public_domain_id":"domain","access_mode":mode,"access_password":password})).unwrap()
+    serde_json::from_value(json!({"service_mode":"reverse_proxy","name":"家庭应用","protocol":"http","local_address":"127.0.0.1","local_port":3000,"hostname":"app","public_domain_id":DOMAIN,"access_mode":mode,"access_password":password})).unwrap()
 }
 fn request_headers(id: &str) -> HeaderMap {
     let mut headers = HeaderMap::new();

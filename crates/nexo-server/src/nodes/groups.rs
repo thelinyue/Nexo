@@ -62,7 +62,10 @@ pub async fn update(
     Path(id): Path<String>,
     Json(input): Json<Input>,
 ) -> Result<Json<Value>, ApiError> {
-    save(&state, &headers, &id, input, false)?;
+    {
+        let _dns_guard = state.tunnel_runtime.direct.dns_lock.lock().await;
+        save(&state, &headers, &id, input, false)?;
+    }
     reverse_proxy::changed(&state, true).await?;
     list(State(state), headers).await
 }

@@ -1,5 +1,5 @@
 import type { Page } from "@playwright/test";
-import type { Tunnel, Device, Domain, DomainEvent, Enrollment, TransportIdentity } from "../src/ui";
+import type { Tunnel, Device, Domain, DomainEvent, Enrollment, TransportIdentity, DnsRecord, DomainDnsPreview } from "../src/ui";
 
 /** 使用真实接口形状覆盖交互；失败注入用于验证界面不会把请求失败当作成功。 */
 export async function installApiMocks(page: Page, options: { empty?: boolean; anonymous?: boolean } = {}) {
@@ -12,7 +12,8 @@ export async function installApiMocks(page: Page, options: { empty?: boolean; an
     tunnels: (options.empty ? [] : [{ id: "t-1", name: "媒体中心", protocol: "https", local_address: "127.0.0.1", local_port: 8096, public_port: null, public_address: "https://media.example.com/a-very-long-public-address", hostname: "media", public_domain: "example.com", device_id: "a-1", device_name: "家庭 Agent", enabled: true, apply_status: "ready", apply_error: null, lan_redirect_enabled: false }] as any[]) as Tunnel[],
     devices: [{ id: "a-1", name: "家庭 Agent", status: "online", os: "Linux", architecture: "amd64", last_seen_at: 1790000000, agent_version: "0.2.0", tunnel_count: 1 }, { id: "a-2", name: "备用 Agent", status: "offline", os: "Linux", agent_version: "0.2.0", tunnel_count: 0 }] as Device[],
     transportIdentity: { server: { status: "valid", expires_at: Math.floor(Date.now()/1000) + 825*86400, renew_after: Math.floor(Date.now()/1000) + 795*86400, error: null, next_retry_at: null }, ca_expires_at: Math.floor(Date.now()/1000) + 3650*86400, ca_needs_attention: false } as TransportIdentity,
-    domains: [{ id: "d-1", domain: "example.com", is_primary: true, https_enabled: true, apply_status: "applied", runtime: { config_status: "applied", config_error: null, service_warning: null, checked_at: Math.floor(Date.now() / 1000), certificates: [{ hostname: "example.com", status: "issued", not_before: Math.floor(Date.now() / 1000) - 3600, expires_at: Math.floor(Date.now() / 1000) + 90 * 86400, error: null, next_retry_at: null }] } }] as Domain[],
+    domains: [{ id: "d-1", domain: "example.com", is_primary: true, https_enabled: true, certificate_mode: "cloudflare_dns", dns_provider: "cloudflare", credential_configured: true, verification_status: "verified", apply_status: "applied", runtime: { config_status: "applied", config_error: null, service_warning: null, checked_at: Math.floor(Date.now() / 1000), certificates: [{ hostname: "example.com", status: "issued", not_before: Math.floor(Date.now() / 1000) - 3600, expires_at: Math.floor(Date.now() / 1000) + 90 * 86400, error: null, next_retry_at: null }] } }] as Domain[],
+    dnsRecords: new Map<string, DnsRecord[]>(),
     domainEvents: [{ id: 1, domain_id: "d-1", summary: "配置已加载", occurred_at: Math.floor(Date.now() / 1000) }] as DomainEvent[],
     enrollments: [{ id: "e-1", kind: "recovery", device_id: "a-1", status: "awaiting_approval", expires_at: 1791000000 }] as Enrollment[],
     failureStatuses: new Map<string, number>(),
@@ -82,7 +83,30 @@ export async function installApiMocks(page: Page, options: { empty?: boolean; an
     if (path.startsWith("/api/v1/enrollments/") && method === "DELETE") { state.enrollments = state.enrollments.filter(item => item.id !== path.split("/").pop()); return respond({ revoked: true }); }
     if (path.endsWith("/approve")) { const invite = state.enrollments.find(item => item.id === path.split("/").at(-2)); if (invite) Object.assign(invite, { status: "approved", device_id: invite.device_id ?? "a-1" }); return respond(invite ?? {}); }
     if (path === "/api/v1/public-domains" && method === "GET") return respond(state.domains);
-    if (path === "/api/v1/public-domains" && method === "POST") { const item = { ...body, id: "d-2", is_primary: false, certificate_mode: "http01", verification_status: "pending", credential_configured: false, dns_resolvers: [], verification_record: { name: `_nexo-verification.${body.domain}`, value: "new-domain-proof" }, apply_status: "pending", runtime: { config_status: "pending", config_error: null, service_warning: null, checked_at: null, certificates: [] } }; state.domains.push(item); return respond(item, 201); }
+    if (path === "/api/v1/public-domains" && method === "POST") { const item = { ...body, id: "d-2", is_primary: false, certificate_mode: "cloudflare_dns", dns_provider: "cloudflare", verification_status: "pending", credential_configured: false, dns_resolvers: [], verification_record: { name: `_nexo-verification.${body.domain}`, value: "new-domain-proof" }, apply_status: "pending", runtime: { config_status: "pending", config_error: null, service_warning: null, checked_at: null, certificates: [] } }; state.domains.push(item); return respond(item, 201); }
+    const domainAction = path.match(/^\/api\/v1\/(?:admin\/workspaces\/[^/]+\/)?public-domains\/([^/]+)(?:\/(cloudflare-credential|dns-credential|dns-records))?$/);
+    if (domainAction && ["PUT", "PATCH", "GET", "POST"].includes(method)) {
+      const domain = state.domains.find(item => item.id === domainAction[1]);
+      if (!domain) return respond({ error: "域名不存在" }, 404);
+      if (method === "PUT") { Object.assign(domain, { dns_provider: body.provider ?? "cloudflare", credential_configured: true, verification_status: "verified", verification_record: null }); return respond(domain); }
+      if (method === "PATCH") { Object.assign(domain, body); return respond(domain); }
+      if (domainAction[2] === "dns-records") {
+        if (!domain.credential_configured) return respond({ error: "请先验证并保存域名的 DNS 凭据" }, 400);
+        if (method === "GET") {
+          const preview: DomainDnsPreview = { ipv4: "8.8.8.8", provider: domain.dns_provider ?? "cloudflare", credential_revision: "credential-test.token", hosts: [domain.domain, `*.${domain.domain}`].map(hostname => {
+            const existing = state.dnsRecords.get(hostname) ?? [];
+            const access = existing.filter(record => ["A", "CNAME"].includes(record.kind));
+            return { hostname, existing, blocked: null, action: !access.length ? "create" : access.length === 1 && access[0].kind === "A" && access[0].value === "8.8.8.8" && !access[0].proxied ? "reuse" : "takeover" };
+          }) };
+          return respond(preview);
+        }
+        const preview = body.preview as DomainDnsPreview;
+        return respond({ hosts: preview.hosts.map(host => {
+          state.dnsRecords.set(host.hostname, [...host.existing.filter(record => !["A", "CNAME"].includes(record.kind)), { id: `a-${host.hostname}`, name: host.hostname, kind: "A", value: preview.ipv4, ttl: 600, proxied: false }]);
+          return { hostname: host.hostname, status: host.action === "reuse" ? "unchanged" : "written", error: null };
+        }) });
+      }
+    }
     if (path === "/api/v1/public-domain-runtime-events") return respond({ events: state.domainEvents.filter(event => !new URL(req.url()).searchParams.has("domain_id") || event.domain_id === new URL(req.url()).searchParams.get("domain_id")), next_cursor: null });
     if (path.startsWith("/api/v1/public-domains/") && method === "DELETE") { state.domains = state.domains.filter(item => item.id !== path.split("/").pop()); return respond({}); }
     if (path === "/api/v1/tunnels" && method === "GET") return respond(state.tunnels);

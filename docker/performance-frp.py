@@ -11,7 +11,6 @@ import random
 import shutil
 import signal
 import socket
-import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -93,8 +92,7 @@ class Harness(smoke.Harness):
                 "local_port": local_port, "public_port": self.ports["public"], "enabled": True}
         if topology == "domain":
             domain = self.api("public-domains", "POST", {"domain": "nexo-smoke.localhost", "https_enabled": True})
-            with sqlite3.connect(self.root / "server/nexo.db") as db:
-                db.execute("UPDATE domain_settings SET verified=1,certificate_mode='http01' WHERE domain_id=?", (domain["id"],))
+            self.configure_local_domain(domain)
             body.update(protocol="https", public_port=None, hostname="secure", public_domain_id=domain["id"])
         tunnel = self.api("tunnels", "POST", body)
         smoke.wait_for(lambda: self.ready(tunnel["id"]), "隧道就绪")
@@ -263,12 +261,12 @@ def certificates(args):
             config = {"admin": {"listen": f"127.0.0.1:{seed.ports['admin']}"},
                       "storage": {"module": "file_system", "root": str(storage)},
                       "apps": {"pki": {"certificate_authorities": {"local": {"install_trust": False}}},
-                               "tls": {"certificates": {"automate": ["nexo-smoke.localhost", HOST]},
+                               "tls": {"certificates": {"automate": ["nexo-smoke.localhost", "*.nexo-smoke.localhost", HOST]},
                                        "automation": {"policies": [{"issuers": [{"module": "internal", "lifetime": "72h"}]}]}}}}
             write_json(seed.root / "issue.json", config)
             with (seed.root / "issue.log").open("wb") as log:
                 issuer = subprocess.Popen([args.caddy_bin, "run", "--config", str(seed.root / "issue.json")], stdout=log, stderr=log)
-                try: smoke.wait_for(lambda: len(list((storage / "certificates/local").glob("*/*.crt"))) == 2, "签发测试证书")
+                try: smoke.wait_for(lambda: len(list((storage / "certificates/local").glob("*/*.crt"))) == 3, "签发测试证书")
                 finally: issuer.terminate(); issuer.wait(timeout=10)
             shutil.copytree(storage / "certificates/local", storage / "certificates/acme-v02.api.letsencrypt.org-directory")
             shutil.copytree(seed.root / "server", args.seed / "server")

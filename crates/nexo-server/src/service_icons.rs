@@ -59,7 +59,7 @@ mod tests {
 
     fn fixture() -> (AppState, HeaderMap) {
         let (state, headers) = crate::tests::domain_fixture();
-        state.db.lock().unwrap().execute_batch("INSERT INTO public_domains(id,tenant_id,domain,https_enabled,created_at,updated_at) VALUES('domain','default','example.com',0,0,0); INSERT INTO domain_settings(domain_id,verification_token,certificate_mode,verified) VALUES('domain','proof','http01',1);").unwrap();
+        state.db.lock().unwrap().execute_batch("INSERT INTO public_domains(id,tenant_id,domain,https_enabled,created_at,updated_at) VALUES('domain','default','example.com',0,0,0); INSERT INTO domain_settings(domain_id,verification_token,certificate_mode,verified) VALUES('domain','proof','cloudflare_dns',1);").unwrap();
         (state, headers)
     }
 

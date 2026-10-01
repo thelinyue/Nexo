@@ -39,7 +39,7 @@ Server 部署在公网可达的 Linux 主机上，提供管理页面和公网入
 | --- | --- | --- |
 | TCP `8280` | Web 管理与入网 API | 限制为可信来源；公网使用时配置 HTTPS 反向代理 |
 | TCP `9890` / `9891` | Agent 控制 / Tunnel 数据 | 允许 Agent 访问；必须直连或 TCP 透传，不可中间终止 TLS |
-| TCP `80` / `443` | Web 服务与 HTTPS 证书验证 | 使用 Web Tunnel 时开放；HTTP-01 验证依赖标准端口 |
+| TCP `80` / `443` | HTTP 服务、跳转与 HTTPS 访问 | 使用相应 Web 服务时开放；证书通过 DNS 验证 |
 | TCP/UDP `20000–29999` | TCP/UDP 服务公网端口池 | 开放实际分配端口；需要任意自动分配端口均可访问时再放行整个范围 |
 | UDP `9891` | Agent QUIC 数据通道 | 使用 UDP 或 TCP+UDP 时开放，直连 Server；普通 HTTP 代理不支持 |
 | UDP `443` | HTTP/3 | 可选；普通 HTTPS 不要求此项 |
@@ -72,7 +72,7 @@ services:
     # host 网络直接使用宿主机端口，不提供以下 ports 映射；部分 Compose 版本可能拒绝两者同时配置。
     # 按需保留此端口清单；实际监听与对外开放由 Server 和宿主机防火墙决定。
     ports:
-      - "80:80/tcp"                    # Web Tunnel 与 HTTP-01 证书验证
+      - "80:80/tcp"                    # HTTP Web Tunnel 与 HTTPS 跳转
       - "443:443/tcp"                  # HTTPS Web Tunnel
       - "443:443/udp"                  # 可选：HTTP/3
       - "8280:8280/tcp"                # Web 管理与入网 API；桥接发布时应限制可信来源
@@ -169,12 +169,14 @@ Agent 身份保存在 `data/nexo-agent`。接入成功后可清空 `NEXO_ENROLLM
 
 ### HTTPS：使用自己的域名
 
-1. 在“域名与证书”添加 `example.com`，按提示添加 TXT 记录完成归属验证，或提交该域名的 Cloudflare Token 验证。
-2. 在 DNS 服务商添加 `app.example.com` 的 A 记录，指向 Server 的公网 IPv4；没有可达 IPv6 时不要添加 AAAA。
+1. 在“域名与证书”添加 `example.com`，选择 Cloudflare、阿里云 DNS 或腾讯云 DNSPod，验证并保存域名专属凭据。
+2. 管理员在“服务器设置”填写公网 IPv4；在域名配置点击“配置解析”，预览并确认，为 `example.com` 和 `*.example.com` 一次性配置直接 A 记录。没有可达 IPv6 时不要添加 AAAA。
 3. 新建 HTTPS 服务，选择 Agent，绑定该域名，服务子域名填 `app`，本地目标填实际应用地址和端口。
-4. 默认 HTTP-01 需要公网 TCP `80/443` 可达。等待配置加载、解析与证书状态正常，再从外部网络打开 `https://app.example.com`。
+4. 证书只通过 DNS-01 验证；开放 HTTPS 服务的公网入口，等待配置加载、解析传播与证书状态正常，再从外部网络打开 `https://app.example.com`。
 
-公网 HTTPS 由 Caddy 终止，本地目标默认使用 HTTP，无需给内网应用安装公网证书。Cloudflare DNS-01 支持泛域名签发，但**不会自动创建访问所需的 A/AAAA 记录**。请自行配置根域名和泛域名解析，Nexo 不检查访问解析结果。
+公网 HTTPS 由 Caddy 终止，本地目标默认使用 HTTP，无需给内网应用安装公网证书。保存凭据只验证和保存；访问解析仅在“配置解析”预览确认后写入，不做后台同步。公网 IPv4 改变后再次点击更新，删除域名保留已写入的记录。“写入成功”表示服务商记录已更新，DNS 传播和公网访问仍需实际验证。
+
+旧 HTTP-01 配置升级后转为 DNS 模式，保留域名归属、已有凭据和高级参数。缺少凭据的域名显示待配置，补齐前无法恢复证书申请和续期，HTTPS 入口可能受影响。HTTP 穿透与 HTTP 跳转继续保留。
 
 ## 配置与备份
 

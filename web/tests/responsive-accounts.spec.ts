@@ -36,7 +36,11 @@ test("用户在全部断点始终单行，更多菜单信息完整且操作可�
           const box = await summary.boundingBox();
           expect(box!.x).toBeGreaterThanOrEqual(heading!.x + heading!.width);
           expect(box!.x + box!.width).toBeLessThanOrEqual(actions!.x);
-          expect(Math.abs(box!.y + box!.height / 2 - actions!.y - actions!.height / 2)).toBeLessThan(1);
+          await expect.poll(() => card.evaluate(el => {
+            const summary = el.querySelector(".user-resource-summary")!.getBoundingClientRect();
+            const actions = el.querySelector(".user-card-actions")!.getBoundingClientRect();
+            return Math.abs(summary.y + summary.height / 2 - actions.y - actions.height / 2);
+          })).toBeLessThan(1);
           await expect(card.locator(".user-resource-mobile")).toBeHidden();
         } else {
           await expect(summary).toBeHidden();
