@@ -1958,14 +1958,26 @@ mod tests {
             .resolve("b.team.caddy-integration.localhost", https_address)
             .build()
             .unwrap();
-        let response = client
-            .get(format!(
-                "https://caddy-integration.localhost:{}/",
-                https_address.port()
-            ))
-            .send()
-            .await
-            .unwrap();
+        // 文件证书状态先于 Caddy 的缓存切换，使用真实握手确认测试入口已就绪。
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+        let response = loop {
+            let response = client
+                .get(format!(
+                    "https://caddy-integration.localhost:{}/",
+                    https_address.port()
+                ))
+                .send()
+                .await;
+            if let Ok(response) = response {
+                break response;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "泛域证书测试入口未就绪：{:?}",
+                supervisor.drain_log_events().await
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        };
         assert_eq!(response.status(), reqwest::StatusCode::NOT_FOUND);
         let mut peer_certificates = Vec::new();
         let before_certificates = read_certificates(&cfg.storage_root).len();

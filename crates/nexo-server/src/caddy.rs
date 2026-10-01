@@ -707,10 +707,10 @@ fn remove_legacy_http_issuance(config: &mut Value) {
                     return true;
                 }
                 if issuer["module"] != "acme"
-                    || !issuer
+                    || issuer
                         .pointer("/challenges/dns/provider/name")
                         .and_then(Value::as_str)
-                        .is_some_and(|name| !name.is_empty())
+                        .is_none_or(|name| name.is_empty())
                 {
                     return false;
                 }
