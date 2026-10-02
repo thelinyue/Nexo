@@ -113,7 +113,7 @@ test("选择图标后取消需要放弃草稿，创建可选择图标", async ({
   expect(state.calls.find(call => call.method === "POST" && call.path === "/api/v1/tunnels")?.body.icon_id).toBe("border-radius/emby-1.png");
 });
 
-test("IPv6 直连 Agent 离线时仍能只更换图标", async ({ page }) => {
+test("IPv6 直连设备离线时仍能只更换图标", async ({ page }) => {
   const state = await installApiMocks(page);
   state.tunnels[0].ipv6_direct_enabled = true;
   await page.route("https://cdn.jsdelivr.net/**", route => route.abort());

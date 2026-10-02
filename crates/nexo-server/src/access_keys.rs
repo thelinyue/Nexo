@@ -25,7 +25,7 @@ fn cipher(state: &AppState, db: &Connection) -> Result<ChaCha20Poly1305> {
                 db.query_row("SELECT COUNT(*) FROM agent_access_keys", [], |r| r.get(0))?;
             anyhow::ensure!(
                 count == 0,
-                "接入密钥加密文件缺失，请从 Server 数据备份恢复 secrets/agent-access.key"
+                "接入密钥加密文件缺失，请从服务端数据备份恢复 secrets/agent-access.key"
             );
             let mut key = [0u8; 32];
             OsRng.fill_bytes(&mut key);
@@ -35,7 +35,7 @@ fn cipher(state: &AppState, db: &Connection) -> Result<ChaCha20Poly1305> {
         Err(error) => return Err(error).context("无法读取接入密钥加密文件"),
     };
     ChaCha20Poly1305::new_from_slice(&bytes)
-        .map_err(|_| anyhow::anyhow!("接入密钥加密文件损坏，请恢复 Server 数据备份"))
+        .map_err(|_| anyhow::anyhow!("接入密钥加密文件损坏，请恢复服务端数据备份"))
 }
 
 fn read_key(
@@ -61,7 +61,7 @@ fn read_key(
                 aad: tenant.as_bytes(),
             },
         )
-        .map_err(|_| db_error("无法解密接入密钥，请核对 Server 数据与加密文件备份"))?;
+        .map_err(|_| db_error("无法解密接入密钥，请核对服务端数据与加密文件备份"))?;
     let token = String::from_utf8(plain).map_err(|_| db_error("接入密钥密文损坏"))?;
     Ok(Some(AccessKey {
         token,
@@ -193,7 +193,7 @@ pub(crate) async fn register(
         .map_err(db_error)?;
     let fingerprint = identity_runtime::fingerprint(&certificate_pem).map_err(db_error)?;
     let name = if input.device_name.trim().is_empty() {
-        "Nexo Agent"
+        "Nexo 设备"
     } else {
         input.device_name.trim()
     };

@@ -17,7 +17,7 @@ test("Compose 是原生配置，docker run 是单条启动命令，均直接携�
   expect(compose).toMatch(/^name: nexo-agent\n/);
   expect(compose).toContain('NEXO_SERVER_URL: "https://nexo.example.com"');
   expect(compose).toContain('NEXO_ENROLLMENT_TOKEN: "nexo_join_secret"');
-  expect(compose).toContain('NEXO_DEVICE_NAME: "Nexo Agent"');
+  expect(compose).toContain('NEXO_DEVICE_NAME: "Nexo 设备"');
   expect(compose).not.toMatch(/docker compose|cat >|<<|set -eu/);
   const command = agentDeploymentContent(template, "https://nexo.example.com", "nexo_join_secret", "docker");
   expect(command).toMatch(/^docker run -d /);

@@ -4,7 +4,7 @@ import { ArrowDownLeft, ArrowUpRight, ChevronDown, ChevronRight, RotateCcw } fro
 import type { ManagedWorkspace } from "./accounts";
 import { WorkspaceContext, WorkspaceLabelContext, Confirm, Notice, Loading, PageHeader, dateText, request, useApi, useResource } from "./ui";
 import type { Auth, Device, Domain, Tunnel } from "./ui";
-import { useResourceDeletions } from "./navigation";
+import { PageNavigationContext, useResourceDeletions } from "./navigation";
 import { bytes, QuotaSummary } from "./traffic-quota";
 import "./home.css";
 
@@ -257,6 +257,8 @@ function AttentionPanel({ items, complete, spaceLabel }: { items: Attention[]; c
 }
 
 export function HomePage({ active, auth, managed }: { active: boolean; auth: Auth; managed: ManagedWorkspace | null }) {
+  const navigation = useContext(PageNavigationContext);
+  const topHeader = Boolean(navigation && (navigation.standalone || !navigation.desktop));
   const visible = useVisible(active);
   const api = useApi();
   const workspace = useContext(WorkspaceContext);
@@ -272,15 +274,15 @@ export function HomePage({ active, auth, managed }: { active: boolean; auth: Aut
   const complete = Boolean(tunnels.data && devices.data && domains.data && !tunnels.error && !devices.error && !domains.error);
   const spaceLabel = managed?.name ?? `${auth.username}的工作空间`;
   return <div className="home-page">
-    <PageHeader title="首页" />
-    <p className="home-workspace">当前空间：{spaceLabel}</p>
+    <PageHeader title="首页" topContent={<span className="home-workspace" title={spaceLabel}>{spaceLabel}</span>} />
+    {!topHeader && <p className="home-workspace">当前空间：{spaceLabel}</p>}
     <div className="home-summaries">
       <a className="panel" href="#/services"><span>服务</span><strong>{tunnels.data?.length ?? "—"}</strong><small>{tunnels.data ? `穿透运行 ${tunnels.data.filter(item => item.service_mode !== "reverse_proxy" && item.enabled && item.apply_status === "ready").length} · 反代生效 ${tunnels.data.filter(item => item.service_mode === "reverse_proxy" && item.enabled && item.apply_status === "ready").length}` : "正在加载"}</small></a>
       <a className="panel" href="#/agents"><span>设备</span><strong>{devices.data ? `${devices.data.filter(item => item.status === "online").length} / ${devices.data.length}` : "—"}</strong><small>在线 / 总数</small></a>
       <a className="panel" href="#/domains"><span>域名</span><strong>{domains.data?.length ?? "—"}</strong><small>{domains.data ? `${items.filter(item => item.id.startsWith("d-")).length} 个需关注` : "总数"}</small></a>
     </div>
     <Notice error={tunnels.error} updatedAt={tunnels.updatedAt} onRetry={() => void tunnels.reload()} /><Notice error={devices.error} updatedAt={devices.updatedAt} onRetry={() => void devices.reload()} /><Notice error={domains.error} updatedAt={domains.updatedAt} onRetry={() => void domains.reload()} />
-    {complete && !devices.data!.length && !tunnels.data!.length && auth.role !== "system_admin" ? <div className="panel home-onboarding"><div><strong>接入第一台设备</strong><p>安装 Agent，将内网服务连接到 Nexo。</p></div><a className="primary-button" href="#/agents">接入设备</a></div> : complete && !tunnels.data!.length ? <div className="panel home-onboarding"><div><strong>创建第一个服务</strong><p>内网穿透需要 Agent；管理员也可直接反代 VPS 服务。网页访问需先配置域名。</p></div><a className="primary-button" href="#/services">创建服务</a></div> : null}
+    {complete && !devices.data!.length && !tunnels.data!.length && auth.role !== "system_admin" ? <div className="panel home-onboarding"><div><strong>接入第一台设备</strong><p>安装客户端，将内网服务连接到 Nexo。</p></div><a className="primary-button" href="#/agents">接入设备</a></div> : complete && !tunnels.data!.length ? <div className="panel home-onboarding"><div><strong>创建第一个服务</strong><p>内网穿透需要设备；管理员也可直接反代 VPS 服务。网页访问需先配置域名。</p></div><a className="primary-button" href="#/services">创建服务</a></div> : null}
     <div className="home-overview">
       <AttentionPanel items={items} complete={complete} spaceLabel={spaceLabel} />
       <TrafficPanel key={workspace ?? "own"} active={visible} auth={auth} managed={managed} ownTunnels={tunnels} />

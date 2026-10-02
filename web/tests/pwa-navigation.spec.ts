@@ -33,7 +33,7 @@ test.describe("PWA 手机导航", () => {
   });
 
   for (const role of ["system_admin", "tenant"] as const) {
-    test(`${role} 的添加入口统一在标题右侧，关闭后保持滚动和焦点`, async ({ page }, info) => {
+    test(`${role} 的添加入口位于底栏旁，关闭后保持滚动和焦点`, async ({ page }, info) => {
       const state = await installApiMocks(page);
       state.authRole = role;
       state.devices = Array.from({ length: 30 }, (_, index) => ({ ...state.devices[0], id: `a-${index}`, name: `设备 ${index}` }));
@@ -44,19 +44,21 @@ test.describe("PWA 手机导航", () => {
         for (const route of ["services", "agents"] as const) {
           await page.goto(`/#/${route}`);
           await expect(current(page).locator(route === "services" ? ".service-row" : ".agent-row")).toHaveCount(route === "services" ? 40 : 30);
-          const header = current(page).locator(".page-header");
-          const add = header.getByRole("button", { name: route === "agents" ? "添加 Agent" : role === "system_admin" ? "添加" : "创建服务", exact: true });
+          const header = page.locator(".workspace-topbar .page-header");
+          const add = page.locator(".mobile-create-slot").getByRole("button", { name: route === "agents" ? "添加设备" : role === "system_admin" ? "添加" : "创建服务", exact: true });
           for (const position of [0, 240]) {
             await page.evaluate(value => scrollTo(0, value), position);
             await expect(add).toBeInViewport({ ratio: 1 });
             const button = (await add.boundingBox())!;
-            const toolbar = (await header.boundingBox())!;
-            await expect(header.locator("h1")).toHaveCSS("clip-path", "inset(50%)");
-            expect(button.width).toBe(44);
-            expect(button.height).toBe(44);
-            expect(button.x + button.width).toBeLessThanOrEqual(toolbar.x + toolbar.width);
-            expect(button.y + button.height / 2).toBeCloseTo(toolbar.y + toolbar.height / 2, 0);
-            await expect(add).toHaveCSS("box-shadow", "none");
+            const nav = (await page.locator(".bottom-nav").boundingBox())!;
+            if (route === "services") await expect(header.locator("h1")).toHaveCSS("clip-path", "inset(50%)");
+            else await expect(header.locator("h1")).toBeVisible();
+            await expect(header).toHaveCSS("min-height", "44px");
+            expect(button.width).toBe(52);
+            expect(button.height).toBe(52);
+            expect(button.x - nav.x - nav.width).toBeCloseTo(8, 0);
+            expect(button.y + button.height / 2).toBeCloseTo(nav.y + nav.height / 2, 0);
+            for (const item of await page.locator(".bottom-nav>a,.bottom-nav>button").all()) expect((await item.boundingBox())!.width).toBeGreaterThanOrEqual(44);
             await expect(add).toHaveCSS("backdrop-filter", "none");
             await expect(header).toHaveCSS("backdrop-filter", "none");
             expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBeTruthy();
@@ -64,7 +66,7 @@ test.describe("PWA 手机导航", () => {
             expect(before.y).toBe(position);
             if (position === 0 && role === "system_admin") await page.screenshot({ path: info.outputPath(`pwa-add-${route}-${colorScheme}.png`) });
             await add.tap();
-            const dialog = page.getByRole("dialog", { name: route === "agents" ? "添加 Agent" : role === "system_admin" ? "添加" : "创建服务", exact: true });
+            const dialog = page.getByRole("dialog", { name: route === "agents" ? "添加设备" : role === "system_admin" ? "添加" : "创建服务", exact: true });
             await expect(dialog).toBeVisible();
             await dialog.getByRole("button", { name: /^(取消|关闭)$/ }).click();
             await expect(dialog).toBeHidden();
@@ -84,32 +86,31 @@ test.describe("PWA 手机导航", () => {
     });
   }
 
-  test("短页面和更多菜单不移动底栏，用户管理只从账号设置进入", async ({ page }, info) => {
+  test("短页面和更多菜单不移动底栏，管理员页面使用独立入口", async ({ page }, info) => {
     await installApiMocks(page);
     await page.goto("/#/agents");
     await expect(current(page).locator(".agent-row")).toHaveCount(2);
     const trigger = page.getByRole("button", { name: "更多功能", exact: true });
     const menu = page.locator(".mobile-more");
     const initial = await geometry(page);
-    for (const [name, title] of [["域名", "域名"], ["账号设置", "我的"]]) {
+    for (const [name, title] of [["域名", "域名"], ["用户管理", "用户管理"]]) {
       const before = await geometry(page);
       await trigger.tap();
       await expect(menu).toBeVisible();
-      await expect(menu.locator("a>span:not(.sr-only)")).toHaveText(["节点", "域名", "账号设置"]);
+      await expect(menu.locator("a>span:not(.sr-only)")).toHaveText(["节点", "域名", "用户管理", "服务器设置"]);
       await expect.poll(() => menu.evaluate(element => element.contains(document.activeElement))).toBe(false);
       await expectStable(page, before);
       await menu.getByRole("link", { name, exact: true }).tap();
-      await expect(current(page).locator("h1")).toHaveText(title);
-      await expect(current(page).locator("h1")).toBeFocused();
+      await expect(page.getByRole("heading", { level: 1 })).toHaveText(title);
+      await expect(page.getByRole("heading", { level: 1 })).toBeFocused();
       await expect(menu).toBeHidden();
       await expectStable(page, initial);
       expect(await page.locator(".app-shell").evaluate(element => element.getBoundingClientRect().height >= innerHeight)).toBe(true);
     }
-    await current(page).getByRole("link", { name: "用户管理", exact: true }).tap();
-    await expect(current(page).locator("h1")).toHaveText("用户管理");
-    await expect(page.locator(".bottom-nav")).toBeHidden();
-    await current(page).getByRole("link", { name: "返回", exact: true }).tap();
-    await expect(current(page).locator("h1")).toHaveText("我的");
+    await expect(page.locator(".bottom-nav")).toBeVisible();
+    await trigger.tap();
+    await page.locator(".pwa-account").tap();
+    await expect(page.getByRole("menu", { name: "本人账号", exact: true })).toBeVisible();
     await expect(page.locator(".bottom-nav")).toBeVisible();
     await page.screenshot({ path: info.outputPath("pwa-account-navigation.png") });
   });
@@ -135,14 +136,15 @@ test.describe("PWA 手机导航", () => {
       }
       await trigger.tap();
       await expect(menu).toBeVisible();
-      await page.touchscreen.tap(8, 8);
+      // 顶部操作行已移除；点击底部安全留白，避免点到滚动到顶边的设备链接。
+      await page.touchscreen.tap(4, page.viewportSize()!.height - 4);
       await expect(menu).toBeHidden();
       await expectStable(page, before);
       await trigger.tap();
       await menu.getByRole("link", { name: "域名", exact: true }).tap();
-      await expect(current(page).locator("h1")).toHaveText("域名");
+      await expect(page.getByRole("heading", { level: 1 })).toHaveText("域名");
       await page.locator(".bottom-nav").getByRole("link", { name: "设备", exact: true }).tap();
-      await expect(current(page).locator("h1")).toHaveText("设备");
+      await expect(page.getByRole("heading", { level: 1 })).toHaveText("设备");
       await expectStable(page, before);
     }
   });
@@ -168,8 +170,8 @@ test.describe("PWA 手机导航", () => {
     await page.keyboard.press("Tab");
     await expect(menu.getByRole("link", { name: "域名", exact: true })).toBeFocused();
     await page.keyboard.press("Enter");
-    await expect(current(page).locator("h1")).toHaveText("域名");
-    await expect(current(page).locator("h1")).toBeFocused();
+    await expect(page.getByRole("heading", { level: 1 })).toHaveText("域名");
+    await expect(page.getByRole("heading", { level: 1 })).toBeFocused();
     await expectStable(page, before);
   });
 
@@ -177,25 +179,25 @@ test.describe("PWA 手机导航", () => {
     const state = await installApiMocks(page);
     state.authRole = "tenant";
     await page.goto("/#/manage");
-    await expect(current(page).locator("h1")).toHaveText("我的");
+    await expect(page.getByRole("heading", { level: 1 })).toHaveText("首页");
+    await expect(page.getByRole("menu", { name: "本人账号", exact: true })).toBeVisible();
     await expect(current(page).getByRole("link", { name: "用户管理", exact: true })).toHaveCount(0);
     await page.getByRole("button", { name: "更多功能", exact: true }).tap();
-    await expect(page.locator(".mobile-more").locator("a>span:not(.sr-only)")).toHaveText(["节点", "域名", "账号设置"]);
+    await expect(page.locator(".mobile-more").locator("a>span:not(.sr-only)")).toHaveText(["节点", "域名"]);
   });
 
   test("各页面顶部和更多菜单在明暗主题下不模糊背景", async ({ page }, info) => {
     await installApiMocks(page);
     for (const colorScheme of ["light", "dark"] as const) {
       await page.emulateMedia({ colorScheme });
-      for (const route of ["home", "services", "agents", "nodes", "domains", "manage", "users"]) {
+      for (const route of ["home", "services", "agents", "nodes", "domains", "settings/sessions", "users"]) {
         await page.goto(`/#/${route}`);
-        const header = current(page).locator(".page-header");
-        await expect(header.locator("h1")).toHaveCSS("clip-path", "inset(50%)");
-        if (route === "home" || route === "manage") await expect(header).toHaveCSS("height", "0px");
-        else { await expect(header).toHaveAttribute("data-empty", "false"); await expect(header).toBeVisible(); }
+        const header = page.locator(".workspace-topbar .page-header");
+        await expect(header.locator("h1")).toHaveCSS("clip-path", ["home", "services", "nodes", "users"].includes(route) ? "inset(50%)" : "none");
+        await expect(header).toHaveCSS("min-height", "44px");
         await expect(header).toHaveCSS("backdrop-filter", "none");
         for (const button of await header.locator(".icon-button").all()) await expect(button).toHaveCSS("backdrop-filter", "none");
-        if (route === "users") continue;
+        if (route === "users" || route === "settings/sessions") continue;
         await page.getByRole("button", { name: "更多功能", exact: true }).tap();
         const menu = page.locator(".mobile-more");
         await expect(menu).toBeVisible();

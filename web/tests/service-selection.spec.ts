@@ -67,7 +67,7 @@ test("滑动、取消触摸、多指和离开列表取消长按，短按不触�
   await expect(page.getByRole("checkbox")).toHaveCount(0);
 });
 
-test("批量修改 Agent 保留最新配置，部分失败只重试失败项", async ({ page }, info) => {
+test("批量修改设备保留最新配置，部分失败只重试失败项", async ({ page }, info) => {
   const state = await installApiMocks(page);
   Object.assign(state.tunnels[0], { icon_id: "border-radius/emby-1.png", public_domain: "example.com", origin_protocol: "https", enabled: false, lan_redirect_enabled: true, local_address: "192.168.1.10" });
   state.tunnels.push({ ...state.tunnels[0], id: "t-2", name: "TCP 应用", protocol: "tcp", public_port: 23456, hostname: null, public_domain: null, lan_redirect_enabled: false });
@@ -75,10 +75,10 @@ test("批量修改 Agent 保留最新配置，部分失败只重试失败项", a
   const select = page.getByRole("button", { name: "选择", exact: true });
   await select.focus(); await select.press("Space");
   await page.getByRole("button", { name: "全选", exact: true }).click();
-  await page.getByRole("button", { name: "修改 Agent", exact: true }).click();
-  const dialog = page.getByRole("dialog", { name: "批量修改 Agent" });
-  await dialog.getByRole("radio", { name: "备用 Agent · 离线", exact: true }).check();
-  await expect(dialog).toContainText("Agent 当前离线");
+  await page.getByRole("button", { name: "修改设备", exact: true }).click();
+  const dialog = page.getByRole("dialog", { name: "批量修改设备" });
+  await dialog.getByRole("radio", { name: "备用设备 · 离线", exact: true }).check();
+  await expect(dialog).toContainText("设备当前离线");
   await page.evaluate(() => { window.location.hash = "#/agents"; });
   await expect(page).toHaveURL(/#\/services$/);
   await page.screenshot({ animations: "disabled", scale: "css", path: info.outputPath("batch-agent-editor.png") });
@@ -109,9 +109,9 @@ test("批量提交期间禁止关闭，失败后保留选择，放弃修改需�
   const select = page.getByRole("button", { name: "选择", exact: true });
   await select.focus(); await select.press("Space");
   await page.getByRole("button", { name: "全选", exact: true }).click();
-  await page.getByRole("button", { name: "修改 Agent", exact: true }).click();
-  const dialog = page.getByRole("dialog", { name: "批量修改 Agent" });
-  await dialog.getByRole("radio", { name: "备用 Agent · 离线", exact: true }).check();
+  await page.getByRole("button", { name: "修改设备", exact: true }).click();
+  const dialog = page.getByRole("dialog", { name: "批量修改设备" });
+  await dialog.getByRole("radio", { name: "备用设备 · 离线", exact: true }).check();
   let release!: () => void;
   const held = new Promise<void>(resolve => { release = resolve; });
   await page.route("**/api/v1/tunnels/t-1", async route => { await held; await route.fulfill({ status: 503, json: { error: "暂时无法保存" } }); });

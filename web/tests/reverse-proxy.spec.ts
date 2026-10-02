@@ -5,7 +5,7 @@ import type { Tunnel } from "../src/ui";
 
 const proxy: Tunnel = { id: "proxy", service_mode: "reverse_proxy", name: "VPS 应用", protocol: "https", origin_protocol: "http", local_address: "127.0.0.1", local_port: 3000, hostname: "app", public_domain: "example.com", public_address: "https://app.example.com", device_id: null, enabled: true, apply_status: "ready", lan_redirect_enabled: false };
 
-test("独立反代入口无需 Agent，创建服务入口保持内网穿透", async ({ page }, info) => {
+test("独立反代入口无需设备，创建服务入口保持内网穿透", async ({ page }, info) => {
   const state = await installApiMocks(page);
   state.tunnels = []; state.devices = [];
   await page.goto("/#/services");
@@ -16,7 +16,7 @@ test("独立反代入口无需 Agent，创建服务入口保持内网穿透", as
   await expect(dialog.getByRole("group", { name: "连接方式", exact: true })).toHaveCount(0);
   await dialog.getByLabel("目标端口").fill("3000");
   await expect(dialog.getByLabel("目标端口")).toHaveValue("3000");
-  await expect(dialog.getByRole("combobox", { name: "Agent", exact: true })).toHaveCount(0);
+  await expect(dialog.getByRole("combobox", { name: "设备", exact: true })).toHaveCount(0);
   await expect(dialog.getByLabel("内网重定向")).toHaveCount(0);
   await dialog.getByRole("combobox", { name: "目标协议", exact: true }).click();
   await expect(dialog.getByRole("listbox", { name: "目标协议选项" }).getByRole("option")).toHaveText(["HTTP", "HTTPS"]);
@@ -32,7 +32,7 @@ test("独立反代入口无需 Agent，创建服务入口保持内网穿透", as
   await page.screenshot({ path: info.outputPath("separate-create-actions.png"), animations: "disabled" });
   await openServiceEditor(page);
   const tunnel = page.getByRole("dialog", { name: "创建服务", exact: true });
-  await expect(tunnel.getByRole("combobox", { name: "Agent", exact: true })).toBeVisible();
+  await expect(tunnel.getByRole("combobox", { name: "设备", exact: true })).toBeVisible();
   await expect(tunnel.getByLabel("服务名称")).toHaveValue("");
   await expect(tunnel.getByRole("radio", { name: "反向代理", exact: true })).toHaveCount(0);
   await expect(tunnel.getByRole("button", { name: "保存服务", exact: true })).toBeDisabled();
@@ -71,20 +71,20 @@ test("手机添加入口位于标题右侧，选择类型后进入独立表单",
   await expect(add).toBeFocused();
   await openServiceEditor(page, "reverse_proxy");
   const proxyForm = page.getByRole("dialog", { name: "添加反向代理" });
-  await expect(proxyForm.getByRole("combobox", { name: "Agent", exact: true })).toHaveCount(0);
+  await expect(proxyForm.getByRole("combobox", { name: "设备", exact: true })).toHaveCount(0);
   await proxyForm.getByRole("button", { name: "取消", exact: true }).click();
   await expect(add).toBeFocused();
   await openServiceEditor(page);
-  await expect(page.getByRole("dialog", { name: "创建服务" }).getByRole("combobox", { name: "Agent", exact: true })).toBeVisible();
+  await expect(page.getByRole("dialog", { name: "创建服务" }).getByRole("combobox", { name: "设备", exact: true })).toBeVisible();
 });
 
-test("反代详情解释已生效，编辑不绑定 Agent，混合批量操作保持权限边界", async ({ page }, info) => {
+test("反代详情解释已生效，编辑不绑定设备，混合批量操作保持权限边界", async ({ page }, info) => {
   const state = await installApiMocks(page); state.tunnels.push({ ...proxy });
   await page.goto("/#/services/proxy");
   await expect(page.locator(".service-detail")).toContainText("已生效");
   await expect(page.locator(".service-detail")).toContainText("不代表目标服务健康");
-  await expect(page.locator(".service-detail")).not.toContainText("Agent 已连接");
-  await expect(page.locator(".service-detail dt").filter({ hasText: /^Agent$/ })).toHaveCount(0);
+  await expect(page.locator(".service-detail")).not.toContainText("设备已连接");
+  await expect(page.locator(".service-detail dt").filter({ hasText: /^设备$/ })).toHaveCount(0);
   await page.getByRole("button", { name: "编辑服务" }).click();
   const dialog = page.getByRole("dialog", { name: "编辑服务" });
   await expect(dialog.getByRole("radio", { name: "内网穿透", exact: true })).toHaveCount(0);
@@ -101,8 +101,8 @@ test("反代详情解释已生效，编辑不绑定 Agent，混合批量操作�
   await expect(list).toBeVisible();
   await list.getByRole("button", { name: "选择", exact: true }).click();
   await page.getByRole("button", { name: "全选", exact: true }).click();
-  await expect(page.getByRole("button", { name: "修改 Agent", exact: true })).toBeDisabled();
-  await expect(page.getByText("选择中包含反向代理，不能修改 Agent。", { exact: true })).toBeVisible();
+  await expect(page.getByRole("button", { name: "修改设备", exact: true })).toBeDisabled();
+  await expect(page.getByText("选择中包含反向代理，不能修改设备。", { exact: true })).toBeVisible();
   await page.locator(".batch-actions").getByRole("button", { name: "关闭", exact: true }).click();
   await expect(page.locator(".page-slot:not([hidden]) .service-row").filter({ hasText: "VPS 应用" })).toContainText("已停用");
   expect(state.calls.some(call => call.path === "/api/v1/tunnels/batch/disable")).toBeTruthy();

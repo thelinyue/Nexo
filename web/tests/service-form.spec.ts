@@ -36,6 +36,55 @@ for (const protocol of ["http", "https"]) for (const origin of ["http", "https"]
   });
 }
 
+for (const service_mode of ["tunnel", "reverse_proxy"]) for (const protocol of ["http", "https"]) {
+  test(`编辑 ${protocol.toUpperCase()} ${service_mode} 可更换根域名，保留配置并回填新地址`, async ({ page }) => {
+    const state = await installApiMocks(page);
+    state.domains.push({ ...state.domains[0], id: "d-2", domain: "new.example.com", is_primary: false });
+    const suffix = protocol === "https" ? ":8443" : "";
+    const device_id = service_mode === "tunnel" ? "a-1" : null;
+    Object.assign(state.tunnels[0], { service_mode, protocol, origin_protocol: "https", device_id, local_port: 9443, https_port: 8443, access_mode: "password", enabled: false, public_address: `${protocol}://media.example.com${suffix}` });
+    await page.goto("/#/services/t-1");
+    await page.getByRole("button", { name: "编辑服务", exact: true }).click();
+    const dialog = page.getByRole("dialog", { name: "编辑服务" });
+    const domain = dialog.getByRole("combobox", { name: "根域名", exact: true });
+    await expect(domain).toBeEnabled();
+    await expect(domain).toHaveAttribute("value", "d-1");
+    await selectServiceOption(domain, "new.example.com");
+    const address = `${protocol}://media.new.example.com${suffix}`;
+    await expect(dialog.locator(".service-submit-preview")).toContainText(address);
+    await dialog.getByRole("button", { name: "保存服务", exact: true }).click();
+    await expect(dialog).toBeHidden();
+    const body = state.calls.find(call => call.method === "PUT" && call.path === "/api/v1/tunnels/t-1")!.body;
+    expect(body).toMatchObject({ public_domain_id: "d-2", hostname: "media", name: "媒体中心", service_mode, protocol, origin_protocol: "https", device_id, local_address: "127.0.0.1", local_port: 9443, https_port: 8443, access_mode: "password", enabled: false });
+    expect(body).not.toHaveProperty("access_password");
+    await expect(page.locator(".service-public-link")).toHaveAttribute("href", address);
+    await page.getByRole("button", { name: "编辑服务", exact: true }).click();
+    await expect(dialog.getByRole("combobox", { name: "根域名", exact: true })).toHaveAttribute("value", "d-2");
+  });
+}
+
+test("编辑更换根域名遇到地址冲突时保留草稿，仍可重新选择并保存", async ({ page }) => {
+  const state = await installApiMocks(page);
+  state.domains.push({ ...state.domains[0], id: "d-2", domain: "new.example.com", is_primary: false });
+  state.failures.set("PUT /api/v1/tunnels/t-1", "该服务域名已被使用");
+  state.failureStatuses.set("PUT /api/v1/tunnels/t-1", 409);
+  await page.goto("/#/services/t-1");
+  await page.getByRole("button", { name: "编辑服务", exact: true }).click();
+  const dialog = page.getByRole("dialog", { name: "编辑服务" });
+  const domain = dialog.getByRole("combobox", { name: "根域名", exact: true });
+  await selectServiceOption(domain, "new.example.com");
+  await dialog.getByRole("button", { name: "保存服务", exact: true }).click();
+  await expect(dialog.getByRole("alert")).toContainText("该服务域名已被使用");
+  await expect(domain).toBeEnabled();
+  await expect(domain).toHaveAttribute("value", "d-2");
+  expect(state.tunnels[0].public_domain).toBe("example.com");
+  state.failures.clear();
+  await selectServiceOption(domain, "example.com");
+  await dialog.getByRole("button", { name: "保存服务", exact: true }).click();
+  await expect(dialog).toBeHidden();
+  expect(state.calls.filter(call => call.method === "PUT").at(-1)!.body.public_domain_id).toBe("d-1");
+});
+
 for (const protocol of ["tcp", "udp", "tcp_udp"]) {
   test(`${protocol} 从地址行创建并编辑，无域名时不能切换网页协议`, async ({ page }) => {
     const state = await installApiMocks(page);
@@ -229,24 +278,24 @@ test("协议切换保留输入，但不提交其他协议的端口；多域名�
   expect(body.public_domain_id).toBe("d-2");
 });
 
-test("Agent 浮层显示当前选择，离线 Agent 可选择并提交", async ({ page }, testInfo) => {
+test("设备浮层显示当前选择，离线设备可选择并提交", async ({ page }, testInfo) => {
   const state = await installApiMocks(page);
   await page.goto("/#/services");
   await openServiceEditor(page);
   const dialog = page.getByRole("dialog", { name: "创建服务" });
-  const agent = dialog.getByRole("combobox", { name: "Agent", exact: true });
-  await expect(agent).toContainText("家庭 Agent");
+  const agent = dialog.getByRole("combobox", { name: "设备", exact: true });
+  await expect(agent).toContainText("家庭设备");
   await page.screenshot({ path: testInfo.outputPath("agent-closed.png"), scale: "css", animations: "disabled" });
   await agent.click();
-  const list = dialog.getByRole("listbox", { name: "Agent选项" });
+  const list = dialog.getByRole("listbox", { name: "设备选项" });
   await expect(list.getByRole("option").first()).toHaveAttribute("aria-selected", "true");
   await expect(list.getByRole("option").first()).toContainText("在线");
   await page.screenshot({ path: testInfo.outputPath("agent-open.png"), scale: "css", animations: "disabled" });
-  await list.getByRole("option", { name: "备用 Agent 离线", exact: true }).click();
+  await list.getByRole("option", { name: "备用设备 离线", exact: true }).click();
   await expect(list).toBeHidden();
-  await expect(agent).toContainText("备用 Agent");
+  await expect(agent).toContainText("备用设备");
   await expect(agent).toBeFocused();
-  await expect(dialog.getByRole("status")).toContainText("Agent 当前离线");
+  await expect(dialog.getByRole("status")).toContainText("设备当前离线");
   await dialog.getByLabel("服务名称").fill("备用设备服务");
   await dialog.getByLabel("主机名").fill("backup");
   await dialog.getByLabel("内网端口").fill("8080");
@@ -261,7 +310,7 @@ test("两个选择框互斥，键盘确认和取消不误提交或关闭表单",
   await page.goto("/#/services");
   await openServiceEditor(page);
   const dialog = page.getByRole("dialog", { name: "创建服务" });
-  const agent = dialog.getByRole("combobox", { name: "Agent", exact: true });
+  const agent = dialog.getByRole("combobox", { name: "设备", exact: true });
   await selectServiceOption(dialog.getByRole("combobox", { name: "内网协议", exact: true }), "HTTP");
   await dialog.getByLabel("服务名称").fill("键盘选择");
   await dialog.getByLabel("内网端口").fill("8080");
@@ -290,7 +339,7 @@ test("两个选择框互斥，键盘确认和取消不误提交或关闭表单",
   await agent.press("ArrowDown");
   await agent.press("Escape");
   await expect(agent).toBeFocused();
-  await expect(agent).toContainText("家庭 Agent");
+  await expect(agent).toContainText("家庭设备");
   await expect(dialog).toBeVisible();
   await expect(page.getByRole("dialog", { name: "放弃未保存的修改？" })).toHaveCount(0);
   await agent.press("Space");
@@ -300,7 +349,7 @@ test("两个选择框互斥，键盘确认和取消不误提交或关闭表单",
   await agent.press("ArrowDown");
   await agent.press("Home");
   await agent.press("Space");
-  await expect(agent).toContainText("家庭 Agent");
+  await expect(agent).toContainText("家庭设备");
   await agent.press("ArrowDown");
   await agent.press("Tab");
   await expect(agent).toHaveAttribute("aria-expanded", "false");
@@ -322,7 +371,7 @@ test("长名称和长域名浮层在窄屏、横屏及低高度视口内可滚�
   await selectServiceOption(dialog.getByRole("combobox", { name: "内网协议", exact: true }), "HTTP");
   for (const viewport of [{ width: 320, height: 568 }, { width: 390, height: 420 }, { width: 812, height: 375 }]) {
     await page.setViewportSize(viewport);
-    for (const label of ["Agent", "根域名"]) {
+    for (const label of ["设备", "根域名"]) {
       const trigger = dialog.getByRole("combobox", { name: label, exact: true });
       await trigger.click();
       const list = dialog.getByRole("listbox", { name: `${label}选项` });
@@ -334,22 +383,22 @@ test("长名称和长域名浮层在窄屏、横屏及低高度视口内可滚�
       expect(await list.evaluate(element => element.scrollWidth <= element.clientWidth)).toBeTruthy();
       await trigger.press("End");
       await expect(list.getByRole("option").last()).toBeInViewport({ ratio: 1 });
-      await page.screenshot({ path: testInfo.outputPath(`${label === "Agent" ? "agent" : "domain"}-${viewport.width}x${viewport.height}.png`), scale: "css", animations: "disabled" });
+      await page.screenshot({ path: testInfo.outputPath(`${label === "设备" ? "agent" : "domain"}-${viewport.width}x${viewport.height}.png`), scale: "css", animations: "disabled" });
       await trigger.press("Enter");
-      await expect(trigger).toContainText(label === "Agent" ? state.devices[13].name : state.domains[13].domain);
+      await expect(trigger).toContainText(label === "设备" ? state.devices[13].name : state.domains[13].domain);
       await expect(list).toBeHidden();
       expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBeTruthy();
     }
   }
 });
 
-test("无 Agent 或域名时指引先取消表单，选择框和保存禁用", async ({ page }) => {
+test("无设备或域名时指引先取消表单，选择框和保存禁用", async ({ page }) => {
   const state = await installApiMocks(page); state.devices = []; state.domains = [];
   await page.goto("/#/services");
   await openServiceEditor(page);
   const dialog = page.getByRole("dialog", { name: "创建服务" });
-  await expect(dialog.getByRole("combobox", { name: "Agent", exact: true })).toBeDisabled();
-  await expect(dialog.getByText("请关闭表单，到设备页添加 Agent。", { exact: true })).toBeVisible();
+  await expect(dialog.getByRole("combobox", { name: "设备", exact: true })).toBeDisabled();
+  await expect(dialog.getByText("请关闭表单，到设备页添加设备。", { exact: true })).toBeVisible();
   await selectServiceOption(dialog.getByRole("combobox", { name: "内网协议", exact: true }), "HTTP");
   await expect(dialog.getByRole("combobox", { name: "根域名", exact: true })).toBeDisabled();
   await expect(dialog.getByText("网页服务需要域名，请关闭表单后到域名页添加。", { exact: true })).toBeVisible();
@@ -364,8 +413,8 @@ test("展开中的浮层跟随表单滚动和视口变化", async ({ page }) => 
   await openServiceEditor(page);
   const dialog = page.getByRole("dialog", { name: "创建服务" });
   await selectServiceOption(dialog.getByRole("combobox", { name: "内网协议", exact: true }), "HTTP");
-  const agent = dialog.getByRole("combobox", { name: "Agent", exact: true });
-  const list = dialog.getByRole("listbox", { name: "Agent选项" });
+  const agent = dialog.getByRole("combobox", { name: "设备", exact: true });
+  const list = dialog.getByRole("listbox", { name: "设备选项" });
   await agent.click();
   await dialog.locator(".modal-body").evaluate(element => { element.scrollTop += 24; });
   for (const height of [568, 420]) {
@@ -399,7 +448,7 @@ test("保存期间关闭浮层并禁用所有选择框，失败后恢复选择�
   await expect(dialog.getByRole("listbox")).toHaveCount(0);
   for (const select of await dialog.getByRole("combobox").all()) await expect(select).toBeDisabled();
   await expect(dialog.getByRole("alert")).toContainText("暂时无法保存");
-  await expect(dialog.getByRole("combobox", { name: "Agent", exact: true })).toBeEnabled();
+  await expect(dialog.getByRole("combobox", { name: "设备", exact: true })).toBeEnabled();
   await expect(dialog.getByRole("combobox", { name: "根域名", exact: true })).toBeEnabled();
   await expect(dialog.getByLabel("服务名称")).toHaveValue("保存期间");
 });

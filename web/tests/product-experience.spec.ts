@@ -31,7 +31,7 @@ test("桌面添加服务属于工具栏，设备识别码可完整复制", async
   await expect(page.getByRole("button", { name: "复制设备识别码", exact: true })).toBeVisible();
 });
 
-test("离线 Agent 可保存配置，打开公网与复制操作分开", async ({ page }) => {
+test("离线设备可保存配置，打开公网与复制操作分开", async ({ page }) => {
   const state = await installApiMocks(page);
   state.devices[0].status = "offline";
   await page.goto("/#/services");
@@ -50,14 +50,14 @@ test("离线 Agent 可保存配置，打开公网与复制操作分开", async (
   await expect(page.getByRole("status")).toContainText("配置已保存");
 });
 
-test("协议、状态和 Agent 筛选组合可清空，空状态按资源给出下一步", async ({ page }) => {
+test("协议、状态和设备筛选组合可清空，空状态按资源给出下一步", async ({ page }) => {
   await page.clock.install();
   const state = await installApiMocks(page);
   state.tunnels.push({ ...state.tunnels[0], id: "t-2", protocol: "tcp", enabled: false, device_id: "a-2", name: "备用服务" });
   await page.goto("/#/services");
   await page.getByLabel("类型筛选").selectOption("tcp");
   await page.getByLabel("服务筛选").selectOption("disabled");
-  await page.getByLabel("Agent 筛选").selectOption("a-2");
+  await page.getByLabel("设备筛选").selectOption("a-2");
   await expect(page.locator(".service-row")).toHaveCount(1);
   await expect(page.locator(".service-row")).toContainText("备用服务");
   await page.getByRole("button", { name: "清除筛选" }).click();
@@ -74,10 +74,10 @@ test("协议、状态和 Agent 筛选组合可清空，空状态按资源给出�
 test("部署命令可直接复制，弹窗显示多台独立设备", async ({ page }, info) => {
   const state = await installApiMocks(page); state.devices = []; state.enrollments = [];
   await page.goto("/#/agents");
-  await page.getByRole("button", { name: "添加 Agent", exact: true }).click();
-  const dialog = page.getByRole("dialog", { name: "添加 Agent", exact: true });
+  await page.getByRole("button", { name: "添加设备", exact: true }).click();
+  const dialog = page.getByRole("dialog", { name: "添加设备", exact: true });
   const progress = dialog.getByRole("region", { name: "最近接入设备" });
-  await expect(progress).toContainText("等待 Agent 连接");
+  await expect(progress).toContainText("等待设备连接");
   state.devices.push({ id: "nas-one-uuid", name: "家庭 NAS", status: "online", tunnel_count: 0, enrolled_at: 1790000001 }, { id: "nas-two-uuid", name: "家庭 NAS", status: "offline", tunnel_count: 0, enrolled_at: 1790000002 });
   await page.evaluate(() => window.dispatchEvent(new Event("focus")));
   await expect(progress.locator("li")).toHaveCount(2);
@@ -96,7 +96,7 @@ test("服务进入关联域名后返回原服务，手机子页隐藏底栏", as
   await expect(page.locator(".service-public-link")).toHaveAttribute("target", "_blank");
   await page.getByRole("link", { name: "域名与 DNS" }).click();
   await expect(page).toHaveURL(/#\/domains\/d-1$/);
-  await expect(page.locator(".page-slot:not([hidden]) h1")).toHaveText("example.com");
+  await expect(page.getByRole("heading", { level: 1 })).toHaveText("example.com");
   if ((page.viewportSize()?.width ?? 0) <= 900) await expect(page.locator(".bottom-nav")).toBeHidden();
   await page.screenshot({ path: info.outputPath("domain-detail.png") });
   await page.getByRole("link", { name: "返回", exact: true }).click();
@@ -141,16 +141,16 @@ test("普通用户首次接入的空状态只有一个添加入口，手机可�
   await page.route("**/api/v1/auth/status", route => route.fulfill({ json: { initialized: true, authenticated: true, user_id: "alice", workspace_id: "default", role: "tenant", username: "alice", csrf_token: "test-csrf" } }));
   if (info.project.name === "mobile-light") await page.setViewportSize({ width: 320, height: 568 });
   await page.goto("/#/services");
-  const connect = page.getByRole("link", { name: "接入 Agent", exact: true });
+  const connect = page.getByRole("link", { name: "接入设备", exact: true });
   await expect(connect).toBeInViewport({ ratio: 1 });
   await page.screenshot({ path: info.outputPath("empty-services.png") });
   await connect.click();
-  const addAgent = page.getByRole("button", { name: "添加 Agent", exact: true });
+  const addAgent = page.getByRole("button", { name: "添加设备", exact: true });
   await expect(addAgent).toHaveCount(1);
   await expect(addAgent).toBeInViewport({ ratio: 1 });
   await page.screenshot({ path: info.outputPath("empty-agents.png") });
   await addAgent.click();
-  await expect(page.getByRole("dialog", { name: "添加 Agent", exact: true })).toBeVisible();
+  await expect(page.getByRole("dialog", { name: "添加设备", exact: true })).toBeVisible();
   await page.getByRole("dialog").getByRole("button", { name: /^(取消|关闭)$/ }).click();
   await page.goto("/#/domains");
   const addDomain = page.getByRole("button", { name: "添加 域名", exact: true });

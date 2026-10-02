@@ -44,7 +44,7 @@ pub async fn create(
     }
     let target = version(&input.target_version).ok_or_else(|| invalid("只能选择正式数字版本"))?;
     if target > version(env!("CARGO_PKG_VERSION")).unwrap() {
-        return Err(invalid("请先升级管理 Server，节点版本不能高于管理 Server"));
+        return Err(invalid("请先升级管理服务端，节点版本不能高于管理服务端"));
     }
     if input.node_ids.is_empty() || input.node_ids.len() > 100 {
         return Err(invalid("请选择 1–100 个节点"));
@@ -65,7 +65,7 @@ pub async fn create(
     let tx = db.unchecked_transaction().map_err(db_error)?;
     for id in &input.node_ids {
         if id == "local" {
-            return Err(invalid("内置节点随 Server 升级，不支持远程更新"));
+            return Err(invalid("内置节点随服务端升级，不支持远程更新"));
         }
         if !visible(&tx, id, &actor.tenant_id, true)? {
             return Err(missing());

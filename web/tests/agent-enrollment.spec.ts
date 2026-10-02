@@ -4,8 +4,8 @@ import { installApiMocks } from "./api-mocks";
 
 async function openEnrollment(page: Page) {
   await page.goto("/#/agents");
-  await page.getByRole("button", { name: "添加 Agent", exact: true }).click();
-  return page.getByRole("dialog", { name: "添加 Agent", exact: true });
+  await page.getByRole("button", { name: "添加设备", exact: true }).click();
+  return page.getByRole("dialog", { name: "添加设备", exact: true });
 }
 
 async function mockClipboard(page: Page, fail = false) {
@@ -15,7 +15,7 @@ async function mockClipboard(page: Page, fail = false) {
   }, fail);
 }
 
-test("一次复制即可配置并启动 Agent，两种部署方式均不写入浏览器存储", async ({ page }, info) => {
+test("一次复制即可配置并启动设备，两种部署方式均不写入浏览器存储", async ({ page }, info) => {
   await installApiMocks(page); await mockClipboard(page);
   const dialog = await openEnrollment(page);
   expect(await page.evaluate(() => document.activeElement instanceof HTMLInputElement)).toBeFalsy();
@@ -37,7 +37,7 @@ test("一次复制即可配置并启动 Agent，两种部署方式均不写入�
   expect(compose).toContain("./data/nexo-agent:/data/nexo-agent");
   expect(compose).not.toMatch(/docker compose|cat >|<<|set -eu/);
   expect(compose).toContain("nexo_join_shared-test-key");
-  await expect(dialog.getByRole("button", { name: "复制 Agent TOML" })).toHaveCount(0);
+  await expect(dialog.getByRole("button", { name: "复制设备 TOML" })).toHaveCount(0);
   expect(compose).toContain('NEXO_SERVER_URL: "https://nexo.example.com/prefix"');
   expect(compose).toContain('NEXO_ENROLLMENT_TOKEN: "nexo_join_shared-test-key"');
   await dialog.getByRole("button", { name: "docker run", exact: true }).click();
@@ -51,7 +51,7 @@ test("一次复制即可配置并启动 Agent，两种部署方式均不写入�
   await page.screenshot({ path: info.outputPath("agent-docker-native.png") });
   expect(await page.evaluate(() => JSON.stringify({ ...localStorage, ...sessionStorage }))).not.toContain("nexo_join_");
   await dialog.getByRole("button", { name: /^(取消|关闭)$/ }).click();
-  await page.getByRole("button", { name: "添加 Agent", exact: true }).click();
+  await page.getByRole("button", { name: "添加设备", exact: true }).click();
   await dialog.getByRole("button", { name: "复制 Compose 配置", exact: true }).click();
   expect(await page.evaluate(() => (window as any).copiedCommand)).toContain("nexo_join_shared-test-key");
 });
@@ -155,7 +155,7 @@ test("管理员代管空间时在目标空间生成凭证", async ({ page }) => 
   await page.getByRole("button", { name: "管理 alice 的空间" }).click();
   await expect(page.locator(".workspace-banner")).toContainText("alice 的工作空间");
   await page.getByRole("link", { name: "设备", exact: true }).click();
-  await page.getByRole("button", { name: "添加 Agent", exact: true }).click();
+  await page.getByRole("button", { name: "添加设备", exact: true }).click();
   await page.getByText("查看 Compose 配置", { exact: true }).click();
   await expect(page.getByLabel("Compose 配置", { exact: true })).toContainText("nexo_join_scoped-secret");
   expect(posts).toEqual(["/api/v1/admin/workspaces/alice-space/agent-access-key"]);

@@ -5,7 +5,7 @@ test("管理首页直达密码与会话，密码键盘不误提交且可切换�
   const state = await installApiMocks(page);
   await page.goto("/#/manage");
   await page.screenshot({ path: testInfo.outputPath("manage-home.png") });
-  await page.getByRole("button", { name: /修改密码/ }).click();
+  await page.getByRole("menuitem", { name: "修改密码", exact: true }).click();
   const dialog = page.getByRole("dialog", { name: "修改密码" });
   expect(await page.evaluate(() => document.activeElement instanceof HTMLInputElement)).toBeFalsy();
   await dialog.getByLabel("当前密码").fill("current-password");
@@ -22,7 +22,8 @@ test("管理首页直达密码与会话，密码键盘不误提交且可切换�
   await dialog.getByRole("button", { name: "取消", exact: true }).click();
   await page.getByRole("button", { name: "放弃修改", exact: true }).click();
   await expect(dialog).toBeHidden();
-  await page.getByRole("link", { name: /登录会话/ }).click();
+  await page.getByRole("button", { name: "账号菜单", exact: true }).click();
+  await page.getByRole("menuitem", { name: "登录会话", exact: true }).click();
   await expect(page.locator(".session-row")).toHaveCount(2);
   const current = page.locator(".session-row").filter({ hasText: "当前会话" });
   await expect(current.getByText(/过期时间/)).toBeHidden();
@@ -34,25 +35,25 @@ test("管理首页直达密码与会话，密码键盘不误提交且可切换�
   expect(state.calls.filter(call => call.method === "POST")).toHaveLength(0);
 });
 
-test("我的页兼容旧链接，设备作为独立导航入口", async ({ page }) => {
+test("账号页兼容旧链接，设备作为独立导航入口", async ({ page }) => {
   await installApiMocks(page);
   await page.goto("/#/settings");
-  await expect(page).toHaveURL(/#\/manage$/);
-  await expect(page.locator(".page-slot:not([hidden]) h1")).toHaveText((page.viewportSize()?.width ?? 0) <= 900 ? "我的" : "账号设置");
-  await expect(page.locator(".manage-page").getByRole("link", { name: /^Agent/ })).toHaveCount(0);
+  await expect(page).toHaveURL(/#\/home$/);
+  await expect(page.getByRole("menu", { name: "本人账号", exact: true })).toBeVisible();
+  await expect(page.locator(".manage-page").getByRole("link", { name: /^设备/ })).toHaveCount(0);
   const nav = page.locator((page.viewportSize()?.width ?? 0) <= 900 ? ".bottom-nav" : ".sidebar nav");
   await nav.getByRole("link", { name: "设备", exact: true }).click();
-  await expect(page.locator(".page-slot:not([hidden]) h1")).toHaveText("设备");
+  await expect(page.getByRole("heading", { level: 1 })).toHaveText("设备");
   await expect(page.locator(".page-slot:not([hidden]) .agent-row")).toHaveCount(2);
 });
 
-test("服务直达 Agent 可返回原列表，正常证书折叠且关联服务优先", async ({ page }, info) => {
+test("服务直达设备可返回原列表，正常证书折叠且关联服务优先", async ({ page }, info) => {
   const state = await installApiMocks(page);
   state.devices[0].certificate = { status: "valid", expires_at: 1893456000, renew_after: 1890864000, error: null, next_retry_at: null };
   await page.goto("/#/services");
   await page.getByLabel("搜索服务").fill("媒体");
   await page.getByRole("link", { name: "媒体中心", exact: true }).click();
-  await page.getByRole("link", { name: "家庭 Agent", exact: true }).click();
+  await page.getByRole("link", { name: "家庭设备", exact: true }).click();
   await expect(page).toHaveURL(/#\/agents\/a-1$/);
   const certificates = page.getByRole("region", { name: "设备内部证书" });
   await expect(certificates.getByRole("button", { name: "恢复设备身份" })).toBeHidden();
@@ -66,6 +67,6 @@ test("服务直达 Agent 可返回原列表，正常证书折叠且关联服务�
   await expect(certificates.getByText("续签失败：磁盘空间不足", { exact: true })).toBeVisible();
   await page.getByRole("link", { name: "返回", exact: true }).click();
   await expect(page).toHaveURL(/#\/services$/);
-  await expect(page.locator(".page-slot:not([hidden]) h1")).toHaveText("服务");
+  await expect(page.getByRole("heading", { level: 1 })).toHaveText("服务");
   await expect(page.getByLabel("搜索服务")).toHaveValue("媒体");
 });

@@ -32,6 +32,7 @@ use uuid::Uuid;
 
 mod access_keys;
 mod accounts;
+mod agent_release;
 mod auth;
 mod caddy;
 mod config;
@@ -49,6 +50,8 @@ mod security;
 mod server_settings;
 mod service_access;
 mod service_icons;
+#[cfg(test)]
+mod service_update_tests;
 mod traffic;
 mod transport;
 use enrollment::{agent_enroll, agent_poll, approve_enrollment};
@@ -92,6 +95,7 @@ enum AdminCommand {
 
 #[derive(Clone)]
 pub(crate) struct AppState {
+    pub(crate) agent_releases: Arc<agent_release::Catalog>,
     pub(crate) config: Arc<config::Config>,
     pub(crate) db: Arc<Mutex<Connection>>,
     pub(crate) security: Arc<security::Security>,
@@ -333,6 +337,7 @@ async fn main() -> Result<()> {
     // 启动配置可能改变内置节点公网地址或监听端口，不能沿用重启前的入口探测。
     connection.execute("DELETE FROM relay_public_health WHERE node_id='local'", [])?;
     let state = AppState {
+        agent_releases: Arc::new(agent_release::Catalog::default()),
         security: Arc::new(security::Security::new(server_settings::load_for_runtime(
             &connection,
             config.http_addr,
@@ -362,10 +367,10 @@ async fn main() -> Result<()> {
         .context("无法恢复用户流量额度，停止启动以避免绕过限制")?;
     let control_listener = TcpListener::bind(&state.control_addr)
         .await
-        .context("无法监听 Agent mTLS 控制端口")?;
+        .context("无法监听设备 mTLS 控制端口")?;
     let data_listener = TcpListener::bind(config.tunnel_addr)
         .await
-        .context("无法监听 Tunnel mTLS 数据端口")?;
+        .context("无法监听隧道 mTLS 数据端口")?;
     let udp_state = state.clone();
     let udp_task = tokio::spawn(async move {
         if let Err(error) = transport::udp::serve(udp_state).await {
@@ -485,6 +490,7 @@ fn router(state: AppState) -> Router {
         .route("/api/v1/auth/sessions", get(auth::list_sessions))
         .route("/api/v1/auth/sessions/{id}", post(auth::revoke_session))
         .route("/api/v1/devices", get(list_devices))
+        .route("/api/v1/agent-release", get(agent_release::list))
         .route("/api/v1/transport-identity", get(transport_identity))
         .route("/api/v1/devices/{id}", delete(delete_device))
         .route(
@@ -822,18 +828,47 @@ async fn update_tunnel(
             &mut input,
             access_hash.as_deref(),
         )?;
-        // 名称和图标不进入 Agent 或 Caddy 配置；原值重复提交也无需重置应用状态。
-        let config_unchanged: bool = db.query_row(
-            "SELECT device_id IS ?2 AND protocol=?3 AND local_address=?4 AND local_port=?5 AND public_port IS ?6 AND hostname IS ?7 AND enabled=?8 AND public_domain_id IS ?9 AND lan_redirect_enabled=?10 AND origin_protocol IS ?11 AND service_mode=?12 AND http_redirect_enabled=?13 AND https_port=?14 AND ipv6_direct_enabled=?15 AND access_mode=?16 FROM tunnels WHERE id=?1",
-            params![id,input.device_id,input.protocol,input.local_address.trim(),input.local_port,input.public_port,input.hostname,input.enabled.unwrap_or(true),input.public_domain_id,input.lan_redirect_enabled.unwrap_or(false),input.origin_protocol,input.service_mode,input.http_redirect_enabled.unwrap_or(false),input.https_port.unwrap_or(443),input.ipv6_direct_enabled.unwrap_or(false),input.access_mode],
-            |row| row.get(0),
+        // 回源、入口和直连分别判断；重定向与节点选择只同步配置，不清零未变链路的健康样本。
+        // 名称、图标和认证不改变链路，认证更新仍由既有数据库触发器撤销旧会话。
+        let (origin_unchanged, entry_unchanged, redirect_unchanged, direct_unchanged, device_unchanged, revision): (bool, bool, bool, bool, bool, i64) = db.query_row(
+            "SELECT device_id IS ?2 AND (protocol=?3 OR protocol IN ('http','https') AND ?3 IN ('http','https')) AND local_address=?4 AND local_port=?5 AND enabled=?8 AND COALESCE(origin_protocol,'http')=COALESCE(?11,'http'),
+                protocol=?3 AND public_port IS ?6 AND hostname IS ?7 AND enabled=?8 AND public_domain_id IS ?9 AND (protocol!='https' OR https_port=?14),
+                lan_redirect_enabled=?10 AND (protocol!='https' OR http_redirect_enabled=?13),
+                ipv6_direct_enabled=?15, device_id IS ?2, apply_revision FROM tunnels WHERE id=?1",
+            params![id,input.device_id,input.protocol,input.local_address.trim(),input.local_port,input.public_port,input.hostname,input.enabled.unwrap_or(true),input.public_domain_id,input.lan_redirect_enabled.unwrap_or(false),input.origin_protocol,input.service_mode,input.http_redirect_enabled.unwrap_or(false),input.https_port.unwrap_or(443),input.ipv6_direct_enabled.unwrap_or(false)],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?)),
         ).map_err(db_error)?;
-        runtime_changed = !config_unchanged || access_hash.is_some() || db.query_row("SELECT distribution_mode IS NOT ?2 OR preferred_node_id IS NOT ?3 OR node_group_id IS NOT NULLIF(?4,'') FROM tunnels WHERE id=?1",params![id,input.distribution_mode,input.preferred_node_id,input.node_group_id],|r|r.get::<_,bool>(0)).map_err(db_error)? || nodes::services::ids(&db,&id).map_err(db_error)? != *input.node_ids.as_ref().unwrap();
-        if runtime_changed {
+        let selection_changed = db.query_row("SELECT distribution_mode IS NOT ?2 OR preferred_node_id IS NOT ?3 OR node_group_id IS NOT NULLIF(?4,'') FROM tunnels WHERE id=?1",params![id,input.distribution_mode,input.preferred_node_id,input.node_group_id],|r|r.get::<_,bool>(0)).map_err(db_error)?;
+        let nodes_changed =
+            nodes::services::ids(&db, &id).map_err(db_error)? != *input.node_ids.as_ref().unwrap();
+        let revision_changed = !origin_unchanged || !entry_unchanged || !direct_unchanged;
+        runtime_changed =
+            revision_changed || !redirect_unchanged || selection_changed || nodes_changed;
+        if revision_changed {
             direct::prepare(&db, &session.tenant_id, &id, &mut input)?;
         }
-        db.execute("UPDATE tunnels SET device_id=?1,name=?2,protocol=?3,local_address=?4,local_port=?5,public_port=?6,hostname=?7,enabled=?8,apply_revision=apply_revision+?17,apply_status=CASE WHEN ?17 THEN 'checking' ELSE apply_status END,updated_at=?9,public_domain_id=?12,lan_redirect_enabled=?13,origin_protocol=?14,service_mode=?15,http_redirect_enabled=?16 WHERE id=?10 AND tenant_id=?11 AND deleted_at IS NULL",params![input.device_id,input.name.trim(),input.protocol,input.local_address.trim(),input.local_port,input.public_port,input.hostname,input.enabled.unwrap_or(true),unix_now(),id,session.tenant_id,input.public_domain_id,input.lan_redirect_enabled.unwrap_or(false),input.origin_protocol,input.service_mode,input.http_redirect_enabled.unwrap_or(false),runtime_changed]).map_err(db_error)?;
+        db.execute("UPDATE tunnels SET device_id=?1,name=?2,protocol=?3,local_address=?4,local_port=?5,public_port=?6,hostname=?7,enabled=?8,apply_revision=apply_revision+?17,apply_status=CASE WHEN ?17 THEN CASE WHEN ?8 THEN 'checking' ELSE 'disabled' END ELSE apply_status END,updated_at=?9,public_domain_id=?12,lan_redirect_enabled=?13,origin_protocol=?14,service_mode=?15,http_redirect_enabled=?16 WHERE id=?10 AND tenant_id=?11 AND deleted_at IS NULL",params![input.device_id,input.name.trim(),input.protocol,input.local_address.trim(),input.local_port,input.public_port,input.hostname,input.enabled.unwrap_or(true),unix_now(),id,session.tenant_id,input.public_domain_id,input.lan_redirect_enabled.unwrap_or(false),input.origin_protocol,input.service_mode,input.http_redirect_enabled.unwrap_or(false),revision_changed]).map_err(db_error)?;
         nodes::services::save(&db, &id, &input)?;
+        if revision_changed {
+            // 只迁移仍匹配旧版本的未变链路，不改时间戳、成功/失败计数或错误；过期结果不能续命。
+            if origin_unchanged {
+                db.execute("UPDATE tunnel_applied_states SET revision=revision+1 WHERE tunnel_id=?1 AND revision=?2", params![id,revision]).map_err(db_error)?;
+            }
+            if entry_unchanged {
+                db.execute("UPDATE relay_public_health SET revision=revision+1 WHERE service_id=?1 AND revision=?2", params![id,revision]).map_err(db_error)?;
+                if device_unchanged {
+                    // 保留样本，但先等待节点确认当前版本已加载；不能用旧监听状态直接发布 DNS。
+                    db.execute("UPDATE relay_service_health SET revision=revision+1,healthy=0 WHERE service_id=?1 AND revision=?2", params![id,revision]).map_err(db_error)?;
+                }
+                if !nodes_changed && !selection_changed {
+                    db.execute("UPDATE relay_dns_state SET revision=revision+1 WHERE service_id=?1 AND revision=?2", params![id,revision]).map_err(db_error)?;
+                }
+                if device_unchanged && direct_unchanged && input.ipv6_direct_enabled == Some(true) {
+                    // IPv6 入口未变时保留探测结果，仍须等待 Agent 验证新回源并上报当前配置就绪。
+                    db.execute("UPDATE direct_services SET revision=revision+1,ready=0 WHERE service_id=?1 AND revision=?2", params![id,revision]).map_err(db_error)?;
+                }
+            }
+        }
         https_ports::save(&db, &id, &input)?;
         db.execute(
             "UPDATE tunnels SET ipv6_direct_enabled=?2 WHERE id=?1",
@@ -1353,7 +1388,7 @@ fn prepare_tunnel(
         if !owned {
             return Err(ApiError::new(
                 StatusCode::BAD_REQUEST,
-                "Agent 不存在或不属于当前工作空间",
+                "设备不存在或不属于当前工作空间",
             ));
         }
     }
@@ -1622,6 +1657,7 @@ mod tests {
         let digest = |value: &str| hex::encode(Sha256::digest(value.as_bytes()));
         db.execute("INSERT INTO auth_sessions (id,user_id,tenant_id,session_digest,csrf_digest,created_at,last_seen_at,expires_at) VALUES ('s','u','default',?1,?2,0,0,?3)", params![digest("domain-test"), digest("csrf-test"), unix_now() + 3600]).unwrap();
         let state = AppState {
+            agent_releases: Arc::new(agent_release::Catalog::default()),
             config: Arc::new(config::Config {
                 runtime_dir: std::env::temp_dir().join(format!("nexo-test-{}", Uuid::new_v4())),
                 ..Default::default()
@@ -1709,6 +1745,279 @@ mod tests {
         server.abort();
         let _ = server.await;
         fs::remove_dir_all(root).unwrap();
+    }
+
+    /// 批量换域名复用单项更新，验证事务只改变域名及运行版本，保留认证密码与其他服务配置。
+    #[tokio::test]
+    async fn root_domain_change_preserves_service_configuration() {
+        let _guard = auth::PASSWORD_TEST_LOCK.lock().await;
+        for mode in ["tunnel", "reverse_proxy"] {
+            let (state, headers) = domain_fixture();
+            state.db.lock().unwrap().execute_batch("INSERT INTO public_domains(id,tenant_id,domain,https_enabled,created_at,updated_at) VALUES('old','default','old.example.com',0,0,0),('new','default','new.example.com',0,0,0); INSERT INTO domain_settings(domain_id,verification_token,certificate_mode,verified) VALUES('old','proof-old','cloudflare_dns',1),('new','proof-new','cloudflare_dns',1); INSERT INTO devices(id,tenant_id,name,created_at,updated_at) VALUES('agent','default','Agent',0,0);").unwrap();
+            let make_input = |domain: &str, creating: bool| {
+                let mut value = serde_json::json!({
+                    "service_mode": mode, "device_id": if mode == "tunnel" { Some("agent") } else { None },
+                    "name": "媒体", "protocol": "http", "origin_protocol": "https", "local_address": "192.168.10.20", "local_port": 8096,
+                    "hostname": "media", "public_domain_id": domain, "enabled": false, "https_port": 8443,
+                    "lan_redirect_enabled": mode == "tunnel", "http_redirect_enabled": mode == "reverse_proxy", "access_mode": "password"
+                });
+                if creating {
+                    value["icon_id"] = serde_json::json!("border-radius/emby-1.png");
+                    value["access_password"] = serde_json::json!("secret-123");
+                }
+                serde_json::from_value::<TunnelInput>(value).unwrap()
+            };
+            let Json(created) = create_tunnel(
+                State(state.clone()),
+                headers.clone(),
+                Json(make_input("old", true)),
+            )
+            .await
+            .unwrap();
+            let password = || {
+                state
+                    .db
+                    .lock()
+                    .unwrap()
+                    .query_row(
+                        "SELECT access_password_hash FROM tunnels WHERE id=?1",
+                        [&created.id],
+                        |r| r.get::<_, String>(0),
+                    )
+                    .unwrap()
+            };
+            let original_password = password();
+            let Json(updated) = update_tunnel(
+                State(state.clone()),
+                headers.clone(),
+                Path(created.id.clone()),
+                Json(make_input("new", false)),
+            )
+            .await
+            .unwrap();
+            let before = serde_json::to_value(&created).unwrap();
+            let after = serde_json::to_value(&updated).unwrap();
+            for field in [
+                "id",
+                "name",
+                "service_mode",
+                "device_id",
+                "protocol",
+                "origin_protocol",
+                "local_address",
+                "local_port",
+                "public_port",
+                "hostname",
+                "https_port",
+                "enabled",
+                "lan_redirect_enabled",
+                "http_redirect_enabled",
+                "access_mode",
+                "icon_id",
+                "node_ids",
+                "node_group_id",
+                "distribution_mode",
+                "preferred_node_id",
+                "ipv6_direct_enabled",
+            ] {
+                assert_eq!(before[field], after[field], "{mode}: {field}");
+            }
+            assert_eq!(updated.public_domain.as_deref(), Some("new.example.com"));
+            assert!(updated
+                .public_address
+                .as_deref()
+                .unwrap()
+                .contains("media.new.example.com"));
+            assert_eq!(updated.apply_revision, created.apply_revision + 1);
+            assert_eq!(password(), original_password);
+            let Json(unchanged) = update_tunnel(
+                State(state.clone()),
+                headers,
+                Path(created.id.clone()),
+                Json(make_input("new", false)),
+            )
+            .await
+            .unwrap();
+            assert_eq!(unchanged.apply_revision, updated.apply_revision);
+        }
+    }
+
+    /// TCP 多节点与 IPv6 直连换域名时继续使用原节点、首选节点和直连能力。
+    #[tokio::test]
+    async fn root_domain_change_preserves_remote_tcp_and_ipv6_direct() {
+        for (protocol, direct) in [("tcp", false), ("https", false), ("https", true)] {
+            let (state, headers) = domain_fixture();
+            let old = add_test_domain(&state, &headers, "old.example.com")
+                .await
+                .unwrap();
+            let new = add_test_domain(&state, &headers, "new.example.com")
+                .await
+                .unwrap();
+            let root = state
+                .domain_runtime
+                .supervisor
+                .config()
+                .cloudflare_token_root
+                .clone();
+            for domain in [&old, &new] {
+                let file = domains::write_credential(&root, &domain.id, "test-token").unwrap();
+                state.db.lock().unwrap().execute("UPDATE domain_settings SET verified=1,credential_file=?2 WHERE domain_id=?1", params![domain.id, file]).unwrap();
+            }
+            state.db.lock().unwrap().execute_batch("INSERT INTO devices(id,tenant_id,name,status,node_capable,created_at,updated_at) VALUES('agent','default','Agent','online',1,0,0); INSERT INTO relay_nodes(id,name,public_ipv4,approved,created_at) VALUES('hk','香港','203.0.113.10',1,0),('jp','日本','203.0.113.11',1,0);").unwrap();
+            let group = if direct {
+                state.db.lock().unwrap().execute("INSERT INTO direct_agents(device_id,addresses,selected_address,last_seen) VALUES('agent','[\"2001:4860::123\"]','2001:4860::123',?1)", [unix_now()]).unwrap();
+                None
+            } else {
+                let Json(groups) = nodes::groups::create(State(state.clone()), headers.clone(), Json(serde_json::from_value(serde_json::json!({"name":"多节点","node_ids":["hk","jp"],"workspace_ids":["default"]})).unwrap())).await.unwrap();
+                Some(groups[0]["id"].as_str().unwrap().to_owned())
+            };
+            let make_input = |domain: &str, creating: bool| {
+                let mut value = serde_json::json!({
+                    "name": "媒体", "device_id": "agent", "protocol": protocol, "local_address": "127.0.0.1", "local_port": 8096,
+                    "public_port": if protocol == "tcp" { Some(23456) } else { None }, "https_port": 8443,
+                    "hostname": "media", "public_domain_id": domain, "ipv6_direct_enabled": direct
+                });
+                if creating && !direct {
+                    value["node_group_id"] = serde_json::json!(group);
+                    value["distribution_mode"] = serde_json::json!("manual");
+                    value["preferred_node_id"] = serde_json::json!("hk");
+                }
+                serde_json::from_value::<TunnelInput>(value).unwrap()
+            };
+            let Json(created) = create_tunnel(
+                State(state.clone()),
+                headers.clone(),
+                Json(make_input(&old.id, true)),
+            )
+            .await
+            .unwrap();
+            let Json(updated) = update_tunnel(
+                State(state.clone()),
+                headers.clone(),
+                Path(created.id.clone()),
+                Json(make_input(&new.id, false)),
+            )
+            .await
+            .unwrap();
+            assert_eq!(updated.node_ids, created.node_ids);
+            assert_eq!(updated.node_group_id, group);
+            assert_eq!(updated.distribution_mode, created.distribution_mode);
+            assert_eq!(updated.preferred_node_id, created.preferred_node_id);
+            assert_eq!(updated.public_port, created.public_port);
+            assert_eq!(updated.https_port, 8443);
+            assert_eq!(updated.ipv6_direct_enabled, direct);
+            assert_eq!(updated.public_domain.as_deref(), Some("new.example.com"));
+            assert!(updated
+                .public_address
+                .as_deref()
+                .unwrap()
+                .contains("media.new.example.com"));
+            if direct {
+                assert_eq!(
+                    direct::service(&state, "agent", &created.id, updated.apply_revision)
+                        .unwrap()
+                        .hostname,
+                    "media.new.example.com"
+                );
+            }
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    /// 单项失败只回滚该服务：成功项保留新域名，冲突、凭据、跨空间和 CSRF 检查继续生效。
+    #[tokio::test]
+    async fn root_domain_change_keeps_validation_and_failed_item_rollback() {
+        let (state, headers) = domain_fixture();
+        state.db.lock().unwrap().execute_batch("INSERT INTO tenants(id,name,created_at) VALUES('other','其他空间',0); INSERT INTO public_domains(id,tenant_id,domain,https_enabled,created_at,updated_at) VALUES('old','default','old.example.com',1,0,0),('new','default','new.example.com',1,0,0),('pending','default','pending.example.com',1,0,0),('foreign','other','foreign.example.com',1,0,0); INSERT INTO domain_settings(domain_id,verification_token,certificate_mode,verified,credential_file) VALUES('old','proof-old','cloudflare_dns',1,NULL),('new','proof-new','cloudflare_dns',1,NULL),('pending','proof-pending','cloudflare_dns',0,NULL),('foreign','proof-foreign','cloudflare_dns',1,NULL); INSERT INTO devices(id,tenant_id,name,created_at,updated_at) VALUES('agent','default','Agent',0,0);").unwrap();
+        let input = |domain: &str, name: &str, protocol: &str| {
+            serde_json::from_value::<TunnelInput>(serde_json::json!({
+            "name": name, "protocol": protocol, "local_address": "127.0.0.1", "local_port": 8096, "device_id": "agent", "hostname": "media", "public_domain_id": domain
+        })).unwrap()
+        };
+        let Json(first) = create_tunnel(
+            State(state.clone()),
+            headers.clone(),
+            Json(input("old", "服务一", "http")),
+        )
+        .await
+        .unwrap();
+        let Json(second) = create_tunnel(
+            State(state.clone()),
+            headers.clone(),
+            Json(input("new", "服务二", "http")),
+        )
+        .await
+        .unwrap();
+        let error = update_tunnel(
+            State(state.clone()),
+            headers.clone(),
+            Path(first.id.clone()),
+            Json(input("new", "服务一", "http")),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.status, StatusCode::CONFLICT);
+        for (domain, protocol) in [
+            ("pending", "http"),
+            ("foreign", "http"),
+            ("missing", "http"),
+            ("new", "https"),
+        ] {
+            let error = update_tunnel(
+                State(state.clone()),
+                headers.clone(),
+                Path(first.id.clone()),
+                Json(input(domain, "服务一", protocol)),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(error.status, StatusCode::BAD_REQUEST);
+            let current = read_tunnel(&state, "default", &first.id, &headers).unwrap();
+            assert_eq!(current.public_domain, first.public_domain);
+            assert_eq!(current.apply_revision, first.apply_revision);
+        }
+        let mut bad_csrf = headers.clone();
+        bad_csrf.remove("x-nexo-csrf");
+        let error = update_tunnel(
+            State(state.clone()),
+            bad_csrf,
+            Path(first.id.clone()),
+            Json(input("old", "服务一", "http")),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.status, StatusCode::FORBIDDEN);
+        // 另一个服务使用不同主机名，成功迁移不受此前失败影响。
+        let mut changed = input("old", "服务二", "http");
+        changed.hostname = Some("other".into());
+        let Json(moved) = update_tunnel(
+            State(state.clone()),
+            headers.clone(),
+            Path(second.id),
+            Json(changed),
+        )
+        .await
+        .unwrap();
+        assert_eq!(moved.public_domain.as_deref(), Some("old.example.com"));
+        assert_eq!(
+            read_tunnel(&state, "default", &first.id, &headers)
+                .unwrap()
+                .public_domain,
+            first.public_domain
+        );
+        state
+            .db
+            .lock()
+            .unwrap()
+            .execute("UPDATE users SET role='tenant' WHERE id='u'", [])
+            .unwrap();
+        let mut proxy = input("old", "反代", "http");
+        proxy.service_mode = Some("reverse_proxy".into());
+        proxy.device_id = None;
+        let error = update_tunnel(State(state), headers, Path(first.id), Json(proxy))
+            .await
+            .unwrap_err();
+        assert_eq!(error.status, StatusCode::FORBIDDEN);
     }
 
     #[tokio::test]

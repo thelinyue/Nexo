@@ -50,7 +50,7 @@ async fn connection(
     let stream = connect_tls(&TlsConnector::from(Arc::new(config)), &endpoint).await?;
     anyhow::ensure!(
         stream.get_ref().1.alpn_protocol() == Some(ALPN),
-        "Server 未协商直连管理协议"
+        "服务端未协商直连管理协议"
     );
     let mut mux = nexo_tunnel::yamux_connection(stream, yamux::Mode::Client);
     let mut tasks = JoinSet::new();
@@ -367,7 +367,7 @@ impl Process {
         command.creation_flags(0x08000000);
         let child = command
             .spawn()
-            .context("无法启动直连 Caddy，请检查 Agent 安装及 caddy_binary 配置")?;
+            .context("无法启动直连 Caddy，请检查客户端安装及 caddy_binary 配置")?;
         let mut process = Self {
             child,
             admin: format!("http://{address}"),
@@ -526,7 +526,7 @@ async fn session(
                         if !running.contains_key(&id) {
                             let listen=format!("[{}]:{}",service.ipv6,service.port);
                             let owned=process.as_ref().is_some_and(|p|p.last["apps"]["http"]["servers"].as_object().is_some_and(|servers|servers.values().any(|v|v["listen"].as_array().is_some_and(|a|a.contains(&json!(listen))))));
-                            if !owned {let probe=std::net::TcpListener::bind((service.ipv6.parse::<Ipv6Addr>()?,service.port)).context("Agent HTTPS 端口已被占用或 IPv6 地址失效")?;drop(probe);}
+                            if !owned {let probe=std::net::TcpListener::bind((service.ipv6.parse::<Ipv6Addr>()?,service.port)).context("客户端 HTTPS 端口已被占用或 IPv6 地址失效")?;drop(probe);}
                             // 本地回源成功后才上报 ready；连接失败不能发布 AAAA。
                             connect_origin(&service.tunnel).await?;
                             running.insert(id.clone(),(service.clone(),Forwarder::start(&service,desired.clone()).await?));

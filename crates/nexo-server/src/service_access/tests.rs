@@ -144,6 +144,181 @@ async fn api_default_password_changes_and_tcp_rejection() {
 }
 
 #[tokio::test]
+async fn access_updates_keep_forwarding_revision_and_public_health() {
+    let _guard = auth::PASSWORD_TEST_LOCK.lock().await;
+    for service_mode in ["tunnel", "reverse_proxy"] {
+        let (state, admin) = fixture();
+        state.db.lock().unwrap().execute_batch("INSERT INTO devices(id,tenant_id,name,node_capable,created_at,updated_at) VALUES('agent','default','Agent',1,0,0);
+            INSERT INTO device_certificates(device_id,certificate_pem) VALUES('agent','test-certificate');
+            INSERT INTO relay_nodes(id,name,public_ipv4,approved,created_at) VALUES('node-test','测试入口','203.0.113.10',1,0);
+            INSERT INTO relay_node_grants VALUES('node-test','default');").unwrap();
+        let make_input = |mode, password| {
+            let mut data = input(Some(mode), password);
+            data.service_mode = Some(service_mode.into());
+            if service_mode == "tunnel" {
+                data.device_id = Some("agent".into());
+                data.node_ids = Some(vec!["local".into(), "node-test".into()]);
+                data.distribution_mode = Some("dns".into());
+            }
+            data
+        };
+        let created = create_tunnel(
+            State(state.clone()),
+            admin.clone(),
+            Json(make_input("public", None)),
+        )
+        .await
+        .unwrap()
+        .0;
+        let checked_at = unix_now() - 1;
+        {
+            let db = state.db.lock().unwrap();
+            db.execute(
+                "UPDATE devices SET status='online',last_seen_at=?1 WHERE id='agent'",
+                [checked_at],
+            )
+            .unwrap();
+            db.execute(
+                "UPDATE relay_nodes SET last_seen=?1 WHERE id='node-test'",
+                [checked_at],
+            )
+            .unwrap();
+            db.execute(
+                "UPDATE tunnels SET apply_status='ready',apply_error=NULL WHERE id=?1",
+                [&created.id],
+            )
+            .unwrap();
+            db.execute("INSERT INTO tunnel_applied_states(tunnel_id,revision,status,updated_at) VALUES(?1,?2,'ready',?3)", params![created.id,created.apply_revision,checked_at]).unwrap();
+            for node in ["local", "node-test"] {
+                db.execute("INSERT OR REPLACE INTO relay_service_health(node_id,service_id,revision,successes,healthy,checked_at,public_probe_supported) VALUES(?1,?2,?3,3,1,?4,1)", params![node,created.id,created.apply_revision,checked_at]).unwrap();
+                db.execute("INSERT INTO relay_public_health(node_id,service_id,revision,successes,healthy,checked_at,probe_kind,address) VALUES(?1,?2,?3,3,1,?4,'http',?5)", params![node,created.id,created.apply_revision,checked_at,if node == "local" { "" } else { "203.0.113.10" }]).unwrap();
+            }
+            db.execute(
+                "INSERT INTO relay_dns_state VALUES(?1,?2,?3,NULL)",
+                params![created.id, created.apply_revision, checked_at],
+            )
+            .unwrap();
+        }
+        let desired = crate::desired_tunnels(&state, "agent").unwrap();
+        let access = access_state(&state);
+        let mut visitor = request_headers(&created.id);
+        assert_eq!(
+            check_inner(&access, &visitor).unwrap().status(),
+            StatusCode::NO_CONTENT
+        );
+
+        // 公开转认证、密码轮换和恢复公开都只改变认证；节点继续同步规则，健康样本不重新累计。
+        for (mode, password, expected) in [
+            ("password", Some("pass!"), StatusCode::UNAUTHORIZED),
+            ("password", Some("new!"), StatusCode::UNAUTHORIZED),
+            ("public", None, StatusCode::NO_CONTENT),
+        ] {
+            state.db.lock().unwrap().execute("INSERT INTO service_access_sessions(digest,service_id,expires_at) VALUES(?1,?2,?3)", params![auth::digest("old-session"),created.id,unix_now()+3600]).unwrap();
+            visitor.insert(
+                header::COOKIE,
+                format!("nexo_access_{}=old-session", created.id.replace('-', ""))
+                    .parse()
+                    .unwrap(),
+            );
+            assert_eq!(
+                check_inner(&access, &visitor).unwrap().status(),
+                StatusCode::NO_CONTENT
+            );
+            let updated = update_tunnel(
+                State(state.clone()),
+                admin.clone(),
+                Path(created.id.clone()),
+                Json(make_input(mode, password)),
+            )
+            .await
+            .unwrap()
+            .0;
+            assert_eq!(updated.access_mode, mode);
+            assert_eq!(updated.apply_revision, created.apply_revision);
+            assert_eq!(updated.apply_status, "ready");
+            assert_eq!(updated.apply_error, None);
+            assert_eq!(crate::desired_tunnels(&state, "agent").unwrap(), desired);
+            assert_eq!(check_inner(&access, &visitor).unwrap().status(), expected);
+            {
+                let db = state.db.lock().unwrap();
+                assert_eq!(
+                    db.query_row(
+                        "SELECT COUNT(*) FROM service_access_sessions WHERE service_id=?1",
+                        [&created.id],
+                        |r| r.get::<_, i64>(0)
+                    )
+                    .unwrap(),
+                    0
+                );
+                for table in ["relay_service_health", "relay_public_health"] {
+                    assert_eq!(db.query_row(&format!("SELECT COUNT(*) FROM {table} WHERE service_id=?1 AND revision=?2 AND successes=3 AND healthy=1 AND checked_at=?3 AND error IS NULL"), params![created.id,created.apply_revision,checked_at], |r| r.get::<_, i64>(0)).unwrap(), 2);
+                }
+                assert!(db.query_row("SELECT revision=?2 AND synced_at=?3 AND error IS NULL FROM relay_dns_state WHERE service_id=?1", params![created.id,created.apply_revision,checked_at], |r| r.get::<_, bool>(0)).unwrap());
+            }
+            if service_mode == "tunnel" {
+                let snapshot = crate::nodes::control::snapshot(&state, "node-test").unwrap();
+                assert_eq!(snapshot.services.len(), 1);
+                assert_eq!(snapshot.services[0].access_mode, mode);
+                assert_eq!(snapshot.services[0].revision, created.apply_revision);
+            }
+            if let Some(password) = password {
+                let logged = login_inner(
+                    &access,
+                    &visitor,
+                    Login {
+                        password: password.into(),
+                        return_to: "/".into(),
+                    },
+                )
+                .await
+                .unwrap();
+                visitor.insert(
+                    header::COOKIE,
+                    logged.headers()[header::SET_COOKIE]
+                        .to_str()
+                        .unwrap()
+                        .split(';')
+                        .next()
+                        .unwrap()
+                        .parse()
+                        .unwrap(),
+                );
+                assert_eq!(
+                    check_inner(&access, &visitor).unwrap().status(),
+                    StatusCode::NO_CONTENT
+                );
+                if password == "new!" {
+                    assert_eq!(
+                        login_inner(
+                            &access,
+                            &visitor,
+                            Login {
+                                password: "pass!".into(),
+                                return_to: "/".into()
+                            }
+                        )
+                        .await
+                        .unwrap_err()
+                        .status,
+                        StatusCode::UNAUTHORIZED
+                    );
+                }
+            }
+        }
+        // 认证与目标地址同时变化时，仍按网络配置更新重新应用，不能跳过真实连通性检查。
+        let mut changed = make_input("password", Some("final!"));
+        changed.local_port = 3001;
+        let updated = update_tunnel(State(state.clone()), admin, Path(created.id), Json(changed))
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(updated.access_mode, "password");
+        assert_eq!(updated.apply_revision, created.apply_revision + 1);
+        assert_ne!(updated.apply_status, "ready");
+    }
+}
+
+#[tokio::test]
 async fn auth_cookie_isolated_expiring_revoked_and_not_forwarded() {
     let _guard = auth::PASSWORD_TEST_LOCK.lock().await;
     let (state, admin) = fixture();

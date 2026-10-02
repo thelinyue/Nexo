@@ -54,6 +54,6 @@ export function QuotaForm({ user, csrf, onClose, onSaved }: { user: { id: string
         </fieldset><p className="helper">每月 1 日北京时间零点恢复；全部隧道双向合计。重置统计不会恢复额度。</p>
         {stopping && <p className="quota-warning" role="alert">保存后将停止该用户全部隧道转发，包括现有连接。账号和设备保持在线。</p>}
       </>}<Notice error={error} /></div>
-    <footer className="modal-actions"><button type="button" className="secondary-button" disabled={busy} onClick={onClose}>取消</button><button className={stopping ? "danger-button" : "primary-button"} disabled={busy || !valid || !dirty || !resource.data}>{busy ? "保存中…" : stopping ? "保存并停止转发" : "保存"}</button></footer>
+    <footer className="modal-actions"><button type="button" className="secondary-button modal-dismiss" disabled={busy} onClick={onClose}>取消</button><button className={stopping ? "danger-button" : "primary-button"} disabled={busy || !valid || !dirty || !resource.data}>{busy ? "保存中…" : stopping ? "保存并停止转发" : "保存"}</button></footer>
   </form></Modal></WorkspaceLabelContext.Provider>;
 }

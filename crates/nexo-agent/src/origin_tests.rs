@@ -12,6 +12,98 @@ fn tunnel(port: u16, origin: &str) -> TunnelDesiredState {
 }
 
 #[tokio::test]
+async fn edit_push_only_connects_changed_origins_and_periodic_checks_continue() {
+    let unchanged = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let changed = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let first = tunnel(unchanged.local_addr().unwrap().port(), "http");
+    let mut second = first.clone();
+    second.tunnel_id = "changed-origin".into();
+    let previous = vec![first.clone(), second.clone()];
+    let mut entry_edit = first.clone();
+    entry_edit.protocol = "http".into();
+    entry_edit.hostname = Some("new".into());
+    entry_edit.revision += 1;
+    second.local_port = changed.local_addr().unwrap().port();
+    second.revision += 1;
+    let next = vec![entry_edit, second];
+    let results = probe_tunnels(origin_checks(&previous, &next, false)).await;
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].tunnel_id, "changed-origin");
+    assert!(results[0].applied);
+    tokio::time::timeout(Duration::from_secs(1), changed.accept())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(30), unchanged.accept())
+            .await
+            .is_err()
+    );
+    let results = probe_tunnels(origin_checks(&next, &next, true)).await;
+    assert_eq!(results.len(), 2);
+    assert!(results.iter().all(|result| result.applied));
+    tokio::time::timeout(Duration::from_secs(1), unchanged.accept())
+        .await
+        .unwrap()
+        .unwrap();
+}
+
+#[tokio::test]
+async fn disabled_edit_reports_without_connecting_and_tls_edits_are_checked() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let old = tunnel(listener.local_addr().unwrap().port(), "https");
+    let mut disabled = old.clone();
+    disabled.enabled = false;
+    let results = probe_tunnels(origin_checks(
+        std::slice::from_ref(&old),
+        &[disabled],
+        false,
+    ))
+    .await;
+    assert_eq!(results[0].status, "disabled");
+    assert!(
+        tokio::time::timeout(Duration::from_millis(30), listener.accept())
+            .await
+            .is_err()
+    );
+    let mut changed = old.clone();
+    changed.origin_tls_verification = Some("custom_ca".into());
+    let results = probe_tunnels(origin_checks(&[old], &[changed], false)).await;
+    assert_eq!(results.len(), 1);
+    assert!(!results[0].applied);
+    assert!(results[0]
+        .error_message
+        .as_deref()
+        .unwrap()
+        .contains("自定义 CA"));
+}
+
+#[tokio::test]
+async fn in_flight_origin_result_survives_entry_edit_but_rejects_changed_target() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let measured = tunnel(listener.local_addr().unwrap().port(), "http");
+    let results = probe_tunnels(vec![measured.clone()]).await;
+    let mut current = measured.clone();
+    current.revision += 1;
+    current.hostname = Some("new".into());
+    current.protocol = "http".into();
+    let reports = current_origin_reports(
+        std::slice::from_ref(&measured),
+        results.clone(),
+        std::slice::from_ref(&current),
+    );
+    assert_eq!(reports.len(), 1);
+    assert_eq!(reports[0].revision, current.revision);
+    assert!(reports[0].applied);
+    current.local_address = "127.0.0.2".into();
+    assert!(
+        current_origin_reports(std::slice::from_ref(&measured), results.clone(), &[current])
+            .is_empty()
+    );
+    assert!(current_origin_reports(&[measured], results, &[]).is_empty());
+}
+
+#[tokio::test]
 async fn public_https_can_use_plain_http_origin() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let desired = tunnel(listener.local_addr().unwrap().port(), "http");

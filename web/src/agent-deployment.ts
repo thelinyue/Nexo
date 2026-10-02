@@ -21,13 +21,13 @@ export function agentDeploymentContent(template: string, serverUrl: string, toke
   const url = normalizeAgentServerUrl(serverUrl);
   if (!url || !token.startsWith("nexo_join_") || /[\u0000-\u001f\u007f]/.test(token)) throw new Error("Server 地址或接入密钥无效。");
   const image = template.match(/^\s+image:\s*(\S+)\s*$/m)?.[1];
-  if (!image || !/:(latest|\d+\.\d+\.\d+(?:-[\w.-]+)?)$/.test(image)) throw new Error("Agent 部署配置需要 latest 或明确的数字版本。");
-  const environment = { NEXO_SERVER_URL: url, NEXO_ENROLLMENT_TOKEN: token, NEXO_DEVICE_NAME: deviceName.trim() || "Nexo Agent" };
+  if (!image || !/:(latest|\d+\.\d+\.\d+(?:-[\w.-]+)?)$/.test(image)) throw new Error("设备部署配置需要 latest 或明确的数字版本。");
+  const environment = { NEXO_SERVER_URL: url, NEXO_ENROLLMENT_TOKEN: token, NEXO_DEVICE_NAME: deviceName.trim() || "Nexo 设备" };
   if (method === "compose") {
     let config = template.replace(/\r\n/g, "\n");
     for (const [name, value] of Object.entries(environment)) {
       const field = new RegExp(`^([ \\t]*${name}:)[ \\t]*\\$\\{${name}:-\\}[ \\t]*$`, "m");
-      if (!field.test(config)) throw new Error(`Agent Compose 模板缺少 ${name} 字段。`);
+      if (!field.test(config)) throw new Error(`设备 Compose 模板缺少 ${name} 字段。`);
       config = config.replace(field, (_line, key: string) => `${key} ${composeLiteral(value)}`);
     }
     return config;

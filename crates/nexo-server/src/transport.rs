@@ -110,7 +110,7 @@ impl Runtime {
         loop {
             tokio::select! {
                 _ = state.tunnel_runtime.stop.cancelled() => break,
-                _ = interval.tick() => if let Err(error) = state.tunnel_runtime.reconcile(&state).await { tracing::error!("Tunnel 状态协调失败：{error:#}"); }
+                _ = interval.tick() => if let Err(error) = state.tunnel_runtime.reconcile(&state).await { tracing::error!("隧道状态协调失败：{error:#}"); }
             }
         }
     }
@@ -421,7 +421,7 @@ impl Runtime {
                         _ = task_cancel.cancelled() => break,
                         accepted = listener.accept() => match accepted {
                             Ok((socket, _)) => handoff(&task_state, &task_service, Box::new(socket), &task_cancel).await,
-                            Err(error) => { tracing::warn!("Web Tunnel 监听停止：{error}"); break; }
+                            Err(error) => { tracing::warn!("Web 隧道监听停止：{error}"); break; }
                         }
                     }
                 }
@@ -480,7 +480,7 @@ fn tcp_listener(
                 _ = cancel.cancelled() => break,
                 accepted = listener.accept() => match accepted {
                     Ok((socket, _)) => handoff(&state, &service, Box::new(socket), &cancel).await,
-                    Err(error) => { tracing::warn!("TCP Tunnel 监听停止：{error}"); break; }
+                    Err(error) => { tracing::warn!("TCP 隧道监听停止：{error}"); break; }
                 }
             }
         }
@@ -547,7 +547,7 @@ fn authenticated_device(
         .1
         .peer_certificates()
         .and_then(|chain| chain.first())
-        .context("连接缺少 Agent 证书")?;
+        .context("连接缺少设备证书")?;
     authenticated_certificate(state, cert.as_ref())
 }
 fn authenticated_certificate(state: &AppState, cert: &[u8]) -> Result<(String, String)> {
@@ -584,12 +584,12 @@ pub async fn serve(state: AppState, listener: TcpListener, data: bool) -> Result
                 tasks.spawn(async move {
                     let result: Result<()> = async {
                         nexo_tunnel::configure_tunnel_tcp_keepalive(&socket)?;
-                        let stream = tokio::time::timeout(Duration::from_secs(10), acceptor.accept(socket)).await.context("Agent TLS 握手超时")??;
+                        let stream = tokio::time::timeout(Duration::from_secs(10), acceptor.accept(socket)).await.context("设备 TLS 握手超时")??;
                         if !data { if let Some(node)=crate::nodes::control::peer_id(&stream) { return crate::nodes::control::session(state,stream,node).await; } }
                         let (device, fingerprint) = authenticated_device(&state, &stream)?;
                         if data && stream.get_ref().1.alpn_protocol()==Some(nexo_protocol::direct::ALPN) { crate::direct::session(state,stream,device,fingerprint).await } else if data { data_session(state, stream, device, fingerprint).await } else { control_session(state, stream, device, fingerprint, peer.ip()).await }
                     }.await;
-                    if let Err(error) = result { tracing::warn!(%peer, "Agent 连接结束：{error:#}"); }
+                    if let Err(error) = result { tracing::warn!(%peer, "设备连接结束：{error:#}"); }
                 });
             }
         }
@@ -611,7 +611,7 @@ async fn control_session(
     let mut lines = FramedRead::new(read, LinesCodec::new_with_max_length(MAX_CONTROL_FRAME));
     let first = tokio::time::timeout(Duration::from_secs(10), lines.next())
         .await?
-        .context("Agent 未发送 Hello")??;
+        .context("设备未发送 Hello")??;
     diagnostics.received();
     let AgentControlMessage::Hello {
         capabilities,
@@ -619,9 +619,9 @@ async fn control_session(
         agent_version,
     } = serde_json::from_str(&first)?
     else {
-        anyhow::bail!("Agent 首帧必须是 Hello");
+        anyhow::bail!("设备首帧必须是 Hello");
     };
-    anyhow::ensure!(device_id == device, "Agent ID 与客户端证书不一致");
+    anyhow::ensure!(device_id == device, "设备 ID 与客户端证书不一致");
     let cancel = state.tunnel_runtime.stop.child_token();
     let (sender, mut receiver) = mpsc::channel(8);
     {
@@ -665,10 +665,10 @@ async fn control_session(
         let deadline = tokio::time::sleep(Duration::from_secs(45)); tokio::pin!(deadline);
         loop { tokio::select! {
             _ = cancel.cancelled() => break,
-            _ = &mut deadline => anyhow::bail!("Agent 心跳超时（45 秒）"),
+            _ = &mut deadline => anyhow::bail!("设备心跳超时（45 秒）"),
             command = receiver.recv() => { let Some(command) = command else { break; }; diagnostics.send(&mut write, &command).await?; },
             incoming = lines.next() => {
-                let line = incoming.context("Agent 控制通道已断开")??;
+                let line = incoming.context("设备控制通道已断开")??;
                 diagnostics.received();
                 deadline.as_mut().reset(tokio::time::Instant::now() + Duration::from_secs(45));
                 match serde_json::from_str::<AgentControlMessage>(&line)? {
@@ -740,7 +740,7 @@ async fn control_session(
             .execute("UPDATE devices SET status='offline' WHERE id=?1", [&device])?;
     }
     result.with_context(|| {
-        format!("Server 控制通道诊断：device_id={device} peer={peer}；{diagnostics}")
+        format!("服务端控制通道诊断：device_id={device} peer={peer}；{diagnostics}")
     })
 }
 
@@ -803,7 +803,7 @@ async fn data_session(
         .get_ref()
         .0
         .set_nodelay(true)
-        .context("设置 Tunnel 数据连接 TCP_NODELAY 失败")?;
+        .context("设置隧道数据连接 TCP_NODELAY 失败")?;
     let (sender, mut receiver) = mpsc::channel::<OpenStream>(nexo_tunnel::DEFAULT_MAX_STREAMS);
     let cancel = state.tunnel_runtime.stop.child_token();
     {
@@ -836,7 +836,7 @@ async fn data_session(
             if command.cancel.is_cancelled() || !allowed(&state, &command.service, &device)? { continue; }
             let quota = state.tunnel_runtime.quotas.get(&state, &command.service.tenant)?;
             let Some(quota_cancel) = quota.connection() else { continue; };
-            let stream = tokio::time::timeout(Duration::from_secs(10), nexo_tunnel::new_outbound(&mut connection)).await.context("Tunnel 开流超时")??;
+            let stream = tokio::time::timeout(Duration::from_secs(10), nexo_tunnel::new_outbound(&mut connection)).await.context("隧道开流超时")??;
             let meter = state.tunnel_runtime.traffic.meter(&command.service.tenant, &command.service.id);
             copies.spawn(state.tunnel_runtime.transfers.track_future(async move {
                 let mut stream = nexo_tunnel::into_tokio_io(stream);
@@ -848,11 +848,11 @@ async fn data_session(
                     tokio::io::copy_bidirectional(&mut socket, &mut stream).await?;
                     anyhow::Ok(())
                 };
-                tokio::select! { _ = command.cancel.cancelled() => {}, _ = quota_cancel.cancelled() => {}, result = transfer => if let Err(error) = result { tracing::debug!("Tunnel 转发结束：{error:#}"); } }
+                tokio::select! { _ = command.cancel.cancelled() => {}, _ = quota_cancel.cancelled() => {}, result = transfer => if let Err(error) = result { tracing::debug!("隧道转发结束：{error:#}"); } }
             }));
         }
         inbound = nexo_tunnel::next_inbound(&mut connection) => match inbound? {
-            Some(_) => anyhow::bail!("Agent 不允许主动打开服务端逻辑流"),
+            Some(_) => anyhow::bail!("设备不允许主动打开服务端逻辑流"),
             None => break,
         }
     } } Ok(()) }.await;
@@ -974,13 +974,13 @@ fn refresh_status(
             .as_ref()
             .is_none_or(|device| !online.contains(device))
         {
-            ("checking", Some("Agent 未连接控制通道".into()))
+            ("checking", Some("设备未连接控制通道".into()))
         } else if device.as_ref().is_none_or(|device| !data.contains(device)) {
-            ("checking", Some("Agent 数据通道未连接".into()))
+            ("checking", Some("设备数据通道未连接".into()))
         } else if !listeners.contains_key(&id) {
             ("failed", Some("服务入口尚未建立".into()))
         } else if applied_revision != Some(revision) {
-            ("checking", Some("等待 Agent 应用当前配置".into()))
+            ("checking", Some("等待设备应用当前配置".into()))
         } else if applied_status.as_deref() != Some("ready") {
             (
                 "failed",
@@ -1252,7 +1252,7 @@ mod tests {
             .unwrap()
             .unwrap_err();
         let detail = format!("{error:#}");
-        assert!(detail.contains("Agent 心跳超时（45 秒）"), "{detail}");
+        assert!(detail.contains("设备心跳超时（45 秒）"), "{detail}");
         assert!(detail.contains("device_id=mine peer=8.8.8.8"), "{detail}");
         assert!(
             detail.contains("最后接收：[") && detail.contains("最后发送：["),
@@ -1371,7 +1371,7 @@ mod tests {
             } else {
                 assert!(
                     result.is_err() || reply.is_empty(),
-                    "普通数据通道不得接受 Agent 主动管理流"
+                    "普通数据通道不得接受设备主动管理流"
                 );
                 driver.abort();
             }

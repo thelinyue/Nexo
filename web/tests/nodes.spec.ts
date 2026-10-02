@@ -165,7 +165,7 @@ test("手机更多选择列表可关闭、导航和区分用户权限", async ({
   const trigger = nav.getByRole("button", { name: "更多功能" });
   await trigger.click();
   const menu = page.getByRole("navigation", { name: "更多功能", exact: true });
-  await expect(menu.getByRole("link")).toHaveText(["节点当前页面", "域名", "账号设置"]);
+  await expect(menu.getByRole("link")).toHaveText(["节点当前页面", "域名"]);
   await expect(menu.getByRole("link", { name: "用户管理" })).toHaveCount(0);
   await expect(trigger).toHaveAttribute("aria-expanded", "true");
   await page.screenshot({ path: info.outputPath("mobile-more.png") });

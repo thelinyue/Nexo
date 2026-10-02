@@ -92,7 +92,7 @@ test("首页概览、管理员用户与隧道筛选、时间图表和手机导�
   await expect(panel.locator(".traffic-usage strong")).toHaveText(["2 KiB", "20 KiB", "200 KiB"]);
   await expect(panel.getByRole("button", { name: "重置统计", exact: true })).toHaveCount(0);
   await expect(page.locator(".home-summaries")).toContainText("穿透运行 1 · 反代生效 0");
-  await expect(page.getByRole("region", { name: "当前空间待处理" })).toContainText("备用 Agent");
+  await expect(page.getByRole("region", { name: "当前空间待处理" })).toContainText("备用设备");
   expect(queries.some(url => url.pathname === "/api/v1/admin/traffic/history" && !url.searchParams.has("user_id"))).toBeTruthy();
   await panel.getByLabel("搜索统计用户").fill("alice");
   await panel.getByLabel("统计用户", { exact: true }).selectOption("alice");

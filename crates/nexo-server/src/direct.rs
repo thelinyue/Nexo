@@ -66,7 +66,7 @@ pub fn prepare(
     {
         return Err(ApiError::new(
             StatusCode::BAD_REQUEST,
-            "IPv6 直连仅支持绑定 Agent 的 HTTPS 穿透服务，请先关闭内网重定向",
+            "IPv6 直连仅支持绑定设备的 HTTPS 穿透服务，请先关闭内网重定向",
         ));
     }
     let capable: bool = db
@@ -79,7 +79,7 @@ pub fn prepare(
     if !capable {
         return Err(ApiError::new(
             StatusCode::BAD_REQUEST,
-            "请先连接支持 IPv6 直连的新版本 Agent",
+            "请先连接支持 IPv6 直连的新版本设备",
         ));
     }
     let configured: bool = db.query_row("SELECT EXISTS(SELECT 1 FROM domain_settings WHERE domain_id=?1 AND verified=1 AND certificate_mode='cloudflare_dns' AND credential_file IS NOT NULL)",[&input.public_domain_id],|r|r.get(0)).map_err(db_error)?;
@@ -98,8 +98,8 @@ pub fn service(state: &AppState, device: &str, id: &str, revision: i64) -> Resul
         .lock()
         .map_err(|_| anyhow::anyhow!("数据库锁不可用"))?;
     let (host,port,address): (String,u16,Option<String>) = db.query_row("SELECT t.hostname||'.'||p.domain,t.https_port,a.selected_address FROM tunnels t JOIN devices d ON d.id=t.device_id AND d.tenant_id=t.tenant_id AND d.status='online' JOIN tenants w ON w.id=t.tenant_id AND w.enabled=1 JOIN public_domains p ON p.id=t.public_domain_id AND p.tenant_id=t.tenant_id JOIN domain_settings s ON s.domain_id=p.id JOIN direct_agents a ON a.device_id=d.id WHERE t.id=?1 AND t.device_id=?2 AND t.apply_revision=?3 AND t.enabled=1 AND t.deleted_at IS NULL AND t.ipv6_direct_enabled=1 AND t.protocol='https' AND t.service_mode='tunnel' AND t.lan_redirect_enabled=0 AND p.https_enabled=1 AND s.verified=1 AND s.certificate_mode='cloudflare_dns' AND s.credential_file IS NOT NULL AND a.last_seen>?4",params![id,device,revision,unix_now()-45],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).context("直连服务不存在、已变更或无权访问")?;
-    let address = address.context("Agent 尚无可用公网 IPv6 地址，等待自动检测")?;
-    anyhow::ensure!(public_address(&address), "Agent IPv6 地址无效");
+    let address = address.context("设备尚无可用公网 IPv6 地址，等待自动检测")?;
+    anyhow::ensure!(public_address(&address), "设备 IPv6 地址无效");
     drop(db);
     let tunnel = desired_tunnels(state, device)?
         .into_iter()
@@ -269,14 +269,14 @@ pub async fn select(
     {
         let db = state.db.lock().map_err(|_| db_error("数据库锁不可用"))?;
         let tx = db.unchecked_transaction().map_err(db_error)?;
-        let raw: String = tx.query_row("SELECT a.addresses FROM direct_agents a JOIN devices d ON d.id=a.device_id WHERE d.id=?1 AND d.tenant_id=?2",params![device,session.tenant_id],|r|r.get(0)).map_err(|_|ApiError::new(StatusCode::NOT_FOUND,"Agent 尚未报告直连能力"))?;
+        let raw: String = tx.query_row("SELECT a.addresses FROM direct_agents a JOIN devices d ON d.id=a.device_id WHERE d.id=?1 AND d.tenant_id=?2",params![device,session.tenant_id],|r|r.get(0)).map_err(|_|ApiError::new(StatusCode::NOT_FOUND,"设备尚未报告直连能力"))?;
         if !serde_json::from_str::<Vec<String>>(&raw)
             .unwrap_or_default()
             .contains(&input.address)
         {
             return Err(ApiError::new(
                 StatusCode::BAD_REQUEST,
-                "请选择 Agent 当前有效的公网 IPv6",
+                "请选择设备当前有效的公网 IPv6",
             ));
         }
         tx.execute(

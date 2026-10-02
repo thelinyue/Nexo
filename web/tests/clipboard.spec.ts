@@ -83,8 +83,8 @@ for (const transport of ["loopback", "http", "https"]) test(`${transport} 真实
   expect(await readClipboard()).toBe(await recovery.locator("code.token").textContent());
   await recovery.getByRole("button", { name: "关闭", exact: true }).click();
   await page.goto(`${base}/#/agents`);
-  await page.getByRole("button", { name: "添加 Agent", exact: true }).click();
-  const dialog = page.getByRole("dialog", { name: "添加 Agent", exact: true });
+  await page.getByRole("button", { name: "添加设备", exact: true }).click();
+  const dialog = page.getByRole("dialog", { name: "添加设备", exact: true });
   await dialog.getByLabel("设备名称（可选）", { exact: true }).fill("家庭 NAS ' $HOME");
   await dialog.getByText("查看 Compose 配置", { exact: true }).click();
   const compose = dialog.getByLabel("Compose 配置", { exact: true });
@@ -112,8 +112,9 @@ for (const transport of ["loopback", "http", "https"]) test(`${transport} 真实
 
   await page.goto(`${base}/#/agents/a-1`);
   await page.getByText("设备信息", { exact: true }).click();
-  await page.getByRole("button", { name: "复制设备识别码", exact: true }).click();
-  await expect(page.getByRole("status")).toHaveText("已复制");
+  const copyDeviceId = page.getByRole("button", { name: "复制设备识别码", exact: true });
+  await copyDeviceId.click();
+  await expect(copyDeviceId.locator("..").getByRole("status")).toHaveText("已复制");
   expect(await readClipboard()).toBe("a-1");
   await reader.close();
 });

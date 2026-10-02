@@ -9,9 +9,11 @@ export async function installApiMocks(page: Page, options: { empty?: boolean; an
     authRole: "system_admin" as "system_admin" | "tenant",
     users: [{ id: "admin", username: "admin", role: "system_admin", workspace_id: "default", workspace_name: "admin的工作空间", enabled: true, devices: 2, services: 1, domains: 1 }, { id: "alice", username: "alice", role: "tenant", workspace_id: "alice-space", workspace_name: "alice 的工作空间", enabled: true, devices: 1, services: 1, domains: 0 }],
     accessKey: "nexo_join_shared-test-key",
-    tunnels: (options.empty ? [] : [{ id: "t-1", name: "媒体中心", protocol: "https", local_address: "127.0.0.1", local_port: 8096, public_port: null, public_address: "https://media.example.com/a-very-long-public-address", hostname: "media", public_domain: "example.com", device_id: "a-1", device_name: "家庭 Agent", enabled: true, apply_status: "ready", apply_error: null, lan_redirect_enabled: false }] as any[]) as Tunnel[],
-    devices: [{ id: "a-1", name: "家庭 Agent", status: "online", os: "Linux", architecture: "amd64", last_seen_at: 1790000000, agent_version: "0.2.0", tunnel_count: 1 }, { id: "a-2", name: "备用 Agent", status: "offline", os: "Linux", agent_version: "0.2.0", tunnel_count: 0 }] as Device[],
+    agentRelease: { version: "0.2.14", release_url: "https://github.com/thelinyue/Nexo/releases/tag/v0.2.14" } as { version: string | null; release_url: string | null },
+    tunnels: (options.empty ? [] : [{ id: "t-1", name: "媒体中心", protocol: "https", local_address: "127.0.0.1", local_port: 8096, public_port: null, public_address: "https://media.example.com/a-very-long-public-address", hostname: "media", public_domain: "example.com", device_id: "a-1", device_name: "家庭设备", enabled: true, apply_status: "ready", apply_error: null, lan_redirect_enabled: false }] as any[]) as Tunnel[],
+    devices: [{ id: "a-1", name: "家庭设备", status: "online", os: "Linux", architecture: "amd64", last_seen_at: 1790000000, agent_version: "0.2.0", tunnel_count: 1 }, { id: "a-2", name: "备用设备", status: "offline", os: "Linux", agent_version: "0.2.0", tunnel_count: 0 }] as Device[],
     transportIdentity: { server: { status: "valid", expires_at: Math.floor(Date.now()/1000) + 825*86400, renew_after: Math.floor(Date.now()/1000) + 795*86400, error: null, next_retry_at: null }, ca_expires_at: Math.floor(Date.now()/1000) + 3650*86400, ca_needs_attention: false } as TransportIdentity,
+    serverSettings: { management_entry: null as { domain_id: string; hostname: string } | null, public_url: "", public_ips: ["203.0.113.7"], relay_ipv4: "203.0.113.7", domains: [{ id: "d-1", domain: "example.com" }], caddy_enabled: true, status: "disabled", error: null as string | null },
     domains: [{ id: "d-1", domain: "example.com", is_primary: true, https_enabled: true, certificate_mode: "cloudflare_dns", dns_provider: "cloudflare", credential_configured: true, verification_status: "verified", apply_status: "applied", runtime: { config_status: "applied", config_error: null, service_warning: null, checked_at: Math.floor(Date.now() / 1000), certificates: [{ hostname: "example.com", status: "issued", not_before: Math.floor(Date.now() / 1000) - 3600, expires_at: Math.floor(Date.now() / 1000) + 90 * 86400, error: null, next_retry_at: null }] } }] as Domain[],
     dnsRecords: new Map<string, DnsRecord[]>(),
     domainEvents: [{ id: 1, domain_id: "d-1", summary: "配置已加载", occurred_at: Math.floor(Date.now() / 1000) }] as DomainEvent[],
@@ -35,6 +37,15 @@ export async function installApiMocks(page: Page, options: { empty?: boolean; an
     if (path.endsWith("/nodes")) return respond({ nodes: [{ id: "local", name: "内置节点", approved: true, enabled: true, status: "online", latencies: [], services: [], connections: 0 }], server_version: "0.2.12" });
     if (path === "/api/v1/admin/users") return respond(state.users);
     if (path === "/api/v1/admin/invitations") return respond([]);
+    if (path === "/api/v1/admin/server-settings") {
+      if (method === "PUT") {
+        Object.assign(state.serverSettings, body);
+        const entry = state.serverSettings.management_entry;
+        state.serverSettings.public_url = entry ? `https://${entry.hostname}.${state.serverSettings.domains.find(domain => domain.id === entry.domain_id)?.domain}` : "";
+        state.serverSettings.status = entry ? "certificate_pending" : "disabled";
+      }
+      return respond(state.serverSettings);
+    }
     if (path.endsWith("/traffic/quota")) {
       const user = new URL(req.url()).searchParams.get("user_id") ?? "alice";
       const quota = state.quotas.get(user) ?? { monthly_limit_bytes: null, used_bytes: 80 * 1024 ** 3 };
@@ -76,6 +87,7 @@ export async function installApiMocks(page: Page, options: { empty?: boolean; an
     if (path === "/api/v1/agent-access-key") return respond({ token: state.accessKey, created_at: 1790000000, updated_at: 1790000000 });
     if (path === "/api/v1/agent-access-key/reset") { state.accessKey = "nexo_join_reset-test-key"; return respond({ token: state.accessKey, created_at: 1790000000, updated_at: Math.floor(Date.now()/1000) }); }
     if (path === "/api/v1/devices") return respond(state.devices);
+    if (path === "/api/v1/agent-release") return respond(state.agentRelease);
     if (path === "/api/v1/transport-identity") return respond(state.transportIdentity);
     if (path.startsWith("/api/v1/devices/") && method === "DELETE") { state.devices = state.devices.filter(item => item.id !== path.split("/").pop()); return respond({}); }
     if (path === "/api/v1/enrollments" && method === "GET") return respond(state.enrollments);
@@ -115,7 +127,15 @@ export async function installApiMocks(page: Page, options: { empty?: boolean; an
     if (/^\/api\/v1\/tunnels\/batch\/(enable|disable)$/.test(path)) { const items = state.tunnels.filter(item => body.tunnel_ids.includes(item.id)); items.forEach(item => Object.assign(item, { enabled: path.endsWith("/enable"), apply_status: path.endsWith("/enable") ? "checking" : "disabled" })); return respond(items); }
     const toggle = path.match(/^\/api\/v1\/tunnels\/([^/]+)\/(enable|disable)$/);
     if (toggle) { const item = state.tunnels.find(item => item.id === toggle[1]); Object.assign(item, { enabled: toggle[2] === "enable", apply_status: toggle[2] === "enable" ? "checking" : "disabled" }); return respond(item); }
-    if (path.startsWith("/api/v1/tunnels/") && method === "PUT") { const item = state.tunnels.find(item => item.id === path.split("/").pop()); Object.assign(item, body, { lan_redirect_enabled: ["tcp", "udp", "tcp_udp"].includes(body.protocol) ? false : body.lan_redirect_enabled ?? item.lan_redirect_enabled ?? false }); delete item.access_password; return respond(item); }
+    if (path.startsWith("/api/v1/tunnels/") && method === "PUT") {
+      const item = state.tunnels.find(item => item.id === path.split("/").pop())!;
+      const domain = state.domains.find(domain => domain.id === body.public_domain_id);
+      if (domain && domain.domain !== item.public_domain) {
+        item.public_address = item.public_address?.replace(`${item.hostname}.${item.public_domain}`, `${body.hostname}.${domain.domain}`);
+        item.public_domain = domain.domain;
+      }
+      Object.assign(item, body, { lan_redirect_enabled: ["tcp", "udp", "tcp_udp"].includes(body.protocol) ? false : body.lan_redirect_enabled ?? item.lan_redirect_enabled ?? false }); delete item.access_password; return respond(item);
+    }
     if (path.startsWith("/api/v1/tunnels/") && method === "DELETE") { state.tunnels = state.tunnels.filter(item => item.id !== path.split("/").pop()); return respond({}); }
     return respond({ error: `未模拟的接口 ${method} ${path}` }, 404);
   });

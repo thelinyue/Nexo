@@ -1,6 +1,7 @@
 import { Component, createContext, useCallback, useContext, useEffect, useRef, useState } from "react";
 import type { InputHTMLAttributes, ReactNode, RefObject } from "react";
-import { ArrowLeft, Check, ChevronRight, CircleAlert, CircleHelp, Clock, Copy, Pause, Plus, TriangleAlert, Users, X } from "./icons";
+import { createPortal } from "react-dom";
+import { ArrowLeft, Check, ChevronRight, CircleAlert, CircleHelp, Clock, Copy, Pause, Plus, TriangleAlert, Users } from "./icons";
 import { PageNavigationContext, rootRoutes } from "./navigation";
 
 export type Auth = { initialized: boolean; authenticated: boolean; user_id?: string; username?: string; role?: "system_admin" | "tenant"; workspace_id?: string; csrf_token?: string | null; local_http_warning?: boolean };
@@ -60,7 +61,7 @@ export function PasswordInput(props: InputHTMLAttributes<HTMLInputElement>) {
 }
 
 export function EnrollmentDevice({ item }: { item: Enrollment }) {
-  return <div className="enrollment-device"><strong>{item.device_name || "尚未收到主机名"}</strong><p>{[item.os, item.architecture, item.agent_version && `Agent ${item.agent_version}`].filter(Boolean).join(" · ") || "等待设备信息"}</p><small>设备自报信息，请在批准前与目标主机核对。</small></div>;
+  return <div className="enrollment-device"><strong>{item.device_name || "尚未收到主机名"}</strong><p>{[item.os, item.architecture, item.agent_version && `设备 ${item.agent_version}`].filter(Boolean).join(" · ") || "等待设备信息"}</p><small>设备自报信息，请在批准前与目标主机核对。</small></div>;
 }
 
 export function Brand() { return <div className="brand"><img className="brand-icon" src="/brand/mole-head.webp" width="38" height="38" alt="" aria-hidden="true" /><span><strong>Nexo</strong><small>联巢 · 内网穿透</small></span></div>; }
@@ -86,17 +87,32 @@ export function Status({ value, kind = "service", badge = false }: { value: stri
   return badge ? <span className={`status application-status ${tone}`} title={label}><Icon size={14} aria-hidden="true" /><span className="sr-only">{label}</span></span> : <span className={`status ${tone}`}><i />{label}</span>;
 }
 
-/** 导航已有的页面名称仅供读屏和切页焦点使用；详情标题、返回和操作入口继续显示。 */
-export function PageHeader({ title, back, action }: { title: string; back?: string; action?: ReactNode }) {
+/** 底部容器只提供呈现位置；添加操作仍归属业务页面，保留表单状态、权限和触发焦点。 */
+export const MobileCreateContext = createContext<HTMLElement | null>(null);
+/** 顶部容器只决定首行位置；搜索、筛选和操作状态仍由原页面持有。 */
+export const WorkspaceHeaderContext = createContext<HTMLElement | null>(null);
+
+/** 手机主添加入口投递到底栏，缓存的非活动页不能投递；辅助操作和详情返回仍留在标题区。 */
+export function PageHeader({ title, back, action, createAction, showTitle = false, topContent }: { title: string; back?: string; action?: ReactNode; createAction?: ReactNode; showTitle?: boolean; topContent?: ReactNode }) {
   const navigation = useContext(PageNavigationContext);
-  const toolbarAction = navigation?.desktop && navigation.route !== "#/home";
+  const createTarget = useContext(MobileCreateContext);
+  const headerTarget = useContext(WorkspaceHeaderContext);
+  const topHeader = Boolean(navigation && (navigation.standalone || !navigation.desktop));
+  const mobileCreate = Boolean(navigation && !navigation.desktop && rootRoutes.includes(navigation.route));
+  const inlineAction = mobileCreate ? action : (action || createAction) && <>{action}{createAction}</>;
+  const toolbarAction = !topHeader && navigation?.desktop && navigation.route !== "#/home";
   const showBack = back && !(navigation?.desktop && navigation.route === "#/users");
-  const hideTitle = Boolean(navigation && (rootRoutes.includes(navigation.route) || navigation.route === "#/users"));
-  const empty = hideTitle && !showBack && !(action && !toolbarAction);
-  return <><header className="page-header" data-title-hidden={hideTitle} data-empty={empty} data-has-action={Boolean(action && !toolbarAction)} data-has-back={Boolean(showBack)}>{showBack && <a className="icon-button page-back" href={back} aria-label="返回"><ArrowLeft size={21} /></a>}<div><h1 id={navigation ? `heading-${encodeURIComponent(navigation.route)}` : undefined} className="mobile-page-title" title={title} tabIndex={-1}>{title}</h1></div>{action && !toolbarAction && <div className="page-actions">{action}</div>}</header>{action && toolbarAction && <div className="page-toolbar-actions">{action}</div>}</>;
+  const hideTitle = topHeader ? Boolean(topContent) : !showTitle && Boolean(navigation && (rootRoutes.includes(navigation.route) || navigation.route === "#/users"));
+  const empty = hideTitle && !showBack && !(inlineAction && !toolbarAction);
+  const header = <header className="page-header" data-title-hidden={hideTitle} data-empty={!topHeader && empty} data-has-action={Boolean(inlineAction && !toolbarAction)} data-has-back={Boolean(showBack)}>{showBack && <a className="icon-button page-back" href={back} aria-label="返回"><ArrowLeft size={21} /></a>}<div><h1 id={navigation ? `heading-${encodeURIComponent(navigation.route)}` : undefined} className="mobile-page-title" title={title} tabIndex={-1}>{title}</h1>{topHeader && topContent}</div>{inlineAction && !toolbarAction && <div className="page-actions">{inlineAction}</div>}</header>;
+  return <>{topHeader ? navigation?.active && headerTarget && createPortal(header, headerTarget) : header}{inlineAction && toolbarAction && <div className="page-toolbar-actions">{inlineAction}</div>}{mobileCreate && navigation?.active && createTarget && createAction && createPortal(createAction, createTarget)}</>;
 }
 export function CreateButton({ label, onClick, disabled }: { label: string; onClick: () => void; disabled?: boolean }) {
-  return <button className="primary-button page-create" data-resource={label} aria-label={label === "服务" ? "创建服务" : `添加 ${label}`} title={label === "服务" ? "添加服务" : `添加${label}`} onClick={onClick} disabled={disabled}><Plus size={20} /><span>{label === "服务" ? "添加服务" : `添加${label}`}</span></button>;
+  return <button className="primary-button page-create" data-resource={label} aria-label={label === "服务" ? "创建服务" : label === "设备" ? "添加设备" : `添加 ${label}`} title={label === "服务" ? "添加服务" : `添加${label}`} onClick={onClick} disabled={disabled}><Plus size={20} /><span>{label === "服务" ? "添加服务" : `添加${label}`}</span></button>;
+}
+/** 跨断点移动会重建按钮 DOM；关闭表单时只恢复同类资源的当前入口，不使用失效引用。 */
+export function currentCreateButton(resource: string) {
+  return Array.from(document.querySelectorAll<HTMLButtonElement>('.mobile-create-slot .page-create,.workspace-topbar .page-create,.page-slot:not([hidden]) .page-create')).find(button => button.dataset.resource === resource) ?? null;
 }
 export function Notice({ error, onRetry, updatedAt }: { error?: string | null; onRetry?: () => void; updatedAt?: number | null }) { return error ? <><div className="notice error" role="alert"><span>{error}</span>{onRetry && <button className="text-button" onClick={onRetry}>重试</button>}</div>{updatedAt && <p className="helper">保留上次数据 · 更新于 {dateText(updatedAt)}</p>}</> : null; }
 /** 同一角色通过场景区分首次使用、搜索无结果和资源不存在；插画只作装饰，状态与操作由文字表达。 */
@@ -167,7 +183,7 @@ export function Modal({ title, children, onClose, full = false, dirty = false, b
     dialog.showModal();
     const resize = () => { dialog.style.setProperty("--visible-height", `${window.visualViewport?.height ?? window.innerHeight}px`); dialog.style.setProperty("--visual-top", `${window.visualViewport?.offsetTop ?? 0}px`); };
     resize(); window.visualViewport?.addEventListener("resize", resize); window.visualViewport?.addEventListener("scroll", resize);
-    return () => { dialog.close(); window.visualViewport?.removeEventListener("resize", resize); window.visualViewport?.removeEventListener("scroll", resize); window.setTimeout(() => { const target = returnFocus ? returnFocus() : trigger; const top = Array.from(document.querySelectorAll("dialog[open]")).at(-1); if (target?.isConnected && !target.closest("[hidden]") && (!top || top.contains(target))) target.focus({ preventScroll: true }); }, 0); };
+    return () => { dialog.close(); window.visualViewport?.removeEventListener("resize", resize); window.visualViewport?.removeEventListener("scroll", resize); window.setTimeout(() => { const target = returnFocus ? returnFocus() : trigger?.isConnected ? trigger : trigger?.dataset.resource ? currentCreateButton(trigger.dataset.resource) : null; const top = Array.from(document.querySelectorAll("dialog[open]")).at(-1); if (target?.isConnected && !target.closest("[hidden]") && (!top || top.contains(target))) target.focus({ preventScroll: true }); }, 0); };
   }, []);
   // 使用独立监听读取最新 dirty，避免首次打开时的状态被闭包固定。
   useEffect(() => { if (!dirty) return; const handler = (e: BeforeUnloadEvent) => { e.preventDefault(); }; window.addEventListener("beforeunload", handler); return () => window.removeEventListener("beforeunload", handler); }, [dirty]);
@@ -191,11 +207,11 @@ export function Modal({ title, children, onClose, full = false, dirty = false, b
     if (!first) { event.preventDefault(); ref.current?.focus(); }
     else if (event.shiftKey && (document.activeElement === first || document.activeElement === ref.current)) { event.preventDefault(); last.focus(); }
     else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first.focus(); }
-  }} onCancel={e => { e.preventDefault(); close(); }} onClick={e => { if (e.target === ref.current) { const box = ref.current.getBoundingClientRect(); if (e.clientX < box.left || e.clientX > box.right || e.clientY < box.top || e.clientY > box.bottom) close(); } }}><header className="modal-heading">{header ?? <h2>{title}</h2>}{dismissible && <><button className={`icon-button${full ? " form-cancel" : ""}${full ? " mobile-form-cancel" : ""}`} aria-label={full ? "取消" : "关闭"} onClick={close} disabled={busy}>{full ? "取消" : <X size={21} />}</button>{full && <button className="icon-button desktop-modal-close" aria-label="关闭" onClick={close} disabled={busy}><X size={19} /></button>}</>}</header>{workspaceLabel && <p className="modal-workspace">操作空间：{workspaceLabel}</p>}{/* 自定义底部取消复用同一关闭入口，保留提交锁、草稿确认和焦点恢复。 */}{typeof children === "function" ? children(close) : children}</dialog>{discard && <Confirm title="放弃未保存的修改？" description="离开后，本次填写的内容将丢失。" label="放弃修改" onClose={() => { pendingNavigation.current = null; setDiscard(false); }} onConfirm={async () => { const resume = pendingNavigation.current; pendingNavigation.current = null; setDiscard(false); onClose(); if (resume) window.setTimeout(resume, 0); }} />}</>;
+  }} onCancel={e => { e.preventDefault(); close(); }} onClick={e => { if (e.target === ref.current) { const box = ref.current.getBoundingClientRect(); if (e.clientX < box.left || e.clientX > box.right || e.clientY < box.top || e.clientY > box.bottom) close(); } }}><header className="modal-heading">{header ?? <h2>{title}</h2>}{dismissible && <><button type="button" className={`text-button modal-dismiss${full ? " form-cancel mobile-form-cancel" : ""}`} aria-label={full ? "取消" : "关闭"} onClick={close} disabled={busy}>{full ? "取消" : "关闭"}</button>{full && <button type="button" className="text-button modal-dismiss desktop-modal-close" aria-label="关闭" onClick={close} disabled={busy}>关闭</button>}</>}</header>{workspaceLabel && <p className="modal-workspace">操作空间：{workspaceLabel}</p>}{/* 自定义底部取消复用同一关闭入口，保留提交锁、草稿确认和焦点恢复。 */}{typeof children === "function" ? children(close) : children}</dialog>{discard && <Confirm title="放弃未保存的修改？" description="离开后，本次填写的内容将丢失。" label="放弃修改" onClose={() => { pendingNavigation.current = null; setDiscard(false); }} onConfirm={async () => { const resume = pendingNavigation.current; pendingNavigation.current = null; setDiscard(false); onClose(); if (resume) window.setTimeout(resume, 0); }} />}</>;
 }
 export function Confirm({ title, description, label, onClose, onConfirm, tone = "danger" }: { title: string; description: string; label: string; tone?: "danger" | "primary"; onClose: () => void; onConfirm: () => Promise<void> }) {
   const [busy, setBusy] = useState(false); const [error, setError] = useState<string | null>(null);
-  return <Modal title={title} onClose={onClose} busy={busy}><div className="modal-body"><p>{description}</p><Notice error={error} /></div><footer className="modal-actions"><button className="secondary-button" onClick={onClose} disabled={busy}>取消</button><button className={`${tone}-button`} disabled={busy} onClick={async () => { setBusy(true); try { await onConfirm(); onClose(); } catch (e) { setError(`${label}失败：${errorText(e)}`); } finally { setBusy(false); } }}>{busy ? "处理中…" : label}</button></footer></Modal>;
+  return <Modal title={title} onClose={onClose} busy={busy}><div className="modal-body"><p>{description}</p><Notice error={error} /></div><footer className="modal-actions"><button className="secondary-button modal-dismiss" onClick={onClose} disabled={busy}>取消</button><button className={`${tone}-button`} disabled={busy} onClick={async () => { setBusy(true); try { await onConfirm(); onClose(); } catch (e) { setError(`${label}失败：${errorText(e)}`); } finally { setBusy(false); } }}>{busy ? "处理中…" : label}</button></footer></Modal>;
 }
 
 /** 前台每 5 秒更新，编辑/后台/登录过期时暂停；只读详情可显式允许弹层内更新，回到页面或网络恢复立即检查。 */

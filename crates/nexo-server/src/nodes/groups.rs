@@ -179,7 +179,12 @@ fn save(
         prepare_tunnel(&tx, &tenant, &service, &mut request)?;
         https_ports::prepare(state, &tx, &tenant, &service, &mut request)?;
         super::services::save(&tx, &service, &request)?;
-        tx.execute("UPDATE tunnels SET apply_revision=apply_revision+1,apply_status='checking',updated_at=?2 WHERE id=?1",params![service,unix_now()]).map_err(db_error)?;
+        // 组编辑只改变成员和授权；save 已清理变化节点，未变入口与回源继续使用原版本。
+        tx.execute(
+            "UPDATE tunnels SET updated_at=?2 WHERE id=?1",
+            params![service, unix_now()],
+        )
+        .map_err(db_error)?;
     }
     accounts::audit(
         &tx,
@@ -257,7 +262,12 @@ mod tests {
                 .unwrap();
             db.execute("INSERT INTO service_nodes VALUES('s','a'),('s','b')", [])
                 .unwrap();
+            db.execute("INSERT INTO relay_public_health(node_id,service_id,revision,successes,healthy,checked_at,probe_kind,address) VALUES('b','s',1,3,1,1,'tcp','203.0.113.11')", []).unwrap();
         }
+        // 组名称或相同成员的保存，不应使已检查的服务入口重新累计样本。
+        let mut renamed = input(&["a", "b"]);
+        renamed.name = "新组名".into();
+        save(&state, &admin, "group", renamed, false).unwrap();
         save(&state, &admin, "group", input(&["b", "c"]), false).unwrap();
         {
             let db = state.db.lock().unwrap();
@@ -274,6 +284,7 @@ mod tests {
                 .unwrap(),
                 "b"
             );
+            assert!(db.query_row("SELECT revision=1 AND successes=3 AND healthy=1 AND checked_at=1 FROM relay_public_health WHERE node_id='b' AND service_id='s'", [], |r| r.get::<_,bool>(0)).unwrap());
         }
         assert!(save(&state, &admin, "group", input(&["a", "c"]), false).is_err());
         {
@@ -297,7 +308,7 @@ mod tests {
             db.query_row("SELECT apply_revision FROM tunnels WHERE id='s'", [], |r| r
                 .get::<_, i64>(0))
                 .unwrap(),
-            2
+            1
         );
     }
 }

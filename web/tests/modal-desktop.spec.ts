@@ -46,24 +46,14 @@ test.beforeEach(async ({ page }, info) => {
   await page.emulateMedia({ reducedMotion: "reduce" });
 });
 
-test("账号与服务器设置弹窗居中，长表单内部滚动", async ({ page }, info) => {
+test("密码与会话确认弹窗在长短桌面视口居中", async ({ page }, info) => {
   await installApiMocks(page);
-  await page.route("**/api/v1/admin/server-settings", route => route.fulfill({ json: { management_entry: null, public_url: "", public_ips: [], domains: [{ id: "d", domain: "example.test" }], caddy_enabled: true, status: "disabled", error: null } }));
   await page.goto("/#/manage");
-  await page.getByRole("button", { name: "修改密码", exact: true }).click();
+  await page.getByRole("menuitem", { name: "修改密码", exact: true }).click();
+  await expect(page.getByRole("dialog", { name: "修改密码", exact: true })).toBeVisible();
   await centered(page, info, "password");
   await page.keyboard.press("Escape");
-  await page.getByRole("button", { name: "服务器设置", exact: true }).click();
-  await expect(page.getByRole("switch", { name: "HTTPS 管理入口" })).toBeVisible();
-  await page.getByRole("switch", { name: "HTTPS 管理入口" }).check();
-  await centered(page, info, "server-settings");
-  await page.setViewportSize({ width: 901, height: 400 });
-  const body = page.getByRole("dialog").locator(".modal-body");
-  await expect.poll(() => body.evaluate(element => element.scrollHeight > element.clientHeight)).toBeTruthy();
-  await body.evaluate(element => { element.scrollTop = element.scrollHeight; });
-  await expect(page.getByRole("button", { name: "保存设置" })).toBeInViewport();
-  await page.getByRole("switch", { name: "HTTPS 管理入口" }).uncheck();
-  await page.keyboard.press("Escape");
+  await expect(page.getByRole("button", { name: "账号菜单", exact: true })).toBeFocused();
   await page.goto("/#/settings/sessions");
   await page.getByRole("button", { name: "结束会话", exact: true }).first().click();
   await centered(page, info, "session-confirm");
@@ -72,7 +62,7 @@ test("账号与服务器设置弹窗居中，长表单内部滚动", async ({ pa
 test("设备接入、密钥确认与身份恢复居中", async ({ page }, info) => {
   await installApiMocks(page);
   await page.goto("/#/agents");
-  await page.getByRole("button", { name: "添加 Agent", exact: true }).click();
+  await page.getByRole("button", { name: "添加设备", exact: true }).click();
   await expect(page.getByRole("button", { name: "完成", exact: true })).toBeVisible();
   await centered(page, info, "agent-enrollment");
   await page.getByText("高级：接入密钥", { exact: true }).click();

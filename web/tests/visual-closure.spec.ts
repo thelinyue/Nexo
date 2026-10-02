@@ -37,7 +37,7 @@ test("所有页面在移动尺寸和明暗主题中无溢出，输出实际截�
   test.skip(testInfo.project.name !== "desktop-dark", "尺寸矩阵由单个项目执行");
   test.setTimeout(120000);
   const state = await installApiMocks(page);
-  state.tunnels.push({ ...state.tunnels[0], id: "t-2", name: "一个很长很长的家庭内网服务名称", local_address: "2001:db8:abcd:1234:5678:90ab:cdef:1234", apply_status: "failed", apply_error: "无法连接本地目标，请检查 Agent 的网络连接和目标服务端口。" });
+  state.tunnels.push({ ...state.tunnels[0], id: "t-2", name: "一个很长很长的家庭内网服务名称", local_address: "2001:db8:abcd:1234:5678:90ab:cdef:1234", apply_status: "failed", apply_error: "无法连接本地目标，请检查设备的网络连接和目标服务端口。" });
   state.tunnels.push({ ...state.tunnels[0], id: "t-3", name: "家庭 NAS", public_address: "https://nas.example.com", local_port: 5000, apply_status: "checking" });
   for (const theme of ["light", "dark"] as const) {
     await page.emulateMedia({ colorScheme: theme, reducedMotion: "reduce" });
@@ -45,8 +45,8 @@ test("所有页面在移动尺寸和明暗主题中无溢出，输出实际截�
       await page.setViewportSize({ width, height });
       for (const route of ["services", "agents", "manage", "domains", "settings", "settings/sessions", "services/t-2", "agents/a-2", "domains/d-1"]) {
         await page.goto(`/#/${route}`);
-        if (width <= 900) await expect(page.locator(".page-slot:not([hidden]) h1")).toBeVisible();
-        else { await expect(page.locator(".page-slot:not([hidden]) h1")).toBeVisible(); await expect(page.locator(".sidebar-settings")).toBeVisible(); }
+        if (width <= 900) await expect(page.getByRole("heading", { level: 1 })).toBeVisible();
+        else { await expect(page.getByRole("heading", { level: 1 })).toBeVisible(); await expect(page.locator(".sidebar-settings")).toBeVisible(); }
         await expect(page.locator(".page-slot:not([hidden]) .skeleton-list")).toHaveCount(0);
         await expect.poll(() => page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBeTruthy();
         if (width <= 900) {
@@ -56,12 +56,13 @@ test("所有页面在移动尺寸和明暗主题中无溢出，输出实际截�
             await expect(page.locator(".page-slot:not([hidden]) .service-name strong").first()).toHaveCSS("-webkit-line-clamp", "2");
             await expect(page.locator(".service-address").first()).toBeHidden();
             const add = (await page.getByRole("button", { name: "添加", exact: true }).boundingBox())!;
-            const header = (await page.locator(".page-slot:not([hidden]) .page-header").boundingBox())!;
             const nav = await page.locator(".bottom-nav").boundingBox();
-            expect(add.width).toBe(44);
-            expect(add.height).toBe(44);
-            expect(add.x + add.width).toBeLessThanOrEqual(header.x + header.width);
-            expect(add.y + add.height / 2).toBeCloseTo(header.y + header.height / 2, 0);
+            await expect(page.locator(".workspace-topbar .page-header")).toHaveCSS("min-height", "44px");
+            expect(add.width).toBe(52);
+            expect(add.height).toBe(52);
+            expect(add.x - nav!.x - nav!.width).toBeCloseTo(8, 0);
+            expect(add.y + add.height / 2).toBeCloseTo(nav!.y + nav!.height / 2, 0);
+            expect(add.x + add.width).toBeLessThanOrEqual(width - 16);
             expect(nav!.x).toBeGreaterThanOrEqual(16);
             expect(nav!.x + nav!.width).toBeLessThanOrEqual(width - 16);
             expect(nav!.y + nav!.height).toBeLessThanOrEqual(height - 12);

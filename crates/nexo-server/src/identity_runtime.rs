@@ -147,13 +147,13 @@ pub fn fingerprint(pem: &str) -> Result<String> {
 /// 只允许仍注册的当前证书或本次待安装证书认证；收到新证书的 mTLS 握手也可补上丢失的安装确认。
 pub fn accept_certificate(db: &Connection, device: &str, digest: &str) -> Result<()> {
     let row: Option<(String, Option<String>)> = db.query_row("SELECT i.secret_digest,c.pending_certificate_pem FROM device_identities i JOIN devices d ON d.id=i.device_id LEFT JOIN device_certificates c ON c.device_id=i.device_id WHERE i.device_id=?1", [device], |r| Ok((r.get(0)?, r.get(1)?))).optional()?;
-    let (active, pending) = row.context("Agent 证书未注册或设备已被删除")?;
+    let (active, pending) = row.context("设备证书未注册或设备已被删除")?;
     if active == digest {
         return Ok(());
     }
     let pending = pending
         .filter(|pem| fingerprint(pem).is_ok_and(|pending| pending == digest))
-        .context("Agent 证书已被替换或未注册")?;
+        .context("设备证书已被替换或未注册")?;
     let tx = db.unchecked_transaction()?;
     tx.execute(
         "UPDATE device_identities SET secret_digest=?1 WHERE device_id=?2",

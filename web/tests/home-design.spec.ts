@@ -23,7 +23,7 @@ test("首页默认概览、图内选点与键盘读数跨主题可用", async ({
   } else {
     await expect(page.getByRole("button", { name: "展开", exact: true })).toHaveAttribute("aria-expanded", "false");
     await page.getByRole("button", { name: "展开", exact: true }).click();
-    await expect(page.locator(".home-attention-items").getByRole("link", { name: /备用 Agent/ })).toBeVisible();
+    await expect(page.locator(".home-attention-items").getByRole("link", { name: /备用设备/ })).toBeVisible();
     await page.getByRole("button", { name: "收起", exact: true }).click();
   }
   for (const colorScheme of ["light", "dark"] as const) {

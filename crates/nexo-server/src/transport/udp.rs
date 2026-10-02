@@ -35,7 +35,7 @@ pub async fn serve(state: AppState) -> Result<()> {
                             if let Some(previous)=connections.udp.insert(device.clone(),peer.clone()){previous.connection.close(0u32.into(),b"replaced");}
                             device
                         };
-                        let result=tokio::select!{result=peer.receive()=>result,_=peer.connection.accept_bi()=>Err(anyhow::anyhow!("Agent 不允许主动创建 UDP 会话"))};
+                        let result=tokio::select!{result=peer.receive()=>result,_=peer.connection.accept_bi()=>Err(anyhow::anyhow!("设备不允许主动创建 UDP 会话"))};
                         peer.connection.close(0u32.into(),b"closed");
                         let mut connections=state.tunnel_runtime.connections.lock().await;
                         if connections.udp.get(&device).is_some_and(|p|Arc::ptr_eq(p,&peer)){connections.udp.remove(&device);}
@@ -177,7 +177,7 @@ async fn forward(
     let header = LogicalStreamHeader::new(&service.id, id.to_string(), service.revision)?;
     tokio::time::timeout(Duration::from_secs(10), async {
         nexo_tunnel::write_logical_header(&mut send, &header).await?;
-        anyhow::ensure!(recv.read_u8().await? == 1, "Agent 拒绝 UDP 会话");
+        anyhow::ensure!(recv.read_u8().await? == 1, "设备拒绝 UDP 会话");
         anyhow::Ok(())
     })
     .await??;
@@ -246,7 +246,7 @@ pub(super) async fn refresh_status(
         {
             Some(crate::traffic::quota::EXHAUSTED.to_owned())
         } else if control.is_none() {
-            Some("Agent 未连接控制通道".into())
+            Some("设备未连接控制通道".into())
         } else if let Some(error) = failures.get(&id) {
             Some(error.clone())
         } else if !connections.udp_listeners.contains_key(&id) {
@@ -259,7 +259,7 @@ pub(super) async fn refresh_status(
         }) {
             Some("UDP 数据通道未连接，请检查 UDP 数据端口".into())
         } else if applied_revision != Some(revision) {
-            Some("等待 Agent 应用 UDP 配置".into())
+            Some("等待设备应用 UDP 配置".into())
         } else {
             match reports.get("udp") {
                 Some(r) if r.status == "ready" => None,
@@ -268,7 +268,7 @@ pub(super) async fn refresh_status(
                         .clone()
                         .unwrap_or_else(|| "UDP 配置未就绪".into()),
                 ),
-                None => Some("等待 Agent 应用 UDP 配置".into()),
+                None => Some("等待设备应用 UDP 配置".into()),
             }
         };
         let udp = ProtocolStatus {

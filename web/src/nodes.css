@@ -69,7 +69,8 @@
 .node-check { display:flex; align-items:center; gap:10px; margin:16px 0; }
 .node-check input { width:20px; min-height:20px; flex:none; }
 @media(max-width:1200px) { .node-grid { grid-template-columns:repeat(2,minmax(0,1fr)); } }
-@media(max-width:600px) { .node-grid { grid-template-columns:minmax(0,1fr); gap:12px; } .node-card { padding:16px 16px 0; } .node-search { flex-basis:100%; } .node-filter-control { flex:1; min-width:100px; } }
+/* 窄屏的两个筛选独占一行；节点组和批量更新共享操作行，不挤压筛选标签。 */
+@media(max-width:600px) { .node-grid { grid-template-columns:minmax(0,1fr); gap:12px; } .node-card { padding:16px 16px 0; } .node-search { flex-basis:100%; } .node-filter-control { flex:1; min-width:calc((100% - 8px)/2); } }
 @media(prefers-contrast:more) { .node-card,.node-card footer,.node-symbol { border-color:var(--text); } .node-status,.node-platform,.node-footer-note { color:var(--text); } }
 @media(prefers-reduced-motion:reduce) { .node-card button { transition:none; } .node-card button:active { transform:none; } }
 

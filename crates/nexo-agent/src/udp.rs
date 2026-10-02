@@ -46,7 +46,7 @@ async fn connection(
     )
     .await??
     .next()
-    .context("UDP Server 地址解析结果为空")?;
+    .context("UDP 服务端地址解析结果为空")?;
     let mut endpoint = quinn::Endpoint::client(
         if address.is_ipv4() {
             "0.0.0.0:0"

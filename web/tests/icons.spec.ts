@@ -35,7 +35,7 @@ test("外部图标服务不可用时，导航、操作与状态图标在明暗�
       expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBeTruthy();
       await page.screenshot({ path: info.outputPath(`services-${width}-${colorScheme}.png`) });
       await page.goto("/#/manage");
-      await page.getByRole("button", { name: /修改密码/ }).click();
+      await page.getByRole("menuitem", { name: "修改密码", exact: true }).click();
       const dialog = page.getByRole("dialog", { name: "修改密码" });
       await expect(dialog.getByRole("button", { name: "显示密码" }).locator("svg")).toBeVisible();
       await dialog.getByRole("button", { name: "显示密码" }).click();

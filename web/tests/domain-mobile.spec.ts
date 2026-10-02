@@ -199,7 +199,9 @@ test("空白输入无需放弃确认，离开页面后清除旧操作提示", as
   await page.getByRole("dialog", { name: /^配置 / }).getByRole("button", { name: "取消", exact: true }).click();
   await page.getByRole("link", { name: "返回", exact: true }).click();
   await page.evaluate(() => { window.location.hash = "#/manage"; });
-  await expect(page).toHaveURL(/#\/manage$/);
+  await expect(page).toHaveURL(/#\/home$/);
+  await expect(page.getByRole("menu", { name: "本人账号", exact: true })).toBeVisible();
+  await page.keyboard.press("Escape");
   await page.evaluate(() => { window.location.hash = "#/domains"; });
   await expect(page.locator(".page-slot:not([hidden]) .domain-row")).toHaveCount(2);
   await expect(page.getByText("已添加", { exact: true })).toBeHidden();

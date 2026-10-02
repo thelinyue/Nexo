@@ -84,7 +84,7 @@ pub fn prepare(
     if remote {
         let capable=db.query_row("SELECT EXISTS(SELECT 1 FROM devices WHERE id=?1 AND tenant_id=?2 AND node_capable=1)",params![input.device_id,tenant],|r|r.get::<_,bool>(0)).map_err(db_error)?;
         if !capable {
-            return Err(invalid("请先连接支持多节点的新版本 Agent"));
+            return Err(invalid("请先连接支持多节点的新版本设备"));
         }
         let domain = input
             .public_domain_id
@@ -118,13 +118,28 @@ pub fn prepare(
     Ok(())
 }
 pub fn save(db: &Connection, id: &str, input: &TunnelInput) -> Result<(), ApiError> {
-    db.execute("DELETE FROM service_nodes WHERE service_id=?1", [id])
-        .map_err(db_error)?;
-    for node in input
+    let previous = ids(db, id).map_err(db_error)?;
+    let nodes = input
         .node_ids
         .as_ref()
-        .ok_or_else(|| invalid("缺少节点绑定"))?
+        .ok_or_else(|| invalid("缺少节点绑定"))?;
+    // 成员变化不改变回源版本；仅清理增删节点的状态，重新加入也必须重新验证，不能复用残留样本。
+    for node in previous
+        .iter()
+        .chain(nodes)
+        .filter(|node| previous.contains(node) != nodes.contains(node))
     {
+        for table in ["relay_service_health", "relay_public_health"] {
+            db.execute(
+                &format!("DELETE FROM {table} WHERE service_id=?1 AND node_id=?2"),
+                params![id, node],
+            )
+            .map_err(db_error)?;
+        }
+    }
+    db.execute("DELETE FROM service_nodes WHERE service_id=?1", [id])
+        .map_err(db_error)?;
+    for node in nodes {
         db.execute("INSERT INTO service_nodes VALUES(?1,?2)", params![id, node])
             .map_err(db_error)?;
     }

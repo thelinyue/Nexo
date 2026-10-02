@@ -3,17 +3,18 @@ import type { Domain } from "./ui";
 
 export const homeRoute = "#/home";
 export const emptyRoute = "#/workspace";
-export const rootRoutes = [homeRoute, "#/services", "#/agents", "#/nodes", "#/domains", "#/manage"];
+export const rootRoutes = [homeRoute, "#/services", "#/agents", "#/nodes", "#/domains", "#/users", "#/settings/server"];
+const accountRoute = (value: string) => value === "#/manage" || value === "#/settings";
 export function normalizeRoute(value: string) {
-  if (value === "#/settings") return "#/manage";
   if (value === emptyRoute) return homeRoute;
-  return /^#\/(services|agents|nodes|domains)(\/[^/]+)?$/.test(value) || [homeRoute, "#/manage", "#/users", "#/settings/sessions"].includes(value) ? value : homeRoute;
+  return /^#\/(services|agents|nodes|domains)(\/[^/]+)?$/.test(value) || [...rootRoutes, "#/settings/sessions"].includes(value) ? value : homeRoute;
 }
 export function routeInfo(route: string) {
+  if (route === "#/settings/server") return { label: "服务器设置", parent: undefined };
   const module = route.split("/")[1];
-  const label = ({ home: "首页", services: "服务", agents: "设备", nodes: "节点", domains: "域名", manage: "账号设置", users: "用户管理", settings: "登录会话" } as Record<string, string>)[module] ?? "首页";
+  const label = ({ home: "首页", services: "服务", agents: "设备", nodes: "节点", domains: "域名", users: "用户管理", settings: "登录会话" } as Record<string, string>)[module] ?? "首页";
   const detail = /^#\/(services|agents|nodes|domains)\//.test(route);
-  return { label: detail ? `${label}详情` : label, parent: detail ? `#/${module}` : route === "#/settings/sessions" ? "#/manage" : undefined };
+  return { label: detail ? `${label}详情` : label, parent: detail ? `#/${module}` : route === "#/settings/sessions" ? homeRoute : undefined };
 }
 
 /** 表单锁独立于 dirty；嵌套确认框不能绕过底层编辑表单的导航限制。 */
@@ -21,7 +22,7 @@ export function navigationLocked() { return Boolean(document.querySelector('dial
 
 type Page = { route: string; back?: string; configureDomain?: Domain };
 type NavigationState = { route: string; pages: Page[] };
-type PageNavigation = { route: string; desktop: boolean; deletions: EventTarget; removePages: (routes: string[], fallback: string) => void; openDomainConfiguration: (domain: Domain) => void };
+type PageNavigation = { route: string; active: boolean; desktop: boolean; standalone: boolean; deletions: EventTarget; removePages: (routes: string[], fallback: string) => void; openDomainConfiguration: (domain: Domain) => void };
 export const PageNavigationContext = createContext<PageNavigation | null>(null);
 
 /** 已成功删除的资源立即从保留的列表中移除，即使随后刷新失败也不会重新显示。
@@ -42,6 +43,15 @@ export function useResourceDeletions(onRemoved: (routes: string[]) => void) {
  */
 export function useWorkspaceNavigation() {
   const [desktop, setDesktop] = useState(() => matchMedia("(min-width:901px)").matches);
+  const [accountRequest, setAccountRequest] = useState(() => accountRoute(window.location.hash) ? 1 : 0);
+  const [standalone, setStandalone] = useState(() => matchMedia("(display-mode: standalone)").matches || (navigator as Navigator & { standalone?: boolean }).standalone === true);
+  // 安装态只改变入口呈现，不重建页面；与启动屏使用相同的浏览器和 iOS 判断。
+  useEffect(() => {
+    const media = matchMedia("(display-mode: standalone)");
+    const update = () => setStandalone(media.matches || (navigator as Navigator & { standalone?: boolean }).standalone === true);
+    media.addEventListener("change", update);
+    return () => media.removeEventListener("change", update);
+  }, []);
   const [state, setState] = useState<NavigationState>(() => {
     const route = normalizeRoute(window.location.hash);
     return { route, pages: [{ route, back: routeInfo(route).parent }] };
@@ -62,6 +72,8 @@ export function useWorkspaceNavigation() {
     const source = current.pages.find(page => page.route === current.route);
     const back = parent && next !== source?.back && !remove.includes(current.route) ? current.route : parent;
     if (!existing) pages = [...pages, { route: next, back }];
+    // 会话页复用数据和滚动位置，但每次打开都返回本次来源，而非第一次打开时的页面。
+    else if (next === "#/settings/sessions" && next !== current.route) pages = pages.map(page => page.route === next ? { ...page, back: current.route } : page);
     remove.forEach(route => positions.current.delete(route));
     commit({ route: next, pages });
   }, [commit]);
@@ -85,7 +97,15 @@ export function useWorkspaceNavigation() {
     mounted.current = true;
     window.history.replaceState(null, "", stateRef.current.route);
     const update = () => {
+      const legacyAccount = accountRoute(window.location.hash);
       const next = normalizeRoute(window.location.hash);
+      if (legacyAccount) {
+        // 旧入口保留导航保护，仅替换当前历史项；菜单本身不写入 URL。
+        const resume = () => { activate(homeRoute); window.history.replaceState(null, "", homeRoute); setAccountRequest(value => value + 1); };
+        if (!navigationLocked() && window.dispatchEvent(new CustomEvent("nexo:route-change", { cancelable: true, detail: { resume } }))) resume();
+        else window.history.replaceState(null, "", stateRef.current.route);
+        return;
+      }
       if (next === stateRef.current.route) {
         if (window.location.hash !== next) window.history.replaceState(null, "", next);
         return;
@@ -103,19 +123,19 @@ export function useWorkspaceNavigation() {
   }, [activate]);
   useLayoutEffect(() => {
     window.scrollTo(0, positions.current.get(state.route) ?? 0);
-    const slot = document.querySelector<HTMLElement>(".page-slot:not([hidden])");
     const focusHeading = () => {
-      const heading = slot?.querySelector<HTMLElement>("h1");
+      const heading = document.getElementById(`heading-${encodeURIComponent(state.route)}`);
       if (!heading) return false;
-      if (!document.querySelector("dialog[open]")) heading.focus({ preventScroll: true });
+      if (!document.querySelector("dialog[open],.account-menu:popover-open")) heading.focus({ preventScroll: true });
       return true;
     };
     // 分包首次加载时标题尚未挂载；仅等待当前页面，切页时取消，避免迟到焦点抢占。
-    if (!focusHeading() && slot) {
+    const shell = document.querySelector(".app-shell");
+    if (!focusHeading() && shell) {
       const observer = new MutationObserver(() => { if (focusHeading()) observer.disconnect(); });
-      observer.observe(slot, { childList: true, subtree: true });
+      observer.observe(shell, { childList: true, subtree: true });
       return () => observer.disconnect();
     }
   }, [state.route]);
-  return { ...state, desktop, deletions, removePages, openDomainConfiguration };
+  return { ...state, desktop, standalone, accountRequest, deletions, removePages, openDomainConfiguration };
 }

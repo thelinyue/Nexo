@@ -12,7 +12,7 @@ test("服务逐节点检查区分健康、失败、兼容、过期和待检查�
     // 前两次失败处于撤出防抖期；仍可用的整体状态不能掩盖最近探测错误。
     { node_id: "failed", node_name: "日本 VPS", healthy: true, error: null, checked_at: now, public_probe: { kind: "https", healthy: true, checked_at: now, error } },
     { node_id: "legacy", node_name: "旧版 VPS", healthy: true, error: null, checked_at: now, public_probe: { kind: "tcp", healthy: true, checked_at: now, error: null } },
-    { node_id: "stale", node_name: "离线 VPS", healthy: false, error: "等待 Agent 确认目标可连接", checked_at: now - 90, public_probe: { kind: "https", healthy: false, checked_at: now - 90, error: null } },
+    { node_id: "stale", node_name: "离线 VPS", healthy: false, error: "等待设备确认目标可连接", checked_at: now - 90, public_probe: { kind: "https", healthy: false, checked_at: now - 90, error: null } },
     { node_id: "pending", node_name: "待检查 VPS", healthy: false, error: null, checked_at: now, public_probe: { kind: "https", healthy: false, checked_at: null, error: null } },
   ];
   await page.goto("/#/services/t-1");

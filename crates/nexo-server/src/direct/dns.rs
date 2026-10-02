@@ -126,7 +126,7 @@ pub async fn ensure(
                     .value
                     .parse::<std::net::IpAddr>()
                     .is_ok_and(|v| servers.contains(&v)),
-                "现有访问记录不属于已配置的 Server，未覆盖"
+                "现有访问记录不属于已配置的服务端，未覆盖"
             );
         }
     }
@@ -412,7 +412,7 @@ async fn probe(service: &Service) -> Result<()> {
             ))
             .send()
             .await
-            .context("Server 未能连接目标 IPv6；也可能是 Server 出口不可用")?;
+            .context("服务端未能连接目标 IPv6；也可能是服务端出口不可用")?;
         anyhow::ensure!(response.status().is_success(), "IPv6 探测入口返回异常状态");
         let mut body = Vec::new();
         while let Some(chunk) = response.chunk().await? {

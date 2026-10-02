@@ -255,7 +255,7 @@ pub async fn verify(
         .and_then(|r| r["value"].as_str())
         .unwrap_or_default();
     let resolver = hickory_resolver::TokioAsyncResolver::tokio_from_system_conf()
-        .map_err(|_| ApiError::new(StatusCode::SERVICE_UNAVAILABLE, "无法读取 Server DNS 配置"))?;
+        .map_err(|_| ApiError::new(StatusCode::SERVICE_UNAVAILABLE, "无法读取服务端 DNS 配置"))?;
     let records = tokio::time::timeout(
         Duration::from_secs(8),
         resolver.txt_lookup(format!("_nexo-verification.{domain}")),

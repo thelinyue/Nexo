@@ -132,16 +132,12 @@ pub async fn session(state: AppState, stream: TlsStream<TcpStream>, id: String) 
     Ok(())
 }
 /// 新配置及超过授权时限的旧样本必须重新累计三次成功，不能继承此前健康状态。
-fn record_health(
-    db: &Connection,
-    node: &str,
-    mut report: wire::ServiceHealth,
-    now: i64,
-) -> Result<()> {
+fn record_health(db: &Connection, node: &str, report: wire::ServiceHealth, now: i64) -> Result<()> {
     let origin_ready: bool = db.query_row("SELECT EXISTS(SELECT 1 FROM tunnel_applied_states WHERE tunnel_id=?1 AND revision=?2 AND status='ready' AND updated_at>?3)", params![report.id, report.revision, now-45], |r| r.get(0))?;
     if !origin_ready {
-        report.ready = false;
-        report.error = Some("等待 Agent 确认目标可连接".into());
+        // 回源与节点分开检查：等待新回源报告不算节点故障，也不消耗未变节点的成功样本。
+        // 回源未确认时仍不采纳节点报告；综合健康视图继续要求当前版本、有效期与回源 ready。
+        return Ok(());
     }
     let valid: bool = db.query_row("SELECT EXISTS(SELECT 1 FROM authorized_service_nodes s JOIN tunnels t ON t.id=s.service_id WHERE s.node_id=?1 AND s.service_id=?2 AND t.apply_revision=?3 AND t.enabled=1 AND t.deleted_at IS NULL)", params![node,report.id,report.revision], |r|r.get(0))?;
     if valid {
@@ -240,6 +236,48 @@ pub fn snapshot(state: &AppState, node: &str) -> Result<Snapshot> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn unchanged_entry_waits_for_current_origin_without_resetting_node_samples() {
+        let (state, headers, mut input, checked) = crate::service_update_tests::fixture();
+        input.local_port += 1;
+        let _ = update_tunnel(
+            State(state.clone()),
+            headers,
+            Path("service".into()),
+            Json(input),
+        )
+        .await
+        .unwrap();
+        let db = state.db.lock().unwrap();
+        let report = |revision| wire::ServiceHealth {
+            id: "service".into(),
+            revision,
+            ready: true,
+            error: None,
+            public_probe_supported: true,
+        };
+        record_health(&db, "b", report(2), checked + 1).unwrap();
+        assert!(db.query_row("SELECT revision=2 AND successes=3 AND healthy=0 AND checked_at=?1 FROM relay_service_health WHERE service_id='service' AND node_id='b'", [checked], |r| r.get::<_,bool>(0)).unwrap());
+        assert_eq!(
+            db.query_row(
+                "SELECT COUNT(*) FROM relay_healthy_service_nodes WHERE service_id='service'",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            0
+        );
+        db.execute(
+            "UPDATE tunnel_applied_states SET revision=2,updated_at=?1 WHERE tunnel_id='service'",
+            [checked + 1],
+        )
+        .unwrap();
+        record_health(&db, "b", report(2), checked + 1).unwrap();
+        assert_eq!(db.query_row("SELECT COUNT(*) FROM relay_healthy_service_nodes WHERE service_id='service' AND node_id='b'", [], |r| r.get::<_,i64>(0)).unwrap(), 1);
+        record_health(&db, "b", report(1), checked + 2).unwrap();
+        assert_eq!(db.query_row("SELECT checked_at FROM relay_service_health WHERE service_id='service' AND node_id='b'", [], |r| r.get::<_,i64>(0)).unwrap(), checked + 1);
+    }
+
     #[test]
     fn capability_changes_clear_public_samples_without_changing_identity() {
         let (state, _) = crate::tests::domain_fixture();

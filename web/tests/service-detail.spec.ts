@@ -89,7 +89,7 @@ test("删除可取消，成功后关闭并恢复列表搜索焦点", async ({ pa
   await expect(page.getByLabel("搜索服务")).toBeFocused();
 });
 
-test("旧详情地址关闭回列表，关联 Agent 导航只执行一次", async ({ page }) => {
+test("旧详情地址关闭回列表，关联设备导航只执行一次", async ({ page }) => {
   await installApiMocks(page);
   await page.goto("/#/services/t-1");
   const detail = page.locator(".application-modal");
@@ -98,7 +98,7 @@ test("旧详情地址关闭回列表，关联 Agent 导航只执行一次", asyn
   const list = page.locator('[id="page-%23%2Fservices"]');
   await expect(list).toBeVisible();
   await list.getByRole("link", { name: "媒体中心", exact: true }).click();
-  await detail.getByRole("link", { name: "家庭 Agent", exact: true }).click();
+  await detail.getByRole("link", { name: "家庭设备", exact: true }).click();
   await expect(page).toHaveURL(/#\/agents\/a-1$/);
   await expect(page.getByRole("dialog")).toHaveCount(0);
 });
@@ -137,7 +137,7 @@ test("长名称、IPv6 与放大字号在小屏和横屏均可操作，缩放后
   test.skip(info.project.name !== "desktop-dark", "尺寸与字号矩阵集中验收");
   test.setTimeout(60000);
   const state = await installApiMocks(page);
-  Object.assign(state.tunnels[0], { name: "一个很长的家庭媒体服务应用名称", ipv6_direct_enabled: true, apply_status: "failed", apply_error: "无法连接内网服务，请检查 Agent。", direct_status: { status: "configured", address: "2001:db8:1234:5678:abcd:ef00:1234:5678", public_reachability: "unverified" } });
+  Object.assign(state.tunnels[0], { name: "一个很长的家庭媒体服务应用名称", ipv6_direct_enabled: true, apply_status: "failed", apply_error: "无法连接内网服务，请检查设备。", direct_status: { status: "configured", address: "2001:db8:1234:5678:abcd:ef00:1234:5678", public_reachability: "unverified" } });
   await page.emulateMedia({ reducedMotion: "reduce" });
   await page.goto("/#/services");
   for (const [width, height] of [[320, 568], [390, 844], [812, 375], [1440, 900]]) {

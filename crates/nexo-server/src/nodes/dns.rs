@@ -46,6 +46,8 @@ struct Snapshot {
     revision: i64,
     protocol: String,
     port: u16,
+    distribution_mode: String,
+    preferred_node_id: Option<String>,
     entries: Vec<Entry>,
 }
 
@@ -66,7 +68,8 @@ fn local_address(state: &AppState) -> Result<String> {
 }
 
 fn snapshot_from_db(state: &AppState, id: &str, local: &str, db: &Connection) -> Result<Snapshot> {
-    let (domain,host,enabled,revision,protocol,port):(String,String,bool,i64,String,u16)=db.query_row("SELECT p.id,t.hostname||'.'||p.domain,t.enabled=1 AND t.deleted_at IS NULL AND w.enabled=1,t.apply_revision,t.protocol,CASE WHEN t.protocol='tcp' THEN t.public_port WHEN t.protocol='https' THEN t.https_port ELSE ?2 END FROM tunnels t JOIN public_domains p ON p.id=t.public_domain_id JOIN tenants w ON w.id=t.tenant_id WHERE t.id=?1",params![id,state.config.caddy.http_port()],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?)))?;
+    // 选择策略不再增加转发版本，必须纳入快照复核，防止网络等待后按旧策略写入 DNS。
+    let (domain,host,enabled,revision,protocol,port,distribution_mode,preferred_node_id):(String,String,bool,i64,String,u16,String,Option<String>)=db.query_row("SELECT p.id,t.hostname||'.'||p.domain,t.enabled=1 AND t.deleted_at IS NULL AND w.enabled=1,t.apply_revision,t.protocol,CASE WHEN t.protocol='tcp' THEN t.public_port WHEN t.protocol='https' THEN t.https_port ELSE ?2 END,t.distribution_mode,t.preferred_node_id FROM tunnels t JOIN public_domains p ON p.id=t.public_domain_id JOIN tenants w ON w.id=t.tenant_id WHERE t.id=?1",params![id,state.config.caddy.http_port()],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?,r.get(7)?)))?;
     let mut q=db.prepare("SELECT n.id,n.public_ipv4,COALESCE(n.approved=1 AND n.enabled=1 AND n.removed_at IS NULL AND (n.id='local' OR n.last_seen>?2) AND h.healthy=1 AND h.revision=t.apply_revision AND h.checked_at>?2 AND a.revision=t.apply_revision AND a.status='ready' AND a.updated_at>?2,0),COALESCE(h.public_probe_supported,0),n.maintenance FROM authorized_service_nodes s JOIN relay_nodes n ON n.id=s.node_id JOIN tunnels t ON t.id=s.service_id LEFT JOIN relay_service_health h ON h.node_id=n.id AND h.service_id=s.service_id LEFT JOIN tunnel_applied_states a ON a.tunnel_id=t.id WHERE s.service_id=?1 ORDER BY n.id")?;
     let entries = q
         .query_map(params![id, unix_now() - 45], |r| {
@@ -100,6 +103,8 @@ fn snapshot_from_db(state: &AppState, id: &str, local: &str, db: &Connection) ->
         revision,
         protocol,
         port,
+        distribution_mode,
+        preferred_node_id,
         entries,
     })
 }
@@ -483,4 +488,44 @@ async fn cleanup_obsolete(state: &AppState, id: &str) -> Result<()> {
         tx.commit()?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn publication_rechecks_selection_without_a_revision_change() {
+        for field in ["strategy", "preferred"] {
+            let (state, _, _, _) = crate::service_update_tests::fixture();
+            let observed = snapshot(&state, "service").unwrap();
+            let selected = vec![super::super::selection::Candidate {
+                id: "b".into(),
+                address: "203.0.113.11".into(),
+                latency: None,
+            }];
+            assert!(publication_current(&state, "service", &observed, &selected).unwrap());
+            let db = state.db.lock().unwrap();
+            if field == "strategy" {
+                db.execute("UPDATE tunnels SET distribution_mode='manual',preferred_node_id='a' WHERE id='service'", []).unwrap();
+            } else {
+                db.execute(
+                    "UPDATE tunnels SET preferred_node_id='b' WHERE id='service'",
+                    [],
+                )
+                .unwrap();
+            }
+            assert_eq!(
+                db.query_row(
+                    "SELECT apply_revision FROM tunnels WHERE id='service'",
+                    [],
+                    |r| r.get::<_, i64>(0)
+                )
+                .unwrap(),
+                1
+            );
+            drop(db);
+            assert!(!publication_current(&state, "service", &observed, &selected).unwrap());
+        }
+    }
 }

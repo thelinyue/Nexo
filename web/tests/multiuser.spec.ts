@@ -195,12 +195,8 @@ test("唯一管理员可改名及管理自身安全，改名失败保留输入�
   await page.getByRole("button", { name: "更多", exact: true }).click();
   await expect(page.getByRole("button", { name: "删除用户", exact: true })).toHaveCount(0);
   await expect(page.getByRole("button", { name: "停用用户", exact: true })).toHaveCount(0);
-  await page.locator(".user-card").getByRole("button", { name: "修改密码", exact: true }).click();
-  await expect(page.getByRole("dialog", { name: "修改密码" }).getByLabel("当前密码", { exact: true })).toBeVisible();
-  await page.getByRole("dialog").getByRole("button", { name: "取消", exact: true }).click();
-  await expect(page.getByRole("button", { name: "更多", exact: true })).toBeFocused();
-  await page.getByRole("button", { name: "更多", exact: true }).click();
-  await expect(page.locator(".user-card").getByRole("link", { name: "登录会话" })).toHaveAttribute("href", "#/settings/sessions");
+  await expect(page.locator(".user-card").getByRole("button", { name: "修改密码", exact: true })).toHaveCount(0);
+  await expect(page.locator(".user-card").getByRole("link", { name: "登录会话" })).toHaveCount(0);
   await page.getByRole("button", { name: "修改用户名", exact: true }).click();
   const dialog = page.getByRole("dialog", { name: "修改用户名" });
   await dialog.getByLabel("新用户名").fill("owner");
@@ -328,7 +324,7 @@ test("用户始终单行，更多菜单显示完整名称且小屏不横向溢�
   await expect(cards.getByRole("button")).toHaveCount(6);
   await expect(page.locator(".user-menu:popover-open")).toHaveCount(0);
   await expect(cards.nth(1).getByRole("heading")).toHaveAttribute("title", longName);
-  await expect(cards.first().locator(".user-resource-summary")).toHaveText("Agent 2 · 服务 12 · 域名 3");
+  await expect(cards.first().locator(".user-resource-summary")).toHaveText("设备 2 · 服务 12 · 域名 3");
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBeTruthy();
   await page.screenshot({ path: info.outputPath("users-overview.png"), fullPage: true });
   await cards.nth(1).getByRole("button", { name: "更多" }).click();

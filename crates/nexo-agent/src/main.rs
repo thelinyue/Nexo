@@ -25,10 +25,20 @@ mod origin_tests;
 mod udp;
 
 #[derive(Parser)]
-#[command(name = "nexo-agent", about = "Nexo 内网穿透 Agent")]
+#[command(
+    name = "nexo-agent",
+    about = "Nexo 内网穿透客户端",
+    disable_help_flag = true,
+    override_usage = "nexo-agent [选项]",
+    help_template = "{about}\n\n用法：{usage}\n\n选项：\n{options}"
+)]
 struct Cli {
-    #[arg(long, default_value = "./data/nexo-agent")]
+    #[arg(short = 'h', long = "help", action = clap::ArgAction::Help, help = "显示帮助信息")]
+    _help: Option<bool>,
+    /// 数据目录；默认 ./data/nexo-agent，保存设备身份及连接配置。
+    #[arg(long, default_value = "./data/nexo-agent", hide_default_value = true)]
     data_dir: PathBuf,
+    /// 配置文件路径，默认读取数据目录中的 agent.toml。
     #[arg(long)]
     config: Option<PathBuf>,
     /// 使用一次性恢复凭证，成功保存身份后退出。
@@ -37,6 +47,35 @@ struct Cli {
     /// 仅供显式恢复身份操作，不覆盖普通启动配置。
     #[arg(long, requires = "recover_identity")]
     enrollment_token: Option<String>,
+}
+
+#[cfg(test)]
+mod cli_tests {
+    use super::*;
+
+    #[test]
+    fn localized_help_and_existing_recovery_arguments_parse_without_panicking() {
+        let help = Cli::try_parse_from(["nexo-agent", "--help"]).err().unwrap();
+        assert_eq!(help.kind(), clap::error::ErrorKind::DisplayHelp);
+        let text = help.to_string();
+        assert!(text.contains("用法：nexo-agent [选项]"));
+        assert!(text.contains("显示帮助信息"));
+        assert!(text.contains("保存设备身份及连接配置"));
+        let cli = Cli::try_parse_from([
+            "nexo-agent",
+            "--data-dir",
+            "./existing",
+            "--config",
+            "./existing/agent.toml",
+            "--recover-identity",
+            "--enrollment-token",
+            "recovery-test",
+        ])
+        .unwrap();
+        assert!(cli.recover_identity);
+        assert_eq!(cli.data_dir, PathBuf::from("./existing"));
+        assert_eq!(cli.enrollment_token.as_deref(), Some("recovery-test"));
+    }
 }
 
 /// TOML 保存连接参数，容器部署可用三个非空环境变量逐项覆盖；操作标志和版本来自本次运行。
@@ -60,7 +99,7 @@ impl Default for Config {
         Self {
             server_url: String::new(),
             enrollment_token: String::new(),
-            device_name: "Nexo Agent".into(),
+            device_name: "Nexo 设备".into(),
             control_endpoint: String::new(),
             tunnel_endpoint: String::new(),
             udp_endpoint: String::new(),
@@ -178,12 +217,12 @@ async fn main() -> Result<()> {
     }
     let mut identity = load_identity(&config, &directory)
         .await
-        .with_context(|| format!("Agent 初始化失败，请检查 {}", path.display()))?;
+        .with_context(|| format!("客户端初始化失败，请检查 {}", path.display()))?;
     if !config.enrollment_token.is_empty() {
-        tracing::info!("身份已保存，请清除 agent.toml 或 NEXO_ENROLLMENT_TOKEN 中的接入凭证；保留 Server 地址和数据目录，重启复用已有身份");
+        tracing::info!("身份已保存，请清除 agent.toml 或 NEXO_ENROLLMENT_TOKEN 中的接入凭证；保留服务端地址和数据目录，重启复用已有身份");
     }
     if config.recover_identity {
-        tracing::info!(device_id = %identity.device_id, "设备身份已恢复，原设备 ID 和服务绑定保留；请正常启动 Agent");
+        tracing::info!(device_id = %identity.device_id, "设备身份已恢复，原设备 ID 和服务绑定保留；请正常启动客户端");
         return Ok(());
     }
     let address = if config.control_endpoint.is_empty() {
@@ -200,7 +239,7 @@ async fn main() -> Result<()> {
         )
         .await;
         if let Err(error) = result {
-            tracing::warn!("Agent 控制连接结束，3 秒后重连：{error:#}");
+            tracing::warn!("客户端控制连接结束，3 秒后重连：{error:#}");
         }
         tokio::time::sleep(Duration::from_secs(3)).await;
     }
@@ -224,15 +263,15 @@ async fn load_identity(config: &Config, directory: &std::path::Path) -> Result<D
         match previous {
             Ok(bytes) => {
                 let identity: DeviceIdentity =
-                    serde_json::from_slice(&bytes).context("Agent 身份文件损坏，请恢复备份")?;
+                    serde_json::from_slice(&bytes).context("客户端身份文件损坏，请恢复备份")?;
                 anyhow::ensure!(
                     identity.server_url == config.server_url,
-                    "持久身份属于其他 Server，请为新 Server 使用独立的 Agent 数据目录"
+                    "持久身份属于其他服务端，请为新服务端使用独立的客户端数据目录"
                 );
                 return Ok(identity);
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error).context("无法读取 Agent 身份"),
+            Err(error) => return Err(error).context("无法读取客户端身份"),
         }
     }
     anyhow::ensure!(
@@ -282,7 +321,7 @@ async fn load_identity(config: &Config, directory: &std::path::Path) -> Result<D
             })
             .send()
             .await
-            .context("无法连接 Server 注册接口，请检查 server_url 和网络")?;
+            .context("无法连接服务端注册接口，请检查 server_url 和网络")?;
         let result: nexo_protocol::AgentRegistrationResponse =
             decode_response(response, &config.enrollment_token).await?;
         identity::client_config(
@@ -305,7 +344,7 @@ async fn load_identity(config: &Config, directory: &std::path::Path) -> Result<D
         };
         identity::write_private_file(&path, &serde_json::to_vec(&identity)?)?;
         fs::remove_file(&request_path)?;
-        tracing::info!(device_id = %identity.device_id, "Agent 已接入，设备身份已保存");
+        tracing::info!(device_id = %identity.device_id, "客户端已接入，设备身份已保存");
         return Ok(identity);
     }
     let response = client
@@ -320,18 +359,18 @@ async fn load_identity(config: &Config, directory: &std::path::Path) -> Result<D
         })
         .send()
         .await
-        .context("无法连接 Server 入网接口")?;
+        .context("无法连接服务端入网接口")?;
     let first: AgentEnrollmentResponse =
         decode_response(response, &config.enrollment_token).await?;
     if config.recover_identity {
         let target = first
             .device_id
             .as_ref()
-            .context("这不是设备恢复凭证，请从原 Agent 的详情页生成恢复凭证")?;
+            .context("这不是设备恢复凭证，请从原设备的详情页生成恢复凭证")?;
         if let Some((server, device)) = expected_device {
             anyhow::ensure!(
                 server == config.server_url && &device == target,
-                "恢复凭证与此目录保存的原设备不一致，请核对 Server 和 Agent"
+                "恢复凭证与此目录保存的原设备不一致，请核对服务端和客户端"
             );
         }
     } else {
@@ -409,21 +448,21 @@ async fn decode_response<T: for<'de> Deserialize<'de>>(
     if !status.is_success() {
         let safe = body.replace(token, "[凭据已隐藏]");
         anyhow::bail!(
-            "Server 拒绝入网请求（HTTP {status}）：{}",
+            "服务端拒绝入网请求（HTTP {status}）：{}",
             safe.chars().take(512).collect::<String>()
         );
     }
-    serde_json::from_str(&body).context("Server 入网响应格式无效")
+    serde_json::from_str(&body).context("服务端入网响应格式无效")
 }
 fn endpoint_address(url: &str, port: u16) -> Result<String> {
-    let url = reqwest::Url::parse(url).context("Server URL 无效")?;
+    let url = reqwest::Url::parse(url).context("服务端 URL 无效")?;
     anyhow::ensure!(
         matches!(url.scheme(), "http" | "https"),
-        "Server URL 必须使用 HTTP 或 HTTPS"
+        "服务端 URL 必须使用 HTTP 或 HTTPS"
     );
     let host = url
         .host_str()
-        .context("Server URL 缺少主机名")?
+        .context("服务端 URL 缺少主机名")?
         .trim_matches(['[', ']']);
     Ok(if host.contains(':') {
         format!("[{host}]:{port}")
@@ -440,14 +479,14 @@ async fn connect_tls(
         TcpStream::connect(&endpoint.address),
     )
     .await
-    .context("连接 Server 超时")??;
+    .context("连接服务端超时")??;
     nexo_tunnel::configure_tunnel_tcp_keepalive(&stream)?;
     let name = rustls::pki_types::ServerName::try_from(endpoint.server_name.clone())
-        .context("Server TLS 名称无效")?;
+        .context("服务端 TLS 名称无效")?;
     Ok(
         tokio::time::timeout(Duration::from_secs(10), connector.connect(name, stream))
             .await
-            .context("Server mTLS 握手超时")??,
+            .context("服务端 mTLS 握手超时")??,
     )
 }
 
@@ -525,9 +564,9 @@ async fn run_control(
                 tokio::time::timeout_at(deadline.deadline(), diagnostics.send(&mut write,&AgentControlMessage::NodeBudget{request_id:budget_sequence,node_id:request.node,service_id:request.service,revision:request.revision,bytes:request.bytes})).await.context("管理控制通道发送超时，停止转发")??;
                 budget_pending.insert(budget_sequence,request.reply);
             },
-            _ = &mut deadline => anyhow::bail!("Server 控制响应超时（45 秒）"),
+            _ = &mut deadline => anyhow::bail!("服务端控制响应超时（45 秒）"),
             _ = target_checks.tick(), if accepted && !desired.borrow().nodes.is_empty() && probes.is_empty() => {
-                probes.spawn(probe_tunnels(desired.borrow().tunnels.clone()));
+                probes.spawn(probe_origin_snapshot(desired.borrow().tunnels.clone()));
             },
             _ = heartbeat.tick(), if accepted => {
                 last_heartbeat=Some(tokio::time::Instant::now());
@@ -550,21 +589,28 @@ async fn run_control(
                 }
             },
             Some(result) = probes.join_next(), if !probes.is_empty() => {
-                if let Ok(results) = result { tokio::time::timeout_at(deadline.deadline(), diagnostics.send(&mut write,&AgentControlMessage::TunnelApplyReport { results })).await.context("管理控制通道发送超时，停止转发")??; }
+                if let Ok((checked, results)) = result {
+                    let results = current_origin_reports(&checked, results, &desired.borrow().tunnels);
+                    tokio::time::timeout_at(deadline.deadline(), diagnostics.send(&mut write,&AgentControlMessage::TunnelApplyReport { results })).await.context("管理控制通道发送超时，停止转发")??;
+                }
             },
             Some(result) = data_tasks.join_next(), if !data_tasks.is_empty() => { result?; anyhow::bail!("数据连接任务意外停止"); },
             incoming = lines.next() => {
-                let line = incoming.context("Server 控制通道已关闭")??;
+                let line = incoming.context("服务端控制通道已关闭")??;
                 diagnostics.received();
                 deadline.as_mut().reset(tokio::time::Instant::now()+Duration::from_secs(45));
                 match serde_json::from_str::<ServerControlMessage>(&line)? {
                     ServerControlMessage::HelloAccepted { nodes,tunnels,tunnel_endpoint,udp_endpoint,capabilities,.. } | ServerControlMessage::HeartbeatAck { nodes,tunnels,tunnel_endpoint,udp_endpoint,capabilities,.. } => {
+                        let periodic_check = !accepted || last_heartbeat.is_some();
                         if let Some(started)=last_heartbeat.take(){let _=budgets.reports.send(AgentControlMessage::NodeLatency{node_id:"local".into(),rtt_ms:started.elapsed().as_millis().clamp(1,30000) as u32});}
+                        let checks = origin_checks(&desired.borrow().tunnels, &tunnels, periodic_check);
                         let next = Desired { nodes,udp_endpoint: udp_endpoint.map(|mut endpoint| { if endpoint.address.is_empty() { endpoint.address = if config.udp_endpoint.is_empty() { fallback.address.clone() } else { config.udp_endpoint.clone() }; } endpoint }), endpoint: tunnel_endpoint.unwrap_or_else(||fallback.clone()),tunnels:tunnels.clone() };
                         if *desired.borrow() != next { desired.send_replace(next); }
                         if !accepted { accepted=true; data_tasks.spawn(run_data(connector_updates.clone(),receiver.clone(),None)); data_tasks.spawn(nodes::run(connector_updates.clone(),receiver.clone(),budgets.clone())); data_tasks.spawn(udp::run(connector_updates.clone(),receiver.clone())); if capabilities.iter().any(|c|c==nexo_protocol::direct::CAPABILITY) { data_tasks.spawn(direct::run(config.caddy_binary.clone(),identity_path.parent().context("身份目录无效")?.join("direct"),connector_updates.clone(),receiver.clone())); } }
-                        probes.abort_all();
-                        probes.spawn(probe_tunnels(tunnels));
+                        if !checks.is_empty() {
+                            if periodic_check { probes.abort_all(); }
+                            probes.spawn(probe_origin_snapshot(checks));
+                        }
                     },
                     ServerControlMessage::NodeBudget{request_id,grant_id,bytes}=>{if let Some(reply)=budget_pending.remove(&request_id){let _=reply.send((grant_id,bytes));}},
                     ServerControlMessage::TunnelApplyAccepted { .. } => {},
@@ -586,14 +632,14 @@ async fn run_control(
                         renewal_deadline = None;
                         let _ = certificate::failed(identity,identity_path,&message,Some(next_retry_at));
                     },
-                    ServerControlMessage::Error { message } => anyhow::bail!("Server 拒绝请求：{message}"),
+                    ServerControlMessage::Error { message } => anyhow::bail!("服务端拒绝请求：{message}"),
                 }
             }
         }
     }
     }.await;
     result.with_context(|| {
-        format!("Agent 控制通道诊断：device_id={device} peer={peer} local={local}；{diagnostics}")
+        format!("客户端控制通道诊断：device_id={device} peer={peer} local={local}；{diagnostics}")
     })
 }
 
@@ -613,13 +659,13 @@ async fn run_data(
                 .get_ref()
                 .0
                 .set_nodelay(true)
-                .context("设置 Tunnel 数据连接 TCP_NODELAY 失败")?;
+                .context("设置隧道数据连接 TCP_NODELAY 失败")?;
             Ok(stream)
         });
         match connected {
             Ok(stream) => {
                 delay = 1;
-                tracing::info!("Tunnel 数据通道已连接");
+                tracing::info!("隧道数据通道已连接");
                 let mut connection = nexo_tunnel::yamux_connection(stream, yamux::Mode::Client);
                 let mut tasks = JoinSet::new();
                 let mut probe = tokio::time::interval(Duration::from_secs(10));
@@ -644,14 +690,14 @@ async fn run_data(
                         Some(_) = tasks.join_next(), if !tasks.is_empty() => {},
                     change = desired.changed() => { if change.is_err() { return; } else if desired.borrow().endpoint != endpoint { break; } },
                         inbound=nexo_tunnel::next_inbound(&mut connection) => match inbound {
-                            Ok(Some(stream)) => { let snapshot=desired.clone(); let budget=budget.clone(); tasks.spawn(async move { if let Err(error)=forward_with_budget(stream,snapshot,budget).await { tracing::debug!("Tunnel 逻辑流结束：{error:#}"); } }); },
+                            Ok(Some(stream)) => { let snapshot=desired.clone(); let budget=budget.clone(); tasks.spawn(async move { if let Err(error)=forward_with_budget(stream,snapshot,budget).await { tracing::debug!("隧道逻辑流结束：{error:#}"); } }); },
                             Ok(None) => break,
-                            Err(error) => { tracing::warn!("Tunnel 数据通道断开：{error}"); break; }
+                            Err(error) => { tracing::warn!("隧道数据通道断开：{error}"); break; }
                         }
                     }
                 }
             }
-            Err(error) => tracing::warn!("Tunnel 数据连接失败，将自动重试：{error:#}"),
+            Err(error) => tracing::warn!("隧道数据连接失败，将自动重试：{error:#}"),
         }
         tokio::select! { _=tokio::time::sleep(Duration::from_secs(delay))=>{}, result=desired.changed()=>if result.is_err(){return;} }
         delay = (delay * 2).min(30);
@@ -768,6 +814,59 @@ async fn connect_origin(tunnel: &TunnelDesiredState) -> Result<Box<dyn OriginIo>
             .context("本地 HTTPS 证书验证失败")?,
     ))
 }
+/// 定期检查仍覆盖全部服务；编辑推送只探测变更的回源，公网协议、域名或版本变化不重查相同目标。
+/// 停用也下发结果，但 probe_tunnels 不建立网络连接；TLS 信任配置变化必须重新验证。
+fn origin_checks(
+    previous: &[TunnelDesiredState],
+    next: &[TunnelDesiredState],
+    periodic: bool,
+) -> Vec<TunnelDesiredState> {
+    next.iter()
+        .filter(|current| periodic || !previous.iter().any(|old| same_origin(old, current)))
+        .cloned()
+        .collect()
+}
+
+fn same_origin(old: &TunnelDesiredState, current: &TunnelDesiredState) -> bool {
+    old.tunnel_id == current.tunnel_id
+        && old.enabled == current.enabled
+        && (old.protocol == current.protocol
+            || matches!(old.protocol.as_str(), "http" | "https")
+                && matches!(current.protocol.as_str(), "http" | "https"))
+        && old.local_address == current.local_address
+        && old.local_port == current.local_port
+        && old.origin_protocol.as_deref().unwrap_or("http")
+            == current.origin_protocol.as_deref().unwrap_or("http")
+        && old.origin_tls_server_name == current.origin_tls_server_name
+        && old.origin_tls_verification == current.origin_tls_verification
+        && old.origin_ca_pem == current.origin_ca_pem
+}
+
+async fn probe_origin_snapshot(
+    tunnels: Vec<TunnelDesiredState>,
+) -> (Vec<TunnelDesiredState>, Vec<TunnelApplyResult>) {
+    let results = probe_tunnels(tunnels.clone()).await;
+    (tunnels, results)
+}
+
+/// 检查期间可能只改了公网入口；回源完全相同才能归入当前版本，避免再次连接或等待下轮心跳。
+/// 若目标、TLS 配置、启停或服务归属已变，丢弃结果，绝不能把旧目标的成功当作新目标就绪。
+fn current_origin_reports(
+    checked: &[TunnelDesiredState],
+    results: Vec<TunnelApplyResult>,
+    desired: &[TunnelDesiredState],
+) -> Vec<TunnelApplyResult> {
+    results
+        .into_iter()
+        .filter_map(|mut result| {
+            let measured = checked.iter().find(|t| t.tunnel_id == result.tunnel_id)?;
+            let current = desired.iter().find(|t| same_origin(measured, t))?;
+            result.revision = current.revision;
+            Some(result)
+        })
+        .collect()
+}
+
 async fn probe_tunnels(tunnels: Vec<TunnelDesiredState>) -> Vec<TunnelApplyResult> {
     let mut tasks = JoinSet::new();
     let permits = Arc::new(tokio::sync::Semaphore::new(16));

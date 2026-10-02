@@ -76,7 +76,7 @@ pub fn prepare(
         {
             return Err(ApiError::new(
                 StatusCode::BAD_REQUEST,
-                "反向代理只支持 HTTP/HTTPS，不能绑定 Agent、公网端口或内网重定向",
+                "反向代理只支持 HTTP/HTTPS，不能绑定设备、公网端口或内网重定向",
             ));
         }
         // 用 URL 解析器验证主机，防止地址字段注入路径、凭据、查询串或额外端口。

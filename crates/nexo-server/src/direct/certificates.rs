@@ -30,7 +30,7 @@ pub async fn request(
             .subject
             .iter_common_name()
             .all(|name| name.as_str().is_ok_and(|name| name == service.hostname)),
-        "CSR Common Name 必须为空或与绑定服务主机名一致，请升级 Agent 后重试"
+        "CSR Common Name 必须为空或与绑定服务主机名一致，请升级设备后重试"
     );
     let id = &service.tunnel.tunnel_id;
     let (chain, retry, error, renew) = {

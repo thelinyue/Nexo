@@ -247,7 +247,7 @@ async fn control_session(runtime: &Arc<Runtime>, saved: &NodeIdentity) -> Result
     tokio::pin!(deadline);
     loop {
         tokio::select! {
-            _=&mut deadline=>anyhow::bail!("管理 Server 45 秒未响应，停止转发"),
+            _=&mut deadline=>anyhow::bail!("管理服务端 45 秒未响应，停止转发"),
             Some(mut call)=access.recv()=>{
                 sequence=sequence.wrapping_add(1);
                 if let wire::Request::Access{request_id,..}=&mut call.request{*request_id=sequence;}
@@ -292,7 +292,7 @@ async fn data(runtime: Arc<Runtime>, saved: Arc<NodeIdentity>) -> Result<()> {
             Some(_)=tasks.join_next(),if !tasks.is_empty()=>{},
             incoming=listener.accept()=>{
                 let (socket,_)=incoming?;let acceptor=acceptor.clone();let runtime=runtime.clone();
-                tasks.spawn(async move{if let Err(error)=data_session(runtime,acceptor,socket).await{tracing::debug!("节点 Agent 连接结束：{error:#}");}});
+                tasks.spawn(async move{if let Err(error)=data_session(runtime,acceptor,socket).await{tracing::debug!("节点设备连接结束：{error:#}");}});
             }
         }
     }
@@ -325,11 +325,11 @@ async fn data_session(
         .1
         .peer_certificates()
         .and_then(|v| v.first())
-        .context("缺少 Agent 证书")?
+        .context("缺少设备证书")?
         .as_ref()
         .to_vec();
     let mut snapshot = runtime.snapshot.subscribe();
-    let device = agent_for(&snapshot.borrow(), &cert).context("Agent 未获此节点授权")?;
+    let device = agent_for(&snapshot.borrow(), &cert).context("设备未获此节点授权")?;
     let (sender, mut receiver) = mpsc::channel::<Open>(nexo_tunnel::DEFAULT_MAX_STREAMS);
     let cancel = CancellationToken::new();
     if let Some(old) = runtime.sessions.lock().await.insert(
@@ -346,7 +346,7 @@ async fn data_session(
     let mut copies = JoinSet::new();
     let result:Result<()>=async{loop{tokio::select!{
         _=cancel.cancelled()=>break,
-        changed=snapshot.changed()=>{changed?;anyhow::ensure!(agent_for(&snapshot.borrow(),&cert).as_deref()==Some(&device),"Agent 授权已撤销");},
+        changed=snapshot.changed()=>{changed?;anyhow::ensure!(agent_for(&snapshot.borrow(),&cert).as_deref()==Some(&device),"设备授权已撤销");},
         Some(_)=copies.join_next(),if !copies.is_empty()=>{},
         request=receiver.recv()=>{
             let Some(mut request)=request else{break;};
@@ -538,7 +538,7 @@ async fn listeners(runtime: Arc<Runtime>, directory: PathBuf, node_id: String) -
                 }
             }
             if !runtime.sessions.lock().await.contains_key(&service.device) {
-                error = Some("等待 Agent 数据连接".into());
+                error = Some("等待设备数据连接".into());
             }
             health.push(wire::ServiceHealth {
                 public_probe_supported: matches!(service.protocol.as_str(), "http" | "https"),

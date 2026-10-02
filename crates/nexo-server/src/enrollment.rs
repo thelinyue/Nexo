@@ -55,7 +55,7 @@ pub(crate) async fn agent_enroll(
     if previous.as_deref().is_some_and(|previous| previous != csr) {
         return Err(ApiError::new(
             StatusCode::CONFLICT,
-            "入网凭证已由其他 Agent 认领，请生成新凭证",
+            "入网凭证已由其他设备认领，请生成新凭证",
         ));
     }
     if previous.is_none() {
@@ -130,7 +130,7 @@ fn approve(
     if status != "awaiting_approval" {
         return Err(ApiError::new(
             StatusCode::CONFLICT,
-            "请等待 Agent 提交设备身份后再批准",
+            "请等待设备提交身份后再批准",
         ));
     }
     let device =
@@ -281,7 +281,7 @@ pub(crate) async fn agent_poll(
         certificate_pem: if approved { row.3 } else { None },
         ca_certificate_pem: approved.then(|| state.authority.ca_pem()),
         message: if approved {
-            "Agent 已批准"
+            "设备已批准"
         } else {
             "等待管理员批准"
         }

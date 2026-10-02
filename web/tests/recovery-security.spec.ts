@@ -76,7 +76,7 @@ test("设备恢复凭证绑定原设备，批准前说明撤销旧身份", async
   await page.goto("/#/agents/a-1");
   await page.getByRole("region", { name: "设备内部证书" }).locator("summary").click();
   await page.getByRole("button", { name: "恢复设备身份" }).click();
-  const recovery = page.getByRole("dialog", { name: "恢复 家庭 Agent 的身份" });
+  const recovery = page.getByRole("dialog", { name: "恢复 家庭设备 的身份" });
   await recovery.getByRole("button", { name: "生成恢复凭证" }).click();
   await expect(recovery.locator(".token")).toHaveText("recovery-token-for-test");
   expect(state.enrollments.find(item => item.kind === "recovery")?.device_id).toBe("a-1");
@@ -87,7 +87,7 @@ test("设备恢复凭证绑定原设备，批准前说明撤销旧身份", async
   await page.getByRole("link", { name: "返回", exact: true }).click();
   await page.clock.fastForward(5000);
   await page.getByRole("button", { name: "批准", exact: true }).click();
-  const confirm = page.getByRole("dialog", { name: "批准恢复 家庭 Agent 的身份？" });
+  const confirm = page.getByRole("dialog", { name: "批准恢复 家庭设备 的身份？" });
   await expect(confirm).toContainText("旧证书及旧连接立即失效");
   await confirm.getByRole("button", { name: "批准恢复", exact: true }).click();
   await expect(confirm).toBeHidden();

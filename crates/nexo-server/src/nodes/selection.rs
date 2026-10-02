@@ -37,7 +37,7 @@ pub fn choose<'a>(
             && best_rtt.saturating_add(10) <= current_rtt
             && u64::from(best_rtt) * 100 <= u64::from(current_rtt) * 80
         {
-            return Some((best, "Agent 延迟持续改善，切换低延迟节点"));
+            return Some((best, "设备延迟持续改善，切换低延迟节点"));
         }
     } else if best.latency.is_some()
         && active.latency.is_none()

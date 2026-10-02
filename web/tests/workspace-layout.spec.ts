@@ -3,7 +3,7 @@ import { installApiMocks } from "./api-mocks";
 
 const activePage = (page: import("@playwright/test").Page) => page.locator(".page-slot:not([hidden])");
 
-test("页面工具栏从首行开始，桌面设置入口只出现一次", async ({ page }, info) => {
+test("页面工具栏从首行开始，桌面账号入口只出现一次", async ({ page }, info) => {
   test.skip(info.project.name !== "desktop-dark", "桌面布局矩阵");
   const state = await installApiMocks(page);
   const names = ["bit2", "emby", "dockge", "qb", "dc", "lucky", "danmu", "tag", "flowlink", "mp", "ik", "music", "siyuan", "paper", "clash", "onenav", "sing", "v", "ck", "huddletab", "emby2", "bit"];
@@ -23,11 +23,10 @@ test("页面工具栏从首行开始，桌面设置入口只出现一次", async
       const filter = (await page.getByLabel("服务筛选").boundingBox())!;
       const create = (await page.getByRole("button", { name: "创建服务", exact: true }).boundingBox())!;
       const navigationRow = (await page.getByRole("navigation", { name: "主导航" }).getByRole("link").first().boundingBox())!;
-      const navigationIcon = (await page.getByRole("navigation", { name: "主导航" }).getByRole("link").first().locator("svg").boundingBox())!;
-      const settingsIcon = (await page.locator(".sidebar-settings svg").boundingBox())!;
+      const avatar = (await page.locator(".sidebar-settings img").boundingBox())!;
       expect(settings.x).toBe(navigationRow.x); expect(settings.width).toBe(navigationRow.width);
-      expect(settings.height).toBe(navigationRow.height);
-      expect(settingsIcon.x).toBe(navigationIcon.x); expect(settingsIcon.width).toBe(navigationIcon.width);
+      expect(settings.height).toBeGreaterThanOrEqual(56);
+      expect(avatar.width).toBe(32); expect(avatar.height).toBe(32);
       expect(settings.y + settings.height).toBe(876);
       const searchControl = (await page.locator(".service-toolbar .search").boundingBox())!;
       const contentTop = await activePage(page).evaluate(element => element.getBoundingClientRect().top + parseFloat(getComputedStyle(element).borderTopWidth) + parseFloat(getComputedStyle(element).paddingTop));
@@ -48,16 +47,16 @@ test("页面工具栏从首行开始，桌面设置入口只出现一次", async
       await page.screenshot({ path: info.outputPath(`services-${theme}-${width}.png`), animations: "disabled" });
     }
   }
-  // 页面缓存保留读屏标题；设置入口属于侧栏，业务页面不再挂载账号菜单。
+  // 页面缓存保留读屏标题；本人账号菜单只由外壳挂载一次。
   for (const width of [901, 1440]) {
     await page.setViewportSize({ width, height: 900 });
-    for (const [route, title] of [["home", "首页"], ["agents", "设备"], ["nodes", "节点"], ["domains", "域名"], ["users", "用户管理"], ["manage", "账号设置"], ["settings/sessions", "登录会话"]]) {
+    for (const [route, title] of [["home", "首页"], ["agents", "设备"], ["nodes", "节点"], ["domains", "域名"], ["users", "用户管理"], ["settings/sessions", "登录会话"]]) {
       await page.evaluate(route => { location.hash = `#/${route}`; }, route);
       await expect(activePage(page).getByRole("heading", { level: 1 })).toHaveText(title);
       await expect(activePage(page).locator("h1")).toHaveCSS("clip-path", route === "settings/sessions" ? "none" : "inset(50%)");
       await expect(activePage(page).locator("h1")).toBeFocused();
       await expect(page.locator(".sidebar-settings")).toHaveCount(1);
-      await expect(page.locator("#account-menu,.account-trigger")).toHaveCount(0);
+      await expect(page.locator(".account-menu")).toHaveCount(1);
       if (route !== "settings/sessions") await expect(activePage(page).locator(".page-header")).toHaveCSS("height", "0px");
       await page.screenshot({ path: info.outputPath(`${route.replaceAll("/", "-")}-${width}.png`), animations: "disabled" });
       await expect.poll(() => page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBeTruthy();
@@ -65,7 +64,7 @@ test("页面工具栏从首行开始，桌面设置入口只出现一次", async
   }
 });
 
-test("长标题保持可读，矮窗口导航独立滚动且设置始终可达", async ({ page }, info) => {
+test("长标题保持可读，矮窗口导航独立滚动且账号菜单始终可达", async ({ page }, info) => {
   test.skip(info.project.name !== "desktop-dark", "桌面侧栏定位");
   const state = await installApiMocks(page);
   state.devices[0].name = "一个非常长的家庭存储设备名称".repeat(8);
@@ -78,7 +77,8 @@ test("长标题保持可读，矮窗口导航独立滚动且设置始终可达",
   await expect.poll(() => page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBeTruthy();
   await page.locator(".sidebar").getByRole("link", { name: "服务", exact: true }).click();
   const settings = page.locator(".sidebar-settings");
-  await expect(settings.locator("img,span")).toHaveCount(0);
+  await expect(settings.locator("img")).toHaveAttribute("data-avatar-role", "admin");
+  await expect(settings.locator("strong")).toHaveAttribute("title", "很长的管理员用户名".repeat(12));
   await page.setViewportSize({ width: 901, height: 375 });
   await page.emulateMedia({ contrast: "more", reducedMotion: "reduce" });
   await page.evaluate(() => { document.documentElement.style.fontSize = "24px"; });
@@ -94,9 +94,14 @@ test("长标题保持可读，矮窗口导航独立滚动且设置始终可达",
   await expect(settings).toBeFocused();
   await expect(settings).toHaveCSS("outline-style", "solid");
   await page.keyboard.press("Enter");
-  await expect(page).toHaveURL(/#\/manage$/);
-  await expect(settings).toHaveAttribute("aria-current", "page");
-  await expect(activePage(page).locator(".account-summary strong")).toHaveText("很长的管理员用户名".repeat(12));
+  await expect(page).toHaveURL(/#\/services$/);
+  await expect(settings).toHaveAttribute("data-selected", "true");
+  const menu = page.getByRole("menu", { name: "本人账号", exact: true });
+  await expect(menu).toBeVisible();
+  await expect(menu.locator(".account-menu-identity strong")).toHaveText("很长的管理员用户名".repeat(12));
+  const menuBox = (await menu.boundingBox())!;
+  expect(menuBox.y + menuBox.height).toBeLessThanOrEqual(before.y);
+  expect(menuBox.y).toBeGreaterThanOrEqual(16);
   await expect.poll(() => page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBeTruthy();
   await page.screenshot({ path: info.outputPath("settings-short-large-text.png"), animations: "disabled" });
 });

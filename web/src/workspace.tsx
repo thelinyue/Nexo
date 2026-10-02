@@ -1,9 +1,10 @@
-import { lazy, Suspense, useId, useEffect, useRef, useState } from "react";
-import { ChevronRight, Ellipsis, Globe2, House, Network, Server, Settings, UserRound, Users } from "./icons";
+import { lazy, Suspense, useId, useEffect, useLayoutEffect, useRef, useState } from "react";
+import { ChevronRight, Ellipsis, Globe2, House, Network, Server, Settings, Users } from "./icons";
+import { AccountMenu } from "./account-menu";
 import type { ManagedWorkspace } from "./accounts";
-import { Loading, PageLoadBoundary, Notice, PageHeader, WorkspaceContext, WorkspaceLabelContext, rememberInteraction, request } from "./ui";
+import { Loading, MobileCreateContext, WorkspaceHeaderContext, PageLoadBoundary, Notice, PageHeader, WorkspaceContext, WorkspaceLabelContext, rememberInteraction, request } from "./ui";
 import type { Auth } from "./ui";
-import { PageNavigationContext, homeRoute, navigationLocked, rootRoutes, useWorkspaceNavigation } from "./navigation";
+import { PageNavigationContext, homeRoute, navigationLocked, rootRoutes, routeInfo, useWorkspaceNavigation } from "./navigation";
 
 /** 按访问页面加载模块；已打开页面仍保留原实例和草稿。 */
 const HomePage = lazy(() => import("./home").then(module => ({ default: module.HomePage })));
@@ -11,8 +12,8 @@ const UsersPage = lazy(() => import("./accounts").then(module => ({ default: mod
 const AgentsPage = lazy(() => import("./management").then(module => ({ default: module.AgentsPage })));
 const NodesPage = lazy(() => import("./nodes").then(module => ({ default: module.NodesPage })));
 const DomainsPage = lazy(() => import("./management").then(module => ({ default: module.DomainsPage })));
-const ManagePage = lazy(() => import("./management").then(module => ({ default: module.ManagePage })));
 const SessionsPage = lazy(() => import("./management").then(module => ({ default: module.SessionsPage })));
+const ServerSettingsPage = lazy(() => import("./server-settings").then(module => ({ default: module.ServerSettingsPage })));
 const ServicesPage = lazy(() => import("./services").then(module => ({ default: module.ServicesPage })));
 
 const resources = [
@@ -23,17 +24,19 @@ const resources = [
   { route: "#/domains", label: "域名", icon: Globe2 },
 ];
 
-/** 手机只常驻三个高频入口；用户管理归入账号设置，避免重复入口。
+const adminNavigation = [{ route: "#/users", label: "用户管理", icon: Users }, { route: "#/settings/server", label: "服务器设置", icon: Settings }];
+
+/** 手机只常驻三个高频入口；更多只承载业务和管理员页面，个人操作统一进入头像菜单。
  * 触摸展开不抢焦点，键盘展开才聚焦菜单；选项导航交由目标页面接管焦点。
  * 链接显式进入 Tab 顺序，使 WebKit 默认键盘设置下也能逐项访问。
  */
-function MobileNavigation({ route, desktop }: { route: string; desktop: boolean }) {
+function MobileNavigation({ route, desktop, admin, standalone }: { route: string; desktop: boolean; admin: boolean; standalone: boolean }) {
   const id = useId(); const menu = useRef<HTMLDivElement>(null); const trigger = useRef<HTMLButtonElement>(null); const [open, setOpen] = useState(false);
   const keyboard = useRef(false);
-  const more = [...resources.slice(3), { route: "#/manage", label: "账号设置", icon: UserRound }];
+  const more = [...resources.slice(3), ...(admin ? adminNavigation : [])];
   const active = (path: string) => route === path || route.startsWith(`${path}/`);
-  const selected = more.some(item => active(item.route)) || route === "#/settings/sessions";
-  useEffect(() => { menu.current?.hidePopover(); }, [route, desktop]);
+  const selected = more.some(item => active(item.route));
+  useEffect(() => { menu.current?.hidePopover(); }, [route, desktop, standalone]);
   useEffect(() => {
     if (!open) return;
     const closeOnEscape = (event: KeyboardEvent) => {
@@ -65,9 +68,20 @@ function MobileNavigation({ route, desktop }: { route: string; desktop: boolean 
 /** 同一业务页面实例跨桌面/手机保留；桌面侧栏和手机底栏仅改变导航呈现。 */
 export function Workspace({ auth, onAuth, onExpired, managed, onManage, message, onRenamed, onDeleted }: { auth: Auth; onAuth: (value: Auth) => void; onExpired: () => void; managed: ManagedWorkspace | null; onManage: (value: ManagedWorkspace | null) => void; message: string | null; onRenamed: (username: string) => void; onDeleted: (workspace: string, message: string) => void }) {
   const navigation = useWorkspaceNavigation();
-  const { route, desktop } = navigation;
-  const desktopItems = [...resources, ...(auth.role === "system_admin" ? [{ route: "#/users", label: "用户管理", icon: Users }] : [])];
-  const settingsActive = route === "#/manage" || route === "#/settings/sessions";
+  const { route, desktop, standalone } = navigation;
+  const [createTarget, setCreateTarget] = useState<HTMLDivElement | null>(null);
+  const [headerTarget, setHeaderTarget] = useState<HTMLDivElement | null>(null);
+  const [accountTarget, setAccountTarget] = useState<HTMLDivElement | null>(null);
+  const shell = useRef<HTMLDivElement>(null); const header = useRef<HTMLDivElement>(null);
+  const topHeader = standalone || !desktop;
+  const desktopItems = [...resources, ...(auth.role === "system_admin" ? adminNavigation : [])];
+  // 安全区包含在实际首行高度中，正文只补一次间距；字体放大不会遮挡页面内容。
+  useLayoutEffect(() => {
+    if (!topHeader || !header.current) return;
+    const update = () => shell.current?.style.setProperty("--workspace-top-height", `${header.current!.getBoundingClientRect().height}px`);
+    update(); const observer = new ResizeObserver(update); observer.observe(header.current);
+    return () => observer.disconnect();
+  }, [topHeader]);
   async function logout() {
     if (navigationLocked()) return;
     await request("/api/v1/auth/logout", { method: "POST" }, auth.csrf_token);
@@ -87,28 +101,30 @@ export function Workspace({ auth, onAuth, onExpired, managed, onManage, message,
   }, []);
   const links = (items: typeof resources) => items.map(item => { const Icon = item.icon; const active = route === item.route || route.startsWith(`${item.route}/`); return <a key={item.route} href={item.route} aria-current={active ? "page" : undefined} className={active ? "active" : ""}><Icon size={22} aria-hidden="true" /><span>{item.label}</span></a>; });
   return <WorkspaceContext.Provider value={managed?.id}><WorkspaceLabelContext.Provider value={managed?.name}>
-    <div className="app-shell" data-root-page={rootRoutes.includes(route)} data-detail-page={/^#\/(services|agents|nodes|domains)\//.test(route)} onPointerDownCapture={event => rememberInteraction(event.target)} onKeyDownCapture={() => rememberInteraction(null)}>
+    <div ref={shell} className="app-shell" data-pwa={standalone} data-top-header={topHeader} data-root-page={rootRoutes.includes(route)} data-detail-page={/^#\/(services|agents|nodes|domains)\//.test(route)} onPointerDownCapture={event => rememberInteraction(event.target)} onKeyDownCapture={() => rememberInteraction(null)}>
       <aside className="sidebar"><div className="sidebar-brand" aria-label="Nexo"><picture aria-hidden="true"><source media="(prefers-color-scheme: dark)" srcSet="/brand/nexo-banner-dark.webp" /><img src="/brand/nexo-banner-light.webp" width="168" height="56" alt="" /></picture></div><nav aria-label="主导航">{links(desktopItems)}</nav>
-        {/* 设置属于登录人，复用原生路由链接及未保存表单的离页保护。 */}
-        <a className="sidebar-settings" href="#/manage" title="账号设置" aria-label="账号设置" aria-current={settingsActive ? "page" : undefined}><Settings size={20} aria-hidden="true" /></a>
+        {!topHeader && <div className="sidebar-account-slot" ref={setAccountTarget} />}
       </aside>
-      <main className="content">
+      <div ref={header} className="workspace-topbar" hidden={!topHeader}><div className="workspace-top-content" data-title={routeInfo(route).label} ref={setHeaderTarget} />{topHeader && <div className="account-trigger-slot" ref={setAccountTarget} />}</div>
+      <AccountMenu auth={auth} target={accountTarget} compact={topHeader} route={route} requestId={navigation.accountRequest} onLogout={logout} onExpired={onExpired} />
+      <WorkspaceHeaderContext.Provider value={headerTarget}><MobileCreateContext.Provider value={createTarget}><main className="content">
         {message && <p role="status" className="action-status">{message}</p>}
         {managed && <div className="workspace-banner" role="status"><div><strong>{managed.name}</strong><span>管理员访问{!managed.enabled && " · 用户已停用，服务暂停转发"}</span></div><button className="secondary-button" onClick={() => switchWorkspace(null)}>返回我的空间</button></div>}
         {navigation.pages.map(page => {
           const active = page.route === route;
-          return <PageNavigationContext.Provider key={page.route} value={{ route: page.route, desktop, deletions: navigation.deletions, removePages: navigation.removePages, openDomainConfiguration: navigation.openDomainConfiguration }}>
+          return <PageNavigationContext.Provider key={page.route} value={{ route: page.route, active, desktop, standalone, deletions: navigation.deletions, removePages: navigation.removePages, openDomainConfiguration: navigation.openDomainConfiguration }}>
             <section className="page-slot" id={`page-${encodeURIComponent(page.route)}`} hidden={!active} aria-labelledby={`heading-${encodeURIComponent(page.route)}`}>
               <PageLoadBoundary><Suspense fallback={<Loading />} >{page.route === homeRoute ? <HomePage active={active} auth={auth} managed={managed} /> : page.route.startsWith("#/services") ? <ServicesPage admin={auth.role === "system_admin"} route={page.route} back={page.back} active={active} csrf={auth.csrf_token} /> :
                 page.route.startsWith("#/agents") ? <AgentsPage route={page.route} back={page.back ?? "#/agents"} active={active} csrf={auth.csrf_token} /> :
                 page.route === "#/nodes" ? <NodesPage admin={auth.role === "system_admin"} active={active} csrf={auth.csrf_token} /> :
                 page.route.startsWith("#/domains") ? <DomainsPage route={page.route} back={page.back ?? "#/domains"} initialConfiguration={page.configureDomain} active={active} csrf={auth.csrf_token} /> :
-                <WorkspaceLabelContext.Provider value={undefined}>{page.route === "#/manage" ? <ManagePage auth={auth} active={active} onLogout={logout} onExpired={onExpired} /> : page.route === "#/settings/sessions" ? <SessionsPage auth={auth} active={active} onExpired={onExpired} /> : auth.role === "system_admin" ? <UsersPage active={active} auth={auth} onManage={switchWorkspace} onRenamed={onRenamed} onDeleted={onDeleted} onExpired={onExpired} /> : <><PageHeader title="用户管理" /><Notice error="此页面需要管理员权限" /></>}</WorkspaceLabelContext.Provider>}</Suspense></PageLoadBoundary>
+                <WorkspaceLabelContext.Provider value={undefined}>{page.route === "#/settings/sessions" ? <SessionsPage auth={auth} active={active} back={page.back ?? homeRoute} onExpired={onExpired} /> : auth.role === "system_admin" ? page.route === "#/settings/server" ? <ServerSettingsPage active={active} auth={auth} /> : <UsersPage active={active} auth={auth} onManage={switchWorkspace} onRenamed={onRenamed} onDeleted={onDeleted} /> : <><PageHeader title={page.route === "#/settings/server" ? "服务器设置" : "用户管理"} showTitle /><Notice error="此页面需要管理员权限" /></>}</WorkspaceLabelContext.Provider>}</Suspense></PageLoadBoundary>
             </section>
           </PageNavigationContext.Provider>;
         })}
-      </main>
-      <MobileNavigation route={route} desktop={desktop} />
+      </main></MobileCreateContext.Provider></WorkspaceHeaderContext.Provider>
+      {/* 添加入口与导航共用一层底座，空槽不占宽度，避免另叠一排悬浮控件。 */}
+      <div className="mobile-dock"><MobileNavigation route={route} desktop={desktop} admin={auth.role === "system_admin"} standalone={standalone} /><div className="mobile-create-slot" ref={setCreateTarget} /></div>
     </div>
   </WorkspaceLabelContext.Provider></WorkspaceContext.Provider>;
 }
