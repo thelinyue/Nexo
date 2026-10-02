@@ -78,9 +78,14 @@ export function Workspace({ auth, onAuth, onExpired, managed, onManage, message,
   // 安全区包含在实际首行高度中，正文只补一次间距；字体放大不会遮挡页面内容。
   useLayoutEffect(() => {
     if (!topHeader || !header.current) return;
-    const update = () => shell.current?.style.setProperty("--workspace-top-height", `${header.current!.getBoundingClientRect().height}px`);
-    update(); const observer = new ResizeObserver(update); observer.observe(header.current);
-    return () => observer.disconnect();
+    let frame = 0;
+    const update = () => {
+      const height = `${header.current!.getBoundingClientRect().height}px`;
+      if (shell.current?.style.getPropertyValue("--workspace-top-height") !== height) shell.current?.style.setProperty("--workspace-top-height", height);
+    };
+    // 在下一帧回写正文间距，避免 WebKit 在尺寸通知中再次布局形成观察循环。
+    update(); const observer = new ResizeObserver(() => { cancelAnimationFrame(frame); frame = requestAnimationFrame(update); }); observer.observe(header.current);
+    return () => { observer.disconnect(); cancelAnimationFrame(frame); };
   }, [topHeader]);
   async function logout() {
     if (navigationLocked()) return;

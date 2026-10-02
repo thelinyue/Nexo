@@ -148,7 +148,8 @@ test("图标失败、服务关闭与端口服务仍有明确入口，选择模�
   await page.getByRole("button", { name: "复制SSH地址", exact: true }).click();
   await expect(page.locator("body")).toHaveAttribute("data-copied", "example.com:22000");
   await page.screenshot({ path: info.outputPath("application-cards.png"), animations: "disabled" });
-  await page.getByRole("button", { name: "选择", exact: true }).click();
+  await page.getByRole("button", { name: "选择", exact: true }).focus();
+  await page.getByRole("button", { name: "选择", exact: true }).press("Space");
   await emby.getByRole("link", { name: "Emby", exact: true }).click();
   await expect(emby.getByRole("checkbox")).toBeChecked();
   await expect(page).toHaveURL(/#\/services$/);

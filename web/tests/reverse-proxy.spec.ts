@@ -39,7 +39,7 @@ test("独立反代入口无需设备，创建服务入口保持内网穿透", as
 
 });
 
-test("手机添加入口位于标题右侧，选择类型后进入独立表单", async ({ page }, info) => {
+test("手机添加入口紧邻底栏，选择类型后进入独立表单", async ({ page }, info) => {
   test.skip(info.project.name === "desktop-dark", "手机操作面板");
   await installApiMocks(page);
   await page.goto("/#/services");
@@ -47,11 +47,11 @@ test("手机添加入口位于标题右侧，选择类型后进入独立表单",
   await expect(add).toBeInViewport();
   await expect(page.getByRole("button", { name: "添加反向代理", exact: true })).toHaveCount(0);
   const button = (await add.boundingBox())!;
-  const heading = (await page.getByRole("heading", { name: "服务", exact: true }).boundingBox())!;
-  expect(button.width).toBe(44);
-  expect(button.height).toBe(44);
-  expect(button.x).toBeGreaterThanOrEqual(heading.x + heading.width);
-  expect(Math.abs(button.y + button.height / 2 - heading.y - heading.height / 2)).toBeLessThanOrEqual(1);
+  const navigation = (await page.locator(".bottom-nav").boundingBox())!;
+  expect(button.width).toBe(52);
+  expect(button.height).toBe(52);
+  expect(button.x - navigation.x - navigation.width).toBeCloseTo(8, 0);
+  expect(Math.abs(button.y + button.height / 2 - navigation.y - navigation.height / 2)).toBeLessThanOrEqual(1);
   await add.click();
   const sheet = page.getByRole("dialog", { name: "添加", exact: true });
   for (const name of ["创建服务", "添加反向代理"]) {
@@ -99,7 +99,8 @@ test("反代详情解释已生效，编辑不绑定设备，混合批量操作�
   await expect(page).toHaveURL(/#\/services$/);
   const list = page.locator('[id="page-%23%2Fservices"]');
   await expect(list).toBeVisible();
-  await list.getByRole("button", { name: "选择", exact: true }).click();
+  await page.getByRole("button", { name: "选择", exact: true }).focus();
+  await page.getByRole("button", { name: "选择", exact: true }).press("Space");
   await page.getByRole("button", { name: "全选", exact: true }).click();
   await expect(page.getByRole("button", { name: "修改设备", exact: true })).toBeDisabled();
   await expect(page.getByText("选择中包含反向代理，不能修改设备。", { exact: true })).toBeVisible();

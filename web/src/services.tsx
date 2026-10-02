@@ -7,7 +7,7 @@ import { PageNavigationContext, useResourceDeletions } from "./navigation";
 import { useContext, useEffect, useId, useMemo, useRef, useState } from "react";
 import type { FormEvent, MouseEvent as ReactMouseEvent, PointerEvent as ReactPointerEvent } from "react";
 import { Check, CircleCheck, ChevronDown, ChevronRight, Globe, Power, PowerOff, Plus, Search, Server, Trash2 } from "./icons";
-import { Confirm, CopyButton, CreateButton, currentCreateButton, DetailField, Empty, Loading, Modal, Notice, PageHeader, Status, errorText, isPortProtocol, protocolLabel, localTarget, useApi, useResource } from "./ui";
+import { Confirm, CopyButton, CreateButton, currentCreateButton, DetailField, Empty, Loading, Modal, Notice, PageHeader, Status, WorkspaceHeaderContext, errorText, isPortProtocol, protocolLabel, localTarget, useApi, useResource } from "./ui";
 import type { Device, Domain, Tunnel } from "./ui";
 import { isLanRedirectAddress } from "./lan-redirect";
 
@@ -362,6 +362,7 @@ function BatchDomainEditor({ items, domains, csrf, onSaved, onClose, onComplete 
 export function ServicesPage({ route, active, admin = false, csrf }: { route: string; active: boolean; admin?: boolean; csrf?: string | null; back?: string }) {
   const request = useApi();
   const navigation = useContext(PageNavigationContext);
+  const workspaceHeader = useContext(WorkspaceHeaderContext);
   const [protocol, setProtocol] = useState("all"); const [agent, setAgent] = useState("all");
   const [query, setQuery] = useState(""); const [filter, setFilter] = useState("all"); const [selecting, setSelecting] = useState(false); const [selected, setSelected] = useState<string[]>([]);
   const [pressing, setPressing] = useState<string | null>(null);
@@ -391,7 +392,8 @@ export function ServicesPage({ route, active, admin = false, csrf }: { route: st
     const trigger = detailPresentation.current.trigger;
     if (trigger?.isConnected && !trigger.closest("[hidden]")) return trigger;
     const page = document.querySelector('.page-slot:not([hidden])');
-    return page?.querySelector<HTMLElement>('input[aria-label="搜索服务"],.empty .primary-button') ?? null;
+    // 手机搜索框投递到工作区顶部；来源被删除后仍把焦点交回当前服务列表。
+    return page?.querySelector<HTMLElement>('input[aria-label="搜索服务"],.empty .primary-button') ?? workspaceHeader?.querySelector<HTMLElement>('input[aria-label="搜索服务"]') ?? null;
   }
   function closeDetail(next?: string) {
     pendingDetailRoute.current = next ?? (route.startsWith("#/services/") ? "#/services" : null);
