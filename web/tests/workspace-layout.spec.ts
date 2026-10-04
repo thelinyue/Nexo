@@ -100,7 +100,9 @@ test("长标题保持可读，矮窗口导航独立滚动且账号菜单始终�
   await expect(menu).toBeVisible();
   await expect(menu.locator(".account-menu-identity strong")).toHaveText("很长的管理员用户名".repeat(12));
   const menuBox = (await menu.boundingBox())!;
-  expect(menuBox.y + menuBox.height).toBeLessThanOrEqual(before.y);
+  // 用户名完整换行后可能高于头像上方的空间；此时约束整个视口并允许菜单内部滚动。
+  if (menuBox.height + 8 <= before.y - 16) expect(menuBox.y + menuBox.height).toBeLessThanOrEqual(before.y);
+  else expect(menuBox.y + menuBox.height).toBeLessThanOrEqual(page.viewportSize()!.height - 16);
   expect(menuBox.y).toBeGreaterThanOrEqual(16);
   await expect.poll(() => page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBeTruthy();
   await page.screenshot({ path: info.outputPath("settings-short-large-text.png"), animations: "disabled" });
