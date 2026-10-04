@@ -576,9 +576,19 @@ async fn health() -> Json<Health> {
     })
 }
 
-/// gzip 与原文件共用 URL，代理缓存必须按请求编码区分；API 仍由安全中间件禁止缓存。
+/// 入口与更新脚本每次访问都重新验证，避免浏览器继续使用旧入口；gzip 协商仍按编码区分。
 async fn static_asset_headers(request: axum::extract::Request, next: middleware::Next) -> Response {
+    let revalidate = matches!(
+        request.uri().path(),
+        "/" | "/index.html" | "/sw.js" | "/registerSW.js" | "/manifest.webmanifest"
+    );
     let mut response = next.run(request).await;
+    if revalidate {
+        response.headers_mut().insert(
+            axum::http::header::CACHE_CONTROL,
+            axum::http::HeaderValue::from_static("no-cache"),
+        );
+    }
     response.headers_mut().append(
         axum::http::header::VARY,
         axum::http::HeaderValue::from_static("Accept-Encoding"),
@@ -1701,6 +1711,14 @@ mod tests {
         // ServeDir 只负责编码协商，不解压；完整 gzip 内容另由浏览器验收核对。
         fs::write(root.join("entry.js.gz"), b"compressed-fixture").unwrap();
         fs::write(root.join("fallback.js"), b"fallback").unwrap();
+        for path in [
+            "index.html",
+            "sw.js",
+            "registerSW.js",
+            "manifest.webmanifest",
+        ] {
+            fs::write(root.join(path), b"entry-fixture").unwrap();
+        }
         let (mut state, _) = domain_fixture();
         Arc::make_mut(&mut state.config).web_dir = root.clone();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1719,6 +1737,7 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(response.headers()["vary"], "Accept-Encoding");
+            assert!(response.headers().get("cache-control").is_none());
             assert_eq!(
                 response.headers().get("content-encoding").is_some(),
                 compressed
@@ -1733,6 +1752,18 @@ mod tests {
             .unwrap();
         assert!(fallback.headers().get("content-encoding").is_none());
         assert_eq!(fallback.text().await.unwrap(), "fallback");
+        for path in [
+            "/",
+            "/index.html?nexo-update-check=1",
+            "/sw.js",
+            "/registerSW.js",
+            "/manifest.webmanifest",
+        ] {
+            let response = client.get(format!("{url}{path}")).send().await.unwrap();
+            assert_eq!(response.status(), reqwest::StatusCode::OK);
+            assert_eq!(response.headers()["cache-control"], "no-cache");
+            assert_eq!(response.headers()["vary"], "Accept-Encoding");
+        }
         let api = client
             .get(format!("{url}/api/v1/auth/status"))
             .send()

@@ -5,6 +5,7 @@ import { createRoot } from "react-dom/client";
 import { homeRoute } from "./navigation";
 import { Brand, Loading, PageLoadBoundary, Notice, errorText, request, resumeSession } from "./ui";
 import type { Auth } from "./ui";
+import { WebUpdateNotice } from "./web-update";
 import "./styles.css";
 import "./service-cards.css";
 import "./service-detail.css";
@@ -57,4 +58,4 @@ function App() {
 }
 
 export default App;
-createRoot(document.getElementById("root")!).render(<PageLoadBoundary><Suspense fallback={<main className="loading-screen"><Loading /></main>}><App /></Suspense></PageLoadBoundary>);
+createRoot(document.getElementById("root")!).render(<><WebUpdateNotice /><PageLoadBoundary><Suspense fallback={<main className="loading-screen"><Loading /></main>}><App /></Suspense></PageLoadBoundary></>);

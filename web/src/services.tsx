@@ -5,7 +5,7 @@ import { ApplicationModal } from "./application-modal";
 import { ServiceIcon, ServiceIconPicker } from "./service-icons";
 import { PageNavigationContext, useResourceDeletions } from "./navigation";
 import { useContext, useEffect, useId, useMemo, useRef, useState } from "react";
-import type { FormEvent, MouseEvent as ReactMouseEvent, PointerEvent as ReactPointerEvent } from "react";
+import type { ClipboardEvent as ReactClipboardEvent, FormEvent, MouseEvent as ReactMouseEvent, PointerEvent as ReactPointerEvent } from "react";
 import { Check, CircleCheck, ChevronDown, ChevronRight, Globe, Power, PowerOff, Plus, Search, Server, Trash2 } from "./icons";
 import { Confirm, CopyButton, CreateButton, currentCreateButton, DetailField, Empty, Loading, Modal, Notice, PageHeader, Status, WorkspaceHeaderContext, errorText, isPortProtocol, protocolLabel, localTarget, useApi, useResource } from "./ui";
 import type { Device, Domain, Tunnel } from "./ui";
@@ -14,6 +14,18 @@ import { isLanRedirectAddress } from "./lan-redirect";
 type ServiceData = { tunnels: Tunnel[]; devices: Device[]; domains: Domain[] };
 const loadServices = async (request: ReturnType<typeof useApi>): Promise<ServiceData> => { const [tunnels, devices, domains] = await Promise.all([request<Tunnel[]>("/api/v1/tunnels"), request<Device[]>("/api/v1/devices"), request<Domain[]>("/api/v1/public-domains")]); return { tunnels, devices, domains: domains.filter(domain => domain.verification_status !== "pending") }; };
 const hasServiceDomain = (item: Tunnel) => ["http", "https", "tcp"].includes(item.protocol) && Boolean(item.public_domain && item.hostname);
+
+/** 仅拆分显式 HTTP/HTTPS 网址；默认端口按协议补齐，IPv6 去掉外层方括号，账号密码不自动丢弃。 */
+function parseServiceAddress(input: string) {
+  const value = input.trim();
+  if (!/^https?:\/\//i.test(value)) return null;
+  try {
+    const url = new URL(value);
+    const port = url.port || (url.protocol === "https:" ? "443" : "80");
+    if (url.username || url.password || Number(port) < 1) return null;
+    return { address: url.hostname.replace(/^\[|\]$/g, ""), protocol: url.protocol.slice(0, -1), port, ignoredParts: url.pathname !== "/" || Boolean(url.search || url.hash) };
+  } catch { return null; }
+}
 
 type ServiceSelectOption = { value: string; label: string; status?: "online" | "offline"; disabled?: boolean };
 
@@ -111,9 +123,11 @@ function ServiceEditor({ tunnel, mode, data, active, csrf, onClose, onSaved }: {
   const webProtocol = useRef(!isPortProtocol(tunnel?.protocol) && tunnel?.protocol ? tunnel.protocol : "https");
   const [draft, setDraft] = useState(initial); const [busy, setBusy] = useState(false); const [error, setError] = useState<string | null>(null);
   const [invalidField, setInvalidField] = useState<keyof typeof initial | null>(null);
+  const [addressPartsIgnored, setAddressPartsIgnored] = useState(false);
   const formRef = useRef<HTMLFormElement>(null);
   const [advancedOpen, setAdvancedOpen] = useState(Boolean(tunnel?.public_port));
   const direct = draft.service_mode === "reverse_proxy";
+  const webOriginDisabled = Boolean(!direct && tunnel && !tunnel.public_domain);
   const nodeData = useResource(() => request<NodeList>("/api/v1/nodes"), active && !direct, false);
   const nodeGroups = useResource(() => request<NodeGroup[]>("/api/v1/node-groups"), active && !direct, false);
   const nodeSupported = !direct && ["http", "https", "tcp"].includes(draft.protocol);
@@ -123,6 +137,7 @@ function ServiceEditor({ tunnel, mode, data, active, csrf, onClose, onSaved }: {
   const dirty = JSON.stringify(draft) !== JSON.stringify(initial);
   const metadataOnly = Boolean(tunnel) && (Object.keys(initial) as (keyof typeof initial)[]).every(field => field === "name" || field === "icon_id" || draft[field] === initial[field]);
   const update = (field: keyof typeof draft, value: string | boolean | string[]) => {
+    if (["local_address", "local_port", "origin_protocol", "protocol"].includes(field)) setAddressPartsIgnored(false);
     if (field === "protocol" && !isPortProtocol(String(value))) webProtocol.current = String(value);
     setDraft(current => {
       if (field === "protocol" && typeof value === "string" && isPortProtocol(value)) return { ...current, protocol: value, ...(value !== "tcp" ? { node_group_id: "", node_ids: ["local"], distribution_mode: "single", preferred_node_id: "" } : {}), ipv6_direct_enabled: false, lan_redirect_enabled: false, access_mode: "public", access_password: "" };
@@ -140,6 +155,18 @@ function ServiceEditor({ tunnel, mode, data, active, csrf, onClose, onSaved }: {
       if (isPortProtocol(draft.protocol)) update("protocol", webProtocol.current);
       update("origin_protocol", value);
     }
+  }
+  /** 从粘贴事件读取文本，无需剪贴板权限；复用协议切换规则，React 批量更新三个连接字段并保留焦点。 */
+  function pasteLocalAddress(event: ReactClipboardEvent<HTMLInputElement>) {
+    setAddressPartsIgnored(false);
+    const address = parseServiceAddress(event.clipboardData.getData("text/plain"));
+    if (!address) return;
+    event.preventDefault();
+    if (webOriginDisabled) { fail("local_address", "此服务未绑定域名，无法切换网页协议；请填写 IP 或主机名，或创建新服务。"); return; }
+    updateOriginProtocol(address.protocol);
+    update("local_address", address.address);
+    update("local_port", address.port);
+    setAddressPartsIgnored(address.ignoredParts);
   }
   const selectedDomain = data.domains.find(item => item.id === draft.public_domain_id);
   const finalAddress = isPortProtocol(draft.protocol) ? `公网端口 ${draft.public_port || "自动分配"}` : `${draft.protocol}://${draft.hostname || "主机名"}.${selectedDomain?.domain || tunnel?.public_domain || "根域名"}${draft.protocol === "https" && draft.https_port !== "443" ? `:${draft.https_port}` : ""}`;
@@ -200,11 +227,11 @@ function ServiceEditor({ tunnel, mode, data, active, csrf, onClose, onSaved }: {
           {!direct && <ServiceSelect {...fieldProps("device_id")} label="设备" value={draft.device_id} placeholder="选择设备" options={devices.map(item => ({ value: item.id, label: item.name, status: item.status === "online" ? "online" : "offline" }))} disabled={busy} onChange={value => update("device_id", value)} />}
         </div>{!direct && !devices.length && <div className="notice"><span>请关闭表单，到设备页添加设备。</span></div>}{!direct && devices.find(item => item.id === draft.device_id)?.status === "offline" && <p className="helper" role="status">设备当前离线，可保存配置，连接恢复后下发。</p>}</section>
         <section className="service-form-section"><h3>{direct ? "目标地址" : "内网地址"}</h3><div className="service-field-group service-address-input" role="group" aria-label={direct ? "目标连接" : "内网连接"}>
-          <ServiceSelect compact menuMinWidth={160} label={direct ? "目标协议" : "内网协议"} {...fieldProps("origin_protocol")} value={isPortProtocol(draft.protocol) ? draft.protocol : draft.origin_protocol} placeholder="选择协议" disabled={busy} options={[{ value: "http", label: "HTTP", disabled: Boolean(!direct && tunnel && !tunnel.public_domain) }, { value: "https", label: "HTTPS", disabled: Boolean(!direct && tunnel && !tunnel.public_domain) }, ...(!direct ? [{ value: "tcp", label: "TCP" }, { value: "udp", label: "UDP" }, { value: "tcp_udp", label: "TCP+UDP" }] : [])]} onChange={updateOriginProtocol} />
-          <input aria-label={direct ? "目标地址" : "内网地址"} {...fieldProps("local_address")} value={draft.local_address} onChange={e => update("local_address", e.target.value)} placeholder="IP 或主机名" inputMode="url" enterKeyHint="next" autoComplete="off" autoCorrect="off" autoCapitalize="none" spellCheck={false} required />
+          <ServiceSelect compact menuMinWidth={160} label={direct ? "目标协议" : "内网协议"} {...fieldProps("origin_protocol")} value={isPortProtocol(draft.protocol) ? draft.protocol : draft.origin_protocol} placeholder="选择协议" disabled={busy} options={[{ value: "http", label: "HTTP", disabled: webOriginDisabled }, { value: "https", label: "HTTPS", disabled: webOriginDisabled }, ...(!direct ? [{ value: "tcp", label: "TCP" }, { value: "udp", label: "UDP" }, { value: "tcp_udp", label: "TCP+UDP" }] : [])]} onChange={updateOriginProtocol} />
+          <input aria-label={direct ? "目标地址" : "内网地址"} {...fieldProps("local_address")} value={draft.local_address} onChange={e => update("local_address", e.target.value)} onPaste={pasteLocalAddress} placeholder="IP 或主机名" inputMode="url" enterKeyHint="next" autoComplete="off" autoCorrect="off" autoCapitalize="none" spellCheck={false} required />
           <span className="service-address-separator" aria-hidden="true">:</span>
           <input aria-label={direct ? "目标端口" : "内网端口"} {...fieldProps("local_port")} value={draft.local_port} onChange={e => update("local_port", e.target.value)} placeholder="端口" type="text" inputMode="numeric" enterKeyHint={isPortProtocol(draft.protocol) ? "done" : "next"} autoComplete="off" required />
-        </div></section>
+        </div>{addressPartsIgnored && <p className="helper" role="status">已填入协议、地址和端口，路径、参数和片段不会保存。</p>}</section>
         {isPortProtocol(draft.protocol) ? <details className="service-advanced" open={advancedOpen} onToggle={event => setAdvancedOpen(event.currentTarget.open)}><summary><span>公网端口</span><span>{draft.public_port || "自动分配"}</span><ChevronRight size={17} /></summary><label className="service-field"><span>指定端口</span><input {...fieldProps("public_port")} aria-label="公网端口" type="text" inputMode="numeric" enterKeyHint="done" autoComplete="off" value={draft.public_port} onChange={e => update("public_port", e.target.value)} placeholder="留空自动分配" /></label><p className="helper">可用范围：20000–29999。</p></details> : <section className="service-form-section"><h3 id="service-public-label">公网入口</h3><div className="service-field-group service-public-input" role="group" aria-labelledby="service-public-label">
           <ServiceSelect compact menuMinWidth={160} label="公网协议" {...fieldProps("protocol")} value={draft.protocol} placeholder="选择协议" disabled={busy} options={[{ value: "https", label: "HTTPS" }, { value: "http", label: "HTTP" }]} onChange={value => update("protocol", value)} />
           <input aria-label="主机名" {...fieldProps("hostname")} value={draft.hostname} onChange={e => update("hostname", e.target.value)} placeholder="主机名" enterKeyHint="done" autoComplete="off" autoCorrect="off" autoCapitalize="none" spellCheck={false} required />

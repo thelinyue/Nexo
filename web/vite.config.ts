@@ -27,6 +27,7 @@ export default defineConfig({
       },
     },
     VitePWA({
+      injectRegister: false,
       registerType: "prompt",
       strategies: "injectManifest",
       srcDir: "src",

@@ -5,6 +5,40 @@ const account = (page: Page) => page.getByRole("button", { name: "账号菜单",
 const menu = (page: Page) => page.getByRole("menu", { name: "本人账号", exact: true });
 async function pwa(page: Page) { await page.addInitScript(() => Object.defineProperty(navigator, "standalone", { configurable: true, value: true })); }
 
+test("账号菜单随内容调整宽度，长用户名与放大字体仍在可见视口内", async ({ page }, info) => {
+  await pwa(page); await installApiMocks(page);
+  let username = "admin"; let warning = false;
+  await page.route("**/api/v1/auth/status", route => route.fulfill({ json: { initialized: true, authenticated: true, user_id: "admin", username, role: "system_admin", workspace_id: "default", csrf_token: "test-csrf", local_http_warning: warning } }));
+  await page.goto("/#/home"); await account(page).click();
+  const compactWidth = (await menu(page).boundingBox())!.width;
+  await page.keyboard.press("Escape"); await expect(account(page)).toBeFocused();
+  username = "很长的管理员用户名-account-owner-" + "a".repeat(57);
+  await page.reload(); await account(page).click();
+  await expect(menu(page).locator(".account-menu-identity strong")).toHaveText(username);
+  expect((await menu(page).boundingBox())!.width).toBeGreaterThan(compactWidth);
+  await page.screenshot({ path: info.outputPath("account-menu-long-name.png") });
+  const viewport = page.viewportSize()!;
+  for (const [width, fontSize] of [[viewport.width, "100%"], [viewport.width, "150%"], [320, "150%"]] as const) {
+    await page.setViewportSize({ width, height: viewport.height });
+    warning = true; await page.reload();
+    await page.evaluate(value => { document.documentElement.style.fontSize = value; }, fontSize);
+    await account(page).click();
+    await expect(menu(page).getByRole("status")).toContainText("当前连接未加密");
+    const box = (await menu(page).boundingBox())!;
+    expect(box.x).toBeGreaterThanOrEqual(16);
+    expect(box.x + box.width).toBeLessThanOrEqual(width - 16);
+    expect(box.y).toBeGreaterThanOrEqual(16);
+    expect(box.y + box.height).toBeLessThanOrEqual(viewport.height - 16);
+    expect(await menu(page).evaluate(element => element.scrollWidth <= element.clientWidth)).toBe(true);
+    for (const item of await menu(page).getByRole("menuitem").all()) {
+      await item.scrollIntoViewIfNeeded(); await expect(item).toBeInViewport();
+      const control = (await item.boundingBox())!;
+      expect(control.width).toBeGreaterThanOrEqual(44); expect(control.height).toBeGreaterThanOrEqual(44);
+    }
+    await page.keyboard.press("Escape"); await expect(account(page)).toBeFocused();
+  }
+});
+
 test("头像菜单共用首行，无账号页，支持键盘和会话返回来源", async ({ page }) => {
   await pwa(page); await installApiMocks(page);
   await page.goto("/#/users");

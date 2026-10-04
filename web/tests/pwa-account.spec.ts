@@ -35,9 +35,12 @@ test("PWA 悬浮头像代表本人，键盘进入账号和会话，代管空间�
   await expect(page.locator(".workspace-banner")).toBeVisible();
   await expect(avatar(page)).toHaveAttribute("title", "admin");
   await expect(avatar(page).locator("img")).toHaveAttribute("data-avatar-role", "admin");
-  const banner = (await page.locator(".workspace-banner").boundingBox())!;
-  const account = (await avatar(page).boundingBox())!;
-  expect(banner.y).toBeGreaterThanOrEqual(account.y + account.height);
+  // 首行尺寸由 ResizeObserver 在下一帧回写，等待布局稳定后检查内容未被头像覆盖。
+  await expect.poll(async () => {
+    const banner = (await page.locator(".workspace-banner").boundingBox())!;
+    const account = (await avatar(page).boundingBox())!;
+    return banner.y - account.y - account.height;
+  }).toBeGreaterThanOrEqual(0);
   if ((page.viewportSize()?.width ?? 0) <= 900) {
     await page.getByRole("button", { name: "更多功能", exact: true }).click();
     await expect(page.locator(".mobile-more a>span:not(.sr-only)")).toHaveText(["节点", "域名", "用户管理", "服务器设置"]);

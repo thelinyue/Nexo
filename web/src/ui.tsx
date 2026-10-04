@@ -21,21 +21,30 @@ export type DomainEvent = { id: number; domain_id: string; summary: string; occu
 export type Session = { created_at?: number; browser?: string | null; os?: string | null; id: string; last_seen_at: number; expires_at: number };
 
 let sessionExpired = false;
+// 刷新网页须等待写请求和响应处理结束，避免操作已提交但用户尚未收到结果。
+let pendingWrites = 0;
+export function hasPendingWrites() { return pendingWrites > 0; }
 export function resumeSession() { sessionExpired = false; window.dispatchEvent(new Event("nexo:authenticated")); }
 export async function request<T>(path: string, options: RequestInit = {}, csrf?: string | null, workspace?: string): Promise<T> {
   if (workspace && /^\/api\/v1\/(devices|nodes|node-groups|enrollments|agent-access-key|tunnels|public-domains|public-domain-runtime-events)(\/|$)/.test(path)) path = `/api/v1/admin/workspaces/${encodeURIComponent(workspace)}/${path.slice("/api/v1/".length)}`;
   const headers = new Headers(options.headers);
   headers.set("content-type", "application/json");
   if (csrf && options.method && options.method !== "GET") headers.set("x-nexo-csrf", csrf);
-  let response: Response;
-  try { response = await fetch(path, { ...options, headers, credentials: "same-origin" }); }
-  catch { throw new Error("无法连接 Nexo，请检查网络后重试"); }
-  const body = await response.json().catch(() => null);
-  if (response.status === 401 && (body?.code === "session_expired" || !path.startsWith("/api/v1/auth/")) && !sessionExpired) {
-    sessionExpired = true; window.dispatchEvent(new Event("nexo:session-expired"));
+  const writing = !["GET", "HEAD"].includes((options.method ?? "GET").toUpperCase());
+  if (writing) { pendingWrites++; window.dispatchEvent(new Event("nexo:writes-changed")); }
+  try {
+    let response: Response;
+    try { response = await fetch(path, { ...options, headers, credentials: "same-origin" }); }
+    catch { throw new Error("无法连接 Nexo，请检查网络后重试"); }
+    const body = await response.json().catch(() => null);
+    if (response.status === 401 && (body?.code === "session_expired" || !path.startsWith("/api/v1/auth/")) && !sessionExpired) {
+      sessionExpired = true; window.dispatchEvent(new Event("nexo:session-expired"));
+    }
+    if (!response.ok) throw new Error(body?.error ?? "请求失败，请稍后重试");
+    return body as T;
+  } finally {
+    if (writing) { pendingWrites--; window.dispatchEvent(new Event("nexo:writes-changed")); }
   }
-  if (!response.ok) throw new Error(body?.error ?? "请求失败，请稍后重试");
-  return body as T;
 }
 /** 请求闭包绑定空间，旧请求和迟到回调不会随界面切换而访问另一个用户。 */
 export const WorkspaceContext = createContext<string | undefined>(undefined);

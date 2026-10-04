@@ -24,7 +24,8 @@ export function AccountMenu({ auth, target, compact, route, requestId, onLogout,
     const viewport = window.visualViewport; const row = button.getBoundingClientRect();
     const left = (viewport?.offsetLeft ?? 0) + 16; const top = (viewport?.offsetTop ?? 0) + 16;
     const right = left + (viewport?.width ?? innerWidth) - 32; const bottom = top + (viewport?.height ?? innerHeight) - 32;
-    menu.style.width = `${Math.min(240, right - left)}px`; menu.style.maxHeight = `${bottom - top}px`;
+    // 宽度由用户名和菜单内容决定；先约束可见视口，再测量以保证贴近头像且不越界。
+    menu.style.setProperty("--menu-available-width", `${right - left}px`); menu.style.maxHeight = `${bottom - top}px`;
     const box = menu.getBoundingClientRect();
     menu.style.left = `${Math.max(left, Math.min(row.right - box.width, right - box.width))}px`;
     menu.style.top = `${Math.max(top, Math.min(row.bottom + 8 + box.height <= bottom ? row.bottom + 8 : row.top - box.height - 8, bottom - box.height))}px`;

@@ -167,6 +167,13 @@ button,a { transition:background-color 160ms ease,color 160ms ease,box-shadow 16
 .notice .text-button { flex-shrink:0; padding-inline:4px; }
 .notice.error { background:var(--danger-soft); color:var(--danger); }
 .notice.error .text-button { color:var(--danger); }
+.web-update-notice { position:fixed; z-index:40; top:calc(12px + env(safe-area-inset-top)); right:max(16px,env(safe-area-inset-right)); display:flex; flex-wrap:wrap; align-items:center; gap:8px 12px; width:min(400px,calc(100% - 32px - env(safe-area-inset-left) - env(safe-area-inset-right))); padding:12px 14px; border:1px solid var(--border); border-radius:12px; background:var(--surface); box-shadow:var(--shadow); font-size:.875rem; overflow-wrap:anywhere; }
+.web-update-notice>div { flex:1; min-width:140px; }
+.web-update-notice p { margin:0; }
+.web-update-notice small { display:block; margin-top:4px; color:var(--secondary); }
+.web-update-notice .secondary-button { flex-shrink:0; }
+.web-update-notice>.form-error { flex-basis:100%; }
+@media(prefers-contrast:more) { .web-update-notice { border-color:var(--text); } }
 .action-status { padding:10px 0; color:var(--success); font-size:.875rem; overflow-wrap:anywhere; }
 .form-error { display:block; color:var(--danger); font-size:.875rem; overflow-wrap:anywhere; }
 .detail-panel { padding:18px; }
@@ -962,10 +969,10 @@ dd>code { display:block; margin-bottom:10px; user-select:text; font-size:.9375re
 
 /* 更多面板使用不透明底色，减少 iOS PWA 顶层浮层与页面顶部的背景模糊合成。
    低高度横屏允许内部滚动，安全区始终留在底栏下方。 */
-.mobile-more { position:fixed; inset:auto max(16px,env(safe-area-inset-right)) calc(var(--nav-gap) + 76px) auto; margin:0; width:min(320px,calc(100vw - 32px)); max-height:calc(100dvh - var(--nav-gap) - 100px); overflow:auto; padding:8px; border:1px solid var(--glass-edge); border-radius:22px; background:var(--surface); color:var(--text); box-shadow:var(--glass-shadow); }
+.mobile-more { position:fixed; inset:auto max(16px,env(safe-area-inset-right)) calc(var(--nav-gap) + 76px) auto; margin:0; width:max-content; max-width:calc(100vw - max(16px,env(safe-area-inset-left)) - max(16px,env(safe-area-inset-right))); max-height:calc(100dvh - var(--nav-gap) - 100px); overflow:auto; padding:8px; border:1px solid var(--glass-edge); border-radius:22px; background:var(--surface); color:var(--text); box-shadow:var(--glass-shadow); }
 .mobile-more nav { display:grid; gap:2px; }
 .mobile-more a { min-height:50px; display:flex; align-items:center; gap:12px; padding:10px 12px; border-radius:14px; font-size:.9375rem; }
-.mobile-more a span { flex:1; }
+.mobile-more a span { flex:1; min-width:0; overflow-wrap:anywhere; }
 .mobile-more a>svg:last-child { color:var(--secondary); }
 .mobile-more a[aria-current=page] { background:var(--nav-selected); color:var(--primary); }
 .mobile-more a:hover { background:var(--surface-soft); }
@@ -1026,10 +1033,10 @@ dd>code { display:block; margin-bottom:10px; user-select:text; font-size:.9375re
 .users-secondary-filter .page-create { position:static; justify-self:end; width:auto; height:auto; min-height:44px; padding:8px 12px; border-radius:10px; }
 .users-secondary-filter .page-create span { display:inline; }
 /* 原生浮层负责外部关闭；账号菜单不承载业务空间信息，也不增加一层页面导航。 */
-.account-menu { position:fixed; inset:auto; margin:0; overflow:auto; padding:8px; border:1px solid var(--border); border-radius:16px; background:var(--surface); color:var(--text); box-shadow:var(--shadow); }
+.account-menu { position:fixed; inset:auto; margin:0; width:max-content; min-width:min(10rem,var(--menu-available-width,calc(100vw - 32px))); max-width:min(24rem,var(--menu-available-width,calc(100vw - 32px))); overflow:auto; padding:8px; border:1px solid var(--border); border-radius:16px; background:var(--surface); color:var(--text); box-shadow:var(--shadow); }
 .account-menu-identity { min-width:0; padding:8px 12px 12px; border-bottom:1px solid var(--border); }
 .account-menu-identity strong,.account-menu-identity small { display:block; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-.account-menu-identity strong { font-size:.9375rem; font-weight:600; }
+.account-menu-identity strong { font-size:.9375rem; font-weight:600; white-space:normal; overflow-wrap:anywhere; }
 .account-menu-identity small { margin-top:2px; font-size:.8125rem; }
 .account-menu-identity .notice { margin:8px 0 0; font-size:.8125rem; }
 .account-menu-actions { display:grid; gap:2px; padding-top:6px; }

@@ -136,7 +136,8 @@ test("两端设置页适应窄屏、横屏与双栏，长用户名和浅深色�
           await page.getByRole("button", { name: "账号菜单", exact: true }).click();
           await expect(page.getByRole("menu", { name: "本人账号", exact: true })).toBeVisible();
           const card = await page.getByRole("menu", { name: "本人账号", exact: true }).boundingBox();
-          expect(card!.width).toBeLessThanOrEqual(240);
+          expect(card!.x).toBeGreaterThanOrEqual(16);
+          expect(card!.x + card!.width).toBeLessThanOrEqual(width - 16);
           await page.getByRole("menuitem", { name: "退出登录", exact: true }).scrollIntoViewIfNeeded();
           await expect(page.getByRole("menuitem", { name: "退出登录", exact: true })).toBeInViewport();
           if (width > 900) {
