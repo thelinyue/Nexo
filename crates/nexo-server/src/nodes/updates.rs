@@ -105,7 +105,10 @@ pub async fn create(
         {
             return Err(invalid("重启不能同时变更版本"));
         }
-        if !input.accept_interruption && !has_alternatives(&tx, id).map_err(db_error)? {
+        if input.operation == "restart"
+            && !input.accept_interruption
+            && !has_alternatives(&tx, id).map_err(db_error)?
+        {
             return Err(invalid("部分服务没有其他健康 VPS 入口，请明确接受更新中断"));
         }
     }
@@ -355,8 +358,20 @@ pub fn advance(
         tx.execute("UPDATE node_update_items SET stage=?3,deadline=?4,error=NULL,started_at=COALESCE(started_at,?5) WHERE job_id=?1 AND node_id=?2",params![job,node,next,deadline,unix_now()])?;
         Ok(())
     };
-    let begin_maintenance = || -> Result<()> {
+    let begin_install = || -> Result<()> {
+        transition("installing", Some(unix_now() + 120))?;
+        tx.execute("DELETE FROM relay_service_health WHERE node_id=?1", [node])?;
+        tx.execute("DELETE FROM relay_public_health WHERE node_id=?1", [node])?;
+        Ok(())
+    };
+    let begin_maintenance = || -> Result<Option<&str>> {
         tx.execute("UPDATE relay_nodes SET maintenance=1 WHERE id=?1", [node])?;
+        // 用户发起版本更新即接受重启中断；业务连接与 DNS 缓存不能阻塞安装。
+        // 独立重启操作继续沿用原有切流和排空流程。
+        if operation == "update" {
+            begin_install()?;
+            return Ok(Some("install"));
+        }
         let ttl = withdrawal_ttl(&tx, node)?;
         // 0 表示本次无需撤出 DNS，直接进入连接排空；沿用已有持久字段。
         tx.execute(
@@ -368,7 +383,7 @@ pub fn advance(
         } else {
             transition("draining", Some(unix_now() + 300))?;
         }
-        Ok(())
+        Ok(None)
     };
     let mut command = None;
     if matches!(reported, "failed" | "rolled_back" | "rollback_failed") {
@@ -382,7 +397,7 @@ pub fn advance(
     } else {
         match stage.as_str() {
             "queued" => {
-                if !accept && !has_alternatives(&tx, node)? {
+                if operation == "restart" && !accept && !has_alternatives(&tx, node)? {
                     pause("服务缺少其他健康 VPS 入口，请调整节点或接受中断后重新创建任务")?;
                 } else {
                     tx.execute(
@@ -390,7 +405,7 @@ pub fn advance(
                         [&job],
                     )?;
                     if operation == "restart" {
-                        begin_maintenance()?;
+                        command = begin_maintenance()?;
                     } else {
                         transition("downloading", Some(unix_now() + 900))?;
                     }
@@ -398,10 +413,10 @@ pub fn advance(
             }
             "downloading" => {
                 if reported == "downloaded" {
-                    if !accept && !has_alternatives(&tx, node)? {
+                    if operation == "restart" && !accept && !has_alternatives(&tx, node)? {
                         pause("下载完成，但备用入口已失效，暂停维护")?;
                     } else {
-                        begin_maintenance()?;
+                        command = begin_maintenance()?;
                     }
                 } else if deadline.is_some_and(|d| d < unix_now()) {
                     pause("安装包下载未在预期时间内完成，状态待确认")?;
@@ -410,8 +425,11 @@ pub fn advance(
                 }
             }
             "withdrawing" => {
-                let remaining = withdrawal_ttl(&tx, node)?.is_some();
-                if !remaining {
+                // 已持久化的旧更新任务也不再等待业务排空，重试后可继续安装。
+                if operation == "update" {
+                    begin_install()?;
+                    command = Some("install");
+                } else if withdrawal_ttl(&tx, node)?.is_none() {
                     if deadline.is_none() {
                         let wait:i64=tx.query_row("SELECT ttl_seconds FROM node_update_items WHERE job_id=?1 AND node_id=?2",params![job,node],|r|r.get(0))?;
                         transition("withdrawing", Some(unix_now() + wait))?;
@@ -421,10 +439,8 @@ pub fn advance(
                 }
             }
             "draining" => {
-                if connections == 0 || force {
-                    transition("installing", Some(unix_now() + 120))?;
-                    tx.execute("DELETE FROM relay_service_health WHERE node_id=?1", [node])?;
-                    tx.execute("DELETE FROM relay_public_health WHERE node_id=?1", [node])?;
+                if operation == "update" || connections == 0 || force {
+                    begin_install()?;
                     command = Some(if operation == "restart" {
                         "restart"
                     } else {
@@ -744,16 +760,17 @@ mod tests {
         let (state, _) = fixture();
         job(&state);
         single_entry(&state);
-        advance(&state, "a", "0.2.10", 1, &Default::default()).unwrap();
-        advance(&state, "a", "0.2.10", 1, &report("downloaded")).unwrap();
-        assert_eq!(stage(&state), ("running".into(), "draining".into()));
-        assert!(preserves_dns(&state.db.lock().unwrap(), "a", "s").unwrap());
-        assert!(advance(&state, "a", "0.2.10", 1, &report("downloaded"))
+        state
+            .db
+            .lock()
             .unwrap()
-            .is_none());
-        let command = advance(&state, "a", "0.2.10", 0, &report("downloaded"))
+            .execute("UPDATE node_update_jobs SET accept_interruption=0", [])
+            .unwrap();
+        advance(&state, "a", "0.2.10", 1, &Default::default()).unwrap();
+        let command = advance(&state, "a", "0.2.10", 1, &report("downloaded"))
             .unwrap()
             .unwrap();
+        assert_eq!(stage(&state), ("running".into(), "installing".into()));
         assert_eq!(command.action, "install");
         assert!(preserves_dns(&state.db.lock().unwrap(), "a", "s").unwrap());
         advance(&state, "a", "0.2.11", 0, &report("installed")).unwrap();
@@ -777,26 +794,79 @@ mod tests {
     }
 
     #[test]
-    fn mixed_services_only_wait_for_records_with_a_healthy_alternative() {
-        let (state, _) = fixture();
-        job(&state);
-        state.db.lock().unwrap().execute_batch("UPDATE node_update_jobs SET accept_interruption=1;
-            INSERT INTO tunnels(id,tenant_id,name,protocol,local_address,local_port,public_port,hostname,public_domain_id,created_at,updated_at) VALUES('single','default','single','tcp','127.0.0.1',80,50002,'single','d',0,0);
-            DELETE FROM service_nodes WHERE service_id='single'; INSERT INTO service_nodes VALUES('single','a');
-            INSERT INTO relay_dns_state VALUES('single',1,0,NULL);
-            INSERT INTO relay_dns_records(service_id,domain_id,hostname,address,written) VALUES('single','d','single.test.example','203.0.113.10','{\"ttl\":7200}'),('s','d','service.test.example','203.0.113.10','{\"ttl\":180}');").unwrap();
-        advance(&state, "a", "0.2.10", 0, &Default::default()).unwrap();
-        advance(&state, "a", "0.2.10", 0, &report("downloaded")).unwrap();
-        assert_eq!(stage(&state).1, "withdrawing");
-        {
+    fn existing_update_withdrawal_or_drain_does_not_block_installation() {
+        for old_stage in ["withdrawing", "draining"] {
+            let (state, _) = fixture();
+            job(&state);
             let db = state.db.lock().unwrap();
-            assert!(preserves_dns(&db, "a", "single").unwrap());
-            assert!(!preserves_dns(&db, "a", "s").unwrap());
-            assert_eq!(withdrawal_ttl(&db, "a").unwrap(), Some(180));
-            db.execute("DELETE FROM relay_dns_records WHERE service_id='s'", [])
+            db.execute("UPDATE node_update_jobs SET status='running'", [])
                 .unwrap();
+            db.execute(
+                "UPDATE node_update_items SET stage=?1,deadline=unixepoch()+7200 WHERE node_id='a'",
+                [old_stage],
+            )
+            .unwrap();
+            db.execute("UPDATE relay_nodes SET maintenance=1 WHERE id='a'", [])
+                .unwrap();
+            drop(db);
+            let command = advance(&state, "a", "0.2.10", 12, &report("downloaded"))
+                .unwrap()
+                .unwrap();
+            assert_eq!(command.action, "install");
+            assert_eq!(stage(&state).1, "installing");
         }
-        advance(&state, "a", "0.2.10", 0, &report("downloaded")).unwrap();
+    }
+
+    #[tokio::test]
+    async fn restart_keeps_interruption_confirmation_ttl_and_drain_decision() {
+        let (state, admin) = fixture();
+        state
+            .db
+            .lock()
+            .unwrap()
+            .execute("DELETE FROM service_nodes WHERE node_id='b'", [])
+            .unwrap();
+        let input = |accept_interruption| Input {
+            node_ids: vec!["a".into()],
+            target_version: "0.2.10".into(),
+            operation: "restart".into(),
+            accept_interruption,
+        };
+        assert!(
+            create(State(state.clone()), admin.clone(), Json(input(false)))
+                .await
+                .is_err()
+        );
+        assert!(
+            create(State(state.clone()), admin.clone(), Json(input(true)))
+                .await
+                .is_ok()
+        );
+
+        let (state, admin) = fixture();
+        job(&state);
+        state.db.lock().unwrap().execute_batch("UPDATE node_update_jobs SET operation='restart',target_version='0.2.10';
+            INSERT INTO relay_dns_records(service_id,domain_id,hostname,address,written) VALUES('s','d','service.test.example','203.0.113.10','{\"ttl\":180}');").unwrap();
+        advance(&state, "a", "0.2.10", 12, &Default::default()).unwrap();
+        assert_eq!(stage(&state).1, "withdrawing");
+        advance(&state, "a", "0.2.10", 12, &Default::default()).unwrap();
+        assert!(state
+            .db
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT deadline IS NULL FROM node_update_items WHERE node_id='a'",
+                [],
+                |r| r.get::<_, bool>(0)
+            )
+            .unwrap());
+        state
+            .db
+            .lock()
+            .unwrap()
+            .execute("DELETE FROM relay_dns_records", [])
+            .unwrap();
+        advance(&state, "a", "0.2.10", 12, &Default::default()).unwrap();
         let deadline: i64 = state
             .db
             .lock()
@@ -809,19 +879,50 @@ mod tests {
             .unwrap();
         assert!((unix_now() + 179..=unix_now() + 181).contains(&deadline));
         expired(&state);
-        advance(&state, "a", "0.2.10", 0, &report("downloaded")).unwrap();
-        assert_eq!(
-            stage(&state).1,
-            "draining",
-            "保留的单入口记录不能阻塞撤出阶段"
-        );
-        assert_eq!(
-            advance(&state, "a", "0.2.10", 0, &report("downloaded"))
-                .unwrap()
-                .unwrap()
-                .action,
-            "install"
-        );
+        advance(&state, "a", "0.2.10", 12, &Default::default()).unwrap();
+        assert_eq!(stage(&state).1, "draining");
+        expired(&state);
+        advance(&state, "a", "0.2.10", 12, &Default::default()).unwrap();
+        assert_eq!(stage(&state).0, "paused");
+        let _ = action(
+            State(state.clone()),
+            admin,
+            Path("job".into()),
+            Json(Action {
+                action: "force".into(),
+            }),
+        )
+        .await
+        .unwrap();
+        let command = advance(&state, "a", "0.2.10", 12, &Default::default())
+            .unwrap()
+            .unwrap();
+        assert_eq!(command.action, "restart");
+        assert!(command.force);
+    }
+
+    #[test]
+    fn mixed_services_update_does_not_wait_for_dns_ttl() {
+        let (state, _) = fixture();
+        job(&state);
+        state.db.lock().unwrap().execute_batch("UPDATE node_update_jobs SET accept_interruption=1;
+            INSERT INTO tunnels(id,tenant_id,name,protocol,local_address,local_port,public_port,hostname,public_domain_id,created_at,updated_at) VALUES('single','default','single','tcp','127.0.0.1',80,50002,'single','d',0,0);
+            DELETE FROM service_nodes WHERE service_id='single'; INSERT INTO service_nodes VALUES('single','a');
+            INSERT INTO relay_dns_state VALUES('single',1,0,NULL);
+            INSERT INTO relay_dns_records(service_id,domain_id,hostname,address,written) VALUES('single','d','single.test.example','203.0.113.10','{\"ttl\":7200}'),('s','d','service.test.example','203.0.113.10','{\"ttl\":180}');").unwrap();
+        advance(&state, "a", "0.2.10", 12, &Default::default()).unwrap();
+        let command = advance(&state, "a", "0.2.10", 12, &report("downloaded"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(command.action, "install");
+        assert_eq!(stage(&state).1, "installing");
+        {
+            let db = state.db.lock().unwrap();
+            assert!(preserves_dns(&db, "a", "single").unwrap());
+            assert!(!preserves_dns(&db, "a", "s").unwrap());
+            db.execute("DELETE FROM relay_dns_records WHERE service_id='s'", [])
+                .unwrap();
+        }
         advance(&state, "a", "0.2.11", 0, &report("installed")).unwrap();
         healthy(&state, "a");
         state.db.lock().unwrap().execute_batch("INSERT INTO tunnel_applied_states(tunnel_id,revision,status,updated_at) VALUES('single',1,'ready',unixepoch());
@@ -878,8 +979,8 @@ mod tests {
         }
     }
     #[tokio::test]
-    async fn rolling_update_waits_for_actual_ttl_and_explicit_drain_decision() {
-        let (state, admin) = fixture();
+    async fn rolling_update_installs_with_active_connections_and_verifies_before_next_node() {
+        let (state, _) = fixture();
         job(&state);
         let idle = nexo_protocol::nodes::UpdateReport::default();
         assert!(advance(&state, "b", "0.2.10", 0, &idle).unwrap().is_none());
@@ -892,75 +993,18 @@ mod tests {
             "prepare"
         );
         state.db.lock().unwrap().execute("INSERT INTO relay_dns_records(service_id,domain_id,hostname,address,written) VALUES('s','d','service.test.example','203.0.113.10',?1)",[json!({"ttl":180}).to_string()]).unwrap();
-        advance(&state, "a", "0.2.10", 1, &report("downloaded")).unwrap();
-        assert_eq!(stage(&state).1, "withdrawing");
-        advance(&state, "a", "0.2.10", 1, &report("downloaded")).unwrap();
-        assert!(state
-            .db
-            .lock()
-            .unwrap()
-            .query_row(
-                "SELECT deadline IS NULL FROM node_update_items WHERE node_id='a'",
-                [],
-                |r| r.get::<_, bool>(0)
-            )
-            .unwrap());
+        // 下载期间备用入口失效，仍执行用户已发起的更新。
         state
             .db
             .lock()
             .unwrap()
-            .execute("DELETE FROM relay_dns_records", [])
+            .execute("DELETE FROM relay_public_health WHERE node_id='b'", [])
             .unwrap();
-        advance(&state, "a", "0.2.10", 1, &report("downloaded")).unwrap();
-        let deadline: i64 = state
-            .db
-            .lock()
-            .unwrap()
-            .query_row(
-                "SELECT deadline FROM node_update_items WHERE node_id='a'",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert!(deadline >= unix_now() + 179);
-        expired(&state);
-        advance(&state, "a", "0.2.10", 1, &report("downloaded")).unwrap();
-        assert_eq!(stage(&state).1, "draining");
-        expired(&state);
-        assert!(advance(&state, "a", "0.2.10", 1, &report("downloaded"))
-            .unwrap()
-            .is_none());
-        assert_eq!(stage(&state).0, "paused");
-        let _ = action(
-            State(state.clone()),
-            admin.clone(),
-            Path("job".into()),
-            Json(Action {
-                action: "wait".into(),
-            }),
-        )
-        .await
-        .unwrap();
-        assert!(advance(&state, "a", "0.2.10", 1, &report("downloaded"))
-            .unwrap()
-            .is_none());
-        expired(&state);
-        advance(&state, "a", "0.2.10", 1, &report("downloaded")).unwrap();
-        let _ = action(
-            State(state.clone()),
-            admin,
-            Path("job".into()),
-            Json(Action {
-                action: "force".into(),
-            }),
-        )
-        .await
-        .unwrap();
         let command = advance(&state, "a", "0.2.10", 1, &report("downloaded"))
             .unwrap()
             .unwrap();
         assert_eq!(command.action, "install");
-        assert!(command.force);
+        assert_eq!(stage(&state).1, "installing");
         assert!(
             advance(&state, "a", "0.2.10", 0, &idle).unwrap().is_none(),
             "未知助手状态不得盲目重放安装"

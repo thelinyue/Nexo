@@ -197,7 +197,7 @@ test("管理端更新时已是最新节点版本的 VPS 不提示更新，旧节
   await expect(dialog).not.toContainText("0.2.19");
 });
 
-test("更新展示逐服务备用入口，无备用时必须接受中断", async ({ page }) => {
+test("更新提示业务中断，无备用和有连接时也可直接开始", async ({ page }) => {
   const { nodes } = await setup(page);
   nodes[0].services.push({ id: "media", name: "媒体服务", enabled: true, alternatives: [{ id: "us", name: "美国 VPS" }] }, { id: "files", name: "文件服务", enabled: true, alternatives: [] });
   let submitted: unknown;
@@ -212,12 +212,13 @@ test("更新展示逐服务备用入口，无备用时必须接受中断", async
   await expect(dialog).toContainText("健康备用入口：美国 VPS");
   await expect(dialog).toContainText("文件服务");
   await expect(dialog).toContainText("暂无已确认的健康 IPv4 备用入口");
-  await expect(dialog.getByRole("button", { name: "开始更新" })).toBeDisabled();
+  await expect(dialog).toContainText("更新会重启节点并中断该节点上的现有业务连接");
+  await expect(dialog.getByRole("checkbox")).toHaveCount(0);
+  await expect(dialog.getByRole("button", { name: "开始更新" })).toBeEnabled();
   expect(submitted).toBeUndefined();
-  await dialog.getByRole("checkbox", { name: "若没有其他健康 IPv4 入口，我接受服务中断" }).check();
   await dialog.getByRole("button", { name: "开始更新" }).click();
   await expect(dialog).toBeHidden();
-  expect(submitted).toEqual({ node_ids: ["hk"], target_version: "0.2.12", accept_interruption: true });
+  expect(submitted).toEqual({ node_ids: ["hk"], target_version: "0.2.12" });
 });
 
 test("普通用户添加节点使用公网管理地址和自定义端口，并自动跟进接入状态", async ({ page }, info) => {

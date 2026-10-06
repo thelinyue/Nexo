@@ -50,7 +50,7 @@ test("批量模式清理筛选和刷新后的选择，只提交仍可更新的�
   await page.getByLabel("选择 美国 VPS").check();
   await page.getByRole("button", { name: "继续", exact: true }).click();
   await page.getByRole("button", { name: "开始更新", exact: true }).click();
-  expect(submitted).toEqual({ node_ids: ["us"], target_version: "0.2.12", accept_interruption: false });
+  expect(submitted).toEqual({ node_ids: ["us"], target_version: "0.2.12" });
   await expect(page.getByRole("checkbox")).toHaveCount(0);
 });
 
