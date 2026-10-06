@@ -110,7 +110,7 @@ test("缺少 DNS 凭据的失败项保留，允许其他服务完成", async ({ 
   expect(state.tunnels.find(item => item.id === "http")!.public_domain).toBe("new.example.com");
 });
 
-test("普通用户可修改穿透域名，混合反代选择保持管理员权限边界", async ({ page }) => {
+test("普通用户可修改自己工作空间的穿透和反代域名", async ({ page }) => {
   const state = await installApiMocks(page); state.authRole = "tenant";
   const dialog = await openBatchDomain(page);
   await dialog.getByRole("button", { name: "取消", exact: true }).click();
@@ -119,7 +119,9 @@ test("普通用户可修改穿透域名，混合反代选择保持管理员权�
   await page.getByRole("button", { name: "选择", exact: true }).focus();
   await page.getByRole("button", { name: "选择", exact: true }).press("Space");
   await page.getByRole("button", { name: "全选", exact: true }).click();
-  await expect(page.getByRole("button", { name: "修改域名", exact: true })).toBeDisabled();
+  await expect(page.getByRole("button", { name: "修改域名", exact: true })).toBeEnabled();
+  await page.getByRole("button", { name: "修改域名", exact: true }).click();
+  await expect(page.getByRole("dialog", { name: "批量修改域名", exact: true })).toBeVisible();
 });
 
 test("弹窗键盘选择、布局、提交关闭保护与放弃草稿", async ({ page }, info) => {

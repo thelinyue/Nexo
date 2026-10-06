@@ -2,6 +2,13 @@
 # 在目标架构 Linux 上构建静态原生包，避免新发行版 glibc 阻止 Debian 12 / Ubuntu 22.04 启动。
 set -euo pipefail
 version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n 1)
+# 复用 Server 二进制不等于随 Server 发布；只有节点运行代码变化才构建新版本。
+if [[ "$(node -p "require('./release-manifest.json').components.includes('node')")" != true ]]; then
+  echo '本次节点代码未变化，保留原节点版本，不生成安装包'
+  exit 0
+fi
+node_version=$(node -p "require('./release-manifest.json').node_version")
+[[ "$node_version" == "$version" ]] || { echo '节点发布版本必须与本次构建版本一致' >&2; exit 1; }
 case "$(uname -m)" in
   x86_64) architecture=x86_64; target=x86_64-unknown-linux-musl;;
   aarch64) architecture=aarch64; target=aarch64-unknown-linux-musl;;

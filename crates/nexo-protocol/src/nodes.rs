@@ -11,6 +11,9 @@ pub struct AgentNode {
 }
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Service {
+    /// 省略目标时保持旧版 Agent 穿透；反代由节点 Caddy 直接访问目标 URL。
+    #[serde(default)]
+    pub reverse_proxy_target: Option<String>,
     pub id: String,
     pub tenant: String,
     pub device: String,
@@ -62,6 +65,9 @@ pub struct UpdateReport {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Request {
     Poll {
+        /// 旧节点缺省为 false，控制器绝不向其下发直接回源服务。
+        #[serde(default)]
+        reverse_proxy_supported: bool,
         version: String,
         os: String,
         architecture: String,

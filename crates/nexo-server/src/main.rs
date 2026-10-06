@@ -851,7 +851,10 @@ async fn update_tunnel(
         let selection_changed = db.query_row("SELECT distribution_mode IS NOT ?2 OR preferred_node_id IS NOT ?3 OR node_group_id IS NOT NULLIF(?4,'') FROM tunnels WHERE id=?1",params![id,input.distribution_mode,input.preferred_node_id,input.node_group_id],|r|r.get::<_,bool>(0)).map_err(db_error)?;
         let nodes_changed =
             nodes::services::ids(&db, &id).map_err(db_error)? != *input.node_ids.as_ref().unwrap();
-        let revision_changed = !origin_unchanged || !entry_unchanged || !direct_unchanged;
+        let revision_changed = !origin_unchanged
+            || !entry_unchanged
+            || !direct_unchanged
+            || (input.service_mode.as_deref() == Some(reverse_proxy::MODE) && nodes_changed);
         runtime_changed =
             revision_changed || !redirect_unchanged || selection_changed || nodes_changed;
         if revision_changed {
@@ -967,6 +970,9 @@ async fn set_tunnel_enabled(
         let connection = state.db.lock().map_err(|_| db_error("数据库锁不可用"))?;
         let connection = connection.unchecked_transaction().map_err(db_error)?;
         is_proxy = reverse_proxy::existing(&connection, &session, &id)?;
+        if enabled && is_proxy {
+            nodes::services::authorize_proxy_enable(&connection, &session.tenant_id, &id)?;
+        }
         changed = connection.execute("UPDATE tunnels SET enabled=?1,apply_status=CASE WHEN ?1=1 THEN 'checking' ELSE 'disabled' END,apply_revision=apply_revision+1,updated_at=?2 WHERE id=?3 AND tenant_id=?4 AND deleted_at IS NULL AND enabled!=?1",params![enabled,unix_now(),id,session.tenant_id]).map_err(db_error)? > 0;
         if changed {
             accounts::audit(&connection, &session, "service_toggled", "service", &id)?;
@@ -1012,6 +1018,9 @@ async fn batch_set_tunnels_enabled(
         let tx = db.unchecked_transaction().map_err(db_error)?;
         for id in &input.tunnel_ids {
             let is_proxy = reverse_proxy::existing(&tx, &session, id)?;
+            if enabled && is_proxy {
+                nodes::services::authorize_proxy_enable(&tx, &session.tenant_id, id)?;
+            }
             let changed = tx.execute("UPDATE tunnels SET enabled=?1,apply_status=CASE WHEN ?1=1 THEN 'checking' ELSE 'disabled' END,apply_revision=apply_revision+1,updated_at=?2 WHERE id=?3 AND tenant_id=?4 AND deleted_at IS NULL AND enabled!=?1", params![enabled,unix_now(),id,session.tenant_id]).map_err(db_error)? > 0;
             if changed {
                 any_changed = true;
@@ -2048,7 +2057,7 @@ mod tests {
         let error = update_tunnel(State(state), headers, Path(first.id), Json(proxy))
             .await
             .unwrap_err();
-        assert_eq!(error.status, StatusCode::FORBIDDEN);
+        assert_eq!(error.status, StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]

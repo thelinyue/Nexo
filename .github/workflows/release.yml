@@ -28,11 +28,11 @@ jobs:
           node-version: 22.16.0
           cache: npm
           cache-dependency-path: web/package-lock.json
-      - name: 判断 Server 发布范围
+      - name: 判断独立节点发布范围
         id: scope
-        run: echo "server=$(node -p "require('./release-manifest.json').components.includes('server')")" >> "$GITHUB_OUTPUT"
+        run: echo "node=$(node -p "require('./release-manifest.json').components.includes('node')")" >> "$GITHUB_OUTPUT"
       - name: 构建原生节点与配套 Caddy
-        if: steps.scope.outputs.server == 'true'
+        if: steps.scope.outputs.node == 'true'
         run: |
           sudo apt-get update
           sudo apt-get install -y musl-tools
@@ -40,7 +40,7 @@ jobs:
           rustup default 1.89.0
           bash docker/build-node.sh
       - uses: actions/upload-artifact@v4
-        if: steps.scope.outputs.server == 'true'
+        if: steps.scope.outputs.node == 'true'
         with:
           name: nexo-node-${{ matrix.runner }}
           path: dist/nexo-node-*.tar.gz
@@ -64,6 +64,7 @@ jobs:
           manifest_version="$(node -p "require('./release-manifest.json').version")"
           publish_server="$(node -p "require('./release-manifest.json').components.includes('server')")"
           publish_agent="$(node -p "require('./release-manifest.json').components.includes('agent')")"
+          publish_node="$(node -p "require('./release-manifest.json').components.includes('node')")"
           if [[ "$GITHUB_REF_NAME" != "v${tag_version}" || -z "$tag_version" ]]; then
             echo "发布标签必须使用 v<版本号> 格式" >&2
             exit 1
@@ -72,13 +73,14 @@ jobs:
             echo "标签、Cargo、Web 和发布清单版本不一致：tag=$tag_version cargo=$cargo_version web=$web_version manifest=$manifest_version" >&2
             exit 1
           fi
-          if [[ "$publish_server" != "true" && "$publish_agent" != "true" ]]; then
+          if [[ "$publish_server" != "true" && "$publish_agent" != "true" && "$publish_node" != "true" ]]; then
             echo "发布清单至少要声明一个实际变化的组件" >&2
             exit 1
           fi
           echo "version=$tag_version" >> "$GITHUB_OUTPUT"
           echo "publish_server=$publish_server" >> "$GITHUB_OUTPUT"
           echo "publish_agent=$publish_agent" >> "$GITHUB_OUTPUT"
+          echo "publish_node=$publish_node" >> "$GITHUB_OUTPUT"
 
       - name: 准备 Docker Buildx
         uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
@@ -123,6 +125,7 @@ jobs:
           cache-to: type=gha,mode=max,scope=nexo-agent
 
       - name: 更新实际发布组件的 latest
+        if: steps.version.outputs.publish_server == 'true' || steps.version.outputs.publish_agent == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           VERSION: ${{ steps.version.outputs.version }}
@@ -136,7 +139,7 @@ jobs:
           python3 .github/scripts/publish_latest.py --version "$VERSION" --components "${components[@]}" --apply
 
       - name: 取得原生节点包
-        if: steps.version.outputs.publish_server == 'true'
+        if: steps.version.outputs.publish_node == 'true'
         uses: actions/download-artifact@v4
         with:
           pattern: nexo-node-*

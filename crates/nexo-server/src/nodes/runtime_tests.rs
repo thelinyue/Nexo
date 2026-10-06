@@ -133,3 +133,121 @@ async fn two_mtls_nodes_isolate_revocation_and_existing_streams() {
     assert_eq!(&bytes, b"live");
     assert_eq!(runtimes[1].connections.load(Ordering::Relaxed), 1);
 }
+
+/// 独立节点的真实 Caddy 在没有任何 Agent 会话时直接回源，并验证入口撤销和 TLS。
+#[tokio::test]
+#[ignore = "需要 NEXO_TEST_CADDY_BIN 与 NEXO_CADDY_BINARY；只访问本机"]
+async fn real_caddy_node_reverse_proxy_without_agent_tls_websocket_and_revocation() {
+    let port = || {
+        std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port()
+    };
+    let http_port = port();
+    let https_port = port();
+    let origin = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let origin_port = origin.local_addr().unwrap().port();
+    let mut tasks = JoinSet::new();
+    tasks.spawn(async move {
+        loop {
+            let (stream, _) = origin.accept().await.unwrap();
+            tokio::spawn(async move {
+                let _ =
+                    crate::domain_runtime::reverse_proxy_tests::echo_origin(stream, "node-origin")
+                        .await;
+            });
+        }
+    });
+    let key = rcgen::KeyPair::generate().unwrap();
+    let certificate = rcgen::CertificateParams::new(vec!["app.localhost".into()])
+        .unwrap()
+        .self_signed(&key)
+        .unwrap();
+    let service:wire::Service=serde_json::from_value(json!({"id":"proxy","tenant":"default","device":"","revision":1,"protocol":"https","port":0,"hostname":"app.localhost","http_port":http_port,"https_port":https_port,"access_mode":"public","http_redirect":true,"certificate":certificate.pem(),"private_key":key.serialize_pem(),"reverse_proxy_target":format!("http://127.0.0.1:{origin_port}")})).unwrap();
+    let (snapshot, _) = watch::channel(Snapshot {
+        data_port: 0,
+        services: vec![service.clone()],
+        agents: vec![],
+        accepting: true,
+    });
+    let runtime = Arc::new(Runtime {
+        snapshot,
+        sessions: Default::default(),
+        connections: Default::default(),
+        health: Default::default(),
+        access: Default::default(),
+        configured: AtomicBool::new(false),
+        stop: CancellationToken::new(),
+        caddy: Default::default(),
+    });
+    let directory = std::env::temp_dir().join(format!("nexo-node-proxy-{}", Uuid::new_v4()));
+    let node = runtime.clone();
+    tasks.spawn(listeners(node, directory, "test-node".into()));
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .add_root_certificate(reqwest::Certificate::from_pem(certificate.pem().as_bytes()).unwrap())
+        .resolve(
+            "app.localhost",
+            (std::net::Ipv4Addr::LOCALHOST, https_port).into(),
+        )
+        .build()
+        .unwrap();
+    let base = format!("https://app.localhost:{https_port}");
+    let result:Result<()>=async {
+        tokio::time::timeout(Duration::from_secs(20),async {
+            loop {
+                if runtime.health.lock().await.iter().any(|s|s.id=="proxy"&&s.ready) {break;}
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        }).await?;
+        anyhow::ensure!(runtime.sessions.lock().await.is_empty(),"反代不得依赖 Agent");
+        let response=client.post(format!("{base}/path/a%2Fb?q=%2F")).header("X-Nexo-Access-Forged","secret").body("original-body").send().await?;
+        anyhow::ensure!(response.status()==200,"反代请求失败");
+        let echo=response.text().await?;
+        anyhow::ensure!(echo.contains("POST /path/a%2Fb?q=%2F") && echo.contains("original-body"),"原请求未保留");
+        anyhow::ensure!(echo.contains(&format!("app.localhost:{https_port}")) && !echo.to_lowercase().contains("x-nexo-access-forged"),"Host 或认证头边界不正确");
+        let redirected=client.post(format!("http://127.0.0.1:{http_port}/path?q=1")).header("Host","app.localhost").send().await?;
+        anyhow::ensure!(redirected.status()==307 && redirected.headers()["location"]==format!("{base}/path?q=1"),"HTTPS 跳转未保留请求地址");
+        // 真实 WebSocket 握手和双向数据；TLS 在前一个请求中已验证。
+        let mut plain=service.clone();plain.protocol="http".into();plain.http_redirect=false;
+        runtime.configured.store(false,Ordering::Release);
+        runtime.snapshot.send_replace(Snapshot {services:vec![plain.clone()],agents:vec![],data_port:0,accepting:true});
+        tokio::time::timeout(Duration::from_secs(5),async {loop {if runtime.configured.load(Ordering::Acquire) {break;}tokio::time::sleep(Duration::from_millis(25)).await;}}).await?;
+        let mut socket=TcpStream::connect(("127.0.0.1",http_port)).await?;
+        socket.write_all(b"GET /ws HTTP/1.1\r\nHost: app.localhost\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n").await?;
+        let mut head=Vec::new();while !head.ends_with(b"\r\n\r\n") {head.push(socket.read_u8().await?);}
+        anyhow::ensure!(String::from_utf8(head)?.contains("101"),"WebSocket 握手失败");
+        socket.write_all(&[0x81,0x84,0,0,0,0,b'p',b'i',b'n',b'g']).await?;
+        let mut frame=[0;6];socket.read_exact(&mut frame).await?;
+        anyhow::ensure!(&frame[2..]==b"ping","WebSocket 数据未回显");
+        drop(socket);
+        // 自签名 HTTPS 回源必须拒绝，不能为了节点直连关闭证书校验。
+        let mut tls_origin=service.clone();tls_origin.id="tls-origin".into();tls_origin.http_redirect=false;
+        plain.reverse_proxy_target=Some(format!("https://127.0.0.1:{https_port}"));
+        runtime.configured.store(false,Ordering::Release);
+        runtime.snapshot.send_replace(Snapshot {services:vec![plain,tls_origin],agents:vec![],data_port:0,accepting:true});
+        tokio::time::timeout(Duration::from_secs(5),async {loop {if runtime.configured.load(Ordering::Acquire) {break;}tokio::time::sleep(Duration::from_millis(25)).await;}}).await?;
+        anyhow::ensure!(client.get(format!("http://127.0.0.1:{http_port}/")).header("Host","app.localhost").send().await?.status().is_server_error(),"不应信任未验证的 HTTPS 回源");
+        // 新证书损坏使 Caddy 保留旧配置时，旧入口仍必须按最新快照拒绝业务请求。
+        let mut invalid=service.clone();invalid.id="invalid".into();invalid.hostname=Some("invalid.localhost".into());invalid.certificate=Some("invalid certificate".into());invalid.private_key=Some("invalid key".into());
+        runtime.configured.store(false,Ordering::Release);
+        runtime.snapshot.send_replace(Snapshot {services:vec![invalid],agents:vec![],data_port:0,accepting:true});
+        tokio::time::timeout(Duration::from_secs(5),async {loop {if runtime.health.lock().await.iter().any(|s|s.id=="invalid"&&!s.ready) {break;}tokio::time::sleep(Duration::from_millis(25)).await;}}).await?;
+        anyhow::ensure!(client.get(format!("http://127.0.0.1:{http_port}/")).header("Host","app.localhost").send().await?.status().is_server_error(),"Caddy 配置失败后不应沿用已撤销的业务授权");
+        runtime.configured.store(false,Ordering::Release);
+        runtime.snapshot.send_replace(Snapshot::default());
+        tokio::time::timeout(Duration::from_secs(5),async {loop {if runtime.health.lock().await.is_empty() && runtime.configured.load(Ordering::Acquire) {break;}tokio::time::sleep(Duration::from_millis(25)).await;}}).await?;
+        let revoked=client.get(format!("http://127.0.0.1:{http_port}/")).header("Host","app.localhost").send().await;
+        anyhow::ensure!(revoked.is_err() || revoked.unwrap().status()!=200,"撤权后仍在转发");
+        Ok(())
+    }.await;
+    runtime.stop.cancel();
+    if let Some(caddy) = runtime.caddy.lock().await.take() {
+        caddy.shutdown().await.unwrap();
+    }
+    tasks.abort_all();
+    result.unwrap();
+}

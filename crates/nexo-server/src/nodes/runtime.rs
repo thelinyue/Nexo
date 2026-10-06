@@ -258,7 +258,7 @@ async fn control_session(runtime: &Arc<Runtime>, saved: &NodeIdentity) -> Result
             },
             _=interval.tick()=>{
                 let services=runtime.health.lock().await.clone();
-                tokio::time::timeout_at(deadline.deadline(), identity::write_message(&mut write,&wire::Request::Poll{version:env!("CARGO_PKG_VERSION").into(),os:operating_system(),architecture:std::env::consts::ARCH.into(),connections:runtime.connections.load(Ordering::Relaxed),services,update:update_report()})).await.context("节点管理通道发送超时，停止转发")??;
+                tokio::time::timeout_at(deadline.deadline(), identity::write_message(&mut write,&wire::Request::Poll{reverse_proxy_supported:true,version:env!("CARGO_PKG_VERSION").into(),os:operating_system(),architecture:std::env::consts::ARCH.into(),connections:runtime.connections.load(Ordering::Relaxed),services,update:update_report()})).await.context("节点管理通道发送超时，停止转发")??;
             },
             line=lines.next()=>{
                 let line=line.context("管理连接关闭")??;
@@ -427,13 +427,20 @@ async fn listeners(runtime: Arc<Runtime>, directory: PathBuf, node_id: String) -
         let mut servers = serde_json::Map::new();
         let mut certificates = Vec::<Value>::new();
         for service in &next.services {
-            let mut error = None;
+            let mut error = if service.reverse_proxy_target.is_some() && !next.accepting {
+                Some("节点正在维护，暂不接受新请求".into())
+            } else {
+                None
+            };
             if service.protocol == "https"
                 && (service.certificate.is_none() || service.private_key.is_none())
             {
                 error = Some("服务证书尚未就绪".to_owned());
             }
-            if !listeners.contains_key(&service.id) && error.is_none() {
+            if service.reverse_proxy_target.is_none()
+                && !listeners.contains_key(&service.id)
+                && error.is_none()
+            {
                 let addr = if service.protocol == "tcp" {
                     format!("0.0.0.0:{}", service.port)
                 } else {
@@ -471,7 +478,12 @@ async fn listeners(runtime: Arc<Runtime>, directory: PathBuf, node_id: String) -
                     Err(e) => error = Some(format!("入口监听失败：{e}")),
                 }
             }
-            if let Some(listener) = listeners.get(&service.id) {
+            let upstream = service.reverse_proxy_target.clone().or_else(|| {
+                listeners
+                    .get(&service.id)
+                    .map(|l| format!("127.0.0.1:{}", l.port))
+            });
+            if let Some(upstream) = upstream.filter(|_| error.is_none()) {
                 if service.protocol != "tcp" {
                     let host = service.hostname.clone().context("网页服务缺少域名")?;
                     {
@@ -521,10 +533,18 @@ async fn listeners(runtime: Arc<Runtime>, directory: PathBuf, node_id: String) -
                         }
                         routes.push(json!({"match":[{"host":[host],"path":["/.nexo-access/*"]}],"handle":[endpoint],"terminal":true}));
                         let mut handlers = Vec::new();
-                        if service.access_mode == "password" {
+                        // 直接回源必须逐请求核对内存授权，避免 Caddy 拒绝新配置后旧路由仍可访问。
+                        if service.access_mode == "password"
+                            || service.reverse_proxy_target.is_some()
+                        {
                             handlers.push(check);
                         }
-                        handlers.push(json!({"handler":"reverse_proxy","upstreams":[{"dial":format!("127.0.0.1:{}",listener.port)}],"headers":{"request":{"delete":["X-Nexo-Access-*","X-Nexo-Upstream-Cookie"]}}}));
+                        let mut proxy = crate::domain_runtime::proxy_handler(&upstream)?;
+                        // 撤权后由 Caddy 立即关闭旧配置中的长连接，沿用节点原有关闭行为。
+                        proxy.as_object_mut().unwrap().remove("stream_close_delay");
+                        proxy["headers"]["request"]["delete"] =
+                            json!(["X-Nexo-Access-*", "X-Nexo-Upstream-Cookie"]);
+                        handlers.push(proxy);
                         routes.push(
                             json!({"match":[{"host":[host]}],"handle":handlers,"terminal":true}),
                         );
@@ -537,7 +557,9 @@ async fn listeners(runtime: Arc<Runtime>, directory: PathBuf, node_id: String) -
                     }
                 }
             }
-            if !runtime.sessions.lock().await.contains_key(&service.device) {
+            if service.reverse_proxy_target.is_none()
+                && !runtime.sessions.lock().await.contains_key(&service.device)
+            {
                 error = Some("等待设备数据连接".into());
             }
             health.push(wire::ServiceHealth {
@@ -578,15 +600,34 @@ async fn access_request(
             .and_then(|v| v.to_str().ok())
             .context("缺少服务标识")?
             .to_owned();
-        anyhow::ensure!(
-            runtime
-                .snapshot
-                .borrow()
+        let service = {
+            let snapshot = runtime.snapshot.borrow();
+            let service = snapshot
                 .services
                 .iter()
-                .any(|s| s.id == service_id),
-            "服务授权已撤销"
-        );
+                .find(|s| s.id == service_id)
+                .context("服务授权已撤销")?
+                .clone();
+            anyhow::ensure!(
+                service.reverse_proxy_target.is_none() || snapshot.accepting,
+                "节点正在维护"
+            );
+            service
+        };
+        if service.reverse_proxy_target.is_some()
+            && service.access_mode == "public"
+            && parts.uri.path() == "/check"
+        {
+            // 公开服务只在本机检查快照，不增加控制器往返；保留业务 Cookie。
+            let cookie = parts
+                .headers
+                .get("cookie")
+                .cloned()
+                .unwrap_or_else(|| axum::http::HeaderValue::from_static(""));
+            return Ok(
+                (StatusCode::NO_CONTENT, [("x-nexo-upstream-cookie", cookie)]).into_response(),
+            );
+        }
         let headers = parts
             .headers
             .iter()

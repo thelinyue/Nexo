@@ -102,12 +102,12 @@ pub async fn session(state: AppState, stream: TlsStream<TcpStream>, id: String) 
                 authorized(&state,&id,&cert)?;
                 let request:Request=serde_json::from_str(&line)?;
                 match request{
-                    Request::Poll{version,os,architecture,connections,services,update}=>{
+                    Request::Poll{version,os,architecture,connections,services,update,reverse_proxy_supported}=>{
                         anyhow::ensure!(version.len()<64&&os.len()<128&&architecture.len()<32&&services.len()<10000,"节点报告过大");
                         deadline.as_mut().reset(tokio::time::Instant::now()+Duration::from_secs(45));
                         {
                             let db=state.db.lock().map_err(|_|anyhow::anyhow!("数据库锁不可用"))?;
-                            db.execute("UPDATE relay_nodes SET version=?2,os=?3,architecture=?4,connections=?5,last_seen=?6 WHERE id=?1",params![id,version,os,architecture,connections.min(i64::MAX as u64),unix_now()])?;
+                            db.execute("UPDATE relay_nodes SET version=?2,os=?3,architecture=?4,connections=?5,last_seen=?6,reverse_proxy_supported=?7 WHERE id=?1",params![id,version,os,architecture,connections.min(i64::MAX as u64),unix_now(),reverse_proxy_supported])?;
                             for report in services {
                                 record_health(&db, &id, report, unix_now())?;
                             }
@@ -134,7 +134,12 @@ pub async fn session(state: AppState, stream: TlsStream<TcpStream>, id: String) 
 /// 新配置及超过授权时限的旧样本必须重新累计三次成功，不能继承此前健康状态。
 fn record_health(db: &Connection, node: &str, report: wire::ServiceHealth, now: i64) -> Result<()> {
     let origin_ready: bool = db.query_row("SELECT EXISTS(SELECT 1 FROM tunnel_applied_states WHERE tunnel_id=?1 AND revision=?2 AND status='ready' AND updated_at>?3)", params![report.id, report.revision, now-45], |r| r.get(0))?;
-    if !origin_ready {
+    let proxy: bool = db.query_row(
+        "SELECT EXISTS(SELECT 1 FROM tunnels WHERE id=?1 AND service_mode='reverse_proxy')",
+        [&report.id],
+        |r| r.get(0),
+    )?;
+    if !origin_ready && !proxy {
         // 回源与节点分开检查：等待新回源报告不算节点故障，也不消耗未变节点的成功样本。
         // 回源未确认时仍不采纳节点报告；综合健康视图继续要求当前版本、有效期与回源 ready。
         return Ok(());
@@ -158,13 +163,22 @@ pub fn snapshot(state: &AppState, node: &str) -> Result<Snapshot> {
     if !enabled {
         return Ok(Snapshot::default());
     }
-    let mut q=db.prepare("SELECT t.id,t.tenant_id,t.device_id,t.apply_revision,t.protocol,COALESCE(t.public_port,0),t.hostname||'.'||p.domain,t.https_port,t.access_mode,t.http_redirect_enabled FROM authorized_service_nodes s JOIN tunnels t ON t.id=s.service_id JOIN devices d ON d.id=t.device_id JOIN tenants w ON w.id=t.tenant_id LEFT JOIN public_domains p ON p.id=t.public_domain_id JOIN relay_node_authorizations g ON g.node_id=s.node_id AND g.tenant_id=t.tenant_id WHERE s.node_id=?1 AND t.enabled=1 AND t.deleted_at IS NULL AND w.enabled=1 AND d.status='online' AND d.node_capable=1 AND t.protocol IN ('http','https','tcp')")?;
+    let mut q=db.prepare("SELECT t.id,t.tenant_id,t.device_id,t.apply_revision,t.protocol,COALESCE(t.public_port,0),t.hostname||'.'||p.domain,t.https_port,t.access_mode,t.http_redirect_enabled,CASE WHEN t.service_mode='reverse_proxy' THEN t.origin_protocol||'://' ELSE NULL END,t.local_address,t.local_port FROM authorized_service_nodes s JOIN tunnels t ON t.id=s.service_id LEFT JOIN devices d ON d.id=t.device_id JOIN tenants w ON w.id=t.tenant_id LEFT JOIN public_domains p ON p.id=t.public_domain_id WHERE s.node_id=?1 AND t.enabled=1 AND t.deleted_at IS NULL AND w.enabled=1 AND ((t.service_mode='tunnel' AND d.status='online' AND d.node_capable=1) OR (t.service_mode='reverse_proxy' AND EXISTS(SELECT 1 FROM relay_nodes n WHERE n.id=s.node_id AND n.reverse_proxy_supported=1))) AND t.protocol IN ('http','https','tcp')")?;
     let mut services = q
         .query_map([node], |r| {
             Ok(wire::Service {
+                reverse_proxy_target: if r.get::<_, Option<String>>(10)?.is_some() {
+                    Some(crate::reverse_proxy::target(
+                        r.get::<_, String>(10)?.trim_end_matches("://"),
+                        &r.get::<_, String>(11)?,
+                        r.get(12)?,
+                    ))
+                } else {
+                    None
+                },
                 id: r.get(0)?,
                 tenant: r.get(1)?,
-                device: r.get(2)?,
+                device: r.get::<_, Option<String>>(2)?.unwrap_or_default(),
                 revision: r.get(3)?,
                 protocol: r.get(4)?,
                 port: r.get(5)?,
@@ -201,6 +215,9 @@ pub fn snapshot(state: &AppState, node: &str) -> Result<Snapshot> {
     }
     let mut agents = Vec::new();
     for service in &services {
+        if service.reverse_proxy_target.is_some() {
+            continue;
+        }
         if agents
             .iter()
             .any(|a: &wire::AgentIdentity| a.id == service.device)
@@ -373,5 +390,69 @@ mod tests {
         assert!(!report(2, true, now + 156));
         assert!(!report(2, true, now + 166));
         assert!(report(2, true, now + 176));
+    }
+}
+
+#[cfg(test)]
+mod proxy_tests {
+    use super::*;
+
+    #[test]
+    fn proxy_reports_do_not_require_agent_and_stale_or_revoked_reports_are_ignored() {
+        let (state, _) = crate::tests::domain_fixture();
+        let db = state.db.lock().unwrap();
+        db.execute_batch("UPDATE users SET role='tenant'; INSERT INTO relay_nodes(id,name,approved,reverse_proxy_supported,created_at) VALUES('remote','远端',1,1,0); INSERT INTO relay_node_grants VALUES('remote','default'); INSERT INTO tunnels(id,tenant_id,name,protocol,local_address,local_port,service_mode,apply_revision,created_at,updated_at) VALUES('proxy','default','反代','http','127.0.0.1',3000,'reverse_proxy',2,0,0); DELETE FROM service_nodes WHERE service_id='proxy'; INSERT INTO service_nodes VALUES('proxy','remote');").unwrap();
+        let report = |revision| wire::ServiceHealth {
+            id: "proxy".into(),
+            revision,
+            ready: true,
+            error: None,
+            public_probe_supported: true,
+        };
+        let now = unix_now();
+        record_health(&db, "remote", report(1), now).unwrap();
+        assert_eq!(
+            db.query_row("SELECT COUNT(*) FROM relay_service_health", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        for _ in 0..3 {
+            record_health(&db, "remote", report(2), now).unwrap();
+        }
+        assert!(db
+            .query_row("SELECT healthy FROM relay_service_health", [], |r| r
+                .get::<_, bool>(0))
+            .unwrap());
+        db.execute("DELETE FROM relay_node_grants", []).unwrap();
+        record_health(&db, "remote", report(2), now + 1).unwrap();
+        assert_eq!(
+            db.query_row("SELECT checked_at FROM relay_service_health", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            now
+        );
+        assert_eq!(
+            db.query_row("SELECT COUNT(*) FROM authorized_service_nodes", [], |r| r
+                .get::<_, i64>(
+                0
+            ))
+            .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn old_poll_and_snapshot_default_to_tunneling() {
+        let request: wire::Request=serde_json::from_value(json!({"type":"poll","version":"0.2.18","os":"Linux","architecture":"x86_64","connections":0,"services":[],"update":{"stage":"idle"}})).unwrap();
+        assert!(matches!(
+            request,
+            wire::Request::Poll {
+                reverse_proxy_supported: false,
+                ..
+            }
+        ));
+        let service: wire::Service=serde_json::from_value(json!({"id":"s","tenant":"default","device":"agent","revision":1,"protocol":"http","port":0,"https_port":443,"access_mode":"public","http_redirect":false})).unwrap();
+        assert!(service.reverse_proxy_target.is_none());
     }
 }

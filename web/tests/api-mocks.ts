@@ -34,7 +34,7 @@ export async function installApiMocks(page: Page, options: { empty?: boolean; an
     if (path.endsWith("/node-update-jobs")) return respond([]);
     if (path.endsWith("/node-releases")) return respond([{ version: "0.2.12", architectures: ["aarch64", "x86_64"] }]);
     if (path.endsWith("/node-groups")) return respond([]);
-    if (path.endsWith("/nodes")) return respond({ nodes: [{ id: "local", name: "内置节点", approved: true, enabled: true, status: "online", latencies: [], services: [], connections: 0 }], server_version: "0.2.12" });
+    if (path.endsWith("/nodes")) return respond({ nodes: [{ id: "local", name: "内置节点", reverse_proxy_supported: true, reverse_proxy_selectable: true, approved: true, enabled: true, status: "online", latencies: [], services: [], connections: 0 }], server_version: "0.2.12" });
     if (path === "/api/v1/admin/users") return respond(state.users);
     if (path === "/api/v1/admin/invitations") return respond([]);
     if (path === "/api/v1/admin/server-settings") {

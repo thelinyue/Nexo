@@ -9,7 +9,7 @@ import { CopyButton, CreateButton, Loading, Modal, Notice, PageHeader, dateText,
 import "./nodes.css";
 
 export type NodeLatency = { device_id: string; device_name: string; rtt_ms: number; checked_at: number; samples: number; fresh: boolean };
-export type RelayNode = { id: string; name: string; public_ipv4: string; control_port: number; status: string; approved: boolean; enabled: boolean; registered: boolean; can_enroll?: boolean; assigned?: boolean; selectable?: boolean; enrollment_expires_at?: number; os?: string; architecture?: string; version?: string; last_seen?: number; connections: number; services: { id: string; name: string; enabled?: boolean; alternatives?: { id: string; name: string }[] }[]; workspace_ids?: string[]; latencies: NodeLatency[]; error?: string; update?: { stage: string; target_version: string; error?: string }; events?: { message: string; occurred_at: number }[] };
+export type RelayNode = { id: string; name: string; public_ipv4: string; control_port: number; status: string; approved: boolean; enabled: boolean; registered: boolean; can_enroll?: boolean; assigned?: boolean; selectable?: boolean; reverse_proxy_supported?: boolean; reverse_proxy_selectable?: boolean; enrollment_expires_at?: number; os?: string; architecture?: string; version?: string; last_seen?: number; connections: number; services: { id: string; name: string; enabled?: boolean; alternatives?: { id: string; name: string }[] }[]; workspace_ids?: string[]; latencies: NodeLatency[]; error?: string; update?: { stage: string; target_version: string; error?: string }; events?: { message: string; occurred_at: number }[] };
 type NodeRelease = { version: string; architectures: string[] };
 type UpdateJob = { id: string; target_version: string; status: string; items: { node_id: string; stage: string; error?: string }[] };
 export type NodeList = { nodes: RelayNode[]; server_version: string };
@@ -125,7 +125,7 @@ function NodeDetail({ node, admin, csrf, onClose }: { node: RelayNode; admin: bo
   const path = `/api/v1/nodes/${encodeURIComponent(node.id)}`;
   const live = useResource(() => api<RelayNode>(path), true, 3000, true);
   const current = live.data ?? node;
-  const editable = admin && node.id !== "local";
+  const editable = admin;
   const [tab, setTab] = useState("overview");
   const tabId = useId();
   const dirty = editable && (name !== node.name || ip !== node.public_ipv4 || port !== node.control_port || enabled !== node.enabled || grants.length !== (node.workspace_ids ?? []).length || grants.some(id => !node.workspace_ids?.includes(id)));
@@ -157,9 +157,10 @@ function NodeDetail({ node, admin, csrf, onClose }: { node: RelayNode; admin: bo
       </div>
       {editable && <form className="modal-form node-config" id={`${tabId}-config`} role="tabpanel" aria-labelledby={`${tabId}-config-tab`} hidden={tab !== "config"} onSubmit={e => { e.preventDefault(); if (!busy && !current.update) void perform(path, "PUT", { name, public_ipv4: ip, control_port: port, enabled, workspace_ids: grants }); }}>
         <div className="modal-body node-form-fields">
-          <section className="node-form-fields"><h3>基本信息</h3><label>节点名称<input value={name} onChange={e => setName(e.target.value)} required maxLength={80} /></label><div className="node-field-pair"><label>公网 IPv4<input required value={ip} onChange={e => setIp(e.target.value)} /></label><label>数据端口<input type="number" min={1} max={65535} value={port} onChange={e => setPort(Number(e.target.value))} /></label></div><label className="node-check"><input type="checkbox" checked={enabled} onChange={e => setEnabled(e.target.checked)} />启用节点</label></section>
+          {node.id !== "local" && <section className="node-form-fields"><h3>基本信息</h3><label>节点名称<input value={name} onChange={e => setName(e.target.value)} required maxLength={80} /></label><div className="node-field-pair"><label>公网 IPv4<input required value={ip} onChange={e => setIp(e.target.value)} /></label><label>数据端口<input type="number" min={1} max={65535} value={port} onChange={e => setPort(Number(e.target.value))} /></label></div><label className="node-check"><input type="checkbox" checked={enabled} onChange={e => setEnabled(e.target.checked)} />启用节点</label></section>}
+          {node.id === "local" && <p className="helper">为以下工作空间授权内置节点反向代理，包括访问 Server 本机及其可达内网。穿透权限不受影响。</p>}
           {tab === "config" && <WorkspaceChoices value={grants} onChange={setGrants} />}
-          <section className="node-section node-maintenance"><h3>维护操作</h3><div><span>重启 Nexo 节点服务<small>先撤出 DNS，并等待连接结束</small></span><button type="button" className="text-button" disabled={busy || !!current.update || current.status !== "online"} onClick={() => { setError(null); setInterruption(false); setRestart(true); }}>重启节点服务</button></div><div><span>移除节点<small>撤销身份，保留 VPS 数据</small></span><button type="button" className="text-button danger-text" disabled={busy || !!current.update} onClick={() => { setError(null); setConfirm(true); }}>移除节点</button></div></section>
+          {node.id !== "local" && <section className="node-section node-maintenance"><h3>维护操作</h3><div><span>重启 Nexo 节点服务<small>先撤出 DNS，并等待连接结束</small></span><button type="button" className="text-button" disabled={busy || !!current.update || current.status !== "online"} onClick={() => { setError(null); setInterruption(false); setRestart(true); }}>重启节点服务</button></div><div><span>移除节点<small>撤销身份，保留 VPS 数据</small></span><button type="button" className="text-button danger-text" disabled={busy || !!current.update} onClick={() => { setError(null); setConfirm(true); }}>移除节点</button></div></section>}
           <Notice error={error ?? live.error} />
         </div>
         <footer className="modal-actions"><button className={current.approved ? "primary-button" : "secondary-button"} disabled={busy || !!current.update}>保存配置</button>{!current.approved && <button type="button" className="primary-button" disabled={busy || !!current.update || !current.registered} onClick={event => { if (event.currentTarget.form?.reportValidity()) void approve(); }}>批准并保存配置</button>}</footer>

@@ -3,23 +3,6 @@ use crate::*;
 
 pub const MODE: &str = "reverse_proxy";
 
-/// 使用同一事务中的真实登录用户校验权限，不能把被管理工作空间当作操作者。
-fn authorize(db: &Connection, session: &auth::Session, mode: &str) -> Result<(), ApiError> {
-    if mode == MODE {
-        let admin: bool = db.query_row(
-            "SELECT EXISTS(SELECT 1 FROM users WHERE id=?1 AND role='system_admin' AND enabled=1)",
-            [&session.user_id], |r| r.get(0),
-        ).map_err(db_error)?;
-        if !admin {
-            return Err(ApiError::new(
-                StatusCode::FORBIDDEN,
-                "反向代理仅允许管理员管理",
-            ));
-        }
-    }
-    Ok(())
-}
-
 pub fn existing(db: &Connection, session: &auth::Session, id: &str) -> Result<bool, ApiError> {
     let mode: String = db
         .query_row(
@@ -30,7 +13,6 @@ pub fn existing(db: &Connection, session: &auth::Session, id: &str) -> Result<bo
         .optional()
         .map_err(db_error)?
         .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "服务不存在"))?;
-    authorize(db, session, &mode)?;
     Ok(mode == MODE)
 }
 
@@ -54,11 +36,6 @@ pub fn prepare(
         .clone()
         .or(previous.clone())
         .unwrap_or_else(|| "tunnel".into());
-    // 先检查原对象权限，避免通过修改模式绕过管理员限制。
-    if let Some(previous) = &previous {
-        authorize(db, session, previous)?;
-    }
-    authorize(db, session, &mode)?;
     if !matches!(mode.as_str(), "tunnel" | MODE) {
         return Err(ApiError::new(StatusCode::BAD_REQUEST, "服务模式无效"));
     }
@@ -73,6 +50,7 @@ pub fn prepare(
             || input.device_id.is_some()
             || input.public_port.is_some()
             || input.lan_redirect_enabled == Some(true)
+            || input.ipv6_direct_enabled == Some(true)
         {
             return Err(ApiError::new(
                 StatusCode::BAD_REQUEST,
@@ -168,7 +146,7 @@ pub fn refresh_status(state: &AppState) -> Result<()> {
             .db
             .lock()
             .map_err(|_| anyhow::anyhow!("数据库锁不可用"))?;
-        let mut query = db.prepare("SELECT t.id,t.enabled AND w.enabled,t.protocol,t.hostname,p.domain,t.public_domain_id,t.origin_protocol,t.local_address,t.local_port,t.https_port,t.apply_revision FROM tunnels t JOIN tenants w ON w.id=t.tenant_id LEFT JOIN public_domains p ON p.id=t.public_domain_id AND p.tenant_id=t.tenant_id WHERE t.service_mode='reverse_proxy' AND t.deleted_at IS NULL")?;
+        let mut query = db.prepare("SELECT t.id,t.enabled AND w.enabled,t.protocol,t.hostname,p.domain,t.public_domain_id,t.origin_protocol,t.local_address,t.local_port,t.https_port,t.apply_revision,COALESCE((SELECT node_id FROM service_nodes WHERE service_id=t.id LIMIT 1),'local'),EXISTS(SELECT 1 FROM authorized_service_nodes a JOIN relay_nodes n ON n.id=a.node_id WHERE a.service_id=t.id AND n.enabled=1 AND n.approved=1 AND n.removed_at IS NULL) FROM tunnels t JOIN tenants w ON w.id=t.tenant_id LEFT JOIN public_domains p ON p.id=t.public_domain_id AND p.tenant_id=t.tenant_id WHERE t.service_mode='reverse_proxy' AND t.deleted_at IS NULL")?;
         let rows = query
             .query_map([], |r| {
                 Ok((
@@ -183,6 +161,8 @@ pub fn refresh_status(state: &AppState) -> Result<()> {
                     r.get::<_, u16>(8)?,
                     r.get::<_, u16>(9)?,
                     r.get::<_, i64>(10)?,
+                    r.get::<_, String>(11)?,
+                    r.get::<_, bool>(12)?,
                 ))
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -201,8 +181,34 @@ pub fn refresh_status(state: &AppState) -> Result<()> {
         port,
         https_port,
         revision,
+        node,
+        authorized,
     ) in rows
     {
+        if !enabled || !authorized || node != "local" {
+            let (status, error) = if !enabled {
+                ("disabled".to_owned(), None)
+            } else if !authorized {
+                (
+                    "failed".to_owned(),
+                    Some("节点未审批、已停用或反向代理授权已撤销".into()),
+                )
+            } else {
+                let db = state
+                    .db
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("数据库锁不可用"))?;
+                db.query_row("SELECT CASE WHEN n.last_seen>?3 AND n.maintenance=0 AND n.reverse_proxy_supported=1 AND h.revision=?4 AND h.checked_at>?3 AND h.healthy=1 THEN 'ready' ELSE 'checking' END,CASE WHEN n.reverse_proxy_supported=0 THEN '请先升级节点，以支持反向代理' WHEN n.last_seen IS NULL OR n.last_seen<=?3 THEN '等待节点连接' WHEN n.maintenance=1 THEN '节点正在维护' ELSE COALESCE(h.error,'等待节点加载当前反向代理配置') END FROM relay_nodes n LEFT JOIN relay_service_health h ON h.node_id=n.id AND h.service_id=?1 WHERE n.id=?2", params![id,node,unix_now()-45,revision], |r| Ok((r.get::<_,String>(0)?,r.get::<_,Option<String>>(1)?)))?
+            };
+            updates.push(crate::transport::StatusUpdate {
+                id,
+                revision,
+                error: if status == "ready" { None } else { error },
+                status,
+                protocols: None,
+            });
+            continue;
+        }
         let runtime = state
             .domain_runtime
             .status(domain_id.as_deref().unwrap_or_default());

@@ -19,7 +19,16 @@ pub mod updates;
 
 pub fn migrate(db: &Connection) -> Result<()> {
     let tx = db.unchecked_transaction()?;
+    let proxy_migration = !tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='relay_local_proxy_grants')",
+        [],
+        |r| r.get::<_, bool>(0),
+    )?;
     tx.execute_batch(include_str!("schema.sql"))?;
+    if proxy_migration {
+        // 已有反代保持可用；只有首次迁移补授权，重启不能复活被撤销的权限。
+        tx.execute("INSERT OR IGNORE INTO relay_local_proxy_grants SELECT DISTINCT t.tenant_id FROM tunnels t JOIN service_nodes s ON s.service_id=t.id WHERE t.service_mode='reverse_proxy' AND t.deleted_at IS NULL AND s.node_id='local'", [])?;
+    }
     if !tx.query_row(
         "SELECT EXISTS(SELECT 1 FROM pragma_table_info('devices') WHERE name='node_capable')",
         [],
@@ -65,6 +74,11 @@ pub fn migrate(db: &Connection) -> Result<()> {
     tx.execute("DROP INDEX IF EXISTS idx_tunnels_tcp_port", [])?;
     for (table, column, definition) in [
         (
+            "relay_nodes",
+            "reverse_proxy_supported",
+            "INTEGER NOT NULL DEFAULT 0",
+        ),
+        (
             "node_update_jobs",
             "operation",
             "TEXT NOT NULL DEFAULT 'update'",
@@ -100,7 +114,7 @@ pub fn migrate(db: &Connection) -> Result<()> {
         }
     }
     // DNS、服务诊断和节点维护共用同一综合健康定义，避免只看在线或旧探测样本。
-    tx.execute_batch("CREATE VIEW IF NOT EXISTS relay_ready_service_nodes AS
+    tx.execute_batch("DROP VIEW IF EXISTS relay_healthy_service_nodes; DROP VIEW IF EXISTS relay_ready_service_nodes; CREATE VIEW relay_ready_service_nodes AS
         SELECT s.service_id,s.node_id,t.apply_revision AS revision,n.maintenance
         FROM authorized_service_nodes s
         JOIN tunnels t ON t.id=s.service_id
@@ -108,11 +122,12 @@ pub fn migrate(db: &Connection) -> Result<()> {
         JOIN relay_nodes n ON n.id=s.node_id
         JOIN relay_service_health h ON h.node_id=s.node_id AND h.service_id=s.service_id
         JOIN relay_public_health p ON p.node_id=s.node_id AND p.service_id=s.service_id
-        JOIN tunnel_applied_states a ON a.tunnel_id=t.id
+        LEFT JOIN tunnel_applied_states a ON a.tunnel_id=t.id
         WHERE t.enabled=1 AND t.deleted_at IS NULL AND w.enabled=1
           AND n.approved=1 AND n.enabled=1 AND n.removed_at IS NULL
+          AND (t.service_mode!='reverse_proxy' OR n.id='local' OR n.reverse_proxy_supported=1)
           AND (n.id='local' OR n.last_seen>unixepoch()-45)
-          AND a.revision=t.apply_revision AND a.status='ready' AND a.updated_at>unixepoch()-45
+          AND (t.service_mode='reverse_proxy' OR (a.revision=t.apply_revision AND a.status='ready' AND a.updated_at>unixepoch()-45))
           AND h.healthy=1 AND h.revision=t.apply_revision AND h.checked_at>unixepoch()-45
           AND p.healthy=1 AND p.revision=t.apply_revision AND p.checked_at>unixepoch()-45
           AND (n.id='local' OR p.address=n.public_ipv4)
@@ -235,6 +250,17 @@ fn view(
         "SELECT EXISTS(SELECT 1 FROM relay_node_authorizations WHERE node_id=?1 AND (?3 OR tenant_id=?2))",
         params![id, tenant, admin], |r| r.get::<_, bool>(0),
     ).map_err(db_error)?);
+    result["reverse_proxy_supported"] = json!(
+        id == "local"
+            || db
+                .query_row(
+                    "SELECT reverse_proxy_supported FROM relay_nodes WHERE id=?1",
+                    [id],
+                    |r| r.get::<_, bool>(0)
+                )
+                .map_err(db_error)?
+    );
+    result["reverse_proxy_selectable"] = json!(db.query_row("SELECT EXISTS(SELECT 1 FROM relay_proxy_authorizations WHERE node_id=?1 AND tenant_id=?2)", params![id,tenant], |r| r.get::<_,bool>(0)).map_err(db_error)?);
     result["selectable"] = json!(db.query_row(
         "SELECT EXISTS(SELECT 1 FROM relay_node_authorizations WHERE node_id=?1 AND tenant_id=?2)",
         params![id, tenant], |r| r.get::<_, bool>(0),
@@ -250,7 +276,7 @@ fn view(
     result["update"]=q.query_row([id],|r|Ok(json!({"stage":r.get::<_,String>(0)?,"error":r.get::<_,Option<String>>(1)?,"target_version":r.get::<_,String>(2)?}))).optional().map_err(db_error)?.unwrap_or(Value::Null);
     if admin {
         let mut q = db
-            .prepare("SELECT tenant_id FROM relay_node_grants WHERE node_id=?1 ORDER BY tenant_id")
+            .prepare("SELECT tenant_id FROM relay_node_grants WHERE node_id=?1 AND ?1!='local' UNION SELECT tenant_id FROM relay_local_proxy_grants WHERE ?1='local' ORDER BY tenant_id")
             .map_err(db_error)?;
         result["workspace_ids"] = json!(q
             .query_map([id], |r| r.get::<_, String>(0))
@@ -408,7 +434,7 @@ fn installation_url(state: &AppState) -> Result<String, ApiError> {
 }
 
 fn enrollment(state: &AppState, id: &str, token: &str, server_url: &str, data_port: u16) -> Value {
-    json!({"id":id,"token":token,"expires_at":unix_now()+1800,"version":env!("CARGO_PKG_VERSION"),
+    json!({"id":id,"token":token,"expires_at":unix_now()+1800,"version":releases::current_version(),
         "server_url":server_url,"http_port":state.config.caddy.http_port(),"data_port":data_port})
 }
 
@@ -464,7 +490,28 @@ async fn update(
 ) -> Result<Json<Value>, ApiError> {
     let actor = admin_write(&state, &headers)?;
     if id == "local" {
-        return Err(invalid("内置节点请通过服务器设置管理"));
+        {
+            let _dns_guard = state.tunnel_runtime.direct.dns_lock.lock().await;
+            let db = state.db.lock().map_err(db_error)?;
+            let tx = db.unchecked_transaction().map_err(db_error)?;
+            if let Some(grants) = input.workspace_ids {
+                tx.execute("DELETE FROM relay_local_proxy_grants", [])
+                    .map_err(db_error)?;
+                for tenant in grants {
+                    accounts::ensure_workspace_enabled(&tx, &tenant)?;
+                    tx.execute(
+                        "INSERT OR IGNORE INTO relay_local_proxy_grants VALUES(?1)",
+                        [tenant],
+                    )
+                    .map_err(db_error)?;
+                }
+            }
+            event(&tx, &id, &actor.user_id, "更新内置节点反向代理授权")?;
+            tx.commit().map_err(db_error)?;
+        }
+        reverse_proxy::changed(&state, false).await?;
+        let db = state.db.lock().map_err(db_error)?;
+        return Ok(Json(view(&state, &db, &id, &actor.tenant_id, true)?));
     }
     validate(&state, &input)?;
     let _dns_guard = state.tunnel_runtime.direct.dns_lock.lock().await;
@@ -538,4 +585,69 @@ async fn remove(
     )?;
     tx.commit().map_err(db_error)?;
     Ok(Json(json!({"removed":true})))
+}
+
+#[cfg(test)]
+mod proxy_permission_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn builtin_grant_api_is_admin_only_and_does_not_change_tunnel_grants() {
+        let (state, headers) = crate::tests::domain_fixture();
+        let input = |ids: Vec<&str>| {
+            serde_json::from_value(json!({"name":"内置节点","public_ipv4":"","workspace_ids":ids}))
+                .unwrap()
+        };
+        let Json(result) = update(
+            State(state.clone()),
+            headers.clone(),
+            Path("local".into()),
+            Json(input(vec!["default"])),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result["workspace_ids"], json!(["default"]));
+        state
+            .db
+            .lock()
+            .unwrap()
+            .execute("UPDATE users SET role='tenant' WHERE id='u'", [])
+            .unwrap();
+        assert!(services::authorize_proxy(&state.db.lock().unwrap(), "default", "local").is_ok());
+        assert_eq!(
+            update(
+                State(state.clone()),
+                headers.clone(),
+                Path("local".into()),
+                Json(input(vec![]))
+            )
+            .await
+            .unwrap_err()
+            .status,
+            StatusCode::FORBIDDEN
+        );
+        state
+            .db
+            .lock()
+            .unwrap()
+            .execute("UPDATE users SET role='system_admin' WHERE id='u'", [])
+            .unwrap();
+        let _ = update(
+            State(state.clone()),
+            headers,
+            Path("local".into()),
+            Json(input(vec![])),
+        )
+        .await
+        .unwrap();
+        state
+            .db
+            .lock()
+            .unwrap()
+            .execute("UPDATE users SET role='tenant' WHERE id='u'", [])
+            .unwrap();
+        let db = state.db.lock().unwrap();
+        assert!(services::authorize_proxy(&db, "default", "local").is_err());
+        assert!(db.query_row("SELECT EXISTS(SELECT 1 FROM relay_node_authorizations WHERE node_id='local' AND tenant_id='default')",[],|r|r.get::<_,bool>(0)).unwrap());
+    }
 }

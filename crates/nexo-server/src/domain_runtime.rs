@@ -21,7 +21,7 @@ use x509_parser::{extensions::GeneralName, pem::parse_x509_pem};
 
 #[cfg(test)]
 #[path = "domain_runtime_reverse_proxy_tests.rs"]
-mod reverse_proxy_tests;
+pub(crate) mod reverse_proxy_tests;
 #[cfg(test)]
 #[path = "service_access/caddy_tests.rs"]
 mod service_access_tests;
@@ -310,7 +310,7 @@ fn admin_listen(settings: &CaddyRuntimeConfig) -> Result<String> {
 }
 
 /// URL 只用于 Server 直连；隧道入口仍是已认证的本地 socket，保持原有回源方式。
-fn proxy_handler(upstream: &str) -> Result<Value> {
+pub(crate) fn proxy_handler(upstream: &str) -> Result<Value> {
     let mut handler = json!({"handler":"reverse_proxy","upstreams":[{"dial":upstream}],"stream_close_delay":300000000000_u64});
     if upstream.starts_with("http://") || upstream.starts_with("https://") {
         let url = reqwest::Url::parse(upstream)?;

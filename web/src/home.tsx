@@ -282,7 +282,7 @@ export function HomePage({ active, auth, managed }: { active: boolean; auth: Aut
       <a className="panel" href="#/domains"><span>域名</span><strong>{domains.data?.length ?? "—"}</strong><small>{domains.data ? `${items.filter(item => item.id.startsWith("d-")).length} 个需关注` : "总数"}</small></a>
     </div>
     <Notice error={tunnels.error} updatedAt={tunnels.updatedAt} onRetry={() => void tunnels.reload()} /><Notice error={devices.error} updatedAt={devices.updatedAt} onRetry={() => void devices.reload()} /><Notice error={domains.error} updatedAt={domains.updatedAt} onRetry={() => void domains.reload()} />
-    {complete && !devices.data!.length && !tunnels.data!.length && auth.role !== "system_admin" ? <div className="panel home-onboarding"><div><strong>接入第一台设备</strong><p>安装客户端，将内网服务连接到 Nexo。</p></div><a className="primary-button" href="#/agents">接入设备</a></div> : complete && !tunnels.data!.length ? <div className="panel home-onboarding"><div><strong>创建第一个服务</strong><p>内网穿透需要设备；管理员也可直接反代 VPS 服务。网页访问需先配置域名。</p></div><a className="primary-button" href="#/services">创建服务</a></div> : null}
+    {complete && !tunnels.data!.length ? <div className="panel home-onboarding"><div><strong>创建第一个服务</strong><p>内网穿透需要设备；反向代理可直接使用自己的已审批节点或管理员授权的节点。网页访问需先配置域名。</p></div><a className="primary-button" href="#/services">创建服务</a></div> : null}
     <div className="home-overview">
       <AttentionPanel items={items} complete={complete} spaceLabel={spaceLabel} />
       <TrafficPanel key={workspace ?? "own"} active={visible} auth={auth} managed={managed} ownTunnels={tunnels} />

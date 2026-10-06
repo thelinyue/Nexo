@@ -258,6 +258,7 @@ async fn enrollment_can_resume_without_changing_identity_or_permissions() {
         StatusCode::CONFLICT
     );
     assert_eq!(first["server_url"], "https://manage.example:8443");
+    assert_eq!(first["version"], releases::current_version());
     assert_eq!(first["http_port"], 8080);
     assert_eq!(first["data_port"], 9892);
     assert_eq!(
@@ -332,6 +333,7 @@ async fn enrollment_can_resume_without_changing_identity_or_permissions() {
         .await
         .unwrap()
         .0;
+    assert_eq!(third["version"], first["version"]);
     assert_ne!(second["token"], third["token"]);
     assert!(
         control::register(State(state.clone()), Json(registration(&second["token"])))

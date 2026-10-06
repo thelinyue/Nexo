@@ -180,6 +180,23 @@ test("手机更多选择列表可关闭、导航和区分用户权限", async ({
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
 });
 
+test("管理端更新时已是最新节点版本的 VPS 不提示更新，旧节点仍更新至节点版本", async ({ page }) => {
+  const { nodes } = await setup(page);
+  nodes[0].version = "0.2.18";
+  nodes[2].version = "0.2.16";
+  await page.route("**/api/v1/nodes", route => route.fulfill({ json: { nodes, server_version: "0.2.19" } }));
+  await page.route("**/api/v1/node-releases", route => route.fulfill({ json: [{ version: "0.2.18", architectures: ["aarch64", "x86_64"] }] }));
+  await page.goto("/#/nodes");
+  const current = page.getByRole("article", { name: "香港 VPS", exact: true });
+  await expect(current).toContainText("v0.2.18");
+  await expect(current.getByRole("button", { name: "更新版本", exact: true })).toHaveCount(0);
+  await page.getByRole("article", { name: "美国 VPS", exact: true }).getByRole("button", { name: "更新版本", exact: true }).click();
+  const dialog = page.getByRole("dialog", { name: "顺序更新节点" });
+  await expect(dialog.getByLabel("目标版本")).toHaveValue("0.2.18");
+  await expect(dialog).toContainText("v0.2.16 → v0.2.18");
+  await expect(dialog).not.toContainText("0.2.19");
+});
+
 test("更新展示逐服务备用入口，无备用时必须接受中断", async ({ page }) => {
   const { nodes } = await setup(page);
   nodes[0].services.push({ id: "media", name: "媒体服务", enabled: true, alternatives: [{ id: "us", name: "美国 VPS" }] }, { id: "files", name: "文件服务", enabled: true, alternatives: [] });
@@ -206,12 +223,13 @@ test("更新展示逐服务备用入口，无备用时必须接受中断", async
 test("普通用户添加节点使用公网管理地址和自定义端口，并自动跟进接入状态", async ({ page }, info) => {
   await setup(page, false);
   const node = { id: "new", name: "新 VPS", public_ipv4: "8.8.8.8", control_port: 9892, status: "unregistered", approved: false, enabled: true, registered: false, can_enroll: true, assigned: false, latencies: [], services: [], connections: 0 };
-  const enrollment = { id: node.id, token: "only-visible-in-copy", expires_at: Math.floor(Date.now() / 1000) + 1800, version: "0.2.12", server_url: "https://manage.example:8443", http_port: 8080, data_port: 9892 };
+  const enrollment = { id: node.id, token: "only-visible-in-copy", expires_at: Math.floor(Date.now() / 1000) + 1800, version: "0.2.18", server_url: "https://manage.example:8443", http_port: 8080, data_port: 9892 };
   let submitted: unknown;
   await page.route("**/api/v1/nodes", route => {
     if (route.request().method() === "POST") { submitted = route.request().postDataJSON(); return route.fulfill({ json: enrollment }); }
-    return route.fulfill({ json: { nodes: [node], server_version: "0.2.12" } });
+    return route.fulfill({ json: { nodes: [node], server_version: "0.2.19" } });
   });
+  await page.route("**/api/v1/node-releases", route => route.fulfill({ json: [{ version: "0.2.18", architectures: ["aarch64", "x86_64"] }] }));
   await page.route("**/api/v1/nodes/new", route => route.fulfill({ json: node }));
   await page.goto("/#/nodes");
   await page.getByRole("button", { name: "添加 节点", exact: true }).click();
@@ -227,6 +245,8 @@ test("普通用户添加节点使用公网管理地址和自定义端口，并�
   await dialog.getByLabel("HTTPS 端口").fill("8443");
   const command = dialog.locator("pre");
   await expect(command).toContainText("https://manage.example:8443/api/v1/node/install.sh");
+  await expect(command).toContainText("--version '0.2.18'");
+  await expect(command).not.toContainText("0.2.19");
   await expect(command).toContainText("--http-port 8080 --https-port 8443 --data-port 9892");
   expect(await command.textContent()).toContain(`<<'NEXO_ENROLLMENT'\n${enrollment.token}\nNEXO_ENROLLMENT\n`);
   await writeFile(info.outputPath("install-command.sh"), (await command.textContent())! + "\n");

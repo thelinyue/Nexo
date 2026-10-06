@@ -125,24 +125,49 @@ test("纯反代首页不要求接入设备且反代不出现在穿透统计筛�
   await expect(page.locator(".traffic-help")).toContainText("不含反向代理");
 });
 
-test("普通用户不提供反代创建入口且不能编辑管理员配置的反代", async ({ page }) => {
-  const state = await installApiMocks(page); state.tunnels.push({ ...proxy });
-  await page.route("**/api/v1/auth/status", route => route.fulfill({ json: { initialized: true, authenticated: true, user_id: "alice", workspace_id: "default", role: "tenant", username: "alice", csrf_token: "test-csrf" } }));
+test("普通用户无需设备即可创建和管理授权节点反代", async ({ page }) => {
+  const state = await installApiMocks(page); state.authRole = "tenant"; state.devices = []; state.tunnels = [];
+  await page.route("**/api/v1/nodes", route => route.fulfill({ json: { nodes: [{ id: "own", name: "我的节点", approved: true, enabled: true, status: "online", reverse_proxy_supported: true, reverse_proxy_selectable: true }] } }));
   await page.goto("/#/services");
-  await expect(page.getByRole("button", { name: "添加反向代理", exact: true })).toHaveCount(0);
-  await openServiceEditor(page);
-  await expect(page.getByRole("radio", { name: "反向代理", exact: true })).toHaveCount(0);
-  await page.getByRole("dialog").getByRole("button", { name: "取消", exact: true }).click();
-  await page.getByRole("link", { name: "VPS 应用", exact: true }).click();
-  await expect(page.getByRole("button", { name: "编辑服务", exact: true })).toBeDisabled();
-  await expect(page.getByRole("button", { name: "关闭服务", exact: true })).toBeDisabled();
-  await expect(page.getByRole("button", { name: "删除服务", exact: true })).toBeDisabled();
+  await expect(page.getByRole("heading", { name: "服务", exact: true })).toBeVisible();
+  await expect(page.locator(".service-row")).toHaveCount(state.tunnels.length);
+  await openServiceEditor(page, "reverse_proxy");
+  const dialog = page.getByRole("dialog", { name: "添加反向代理" });
+  await expect(dialog.getByRole("combobox", { name: "回源节点", exact: true })).toContainText("我的节点");
+  await expect(dialog.getByText("目标地址由所选节点访问，127.0.0.1 表示该节点本机。")).toBeVisible();
+  await dialog.getByLabel("服务名称").fill("普通用户应用");
+  await dialog.getByLabel("目标端口").fill("3000");
+  await dialog.getByLabel("主机名").fill("app");
+  await dialog.getByRole("button", { name: "保存服务" }).click();
+  await expect(dialog).toBeHidden();
+  expect(state.calls.find(call => call.method === "POST" && call.path === "/api/v1/tunnels")?.body).toMatchObject({ node_ids: ["own"], distribution_mode: "single", device_id: null });
+  await page.locator(".service-row").getByRole("link", { name: "普通用户应用", exact: true }).click();
+  await expect(page.getByRole("button", { name: "编辑服务", exact: true })).toBeEnabled();
+  await expect(page.getByRole("button", { name: "关闭服务", exact: true })).toBeEnabled();
+  await expect(page.getByRole("button", { name: "删除服务", exact: true })).toBeEnabled();
 });
 
+test("普通用户仅能选择授权且支持反代的节点，无可选节点禁止保存", async ({ page }) => {
+  const state = await installApiMocks(page); state.authRole = "tenant"; state.devices = [];
+  await page.route("**/api/v1/nodes", route => route.fulfill({ json: { nodes: [
+    { id: "local", name: "内置节点", approved: true, enabled: true, reverse_proxy_supported: true, reverse_proxy_selectable: false },
+    { id: "old", name: "旧节点", approved: true, enabled: true, reverse_proxy_supported: false, reverse_proxy_selectable: true },
+    { id: "pending", name: "待审批节点", approved: false, enabled: true, reverse_proxy_supported: true, reverse_proxy_selectable: true }
+  ] } }));
+  await page.goto("/#/services");
+  await expect(page.getByRole("heading", { name: "服务", exact: true })).toBeVisible();
+  await expect(page.locator(".service-row")).toHaveCount(state.tunnels.length);
+  await openServiceEditor(page, "reverse_proxy");
+  const dialog = page.getByRole("dialog", { name: "添加反向代理" });
+  await expect(dialog.getByText("没有可选节点，请先获得管理员审批、反向代理授权或升级节点。")).toBeVisible();
+  await expect(dialog.getByRole("button", { name: "保存服务" })).toBeDisabled();
+});
 
 test("反向代理默认强制 HTTPS，切换协议保留选择，编辑读取保存值", async ({ page }) => {
   const state = await installApiMocks(page); state.tunnels = [];
   await page.goto("/#/services");
+  await expect(page.getByRole("heading", { name: "服务", exact: true })).toBeVisible();
+  await expect(page.locator(".service-row")).toHaveCount(state.tunnels.length);
   await openServiceEditor(page, "reverse_proxy");
   const dialog = page.getByRole("dialog", { name: "添加反向代理" });
   const force = dialog.getByRole("switch", { name: "强制 HTTPS" });
@@ -167,4 +192,23 @@ test("反向代理默认强制 HTTPS，切换协议保留选择，编辑读取�
   await editor.getByRole("button", { name: "保存服务" }).click();
   await expect(editor).toBeHidden();
   expect(state.calls.find(call => call.method === "PUT")?.body).toMatchObject({ http_redirect_enabled: true });
+});
+
+test("管理员在内置节点配置明确分配反代权限", async ({ page }) => {
+  const state = await installApiMocks(page);
+  const node = { id: "local", name: "内置节点", public_ipv4: "", control_port: 9891, approved: true, enabled: true, registered: true, status: "online", connections: 0, services: [], latencies: [], workspace_ids: [] as string[] };
+  await page.route("**/api/v1/nodes", route => route.fulfill({ json: { nodes: [node] } }));
+  await page.route("**/api/v1/nodes/local", async route => {
+    if (route.request().method() === "PUT") { const body = route.request().postDataJSON(); state.calls.push({ method: "PUT", path: "/api/v1/nodes/local", body }); node.workspace_ids = body.workspace_ids; }
+    await route.fulfill({ json: node });
+  });
+  await page.goto("/#/nodes");
+  await page.getByRole("button", { name: /内置节点/ }).click();
+  const dialog = page.getByRole("dialog", { name: "内置节点", exact: true });
+  await dialog.getByRole("tab", { name: "配置", exact: true }).click();
+  await expect(dialog.getByText("为以下工作空间授权内置节点反向代理，包括访问 Server 本机及其可达内网。穿透权限不受影响。")).toBeVisible();
+  await dialog.getByRole("checkbox", { name: /alice/ }).check();
+  await dialog.getByRole("button", { name: "保存配置", exact: true }).click();
+  await expect(dialog).toBeHidden();
+  expect(state.calls.find(call => call.method === "PUT" && call.path === "/api/v1/nodes/local")?.body.workspace_ids).toEqual(["alice-space"]);
 });

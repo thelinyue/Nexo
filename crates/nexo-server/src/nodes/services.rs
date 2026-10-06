@@ -68,23 +68,31 @@ pub fn prepare(
             "单节点需选择一个节点，多节点需选择 2–16 个不同节点",
         ));
     }
+    let proxy = input.service_mode.as_deref() == Some("reverse_proxy");
+    if proxy && (input.node_group_id.is_some() || *mode != "single" || nodes.len() != 1) {
+        return Err(invalid("反向代理只能手动选择一个节点"));
+    }
     let remote = nodes.iter().any(|n| n != "local");
-    if (remote || *mode == "dns")
-        && (!matches!(input.protocol.as_str(), "http" | "https" | "tcp")
-            || input.service_mode.as_deref() == Some("reverse_proxy"))
+    if (remote || *mode == "dns") && (!matches!(input.protocol.as_str(), "http" | "https" | "tcp"))
     {
         return Err(invalid("多 VPS 仅支持 HTTP、HTTPS、TCP 内网穿透"));
     }
     for node in nodes.iter() {
+        if proxy {
+            authorize_proxy(db, tenant, node)?;
+            continue;
+        }
         let allowed=db.query_row("SELECT EXISTS(SELECT 1 FROM relay_nodes n WHERE n.id=?1 AND n.approved=1 AND n.enabled=1 AND n.removed_at IS NULL AND (n.id='local' OR EXISTS(SELECT 1 FROM relay_node_authorizations g WHERE g.node_id=n.id AND g.tenant_id=?2)))",params![node,tenant],|r|r.get::<_,bool>(0)).map_err(db_error)?;
         if !allowed {
             return Err(invalid("节点未审批、已停用或未分配给当前工作空间"));
         }
     }
     if remote {
-        let capable=db.query_row("SELECT EXISTS(SELECT 1 FROM devices WHERE id=?1 AND tenant_id=?2 AND node_capable=1)",params![input.device_id,tenant],|r|r.get::<_,bool>(0)).map_err(db_error)?;
-        if !capable {
-            return Err(invalid("请先连接支持多节点的新版本设备"));
+        if !proxy {
+            let capable=db.query_row("SELECT EXISTS(SELECT 1 FROM devices WHERE id=?1 AND tenant_id=?2 AND node_capable=1)",params![input.device_id,tenant],|r|r.get::<_,bool>(0)).map_err(db_error)?;
+            if !capable {
+                return Err(invalid("请先连接支持多节点的新版本设备"));
+            }
         }
         let domain = input
             .public_domain_id
@@ -117,6 +125,37 @@ pub fn prepare(
     nodes.sort();
     Ok(())
 }
+/// 反代权限和能力由控制器数据决定；节点离线允许保存，未升级则拒绝。
+pub fn authorize_proxy(db: &Connection, tenant: &str, node: &str) -> Result<(), ApiError> {
+    let allowed = db.query_row("SELECT EXISTS(SELECT 1 FROM relay_nodes n JOIN relay_proxy_authorizations a ON a.node_id=n.id WHERE n.id=?1 AND a.tenant_id=?2 AND n.approved=1 AND n.enabled=1 AND n.removed_at IS NULL)", params![node,tenant], |r| r.get::<_,bool>(0)).map_err(db_error)?;
+    if !allowed {
+        return Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "节点未审批、已停用或未授权当前工作空间使用反向代理",
+        ));
+    }
+    let supported = node == "local"
+        || db
+            .query_row(
+                "SELECT reverse_proxy_supported FROM relay_nodes WHERE id=?1",
+                [node],
+                |r| r.get::<_, bool>(0),
+            )
+            .map_err(db_error)?;
+    if !supported {
+        return Err(invalid("请先升级节点，以支持反向代理"));
+    }
+    Ok(())
+}
+
+/// 删除和停用不依赖节点权限；重新启用必须重新验证，不能利用旧绑定绕过撤权。
+pub fn authorize_proxy_enable(db: &Connection, tenant: &str, id: &str) -> Result<(), ApiError> {
+    for node in ids(db, id).map_err(db_error)? {
+        authorize_proxy(db, tenant, &node)?;
+    }
+    Ok(())
+}
+
 pub fn save(db: &Connection, id: &str, input: &TunnelInput) -> Result<(), ApiError> {
     let previous = ids(db, id).map_err(db_error)?;
     let nodes = input

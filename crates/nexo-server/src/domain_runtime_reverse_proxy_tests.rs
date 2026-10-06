@@ -21,7 +21,7 @@ fn direct_tls_keeps_host_and_verifies_target_while_tunnels_keep_socket_transport
 }
 
 /// 测试上游回显原始 HTTP 请求；WebSocket 握手后解码一帧并返回，验证真实升级后的双向通道。
-pub(super) async fn echo_origin<S: AsyncRead + AsyncWrite + Unpin>(
+pub(crate) async fn echo_origin<S: AsyncRead + AsyncWrite + Unpin>(
     mut stream: S,
     label: &str,
 ) -> anyhow::Result<()> {

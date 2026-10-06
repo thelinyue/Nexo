@@ -73,10 +73,19 @@ CREATE VIEW IF NOT EXISTS relay_node_authorizations AS
  SELECT node_id,tenant_id FROM relay_node_grants
  UNION SELECT m.node_id,g.tenant_id FROM relay_group_members m JOIN relay_group_grants g ON g.group_id=m.group_id
  UNION SELECT 'local',id FROM tenants;
-CREATE VIEW IF NOT EXISTS authorized_service_nodes AS
+-- 内置反代授权必须显式保存，不能复用默认授予所有工作空间的穿透授权。
+CREATE TABLE IF NOT EXISTS relay_local_proxy_grants(tenant_id TEXT PRIMARY KEY REFERENCES tenants(id) ON DELETE CASCADE);
+CREATE VIEW IF NOT EXISTS relay_proxy_authorizations AS
+ SELECT n.id AS node_id,n.owner_tenant AS tenant_id FROM relay_nodes n WHERE n.id!='local' AND n.owner_tenant IS NOT NULL
+ UNION SELECT node_id,tenant_id FROM relay_node_authorizations WHERE node_id!='local'
+ UNION SELECT 'local',tenant_id FROM relay_local_proxy_grants
+ UNION SELECT n.id,u.tenant_id FROM relay_nodes n CROSS JOIN users u WHERE u.role='system_admin' AND u.enabled=1;
+DROP VIEW IF EXISTS authorized_service_nodes;
+CREATE VIEW authorized_service_nodes AS
  SELECT s.service_id,s.node_id FROM service_nodes s JOIN tunnels t ON t.id=s.service_id
- JOIN relay_node_authorizations a ON a.node_id=s.node_id AND a.tenant_id=t.tenant_id
- WHERE t.node_group_id IS NULL OR EXISTS(SELECT 1 FROM relay_group_grants g JOIN relay_group_members m ON m.group_id=g.group_id WHERE g.group_id=t.node_group_id AND g.tenant_id=t.tenant_id AND m.node_id=s.node_id);
+ WHERE (t.service_mode='reverse_proxy' AND EXISTS(SELECT 1 FROM relay_nodes n WHERE n.id=s.node_id AND n.approved=1 AND n.enabled=1 AND n.removed_at IS NULL) AND EXISTS(SELECT 1 FROM relay_proxy_authorizations a WHERE a.node_id=s.node_id AND a.tenant_id=t.tenant_id))
+ OR (t.service_mode='tunnel' AND EXISTS(SELECT 1 FROM relay_node_authorizations a WHERE a.node_id=s.node_id AND a.tenant_id=t.tenant_id)
+ AND (t.node_group_id IS NULL OR EXISTS(SELECT 1 FROM relay_group_grants g JOIN relay_group_members m ON m.group_id=g.group_id WHERE g.group_id=t.node_group_id AND g.tenant_id=t.tenant_id AND m.node_id=s.node_id)));
 
 CREATE TRIGGER IF NOT EXISTS bind_builtin_node AFTER INSERT ON tunnels BEGIN INSERT OR IGNORE INTO service_nodes(service_id,node_id) VALUES(NEW.id,'local'); END;
 
