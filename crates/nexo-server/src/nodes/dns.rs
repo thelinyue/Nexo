@@ -36,6 +36,7 @@ struct Entry {
     target: super::health::Target,
     eligible: bool,
     maintenance: bool,
+    preserve_dns: bool,
 }
 
 #[derive(PartialEq, Eq)]
@@ -75,7 +76,11 @@ fn snapshot_from_db(state: &AppState, id: &str, local: &str, db: &Connection) ->
         .query_map(params![id, unix_now() - 45], |r| {
             let node: String = r.get(0)?;
             let supported: bool = r.get(3)?;
+            let exhausted = super::quota::policy(db, &node)
+                .map_err(|e| rusqlite::Error::ToSqlConversionFailure(e.into()))?
+                .is_some_and(|q| q.exhausted);
             Ok(Entry {
+                preserve_dns: !exhausted && super::updates::preserves_dns(db, &node, id)?,
                 target: super::health::Target {
                     address: if node == "local" {
                         local.to_owned()
@@ -91,7 +96,7 @@ fn snapshot_from_db(state: &AppState, id: &str, local: &str, db: &Connection) ->
                     },
                     node,
                 },
-                eligible: r.get(2)?,
+                eligible: r.get::<_, bool>(2)? && !exhausted,
                 maintenance: r.get(4)?,
             })
         })?
@@ -233,7 +238,35 @@ pub async fn sync(state: &AppState, id: &str) -> Result<()> {
     let desired = selected
         .iter()
         .map(|n| n.address.clone())
+        // 无备用的维护服务只保留已有地址，不把维护节点重新判定为健康或备用。
+        .chain(
+            observed
+                .entries
+                .iter()
+                .filter(|e| e.preserve_dns)
+                .map(|e| e.target.address.clone()),
+        )
         .collect::<HashSet<_>>();
+    if observed.entries.iter().any(|e| e.preserve_dns) {
+        let db = state
+            .db
+            .lock()
+            .map_err(|_| anyhow::anyhow!("数据库锁不可用"))?;
+        let records = db.prepare("SELECT address,written IS NOT NULL FROM relay_dns_records WHERE service_id=?1 AND hostname=?2 AND domain_id=?3")?
+            .query_map(params![id,host,domain], |r| Ok((r.get::<_, String>(0)?,r.get::<_, bool>(1)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        // 只有维护中且所有已写入的地址均保持不变时才跳过 DNS API，探测仍照常执行。
+        // 这避免 DNS 服务商暂不可用给单入口维护增加额外失败；不写入或覆盖任何外部记录。
+        if records.iter().all(|(_, written)| *written)
+            && records
+                .into_iter()
+                .map(|(address, _)| address)
+                .collect::<HashSet<_>>()
+                == desired
+        {
+            return Ok(());
+        }
+    }
     let zone = crate::direct::dns::zone(state, domain).await?;
     if !publication_current(state, id, &observed, &selected)? {
         return Ok(());

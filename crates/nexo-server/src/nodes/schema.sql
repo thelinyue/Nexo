@@ -66,6 +66,10 @@ CREATE TABLE IF NOT EXISTS relay_selection (
 );
 
 -- 组分配授予组内节点使用权；组服务还必须持续持有组授权，不能靠旧服务绑定继续转发。
+-- 节点账本独立于用户额度。未结算预算持久占用，重启不能重复花费。
+CREATE TABLE IF NOT EXISTS node_traffic_limits(node_id TEXT PRIMARY KEY REFERENCES relay_nodes(id),monthly_limit_bytes INTEGER,revision INTEGER NOT NULL DEFAULT 0,started_at INTEGER);
+CREATE TABLE IF NOT EXISTS node_traffic_months(node_id TEXT NOT NULL REFERENCES relay_nodes(id),month INTEGER NOT NULL,used_bytes INTEGER NOT NULL DEFAULT 0,reserved_bytes INTEGER NOT NULL DEFAULT 0,PRIMARY KEY(node_id,month));
+CREATE TABLE IF NOT EXISTS node_traffic_budgets(id TEXT PRIMARY KEY,node_id TEXT NOT NULL REFERENCES relay_nodes(id),service_id TEXT NOT NULL,service_revision INTEGER NOT NULL,quota_revision INTEGER NOT NULL,month INTEGER NOT NULL,reserved INTEGER NOT NULL,to_origin INTEGER NOT NULL DEFAULT 0,to_public INTEGER NOT NULL DEFAULT 0,finished INTEGER NOT NULL DEFAULT 0);
 CREATE TABLE IF NOT EXISTS relay_node_groups(id TEXT PRIMARY KEY,name TEXT NOT NULL,created_at INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS relay_group_members(group_id TEXT NOT NULL REFERENCES relay_node_groups(id) ON DELETE CASCADE,node_id TEXT NOT NULL REFERENCES relay_nodes(id),PRIMARY KEY(group_id,node_id));
 CREATE TABLE IF NOT EXISTS relay_group_grants(group_id TEXT NOT NULL REFERENCES relay_node_groups(id) ON DELETE CASCADE,tenant_id TEXT NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,PRIMARY KEY(group_id,tenant_id));

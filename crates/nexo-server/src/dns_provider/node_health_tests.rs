@@ -114,6 +114,173 @@ impl Fixture {
 }
 
 #[tokio::test]
+async fn completed_node_update_does_not_publish_failed_origin() {
+    let fixture = Fixture::new().await;
+    fixture
+        .state
+        .db
+        .lock()
+        .unwrap()
+        .execute("DELETE FROM service_nodes WHERE node_id='b'", [])
+        .unwrap();
+    for _ in 0..3 {
+        fixture.sync().await;
+    }
+    assert_eq!(fixture.addresses(), ["127.0.0.1"]);
+    fixture.state.db.lock().unwrap().execute_batch("INSERT INTO node_update_jobs(id,actor,target_version,status,accept_interruption,created_at) VALUES('maintenance','u','0.2.20','running',1,unixepoch());
+        INSERT INTO node_update_items(job_id,node_id,position,stage,deadline) VALUES('maintenance','a',0,'verifying',unixepoch()+120);
+        UPDATE relay_nodes SET maintenance=1 WHERE id='a';
+        UPDATE tunnel_applied_states SET status='failed',error_message='Connection refused';").unwrap();
+    let report = nexo_protocol::nodes::UpdateReport {
+        task_id: Some("maintenance-0-0".into()),
+        stage: "installed".into(),
+        error: None,
+    };
+    for _ in 0..3 {
+        assert!(
+            nodes::updates::advance(&fixture.state, "a", "0.2.20", 0, &report)
+                .unwrap()
+                .is_none()
+        );
+    }
+    assert!(fixture
+        .state
+        .db
+        .lock()
+        .unwrap()
+        .query_row(
+            "SELECT status='complete' FROM node_update_jobs WHERE id='maintenance'",
+            [],
+            |r| r.get::<_, bool>(0)
+        )
+        .unwrap());
+    fixture.sync().await;
+    assert!(
+        fixture.addresses().is_empty(),
+        "节点安装成功不能恢复故障服务的 A"
+    );
+    assert_eq!(fixture.health()[0]["healthy"], false);
+}
+
+#[tokio::test]
+async fn single_entry_maintenance_does_not_require_dns_provider_availability() {
+    let fixture = Fixture::new().await;
+    fixture
+        .state
+        .db
+        .lock()
+        .unwrap()
+        .execute("DELETE FROM service_nodes WHERE node_id='b'", [])
+        .unwrap();
+    for _ in 0..3 {
+        fixture.sync().await;
+    }
+    let original = fixture.dns.records.lock().unwrap().clone();
+    fixture.state.db.lock().unwrap().execute_batch("INSERT INTO node_update_jobs(id,actor,target_version,status,accept_interruption,created_at) VALUES('maintenance','u','0.2.20','running',1,unixepoch());
+        INSERT INTO node_update_items(job_id,node_id,position,stage,ttl_seconds) VALUES('maintenance','a',0,'installing',0);
+        UPDATE relay_nodes SET maintenance=1,last_seen=0 WHERE id='a';
+        DELETE FROM relay_service_health WHERE node_id='a'; DELETE FROM relay_public_health WHERE node_id='a';").unwrap();
+    fixture.tasks[0].abort();
+    fixture.sync().await;
+    fixture
+        .state
+        .db
+        .lock()
+        .unwrap()
+        .execute("UPDATE node_update_jobs SET status='paused'", [])
+        .unwrap();
+    fixture.sync().await;
+    assert_eq!(*fixture.dns.records.lock().unwrap(), original);
+    assert!(fixture
+        .state
+        .db
+        .lock()
+        .unwrap()
+        .query_row(
+            "SELECT error IS NULL FROM relay_dns_state WHERE service_id='s'",
+            [],
+            |r| r.get::<_, bool>(0)
+        )
+        .unwrap());
+    assert_eq!(
+        fixture.health()[0]["healthy"],
+        false,
+        "保留 DNS 不能把停机节点标为健康"
+    );
+}
+
+#[tokio::test]
+async fn maintenance_keeps_single_entry_dns_but_withdraws_shared_entries_and_honors_revocation() {
+    let fixture = Fixture::new().await;
+    for _ in 0..3 {
+        fixture.sync().await;
+    }
+    {
+        let db = fixture.state.db.lock().unwrap();
+        db.execute_batch("INSERT INTO tunnels(id,tenant_id,device_id,name,protocol,local_address,local_port,hostname,public_domain_id,created_at,updated_at) SELECT 'single',tenant_id,device_id,'single',protocol,local_address,local_port,'single',public_domain_id,0,0 FROM tunnels WHERE id='s';
+            DELETE FROM service_nodes WHERE service_id='single'; INSERT INTO service_nodes VALUES('single','a');
+            INSERT INTO tunnel_applied_states(tunnel_id,revision,status,updated_at) VALUES('single',1,'ready',unixepoch());
+            INSERT INTO relay_service_health(node_id,service_id,revision,healthy,checked_at) VALUES('a','single',1,1,unixepoch());").unwrap();
+    }
+    for _ in 0..3 {
+        nodes::dns::sync(&fixture.state, "single").await.unwrap();
+    }
+    let original = fixture
+        .dns
+        .records
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|r| r.name == "single.direct.test" && r.kind == "A")
+        .unwrap()
+        .clone();
+    {
+        let db = fixture.state.db.lock().unwrap();
+        db.execute_batch("INSERT INTO node_update_jobs(id,actor,target_version,status,accept_interruption,created_at) VALUES('maintenance','u','0.2.20','running',1,unixepoch());
+            INSERT INTO node_update_items(job_id,node_id,position,stage,ttl_seconds) VALUES('maintenance','a',0,'installing',60);
+            UPDATE relay_nodes SET maintenance=1,last_seen=0 WHERE id='a';
+            DELETE FROM relay_service_health WHERE node_id='a'; DELETE FROM relay_public_health WHERE node_id='a';").unwrap();
+    }
+    fixture.sync().await;
+    nodes::dns::sync(&fixture.state, "single").await.unwrap();
+    {
+        let records = fixture.dns.records.lock().unwrap();
+        assert!(
+            records.contains(&original),
+            "单入口的记录及 ID 必须保持不变"
+        );
+        assert!(!records
+            .iter()
+            .any(|r| r.name == "emby.direct.test" && r.kind == "A" && r.value == "127.0.0.1"));
+        assert!(records
+            .iter()
+            .any(|r| r.name == "emby.direct.test" && r.kind == "A" && r.value == "127.0.0.2"));
+    }
+    fixture
+        .state
+        .db
+        .lock()
+        .unwrap()
+        .execute("DELETE FROM relay_node_grants WHERE node_id='a'", [])
+        .unwrap();
+    nodes::dns::sync(&fixture.state, "single").await.unwrap();
+    assert!(!fixture
+        .dns
+        .records
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|r| r.name == "single.direct.test" && r.kind == "A"));
+    assert!(fixture
+        .dns
+        .records
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|r| r.kind == "AAAA"));
+}
+
+#[tokio::test]
 async fn mixed_nodes_reject_wrong_identity_withdraw_after_three_failures_and_recover() {
     let fixture = Fixture::new().await;
     fixture.body.lock().unwrap()["service_id"] = json!("wrong");

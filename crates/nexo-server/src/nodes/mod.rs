@@ -9,6 +9,7 @@ pub mod control;
 pub mod dns;
 pub mod groups;
 pub mod health;
+pub mod quota;
 pub mod releases;
 pub mod runtime;
 pub mod selection;
@@ -79,6 +80,11 @@ pub fn migrate(db: &Connection) -> Result<()> {
             "INTEGER NOT NULL DEFAULT 0",
         ),
         (
+            "relay_nodes",
+            "traffic_quota_supported",
+            "INTEGER NOT NULL DEFAULT 0",
+        ),
+        (
             "node_update_jobs",
             "operation",
             "TEXT NOT NULL DEFAULT 'update'",
@@ -125,6 +131,7 @@ pub fn migrate(db: &Connection) -> Result<()> {
         LEFT JOIN tunnel_applied_states a ON a.tunnel_id=t.id
         WHERE t.enabled=1 AND t.deleted_at IS NULL AND w.enabled=1
           AND n.approved=1 AND n.enabled=1 AND n.removed_at IS NULL
+          AND NOT EXISTS(SELECT 1 FROM node_traffic_limits q LEFT JOIN node_traffic_months m ON m.node_id=q.node_id AND m.month=unixepoch(strftime('%Y-%m-01','now','+8 hours'),'-8 hours') WHERE q.node_id=n.id AND q.monthly_limit_bytes IS NOT NULL AND (n.traffic_quota_supported=0 OR COALESCE(m.used_bytes,0)>=q.monthly_limit_bytes))
           AND (t.service_mode!='reverse_proxy' OR n.id='local' OR n.reverse_proxy_supported=1)
           AND (n.id='local' OR n.last_seen>unixepoch()-45)
           AND (t.service_mode='reverse_proxy' OR (a.revision=t.apply_revision AND a.status='ready' AND a.updated_at>unixepoch()-45))
@@ -164,6 +171,10 @@ pub fn routes() -> Router<AppState> {
         )
         .route("/api/v1/node/register", post(control::register))
         .route("/api/v1/nodes/{id}", get(detail).put(update).delete(remove))
+        .route(
+            "/api/v1/nodes/{id}/traffic/quota",
+            get(quota::get).put(quota::update),
+        )
         .route("/api/v1/nodes/{id}/approve", post(approve))
         .route("/api/v1/nodes/{id}/enrollment", post(renew_enrollment))
         .route(
@@ -246,6 +257,10 @@ fn view(
             && (admin || owner.as_deref() == Some(tenant))
     );
     result["enrollment_expires_at"] = json!(expires);
+    if id != "local" {
+        result["can_manage_quota"] = json!(admin || owner.as_deref() == Some(tenant));
+        result["traffic_quota"] = json!(quota::view(db, id, unix_now()).map_err(db_error)?);
+    }
     result["assigned"] = json!(db.query_row(
         "SELECT EXISTS(SELECT 1 FROM relay_node_authorizations WHERE node_id=?1 AND (?3 OR tenant_id=?2))",
         params![id, tenant, admin], |r| r.get::<_, bool>(0),
@@ -337,6 +352,7 @@ async fn detail(
 }
 #[derive(Deserialize)]
 struct Input {
+    monthly_limit_bytes: Option<Value>,
     name: String,
     public_ipv4: String,
     #[serde(default = "default_port")]
@@ -391,6 +407,14 @@ async fn create(
     let tx = db.unchecked_transaction().map_err(db_error)?;
     ensure_unique_endpoint(&tx, &id, &input)?;
     tx.execute("INSERT INTO relay_nodes(id,owner_tenant,name,public_ipv4,control_port,token_digest,token_expires,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",params![id,session.tenant_id,input.name.trim(),input.public_ipv4,input.control_port,auth::digest(&token),unix_now()+1800,unix_now()]).map_err(db_error)?;
+    if let Some(value) = &input.monthly_limit_bytes {
+        let limit = quota::parse_limit(value)?;
+        tx.execute(
+            "INSERT INTO node_traffic_limits(node_id,monthly_limit_bytes,revision) VALUES(?1,?2,1)",
+            params![id, limit],
+        )
+        .map_err(db_error)?;
+    }
     event(&tx, &id, &session.user_id, "提交 VPS 节点接入申请")?;
     tx.commit().map_err(db_error)?;
     Ok(Json(enrollment(

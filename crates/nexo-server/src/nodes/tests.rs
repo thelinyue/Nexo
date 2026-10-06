@@ -1,6 +1,6 @@
 use super::*;
 
-fn tenant(state: &AppState, id: &str) -> HeaderMap {
+pub(super) fn tenant(state: &AppState, id: &str) -> HeaderMap {
     let db = state.db.lock().unwrap();
     db.execute(
         "INSERT INTO tenants(id,name,created_at) VALUES(?1,?1,0)",

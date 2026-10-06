@@ -22,6 +22,8 @@ use tokio_util::{
     codec::{FramedRead, LinesCodec},
     sync::CancellationToken,
 };
+#[path = "runtime_budget.rs"]
+mod budget;
 
 #[derive(serde::Serialize, Deserialize)]
 struct NodeIdentity {
@@ -51,6 +53,7 @@ struct Runtime {
     connections: Arc<AtomicU64>,
     health: AsyncMutex<Vec<wire::ServiceHealth>>,
     access: AsyncMutex<Option<mpsc::Sender<Access>>>,
+    usage: AsyncMutex<Option<mpsc::UnboundedSender<wire::Request>>>,
     configured: AtomicBool,
     stop: CancellationToken,
     caddy: AsyncMutex<Option<Arc<crate::caddy::CaddySupervisor>>>,
@@ -145,6 +148,7 @@ pub async fn run(
         connections: Default::default(),
         health: Default::default(),
         access: Default::default(),
+        usage: Default::default(),
         configured: AtomicBool::new(false),
         stop: CancellationToken::new(),
         caddy: Default::default(),
@@ -208,6 +212,7 @@ async fn control(runtime: Arc<Runtime>, identity: Arc<NodeIdentity>) -> Result<(
         runtime.configured.store(false, Ordering::Release);
         runtime.snapshot.send_replace(Snapshot::default());
         *runtime.access.lock().await = None;
+        *runtime.usage.lock().await = None;
         if let Err(error) = result {
             tracing::warn!("节点管理连接中断，将重新连接：{error:#}");
         }
@@ -241,6 +246,8 @@ async fn control_session(runtime: &Arc<Runtime>, saved: &NodeIdentity) -> Result
     let mut interval = tokio::time::interval(Duration::from_secs(10));
     let (sender, mut access) = mpsc::channel::<Access>(32);
     *runtime.access.lock().await = Some(sender);
+    let (usage_sender, mut usage) = mpsc::unbounded_channel();
+    *runtime.usage.lock().await = Some(usage_sender);
     let mut requests = HashMap::new();
     let mut sequence = 0u64;
     let deadline = tokio::time::sleep(Duration::from_secs(45));
@@ -250,15 +257,18 @@ async fn control_session(runtime: &Arc<Runtime>, saved: &NodeIdentity) -> Result
             _=&mut deadline=>anyhow::bail!("管理服务端 45 秒未响应，停止转发"),
             Some(mut call)=access.recv()=>{
                 sequence=sequence.wrapping_add(1);
-                if let wire::Request::Access{request_id,..}=&mut call.request{*request_id=sequence;}
+                match &mut call.request {wire::Request::Access{request_id,..}|wire::Request::Budget{request_id,..}=>*request_id=sequence,_=>{}}
                 requests.retain(|_,reply:&mut tokio::sync::oneshot::Sender<wire::Response>|!reply.is_closed());
                 if requests.len()>=64{continue;}
                 tokio::time::timeout_at(deadline.deadline(), identity::write_message(&mut write,&call.request)).await.context("节点管理通道发送超时，停止转发")??;
                 requests.insert(sequence,call.reply);
             },
+            Some(report)=usage.recv()=>{
+                tokio::time::timeout_at(deadline.deadline(),identity::write_message(&mut write,&report)).await.context("节点流量结算发送超时")??;
+            },
             _=interval.tick()=>{
                 let services=runtime.health.lock().await.clone();
-                tokio::time::timeout_at(deadline.deadline(), identity::write_message(&mut write,&wire::Request::Poll{reverse_proxy_supported:true,version:env!("CARGO_PKG_VERSION").into(),os:operating_system(),architecture:std::env::consts::ARCH.into(),connections:runtime.connections.load(Ordering::Relaxed),services,update:update_report()})).await.context("节点管理通道发送超时，停止转发")??;
+                tokio::time::timeout_at(deadline.deadline(), identity::write_message(&mut write,&wire::Request::Poll{traffic_quota_supported:true,reverse_proxy_supported:true,version:env!("CARGO_PKG_VERSION").into(),os:operating_system(),architecture:std::env::consts::ARCH.into(),connections:runtime.connections.load(Ordering::Relaxed),services,update:update_report()})).await.context("节点管理通道发送超时，停止转发")??;
             },
             line=lines.next()=>{
                 let line=line.context("管理连接关闭")??;
@@ -266,7 +276,7 @@ async fn control_session(runtime: &Arc<Runtime>, saved: &NodeIdentity) -> Result
                 match serde_json::from_str::<wire::Response>(&line)?{
                     wire::Response::State{snapshot,command}=>{if let Some(command)=command{submit_update(command)?;}runtime.snapshot.send_if_modified(|old|if *old!=snapshot{runtime.configured.store(false,Ordering::Release);*old=snapshot;true}else{false});},
                     wire::Response::Error{message}=>anyhow::bail!("控制器拒绝：{message}"),
-                    response@wire::Response::Access{request_id,..}=>{if let Some(reply)=requests.remove(&request_id){let _=reply.send(response);}},
+                    response@wire::Response::Access{request_id,..}|response@wire::Response::Budget{request_id,..}=>{if let Some(reply)=requests.remove(&request_id){let _=reply.send(response);}},
                 }
             }
         }
@@ -353,12 +363,13 @@ async fn data_session(
             if request.cancel.is_cancelled()||!snapshot.borrow().services.contains(&request.service){continue;}
             let stream=tokio::time::timeout(Duration::from_secs(10),nexo_tunnel::new_outbound(&mut connection)).await??;
             let count=runtime.connections.clone();count.fetch_add(1,Ordering::Relaxed);
+            let metered_runtime=runtime.clone();
             copies.spawn(async move{
                 struct Count(Arc<AtomicU64>);impl Drop for Count{fn drop(&mut self){self.0.fetch_sub(1,Ordering::Relaxed);}}
                 let _count=Count(count);let mut stream=nexo_tunnel::into_tokio_io(stream);
                 let transfer=async{
                     nexo_tunnel::write_logical_header(&mut stream,&LogicalStreamHeader::new(&request.service.id,Uuid::new_v4().to_string(),request.service.revision)?).await?;
-                    tokio::io::copy_bidirectional(&mut stream,&mut request.socket).await?;anyhow::Ok(())
+                    budget::copy(&mut request.socket,&mut stream,metered_runtime,&request.service).await?;anyhow::Ok(())
                 };
                 tokio::select!{_=request.cancel.cancelled()=>{},result=transfer=>if let Err(error)=result{tracing::debug!("节点转发结束：{error:#}");}}
             });
@@ -478,6 +489,64 @@ async fn listeners(runtime: Arc<Runtime>, directory: PathBuf, node_id: String) -
                     Err(e) => error = Some(format!("入口监听失败：{e}")),
                 }
             }
+            // Caddy 仍负责 HTTPS 回源握手和证书校验；计量桥只转发原始 TCP 字节。
+            // 仅将 dial 改为回环地址，TLS SNI 和 Host 均继续来自原目标。
+            if let Some(target) = service.reverse_proxy_target.as_ref().filter(|_| {
+                next.traffic_quota.is_some()
+                    && !listeners.contains_key(&service.id)
+                    && error.is_none()
+            }) {
+                match TcpListener::bind("127.0.0.1:0").await {
+                    Ok(listener) => {
+                        let port = listener.local_addr()?.port();
+                        let cancel = CancellationToken::new();
+                        let stop = cancel.clone();
+                        let rt = runtime.clone();
+                        let served = service.clone();
+                        let target = reqwest::Url::parse(target)?;
+                        let host = target
+                            .host_str()
+                            .context("回源主机缺失")?
+                            .trim_matches(['[', ']'])
+                            .to_owned();
+                        let target_port = target.port_or_known_default().context("回源端口缺失")?;
+                        let task = tokio::spawn(async move {
+                            let mut copies = JoinSet::new();
+                            loop {
+                                tokio::select! {
+                                    _=stop.cancelled()=>break,
+                                    Some(_)=copies.join_next(),if !copies.is_empty()=>{},
+                                    incoming=listener.accept()=>{
+                                        let Ok((mut socket,_))=incoming else{break;};
+                                        if !rt.snapshot.borrow().accepting {continue;}
+                                        let rt=rt.clone();let served=served.clone();let host=host.clone();
+                                        copies.spawn(async move {
+                                            let count=rt.connections.clone();count.fetch_add(1,Ordering::Relaxed);
+                                            struct Count(Arc<AtomicU64>);impl Drop for Count{fn drop(&mut self){self.0.fetch_sub(1,Ordering::Relaxed);}}
+                                            let _count=Count(count);
+                                            let transfer=async {
+                                                let mut origin=tokio::time::timeout(Duration::from_secs(10),TcpStream::connect((host.as_str(),target_port))).await??;
+                                                budget::copy(&mut socket,&mut origin,rt,&served).await
+                                            };
+                                            if let Err(error)=transfer.await {tracing::debug!("节点反向代理计量连接结束：{error:#}");}
+                                        });
+                                    }
+                                }
+                            }
+                        });
+                        listeners.insert(
+                            service.id.clone(),
+                            Listener {
+                                service: service.clone(),
+                                cancel,
+                                port,
+                                task,
+                            },
+                        );
+                    }
+                    Err(e) => error = Some(format!("反向代理计量入口监听失败：{e}")),
+                }
+            }
             let upstream = service.reverse_proxy_target.clone().or_else(|| {
                 listeners
                     .get(&service.id)
@@ -540,6 +609,12 @@ async fn listeners(runtime: Arc<Runtime>, directory: PathBuf, node_id: String) -
                             handlers.push(check);
                         }
                         let mut proxy = crate::domain_runtime::proxy_handler(&upstream)?;
+                        if service.reverse_proxy_target.is_some() && next.traffic_quota.is_some() {
+                            proxy["upstreams"][0]["dial"] = json!(format!(
+                                "127.0.0.1:{}",
+                                listeners.get(&service.id).context("计量入口缺失")?.port
+                            ));
+                        }
                         // 撤权后由 Caddy 立即关闭旧配置中的长连接，沿用节点原有关闭行为。
                         proxy.as_object_mut().unwrap().remove("stream_close_delay");
                         proxy["headers"]["request"]["delete"] =

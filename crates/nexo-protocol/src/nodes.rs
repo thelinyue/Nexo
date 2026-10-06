@@ -39,11 +39,23 @@ pub struct AgentIdentity {
 }
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Snapshot {
+    /// 缺省表示旧控制器；支持计量的控制器即使不限额也下发独立月周期。
+    #[serde(default)]
+    pub traffic_quota: Option<NodeQuota>,
     #[serde(default)]
     pub data_port: u16,
     pub services: Vec<Service>,
     pub agents: Vec<AgentIdentity>,
     pub accepting: bool,
+}
+/// 节点只持有额度策略；用量以控制器持久化的预算和累计结算为准。
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NodeQuota {
+    pub revision: i64,
+    pub period_start: i64,
+    pub period_end: i64,
+    pub monthly_limit_bytes: Option<u64>,
+    pub exhausted: bool,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ServiceHealth {
@@ -65,6 +77,8 @@ pub struct UpdateReport {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Request {
     Poll {
+        #[serde(default)]
+        traffic_quota_supported: bool,
         /// 旧节点缺省为 false，控制器绝不向其下发直接回源服务。
         #[serde(default)]
         reverse_proxy_supported: bool,
@@ -74,6 +88,20 @@ pub enum Request {
         connections: u64,
         services: Vec<ServiceHealth>,
         update: UpdateReport,
+    },
+    Budget {
+        request_id: u64,
+        service_id: String,
+        service_revision: i64,
+        quota_revision: i64,
+        month: i64,
+        bytes: u32,
+    },
+    Usage {
+        grant_id: String,
+        to_origin: u64,
+        to_public: u64,
+        finished: bool,
     },
     Access {
         request_id: u64,
@@ -87,6 +115,11 @@ pub enum Request {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Response {
+    Budget {
+        request_id: u64,
+        grant_id: String,
+        bytes: u64,
+    },
     State {
         snapshot: Snapshot,
         command: Option<UpdateCommand>,

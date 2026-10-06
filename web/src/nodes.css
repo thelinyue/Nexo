@@ -1,5 +1,13 @@
 /* 实测延迟为主指标；状态文字与图标一起出现，不依赖颜色。 */
 .nodes-page { min-width:0; }
+.node-quota-heading { display:flex; align-items:center; justify-content:space-between; gap:12px; flex-wrap:wrap; }
+.node-quota-heading h3 { margin:0; }
+.node-quota-heading button { min-height:44px; }
+.node-quota p { overflow-wrap:anywhere; }
+.node-quota progress { width:100%; accent-color:var(--primary); }
+.node-quota details { color:var(--secondary); font-size:.8125rem; }
+.node-quota summary { cursor:pointer; min-height:44px; display:flex; align-items:center; }
+.node-form-fields fieldset { border:0; padding:0; margin:0; min-width:0; display:grid; gap:12px; }
 .node-page-caption { margin:0 0 16px; font-size:.8125rem; }
 .nodes-page .page-actions>.secondary-button { min-height:44px; padding:8px 12px; border-radius:10px; }
 .node-filters { display:flex; gap:8px; flex-wrap:wrap; margin-bottom:16px; align-items:center; }

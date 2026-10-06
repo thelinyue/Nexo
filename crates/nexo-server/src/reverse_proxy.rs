@@ -198,6 +198,16 @@ pub fn refresh_status(state: &AppState) -> Result<()> {
                     .db
                     .lock()
                     .map_err(|_| anyhow::anyhow!("数据库锁不可用"))?;
+                if crate::nodes::quota::policy(&db, &node)?.is_some_and(|q| q.exhausted) {
+                    updates.push(crate::transport::StatusUpdate {
+                        id,
+                        revision,
+                        error: Some(crate::nodes::quota::EXHAUSTED.into()),
+                        status: "checking".into(),
+                        protocols: None,
+                    });
+                    continue;
+                }
                 db.query_row("SELECT CASE WHEN n.last_seen>?3 AND n.maintenance=0 AND n.reverse_proxy_supported=1 AND h.revision=?4 AND h.checked_at>?3 AND h.healthy=1 THEN 'ready' ELSE 'checking' END,CASE WHEN n.reverse_proxy_supported=0 THEN '请先升级节点，以支持反向代理' WHEN n.last_seen IS NULL OR n.last_seen<=?3 THEN '等待节点连接' WHEN n.maintenance=1 THEN '节点正在维护' ELSE COALESCE(h.error,'等待节点加载当前反向代理配置') END FROM relay_nodes n LEFT JOIN relay_service_health h ON h.node_id=n.id AND h.service_id=?1 WHERE n.id=?2", params![id,node,unix_now()-45,revision], |r| Ok((r.get::<_,String>(0)?,r.get::<_,Option<String>>(1)?)))?
             };
             updates.push(crate::transport::StatusUpdate {

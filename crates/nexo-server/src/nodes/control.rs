@@ -94,6 +94,7 @@ pub async fn session(state: AppState, stream: TlsStream<TcpStream>, id: String) 
             _=&mut deadline=>anyhow::bail!("节点心跳超时（45 秒）"),
             _=tick.tick()=>{
                 authorized(&state,&id,&cert)?;
+                refresh_quota_health(&state,&id)?;
                 let snapshot=snapshot(&state,&id)?;
                 if last.as_ref()!=Some(&snapshot){identity::write_message(&mut write,&Response::State{snapshot:snapshot.clone(),command:None}).await?;last=Some(snapshot);}
             },
@@ -102,12 +103,14 @@ pub async fn session(state: AppState, stream: TlsStream<TcpStream>, id: String) 
                 authorized(&state,&id,&cert)?;
                 let request:Request=serde_json::from_str(&line)?;
                 match request{
-                    Request::Poll{version,os,architecture,connections,services,update,reverse_proxy_supported}=>{
+                    Request::Poll{version,os,architecture,connections,services,update,reverse_proxy_supported,traffic_quota_supported}=>{
                         anyhow::ensure!(version.len()<64&&os.len()<128&&architecture.len()<32&&services.len()<10000,"节点报告过大");
                         deadline.as_mut().reset(tokio::time::Instant::now()+Duration::from_secs(45));
+                        refresh_quota_health(&state,&id)?;
                         {
                             let db=state.db.lock().map_err(|_|anyhow::anyhow!("数据库锁不可用"))?;
                             db.execute("UPDATE relay_nodes SET version=?2,os=?3,architecture=?4,connections=?5,last_seen=?6,reverse_proxy_supported=?7 WHERE id=?1",params![id,version,os,architecture,connections.min(i64::MAX as u64),unix_now(),reverse_proxy_supported])?;
+                            db.execute("UPDATE relay_nodes SET traffic_quota_supported=?2 WHERE id=?1",params![id,traffic_quota_supported])?;
                             for report in services {
                                 record_health(&db, &id, report, unix_now())?;
                             }
@@ -115,6 +118,15 @@ pub async fn session(state: AppState, stream: TlsStream<TcpStream>, id: String) 
                         let command=super::updates::advance(&state,&id,&version,connections,&update)?;
                         let next=snapshot(&state,&id)?;
                         identity::write_message(&mut write,&Response::State{snapshot:next.clone(),command}).await?;last=Some(next);
+                    },
+                    Request::Budget{request_id,service_id,service_revision,quota_revision,month,bytes}=>{
+                        let (grant_id,bytes)={let db=state.db.lock().map_err(|_|anyhow::anyhow!("数据库锁不可用"))?;
+                            super::quota::reserve(&db,&id,&service_id,service_revision,quota_revision,month,bytes)?};
+                        identity::write_message(&mut write,&Response::Budget{request_id,grant_id,bytes}).await?;
+                    },
+                    Request::Usage{grant_id,to_origin,to_public,finished}=>{
+                        let db=state.db.lock().map_err(|_|anyhow::anyhow!("数据库锁不可用"))?;
+                        super::quota::settle(&db,&id,&grant_id,to_origin,to_public,finished)?;
                     },
                     Request::Access{request_id,service_id,method:_,path,headers,body}=>{
                         let authorized=snapshot(&state,&id)?.services.into_iter().find(|s|s.id==service_id).context("节点未获此服务认证权限")?;
@@ -128,6 +140,24 @@ pub async fn session(state: AppState, stream: TlsStream<TcpStream>, id: String) 
                 }
             }
         }
+    }
+    Ok(())
+}
+/// 跨月恢复不能继承上月健康样本；仅清理月界之前的结果，正常轮询不会反复重置。
+fn refresh_quota_health(state: &AppState, node: &str) -> Result<()> {
+    let db = state
+        .db
+        .lock()
+        .map_err(|_| anyhow::anyhow!("数据库锁不可用"))?;
+    if let Some(q) = super::quota::policy(&db, node)? {
+        db.execute(
+            "DELETE FROM relay_service_health WHERE node_id=?1 AND checked_at<?2",
+            params![node, q.period_start],
+        )?;
+        db.execute(
+            "DELETE FROM relay_public_health WHERE node_id=?1 AND checked_at<?2",
+            params![node, q.period_start],
+        )?;
     }
     Ok(())
 }
@@ -162,6 +192,13 @@ pub fn snapshot(state: &AppState, node: &str) -> Result<Snapshot> {
     let (enabled,maintenance):(bool,bool)=db.query_row("SELECT approved=1 AND enabled=1 AND removed_at IS NULL,maintenance FROM relay_nodes WHERE id=?1",[node],|r|Ok((r.get(0)?,r.get(1)?)))?;
     if !enabled {
         return Ok(Snapshot::default());
+    }
+    let traffic_quota = super::quota::policy(&db, node)?;
+    if traffic_quota.as_ref().is_some_and(|q| q.exhausted) {
+        return Ok(Snapshot {
+            traffic_quota,
+            ..Default::default()
+        });
     }
     let mut q=db.prepare("SELECT t.id,t.tenant_id,t.device_id,t.apply_revision,t.protocol,COALESCE(t.public_port,0),t.hostname||'.'||p.domain,t.https_port,t.access_mode,t.http_redirect_enabled,CASE WHEN t.service_mode='reverse_proxy' THEN t.origin_protocol||'://' ELSE NULL END,t.local_address,t.local_port FROM authorized_service_nodes s JOIN tunnels t ON t.id=s.service_id LEFT JOIN devices d ON d.id=t.device_id JOIN tenants w ON w.id=t.tenant_id LEFT JOIN public_domains p ON p.id=t.public_domain_id WHERE s.node_id=?1 AND t.enabled=1 AND t.deleted_at IS NULL AND w.enabled=1 AND ((t.service_mode='tunnel' AND d.status='online' AND d.node_capable=1) OR (t.service_mode='reverse_proxy' AND EXISTS(SELECT 1 FROM relay_nodes n WHERE n.id=s.node_id AND n.reverse_proxy_supported=1))) AND t.protocol IN ('http','https','tcp')")?;
     let mut services = q
@@ -243,6 +280,7 @@ pub fn snapshot(state: &AppState, node: &str) -> Result<Snapshot> {
         |r| r.get(0),
     )?;
     Ok(Snapshot {
+        traffic_quota,
         data_port,
         services,
         agents,

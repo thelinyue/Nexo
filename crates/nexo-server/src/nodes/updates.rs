@@ -140,6 +140,26 @@ pub fn has_alternatives(db: &Connection, node: &str) -> rusqlite::Result<bool> {
     }
     Ok(true)
 }
+
+/// 无健康备用的服务在节点维护期间保留原 A，避免固定 IP 因重启产生额外 DNS 中断。
+/// 只保留当前授权、当前配置已写入的记录；停用、撤权、改域名或地址不能借维护绕过清理。
+pub fn preserves_dns(db: &Connection, node: &str, service: &str) -> rusqlite::Result<bool> {
+    db.query_row("SELECT EXISTS(SELECT 1 FROM authorized_service_nodes s JOIN tunnels t ON t.id=s.service_id JOIN tenants w ON w.id=t.tenant_id JOIN relay_nodes n ON n.id=s.node_id JOIN public_domains p ON p.id=t.public_domain_id JOIN relay_dns_state d ON d.service_id=t.id JOIN relay_dns_records r ON r.service_id=t.id WHERE s.node_id=?1 AND t.id=?2 AND t.enabled=1 AND t.deleted_at IS NULL AND w.enabled=1 AND n.approved=1 AND n.enabled=1 AND n.removed_at IS NULL AND d.revision=t.apply_revision AND d.error IS NULL AND r.domain_id=p.id AND r.hostname=t.hostname||'.'||p.domain AND r.address=n.public_ipv4 AND r.written IS NOT NULL AND EXISTS(SELECT 1 FROM node_update_items i JOIN node_update_jobs j ON j.id=i.job_id WHERE i.node_id=n.id AND j.status IN ('queued','running','paused') AND i.stage NOT IN ('complete','skipped','cancelled') AND (n.maintenance=1 OR i.stage='restoring')) AND NOT EXISTS(SELECT 1 FROM relay_healthy_service_nodes h WHERE h.service_id=t.id AND h.node_id!=n.id))",params![node,service],|r|r.get(0))
+}
+
+/// 仅等待实际需要撤出的记录；同一节点上的单入口服务不参与多入口服务的 TTL 排空。
+fn withdrawal_ttl(db: &Connection, node: &str) -> rusqlite::Result<Option<i64>> {
+    let records = db.prepare("SELECT r.service_id,COALESCE(CAST(json_extract(r.written,'$.ttl') AS INTEGER),60) FROM relay_dns_records r JOIN relay_nodes n ON n.public_ipv4=r.address WHERE n.id=?1 AND r.written IS NOT NULL")?
+        .query_map([node], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut ttl = None;
+    for (service, seconds) in records {
+        if !preserves_dns(db, node, &service)? {
+            ttl = Some(ttl.unwrap_or(60).max(seconds));
+        }
+    }
+    Ok(ttl)
+}
 pub async fn list(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -291,17 +311,20 @@ pub fn advance(
     } else {
         "unknown"
     };
+    // 助手的 installed 已核对新进程与本机健康；管理端再确认当前任务、版本和节点资格。
+    // 业务恢复由逐服务健康与 DNS 协调处理，不能让一个后端故障锁住整个节点。
+    let installed = reported == "installed"
+        && report.error.is_none()
+        && current_version == target
+        && tx.query_row("SELECT EXISTS(SELECT 1 FROM relay_nodes WHERE id=?1 AND approved=1 AND enabled=1 AND removed_at IS NULL AND last_seen>?2)", params![node,unix_now()-45], |r| r.get::<_, bool>(0))?;
     if status == "paused" {
         // 管理进程重启或超时后只核对实际结果；恢复队列仍需管理员点击重试。
-        let next = if matches!(stage.as_str(), "installing" | "unknown")
-            && reported == "installed"
-            && current_version == target
-        {
-            Some(("verifying", "助手确认安装完成，正在核对服务入口"))
-        } else if stage == "verifying" && current_version == target && verified(&tx, node)? {
+        let next = if matches!(stage.as_str(), "installing" | "unknown") && installed {
+            Some(("verifying", "助手确认安装完成，正在核对节点状态"))
+        } else if stage == "verifying" && installed {
             Some((
                 "restoring",
-                "实际版本和服务入口已确认，点击重试恢复 DNS 并继续队列",
+                "节点安装已确认，点击重试按服务健康状态恢复入口并继续队列",
             ))
         } else if matches!(reported, "failed" | "rolled_back" | "rollback_failed") {
             Some((reported, "助手已确认维护结果，请核对后重试、跳过或取消"))
@@ -332,14 +355,19 @@ pub fn advance(
         tx.execute("UPDATE node_update_items SET stage=?3,deadline=?4,error=NULL,started_at=COALESCE(started_at,?5) WHERE job_id=?1 AND node_id=?2",params![job,node,next,deadline,unix_now()])?;
         Ok(())
     };
-    let ttl:i64=tx.query_row("SELECT COALESCE(MAX(CAST(json_extract(r.written,'$.ttl') AS INTEGER)),60) FROM relay_dns_records r JOIN relay_nodes n ON n.public_ipv4=r.address WHERE n.id=?1 AND r.written IS NOT NULL",[node],|r|r.get(0))?;
-    let withdraw = || -> Result<()> {
-        transition("withdrawing", None)?;
+    let begin_maintenance = || -> Result<()> {
+        tx.execute("UPDATE relay_nodes SET maintenance=1 WHERE id=?1", [node])?;
+        let ttl = withdrawal_ttl(&tx, node)?;
+        // 0 表示本次无需撤出 DNS，直接进入连接排空；沿用已有持久字段。
         tx.execute(
             "UPDATE node_update_items SET ttl_seconds=?3 WHERE job_id=?1 AND node_id=?2",
-            params![job, node, ttl.max(60)],
+            params![job, node, ttl.unwrap_or(0)],
         )?;
-        tx.execute("UPDATE relay_nodes SET maintenance=1 WHERE id=?1", [node])?;
+        if ttl.is_some() {
+            transition("withdrawing", None)?;
+        } else {
+            transition("draining", Some(unix_now() + 300))?;
+        }
         Ok(())
     };
     let mut command = None;
@@ -362,7 +390,7 @@ pub fn advance(
                         [&job],
                     )?;
                     if operation == "restart" {
-                        withdraw()?;
+                        begin_maintenance()?;
                     } else {
                         transition("downloading", Some(unix_now() + 900))?;
                     }
@@ -373,7 +401,7 @@ pub fn advance(
                     if !accept && !has_alternatives(&tx, node)? {
                         pause("下载完成，但备用入口已失效，暂停维护")?;
                     } else {
-                        withdraw()?;
+                        begin_maintenance()?;
                     }
                 } else if deadline.is_some_and(|d| d < unix_now()) {
                     pause("安装包下载未在预期时间内完成，状态待确认")?;
@@ -382,7 +410,7 @@ pub fn advance(
                 }
             }
             "withdrawing" => {
-                let remaining:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM relay_dns_records r JOIN relay_nodes n ON n.public_ipv4=r.address WHERE n.id=?1 AND r.written IS NOT NULL)",[node],|r|r.get(0))?;
+                let remaining = withdrawal_ttl(&tx, node)?.is_some();
                 if !remaining {
                     if deadline.is_none() {
                         let wait:i64=tx.query_row("SELECT ttl_seconds FROM node_update_items WHERE job_id=?1 AND node_id=?2",params![job,node],|r|r.get(0))?;
@@ -407,7 +435,7 @@ pub fn advance(
                 }
             }
             "installing" => {
-                if reported == "installed" && current_version == target {
+                if installed {
                     transition("verifying", Some(unix_now() + 120))?;
                 } else if deadline.is_some_and(|d| d <= unix_now()) {
                     pause("更新结果尚未确认，请核对节点实际版本；未恢复 DNS")?;
@@ -417,19 +445,40 @@ pub fn advance(
                 }
             }
             "verifying" => {
-                let unhealthy = !verified(&tx, node)?;
-                if !unhealthy && current_version == target {
+                if installed {
                     transition("restoring", Some(unix_now() + 120))?;
                     tx.execute("UPDATE relay_nodes SET maintenance=0 WHERE id=?1", [node])?;
                 } else if deadline.is_some_and(|d| d <= unix_now()) {
-                    pause("新版本已启动，但关联服务尚未恢复健康")?;
+                    pause("节点安装结果尚未确认，请核对实际版本与本机更新助手状态")?;
                 }
             }
             "restoring" => {
-                let unhealthy:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM tunnels t JOIN service_nodes s ON s.service_id=t.id LEFT JOIN relay_dns_state d ON d.service_id=t.id WHERE s.node_id=?1 AND t.enabled=1 AND t.deleted_at IS NULL AND (d.service_id IS NULL OR d.error IS NOT NULL OR d.revision!=t.apply_revision OR d.synced_at<?2))",params![node,deadline.unwrap_or(i64::MAX)-120],|r|r.get(0))?;
+                if !installed {
+                    pause("恢复入口时节点安装结果或在线状态发生变化，请核对节点与本机更新助手")?;
+                    tx.commit()?;
+                    return Ok(None);
+                }
+                // 只等待当前健康且需要域名解析的服务；故障服务继续由协调器撤出或等待恢复。
+                let pending = tx.prepare("SELECT t.id FROM tunnels t JOIN relay_healthy_service_nodes s ON s.service_id=t.id LEFT JOIN relay_dns_state d ON d.service_id=t.id WHERE s.node_id=?1 AND t.service_mode='tunnel' AND t.public_domain_id IS NOT NULL AND t.hostname IS NOT NULL AND t.hostname!='' AND (d.service_id IS NULL OR d.error IS NOT NULL OR d.revision!=t.apply_revision OR d.synced_at<?2)")?
+                    .query_map(params![node,deadline.unwrap_or(i64::MAX)-120], |r| r.get::<_, String>(0))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                let mut unhealthy = false;
+                for service in pending {
+                    // 混合绑定也逐服务恢复：保留原解析的服务无需依赖新一次 DNS 同步。
+                    if !preserves_dns(&tx, node, &service)? {
+                        unhealthy = true;
+                        break;
+                    }
+                }
                 if !unhealthy {
+                    let services = unhealthy_services(&tx, node)?;
+                    let message = if services.is_empty() {
+                        "节点维护完成，版本已确认；入口按服务健康状态恢复".to_owned()
+                    } else {
+                        format!("节点维护完成，版本已确认；{} 个关联服务尚未恢复健康：{}，请在服务详情检查", services.len(), services.join("、"))
+                    };
                     transition("complete", None)?;
-                    tx.execute("INSERT INTO relay_node_events(node_id,actor,message,occurred_at) SELECT ?2,actor,'节点维护完成，版本和服务已验证',?3 FROM node_update_jobs WHERE id=?1",params![job,node,unix_now()])?;
+                    tx.execute("INSERT INTO relay_node_events(node_id,actor,message,occurred_at) SELECT ?2,actor,?3,?4 FROM node_update_jobs WHERE id=?1",params![job,node,message,unix_now()])?;
                     tx.execute("UPDATE node_update_items SET finished_at=?3 WHERE job_id=?1 AND node_id=?2",params![job,node,unix_now()])?;
                 } else if deadline.is_some_and(|d| d <= unix_now()) {
                     pause("节点已恢复，DNS 更新尚未完成，后续队列暂停")?;
@@ -447,10 +496,10 @@ pub fn advance(
     }))
 }
 
-/// 维护后的验证必须同时包含配置版本、Agent 通道及公网探测，旧统计不能视为恢复。
-fn verified(db: &Connection, node: &str) -> rusqlite::Result<bool> {
-    // 维护节点继续接受检查，但恢复前不能作为 DNS 候选或其他节点的备用入口。
-    db.query_row("SELECT NOT EXISTS(SELECT 1 FROM authorized_service_nodes s JOIN tunnels t ON t.id=s.service_id JOIN tenants w ON w.id=t.tenant_id WHERE s.node_id=?1 AND t.enabled=1 AND t.deleted_at IS NULL AND w.enabled=1 AND NOT EXISTS(SELECT 1 FROM relay_ready_service_nodes h WHERE h.service_id=s.service_id AND h.node_id=s.node_id))",[node],|r|r.get(0))
+/// 服务故障记录与节点安装结果分开；当前配置、Agent 通道和公网检查仍共同决定服务健康。
+fn unhealthy_services(db: &Connection, node: &str) -> rusqlite::Result<Vec<String>> {
+    db.prepare("SELECT t.name FROM authorized_service_nodes s JOIN tunnels t ON t.id=s.service_id JOIN tenants w ON w.id=t.tenant_id WHERE s.node_id=?1 AND t.enabled=1 AND t.deleted_at IS NULL AND w.enabled=1 AND NOT EXISTS(SELECT 1 FROM relay_ready_service_nodes h WHERE h.service_id=s.service_id AND h.node_id=s.node_id) ORDER BY t.name,t.id")?
+        .query_map([node], |r| r.get(0))?.collect()
 }
 
 /// 节点停止轮询时也要暂停持久任务，重启后根据同一任务状态核对，不能把失联算作成功。
@@ -520,6 +569,313 @@ mod tests {
                 [unix_now() - 1],
             )
             .unwrap();
+    }
+    fn single_entry(state: &AppState) {
+        state.db.lock().unwrap().execute_batch("DELETE FROM service_nodes WHERE service_id='s' AND node_id='b';
+            UPDATE node_update_jobs SET accept_interruption=1;
+            INSERT INTO relay_dns_records(service_id,domain_id,hostname,address,written) VALUES('s','d','service.test.example','203.0.113.10','{\"ttl\":180}');
+            INSERT INTO relay_dns_state VALUES('s',1,0,NULL);").unwrap();
+    }
+
+    fn verifying_job(state: &AppState) {
+        job(state);
+        state.db.lock().unwrap().execute_batch("UPDATE node_update_jobs SET status='running';
+            UPDATE node_update_items SET stage='verifying',deadline=unixepoch()+120 WHERE node_id='a';
+            UPDATE relay_nodes SET maintenance=1 WHERE id='a';
+            INSERT INTO relay_dns_state VALUES('s',1,unixepoch(),NULL);").unwrap();
+    }
+
+    #[test]
+    fn failed_origin_does_not_block_other_services_or_mark_it_healthy() {
+        let (state, _) = fixture();
+        verifying_job(&state);
+        state.db.lock().unwrap().execute_batch("INSERT INTO tunnels(id,tenant_id,name,protocol,local_address,local_port,public_port,hostname,public_domain_id,created_at,updated_at) VALUES('bad','default','Synctv','tcp','127.0.0.1',8066,50002,'tv','d',0,0);
+            DELETE FROM service_nodes WHERE service_id='bad'; INSERT INTO service_nodes VALUES('bad','a');
+            INSERT INTO tunnel_applied_states(tunnel_id,revision,status,error_message,updated_at) VALUES('bad',1,'failed','Connection refused',unixepoch());").unwrap();
+        advance(&state, "a", "0.2.11", 0, &report("installed")).unwrap();
+        assert_eq!(stage(&state).1, "restoring");
+        {
+            let db = state.db.lock().unwrap();
+            assert!(!db
+                .query_row(
+                    "SELECT maintenance FROM relay_nodes WHERE id='a'",
+                    [],
+                    |r| r.get::<_, bool>(0)
+                )
+                .unwrap());
+            assert!(db.query_row("SELECT EXISTS(SELECT 1 FROM relay_healthy_service_nodes WHERE node_id='a' AND service_id='s')", [], |r| r.get::<_, bool>(0)).unwrap());
+            assert!(!db.query_row("SELECT EXISTS(SELECT 1 FROM relay_healthy_service_nodes WHERE node_id='a' AND service_id='bad')", [], |r| r.get::<_, bool>(0)).unwrap());
+        }
+        advance(&state, "a", "0.2.11", 0, &report("installed")).unwrap();
+        assert_eq!(stage(&state).1, "complete");
+        let message: String = state
+            .db
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT message FROM relay_node_events WHERE node_id='a' ORDER BY id DESC LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(message.contains("Synctv"));
+        assert!(message.contains("尚未恢复健康"));
+    }
+
+    #[test]
+    fn installed_node_can_finish_with_all_origins_failed_or_no_services() {
+        for no_services in [false, true] {
+            let (state, _) = fixture();
+            verifying_job(&state);
+            let db = state.db.lock().unwrap();
+            db.execute("UPDATE tunnel_applied_states SET status='failed',error_message='Connection refused'", []).unwrap();
+            if no_services {
+                db.execute("DELETE FROM service_nodes WHERE node_id='a'", [])
+                    .unwrap();
+            }
+            drop(db);
+            advance(&state, "a", "0.2.11", 0, &report("installed")).unwrap();
+            advance(&state, "a", "0.2.11", 0, &report("installed")).unwrap();
+            assert_eq!(stage(&state).1, "complete");
+        }
+    }
+
+    #[test]
+    fn verification_cannot_accept_unknown_or_wrong_install_result() {
+        for (version, result) in [
+            ("0.2.10", report("installed")),
+            ("0.2.11", report("downloaded")),
+            (
+                "0.2.11",
+                nexo_protocol::nodes::UpdateReport {
+                    task_id: Some("old-job-0-0".into()),
+                    ..report("installed")
+                },
+            ),
+            (
+                "0.2.11",
+                nexo_protocol::nodes::UpdateReport {
+                    error: Some("安装结果有误".into()),
+                    ..report("installed")
+                },
+            ),
+        ] {
+            let (state, _) = fixture();
+            verifying_job(&state);
+            advance(&state, "a", version, 0, &result).unwrap();
+            assert_eq!(stage(&state).1, "verifying");
+        }
+        for change in [
+            "UPDATE relay_nodes SET last_seen=unixepoch()-46 WHERE id='a'",
+            "UPDATE relay_nodes SET approved=0 WHERE id='a'",
+            "UPDATE relay_nodes SET enabled=0 WHERE id='a'",
+            "UPDATE relay_nodes SET removed_at=unixepoch() WHERE id='a'",
+        ] {
+            let (state, _) = fixture();
+            verifying_job(&state);
+            state.db.lock().unwrap().execute_batch(change).unwrap();
+            advance(&state, "a", "0.2.11", 0, &report("installed")).unwrap();
+            assert_eq!(stage(&state).1, "verifying");
+        }
+    }
+
+    #[tokio::test]
+    async fn healthy_service_dns_failure_pauses_and_retry_does_not_reinstall() {
+        let (state, admin) = fixture();
+        verifying_job(&state);
+        state
+            .db
+            .lock()
+            .unwrap()
+            .execute("UPDATE relay_dns_state SET error='DNS 服务商不可用'", [])
+            .unwrap();
+        advance(&state, "a", "0.2.11", 0, &report("installed")).unwrap();
+        assert_eq!(stage(&state).1, "restoring");
+        expired(&state);
+        advance(&state, "a", "0.2.11", 0, &report("installed")).unwrap();
+        assert_eq!(stage(&state), ("paused".into(), "restoring".into()));
+        let _ = action(
+            State(state.clone()),
+            admin,
+            Path("job".into()),
+            Json(Action {
+                action: "retry".into(),
+            }),
+        )
+        .await
+        .unwrap();
+        state
+            .db
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE relay_dns_state SET error=NULL,synced_at=?1",
+                [unix_now()],
+            )
+            .unwrap();
+        assert!(advance(&state, "a", "0.2.11", 0, &report("installed"))
+            .unwrap()
+            .is_none());
+        assert_eq!(stage(&state).1, "complete");
+    }
+
+    #[test]
+    fn services_without_managed_domain_do_not_wait_for_dns() {
+        for proxy in [false, true] {
+            let (state, _) = fixture();
+            verifying_job(&state);
+            let db = state.db.lock().unwrap();
+            db.execute("DELETE FROM relay_dns_state", []).unwrap();
+            if proxy {
+                db.execute_batch("UPDATE tunnels SET service_mode='reverse_proxy'; UPDATE relay_nodes SET reverse_proxy_supported=1;").unwrap();
+            } else {
+                db.execute("UPDATE tunnels SET public_domain_id=NULL,hostname=NULL", [])
+                    .unwrap();
+            }
+            drop(db);
+            advance(&state, "a", "0.2.11", 0, &report("installed")).unwrap();
+            advance(&state, "a", "0.2.11", 0, &report("installed")).unwrap();
+            assert_eq!(stage(&state).1, "complete");
+        }
+    }
+
+    #[test]
+    fn single_entry_update_keeps_dns_and_skips_ttl_and_dns_restoration() {
+        let (state, _) = fixture();
+        job(&state);
+        single_entry(&state);
+        advance(&state, "a", "0.2.10", 1, &Default::default()).unwrap();
+        advance(&state, "a", "0.2.10", 1, &report("downloaded")).unwrap();
+        assert_eq!(stage(&state), ("running".into(), "draining".into()));
+        assert!(preserves_dns(&state.db.lock().unwrap(), "a", "s").unwrap());
+        assert!(advance(&state, "a", "0.2.10", 1, &report("downloaded"))
+            .unwrap()
+            .is_none());
+        let command = advance(&state, "a", "0.2.10", 0, &report("downloaded"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(command.action, "install");
+        assert!(preserves_dns(&state.db.lock().unwrap(), "a", "s").unwrap());
+        advance(&state, "a", "0.2.11", 0, &report("installed")).unwrap();
+        assert_eq!(stage(&state).1, "verifying");
+        healthy(&state, "a");
+        advance(&state, "a", "0.2.11", 0, &report("installed")).unwrap();
+        assert_eq!(stage(&state).1, "restoring");
+        // 原 DNS 未变化，即使没有新的 DNS 同步时间，也能在健康核验后完成。
+        advance(&state, "a", "0.2.11", 0, &report("installed")).unwrap();
+        assert_eq!(stage(&state).1, "complete");
+        assert_eq!(
+            state
+                .db
+                .lock()
+                .unwrap()
+                .query_row("SELECT COUNT(*) FROM relay_dns_records", [], |r| r
+                    .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn mixed_services_only_wait_for_records_with_a_healthy_alternative() {
+        let (state, _) = fixture();
+        job(&state);
+        state.db.lock().unwrap().execute_batch("UPDATE node_update_jobs SET accept_interruption=1;
+            INSERT INTO tunnels(id,tenant_id,name,protocol,local_address,local_port,public_port,hostname,public_domain_id,created_at,updated_at) VALUES('single','default','single','tcp','127.0.0.1',80,50002,'single','d',0,0);
+            DELETE FROM service_nodes WHERE service_id='single'; INSERT INTO service_nodes VALUES('single','a');
+            INSERT INTO relay_dns_state VALUES('single',1,0,NULL);
+            INSERT INTO relay_dns_records(service_id,domain_id,hostname,address,written) VALUES('single','d','single.test.example','203.0.113.10','{\"ttl\":7200}'),('s','d','service.test.example','203.0.113.10','{\"ttl\":180}');").unwrap();
+        advance(&state, "a", "0.2.10", 0, &Default::default()).unwrap();
+        advance(&state, "a", "0.2.10", 0, &report("downloaded")).unwrap();
+        assert_eq!(stage(&state).1, "withdrawing");
+        {
+            let db = state.db.lock().unwrap();
+            assert!(preserves_dns(&db, "a", "single").unwrap());
+            assert!(!preserves_dns(&db, "a", "s").unwrap());
+            assert_eq!(withdrawal_ttl(&db, "a").unwrap(), Some(180));
+            db.execute("DELETE FROM relay_dns_records WHERE service_id='s'", [])
+                .unwrap();
+        }
+        advance(&state, "a", "0.2.10", 0, &report("downloaded")).unwrap();
+        let deadline: i64 = state
+            .db
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT deadline FROM node_update_items WHERE node_id='a'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!((unix_now() + 179..=unix_now() + 181).contains(&deadline));
+        expired(&state);
+        advance(&state, "a", "0.2.10", 0, &report("downloaded")).unwrap();
+        assert_eq!(
+            stage(&state).1,
+            "draining",
+            "保留的单入口记录不能阻塞撤出阶段"
+        );
+        assert_eq!(
+            advance(&state, "a", "0.2.10", 0, &report("downloaded"))
+                .unwrap()
+                .unwrap()
+                .action,
+            "install"
+        );
+        advance(&state, "a", "0.2.11", 0, &report("installed")).unwrap();
+        healthy(&state, "a");
+        state.db.lock().unwrap().execute_batch("INSERT INTO tunnel_applied_states(tunnel_id,revision,status,updated_at) VALUES('single',1,'ready',unixepoch());
+            INSERT INTO relay_service_health(node_id,service_id,revision,healthy,checked_at) VALUES('a','single',1,1,unixepoch());
+            INSERT INTO relay_public_health(node_id,service_id,revision,healthy,checked_at,address) VALUES('a','single',1,1,unixepoch(),'203.0.113.10');").unwrap();
+        advance(&state, "a", "0.2.11", 0, &report("installed")).unwrap();
+        assert_eq!(stage(&state).1, "restoring");
+        advance(&state, "a", "0.2.11", 0, &report("installed")).unwrap();
+        assert_eq!(
+            stage(&state).1,
+            "restoring",
+            "撤出的多入口服务仍须等待 DNS 恢复"
+        );
+        state
+            .db
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO relay_dns_state VALUES('s',1,?1,NULL)",
+                [unix_now()],
+            )
+            .unwrap();
+        advance(&state, "a", "0.2.11", 0, &report("installed")).unwrap();
+        assert_eq!(
+            stage(&state).1,
+            "complete",
+            "保留原 A 的服务无需新的 DNS 同步时间"
+        );
+    }
+
+    #[test]
+    fn maintenance_dns_preservation_cannot_override_configuration_or_authorization() {
+        for change in [
+            "UPDATE tunnels SET enabled=0 WHERE id='s'",
+            "UPDATE tunnels SET deleted_at=1 WHERE id='s'",
+            "UPDATE tunnels SET apply_revision=2 WHERE id='s'",
+            "UPDATE tunnels SET hostname='changed' WHERE id='s'",
+            "UPDATE relay_dns_state SET error='受管记录已被外部修改'",
+            "UPDATE relay_nodes SET public_ipv4='203.0.113.20' WHERE id='a'",
+            "UPDATE relay_nodes SET enabled=0 WHERE id='a'",
+            "UPDATE tenants SET enabled=0",
+            "DELETE FROM relay_node_grants WHERE node_id='a'",
+            "UPDATE node_update_jobs SET status='cancelled'",
+        ] {
+            let (state, _) = fixture();
+            job(&state);
+            single_entry(&state);
+            let db = state.db.lock().unwrap();
+            db.execute("UPDATE relay_nodes SET maintenance=1 WHERE id='a'", [])
+                .unwrap();
+            assert!(preserves_dns(&db, "a", "s").unwrap());
+            db.execute_batch(change).unwrap();
+            assert!(!preserves_dns(&db, "a", "s").unwrap(), "{change}");
+        }
     }
     #[tokio::test]
     async fn rolling_update_waits_for_actual_ttl_and_explicit_drain_decision() {
@@ -612,7 +968,24 @@ mod tests {
         advance(&state, "a", "0.2.11", 0, &report("installed")).unwrap();
         assert_eq!(stage(&state).1, "verifying");
         advance(&state, "a", "0.2.11", 0, &report("installed")).unwrap();
-        assert_eq!(stage(&state).1, "verifying", "旧健康记录必须已清除");
+        assert_eq!(
+            stage(&state).1,
+            "restoring",
+            "助手确认节点安装后，逐服务恢复入口"
+        );
+        assert!(
+            !state
+                .db
+                .lock()
+                .unwrap()
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM relay_healthy_service_nodes WHERE node_id='a')",
+                    [],
+                    |r| r.get::<_, bool>(0)
+                )
+                .unwrap(),
+            "旧健康记录不能用于恢复入口"
+        );
         healthy(&state, "a");
         advance(&state, "a", "0.2.11", 0, &report("installed")).unwrap();
         assert_eq!(stage(&state).1, "restoring");
@@ -658,7 +1031,7 @@ mod tests {
         assert!(advance(&state, "b", "0.2.10", 0, &Default::default())
             .unwrap()
             .is_none());
-        healthy(&state, "a");
+        state.db.lock().unwrap().execute("UPDATE tunnel_applied_states SET status='failed',error_message='Connection refused'", []).unwrap();
         advance(&state, "a", "0.2.11", 0, &report("installed")).unwrap();
         assert_eq!(stage(&state), ("paused".into(), "restoring".into()));
         assert!(state
@@ -695,47 +1068,56 @@ mod tests {
     }
 
     #[test]
-    fn maintenance_verification_requires_current_method_address_and_origin() {
+    fn service_recovery_requires_current_method_address_and_origin() {
         let (state, _) = fixture();
         let db = state.db.lock().unwrap();
         db.execute_batch(
             "UPDATE tunnels SET protocol='http'; UPDATE relay_nodes SET maintenance=1 WHERE id='a'",
         )
         .unwrap();
-        assert!(verified(&db, "a").unwrap(), "旧节点仍允许 TCP 兼容检查");
+        assert!(
+            unhealthy_services(&db, "a").unwrap().is_empty(),
+            "旧节点仍允许 TCP 兼容检查"
+        );
         db.execute(
             "UPDATE relay_service_health SET public_probe_supported=1 WHERE node_id='a'",
             [],
         )
         .unwrap();
-        assert!(!verified(&db, "a").unwrap(), "旧 TCP 样本不能验证新节点");
+        assert!(
+            !unhealthy_services(&db, "a").unwrap().is_empty(),
+            "旧 TCP 样本不能验证新节点"
+        );
         db.execute(
             "UPDATE relay_public_health SET probe_kind='http' WHERE node_id='a'",
             [],
         )
         .unwrap();
-        assert!(verified(&db, "a").unwrap(), "维护状态不阻止恢复前验证");
+        assert!(
+            unhealthy_services(&db, "a").unwrap().is_empty(),
+            "维护状态不阻止恢复前验证"
+        );
         db.execute(
             "UPDATE relay_nodes SET public_ipv4='203.0.113.20' WHERE id='a'",
             [],
         )
         .unwrap();
-        assert!(!verified(&db, "a").unwrap());
+        assert!(!unhealthy_services(&db, "a").unwrap().is_empty());
         db.execute(
             "UPDATE relay_public_health SET address='203.0.113.20' WHERE node_id='a'",
             [],
         )
         .unwrap();
-        assert!(verified(&db, "a").unwrap());
+        assert!(unhealthy_services(&db, "a").unwrap().is_empty());
         db.execute("UPDATE tunnel_applied_states SET status='failed'", [])
             .unwrap();
-        assert!(!verified(&db, "a").unwrap());
+        assert!(!unhealthy_services(&db, "a").unwrap().is_empty());
         db.execute(
             "UPDATE tunnel_applied_states SET status='ready',updated_at=unixepoch()-46",
             [],
         )
         .unwrap();
-        assert!(!verified(&db, "a").unwrap());
+        assert!(!unhealthy_services(&db, "a").unwrap().is_empty());
     }
 
     #[test]
