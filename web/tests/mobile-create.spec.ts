@@ -117,7 +117,7 @@ for (const role of ["system_admin", "tenant"] as const) {
       await page.keyboard.press("Escape");
       await page.getByRole("button", { name: "放弃修改", exact: true }).click();
       await expect(dialog).toBeHidden();
-      const add = page.getByRole("button", { name: to <= 900 && role === "system_admin" ? "添加" : "创建服务", exact: true });
+      const add = page.getByRole("button", { name: to <= 900 ? "添加" : "创建服务", exact: true });
       await expect(add).toBeFocused();
     }
   });

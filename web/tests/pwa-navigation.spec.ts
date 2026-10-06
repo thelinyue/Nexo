@@ -45,7 +45,7 @@ test.describe("PWA 手机导航", () => {
           await page.goto(`/#/${route}`);
           await expect(current(page).locator(route === "services" ? ".service-row" : ".agent-row")).toHaveCount(route === "services" ? 40 : 30);
           const header = page.locator(".workspace-topbar .page-header");
-          const add = page.locator(".mobile-create-slot").getByRole("button", { name: route === "agents" ? "添加设备" : role === "system_admin" ? "添加" : "创建服务", exact: true });
+          const add = page.locator(".mobile-create-slot").getByRole("button", { name: route === "agents" ? "添加设备" : "添加", exact: true });
           for (const position of [0, 240]) {
             await page.evaluate(value => scrollTo(0, value), position);
             await expect(add).toBeInViewport({ ratio: 1 });
@@ -66,7 +66,7 @@ test.describe("PWA 手机导航", () => {
             expect(before.y).toBe(position);
             if (position === 0 && role === "system_admin") await page.screenshot({ path: info.outputPath(`pwa-add-${route}-${colorScheme}.png`) });
             await add.tap();
-            const dialog = page.getByRole("dialog", { name: route === "agents" ? "添加设备" : role === "system_admin" ? "添加" : "创建服务", exact: true });
+            const dialog = page.getByRole("dialog", { name: route === "agents" ? "添加设备" : "添加", exact: true });
             await expect(dialog).toBeVisible();
             await dialog.getByRole("button", { name: /^(取消|关闭)$/ }).click();
             await expect(dialog).toBeHidden();

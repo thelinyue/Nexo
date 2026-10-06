@@ -135,16 +135,17 @@ test("用户列表加载失败可就地重试", async ({ page }) => {
   await expect(page.getByRole("alert")).toHaveCount(0);
 });
 
-test("普通用户首次接入的空状态只有一个添加入口，手机可直接操作", async ({ page }, info) => {
+test("普通用户空状态支持两类服务，设备与域名仍只有一个添加入口", async ({ page }, info) => {
   const state = await installApiMocks(page, { empty: true });
   state.devices = []; state.domains = []; state.enrollments = [];
   await page.route("**/api/v1/auth/status", route => route.fulfill({ json: { initialized: true, authenticated: true, user_id: "alice", workspace_id: "default", role: "tenant", username: "alice", csrf_token: "test-csrf" } }));
   if (info.project.name === "mobile-light") await page.setViewportSize({ width: 320, height: 568 });
   await page.goto("/#/services");
-  const connect = page.getByRole("link", { name: "接入设备", exact: true });
-  await expect(connect).toBeInViewport({ ratio: 1 });
+  await expect(page.getByRole("button", { name: "创建服务", exact: true })).toBeInViewport({ ratio: 1 });
+  await page.getByRole("button", { name: "添加反向代理", exact: true }).scrollIntoViewIfNeeded();
+  await expect(page.getByRole("button", { name: "添加反向代理", exact: true })).toBeInViewport({ ratio: 1 });
   await page.screenshot({ path: info.outputPath("empty-services.png") });
-  await connect.click();
+  await page.goto("/#/agents");
   const addAgent = page.getByRole("button", { name: "添加设备", exact: true });
   await expect(addAgent).toHaveCount(1);
   await expect(addAgent).toBeInViewport({ ratio: 1 });

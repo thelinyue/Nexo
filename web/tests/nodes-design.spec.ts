@@ -136,12 +136,14 @@ test("空列表、筛选无结果和请求失败提供不同恢复入口", async
   await page.getByRole("button", { name: "关闭", exact: true }).click();
 });
 
-test("本地节点只提供概览，窄屏和主题变化不遮挡信息与操作", async ({ page }, info) => {
+test("本地节点支持反代授权配置，窄屏和主题变化不遮挡信息与操作", async ({ page }, info) => {
   const { state } = await setup(page);
   state.nodes.push({ ...state.nodes[0], id: "local", name: "本地入口", public_ipv4: "" });
   await page.goto("/#/nodes");
   await page.getByRole("article", { name: "本地入口", exact: true }).getByRole("button", { name: "详情", exact: true }).click();
-  await expect(page.getByRole("tab")).toHaveCount(0);
+  const detail = page.getByRole("dialog", { name: "本地入口", exact: true });
+  await expect(detail).toBeVisible();
+  await expect(detail.getByRole("tab")).toHaveCount(2);
   await expect(page.getByRole("button", { name: "保存配置" })).toHaveCount(0);
   await page.getByRole("button", { name: "关闭", exact: true }).click();
   await page.getByLabel("搜索节点名称或 IP").fill("不存在");
