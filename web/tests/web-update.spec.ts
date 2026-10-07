@@ -80,7 +80,9 @@ test("服务器设置草稿须确认放弃，弹窗和写入期间暂停刷新�
   release?.(); await expect(page.getByRole("alert")).toContainText("保存失败");
   await expect(notice(page).getByRole("button", { name: "刷新页面" })).toBeEnabled();
   await notice(page).getByRole("button", { name: "刷新页面" }).click();
+  await page.evaluate(() => { document.documentElement.dataset.sameDocument = "yes"; });
   await discard.getByRole("button", { name: "放弃修改", exact: true }).click();
+  await expect.poll(() => page.evaluate(() => document.documentElement.dataset.sameDocument)).toBeUndefined();
   await expect(page.getByLabel("公网 IPv4", { exact: true })).toHaveValue("203.0.113.7");
   expect(state.serverSettings.relay_ipv4).toBe("203.0.113.7");
   await notice(page).getByRole("button", { name: "稍后" }).click();

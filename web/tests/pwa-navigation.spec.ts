@@ -34,6 +34,8 @@ test.describe("PWA 手机导航", () => {
 
   for (const role of ["system_admin", "tenant"] as const) {
     test(`${role} 的添加入口位于底栏旁，关闭后保持滚动和焦点`, async ({ page }, info) => {
+      // 本用例遍历主题、页面和滚动位置；Linux WebKit 的完整矩阵需要更长执行时间。
+      test.setTimeout(60_000);
       const state = await installApiMocks(page);
       state.authRole = role;
       state.devices = Array.from({ length: 30 }, (_, index) => ({ ...state.devices[0], id: `a-${index}`, name: `设备 ${index}` }));
