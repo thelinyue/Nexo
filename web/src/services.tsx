@@ -2,7 +2,8 @@ import type { NodeGroup } from "./node-groups";
 import "./nodes.css";
 import type { NodeList } from "./nodes";
 import { ApplicationModal } from "./application-modal";
-import { ServiceIcon, ServiceIconPicker } from "./service-icons";
+import { ServiceIcon, ServiceIconPicker, readIconUpload } from "./service-icons";
+import type { IconUpload } from "./service-icons";
 import { PageNavigationContext, useResourceDeletions } from "./navigation";
 import { useContext, useEffect, useId, useMemo, useRef, useState } from "react";
 import type { ClipboardEvent as ReactClipboardEvent, FormEvent, MouseEvent as ReactMouseEvent, PointerEvent as ReactPointerEvent } from "react";
@@ -117,11 +118,21 @@ function ServiceSelect({ label, name, value, placeholder, options, disabled, com
 }
 
 /** 表单草稿只驻留内存；跳转配置 Agent / 域名时暂时隐藏，返回后继续填写。 */
-function ServiceEditor({ tunnel, mode, data, active, csrf, onClose, onSaved }: { tunnel?: Tunnel; mode: "tunnel" | "reverse_proxy"; data: ServiceData; active: boolean; csrf?: string | null; onClose: () => void; onSaved: (item: Tunnel) => void }) {
+function ServiceEditor({ tunnel, mode, data, active, admin, csrf, onClose, onSaved }: { tunnel?: Tunnel; mode: "tunnel" | "reverse_proxy"; data: ServiceData; active: boolean; admin?: boolean; csrf?: string | null; onClose: () => void; onSaved: (item: Tunnel) => void }) {
   const request = useApi();
   const initial = useMemo(() => ({ node_group_id: tunnel?.node_group_id ?? "", node_ids: tunnel?.node_ids ?? ["local"], distribution_mode: tunnel?.distribution_mode ?? "single", preferred_node_id: tunnel?.preferred_node_id ?? "", icon_id: tunnel?.icon_id ?? "", ipv6_direct_enabled: tunnel?.ipv6_direct_enabled ?? false, https_port: String(tunnel?.https_port ?? 443), http_redirect_enabled: tunnel ? tunnel.http_redirect_enabled ?? false : mode === "reverse_proxy", access_mode: tunnel?.access_mode ?? "public", access_password: "", service_mode: tunnel?.service_mode ?? mode, name: tunnel?.name ?? "", protocol: tunnel?.protocol ?? "https", origin_protocol: tunnel?.origin_protocol ?? "http", device_id: tunnel?.device_id ?? data.devices.find(item => item.status === "online")?.id ?? data.devices[0]?.id ?? "", local_address: tunnel?.local_address ?? "127.0.0.1", local_port: String(tunnel?.local_port ?? ""), public_port: String(tunnel?.public_port ?? ""), hostname: tunnel?.hostname ?? "", public_domain_id: tunnel ? data.domains.find(item => item.domain === tunnel.public_domain)?.id ?? "" : data.domains.length === 1 ? data.domains[0].id : "", lan_redirect_enabled: !isPortProtocol(tunnel?.protocol) && (tunnel?.lan_redirect_enabled ?? false) }), []);
   const webProtocol = useRef(!isPortProtocol(tunnel?.protocol) && tunnel?.protocol ? tunnel.protocol : "https");
   const [draft, setDraft] = useState(initial); const [busy, setBusy] = useState(false); const [error, setError] = useState<string | null>(null);
+  const [iconUpload, setIconUpload] = useState<IconUpload | null>(null);
+  const [iconProcessing, setIconProcessing] = useState(false);
+  const [iconPreview, setIconPreview] = useState<string>();
+  // 对象 URL 随草稿生命周期释放；表单暂时隐藏时仍保留原文件，返回后可继续预览和保存。
+  useEffect(() => {
+    if (!iconUpload) { setIconPreview(undefined); return; }
+    if ("data_url" in iconUpload) { setIconPreview(iconUpload.data_url); return; }
+    const url = URL.createObjectURL(iconUpload.file); setIconPreview(url);
+    return () => URL.revokeObjectURL(url);
+  }, [iconUpload]);
   const [invalidField, setInvalidField] = useState<keyof typeof initial | null>(null);
   const [addressPartsIgnored, setAddressPartsIgnored] = useState(false);
   const formRef = useRef<HTMLFormElement>(null);
@@ -139,7 +150,7 @@ function ServiceEditor({ tunnel, mode, data, active, csrf, onClose, onSaved }: {
   const remoteTcp = draft.protocol === "tcp" && draft.node_ids.some(id => id !== "local");
   const ipv6 = useResource(() => request<{ addresses: string[]; selected_address: string | null; supported: boolean }>(`/api/v1/devices/${encodeURIComponent(draft.device_id)}/ipv6`), active && !direct && draft.protocol === "https" && Boolean(draft.device_id), true, true);
   useEffect(() => { ipv6.setData(null); if (active && !direct && draft.protocol === "https" && draft.device_id) void ipv6.reload(); }, [draft.device_id]);
-  const dirty = JSON.stringify(draft) !== JSON.stringify(initial);
+  const dirty = Boolean(iconUpload) || JSON.stringify(draft) !== JSON.stringify(initial);
   const metadataOnly = Boolean(tunnel) && (Object.keys(initial) as (keyof typeof initial)[]).every(field => field === "name" || field === "icon_id" || draft[field] === initial[field]);
   const update = (field: keyof typeof draft, value: string | boolean | string[]) => {
     if (["local_address", "local_port", "origin_protocol", "protocol"].includes(field)) setAddressPartsIgnored(false);
@@ -195,6 +206,7 @@ function ServiceEditor({ tunnel, mode, data, active, csrf, onClose, onSaved }: {
   const fieldProps = (field: keyof typeof draft) => ({ name: field, "aria-invalid": invalidField === field || undefined, "aria-describedby": invalidField === field ? "service-form-error" : undefined });
   async function save(event: FormEvent) {
     event.preventDefault(); setError(null); setInvalidField(null);
+    if (busy || iconProcessing) return;
     if (!draft.name.trim()) { fail("name", "请填写服务名称"); return; }
     if (!direct && !devices.some(item => item.id === draft.device_id)) { fail("device_id", "请选择已入网的设备"); return; }
     if (draft.ipv6_direct_enabled && (direct || draft.protocol !== "https" || draft.lan_redirect_enabled)) { fail("ipv6_direct_enabled", "直连需使用 HTTPS，并关闭内网重定向"); return; }
@@ -211,7 +223,7 @@ function ServiceEditor({ tunnel, mode, data, active, csrf, onClose, onSaved }: {
     if (draft.access_mode === "password" && (draft.access_password || tunnel?.access_mode !== "password") && !/^[!-~]{4,16}$/.test(draft.access_password)) { fail("access_password", "请输入 4–16 位字母、数字或符号，不含空格"); return; }
     setBusy(true);
     try {
-      const body = { ...draft, icon_id: draft.icon_id || null, https_port: Number(draft.https_port), access_password: draft.access_mode === "password" && draft.access_password ? draft.access_password : undefined, device_id: direct ? null : draft.device_id, origin_protocol: isPortProtocol(draft.protocol) ? null : draft.origin_protocol, name: draft.name.trim(), local_address: draft.local_address.trim(), local_port: Number(draft.local_port), public_port: isPortProtocol(draft.protocol) && draft.public_port ? Number(draft.public_port) : null, hostname: isPortProtocol(draft.protocol) && !remoteTcp ? null : draft.hostname.trim(), public_domain_id: isPortProtocol(draft.protocol) && !remoteTcp ? null : draft.public_domain_id, enabled: tunnel?.enabled ?? true, lan_redirect_enabled: !isPortProtocol(draft.protocol) && draft.lan_redirect_enabled };
+      const body = { ...draft, icon_id: iconUpload ? undefined : draft.icon_id || null, icon_upload: iconUpload ? await readIconUpload(iconUpload) : undefined, https_port: Number(draft.https_port), access_password: draft.access_mode === "password" && draft.access_password ? draft.access_password : undefined, device_id: direct ? null : draft.device_id, origin_protocol: isPortProtocol(draft.protocol) ? null : draft.origin_protocol, name: draft.name.trim(), local_address: draft.local_address.trim(), local_port: Number(draft.local_port), public_port: isPortProtocol(draft.protocol) && draft.public_port ? Number(draft.public_port) : null, hostname: isPortProtocol(draft.protocol) && !remoteTcp ? null : draft.hostname.trim(), public_domain_id: isPortProtocol(draft.protocol) && !remoteTcp ? null : draft.public_domain_id, enabled: tunnel?.enabled ?? true, lan_redirect_enabled: !isPortProtocol(draft.protocol) && draft.lan_redirect_enabled };
       onSaved(await request<Tunnel>(tunnel ? `/api/v1/tunnels/${encodeURIComponent(tunnel.id)}` : "/api/v1/tunnels", { method: tunnel ? "PUT" : "POST", body: JSON.stringify(body) }, csrf));
       onClose();
     } catch (e) { setError(errorText(e)); } finally { setBusy(false); }
@@ -229,7 +241,7 @@ function ServiceEditor({ tunnel, mode, data, active, csrf, onClose, onSaved }: {
       <div className="modal-body"><fieldset disabled={busy}>
         {direct && <p className="helper">由所选节点直接访问目标，无需设备，不计入穿透流量。</p>}
         <section className="service-form-section"><h3 className="desktop-form-label">基本信息</h3><div className="service-field-group">
-          <div className="application-name-row"><ServiceIconPicker value={draft.icon_id} name={draft.name} protocol={draft.protocol} onChange={value => update("icon_id", value)} /><label className="service-field"><span>服务名称</span><input {...fieldProps("name")} value={draft.name} onChange={e => update("name", e.target.value)} placeholder="例如：家庭 NAS" enterKeyHint="next" autoComplete="off" required /></label></div>
+          <div className="application-name-row"><ServiceIconPicker value={draft.icon_id} name={draft.name} protocol={draft.protocol} preview={iconPreview} admin={admin} csrf={csrf} onUpload={upload => { setIconUpload(upload); update("icon_id", ""); }} onProcessing={setIconProcessing} onChange={value => { setIconUpload(null); update("icon_id", value); }} /><label className="service-field"><span>服务名称</span><input {...fieldProps("name")} value={draft.name} onChange={e => update("name", e.target.value)} placeholder="例如：家庭 NAS" enterKeyHint="next" autoComplete="off" required /></label></div>
           {!direct && <ServiceSelect {...fieldProps("device_id")} label="设备" value={draft.device_id} placeholder="选择设备" options={devices.map(item => ({ value: item.id, label: item.name, status: item.status === "online" ? "online" : "offline" }))} disabled={busy} onChange={value => update("device_id", value)} />}
         </div>{!direct && !devices.length && <div className="notice"><span>请关闭表单，到设备页添加设备。</span></div>}{!direct && devices.find(item => item.id === draft.device_id)?.status === "offline" && <p className="helper" role="status">设备当前离线，可保存配置，连接恢复后下发。</p>}</section>
         <section className="service-form-section"><h3>{direct ? "目标地址" : "内网地址"}</h3><div className="service-field-group service-address-input" role="group" aria-label={direct ? "目标连接" : "内网连接"}>
@@ -269,7 +281,7 @@ function ServiceEditor({ tunnel, mode, data, active, csrf, onClose, onSaved }: {
         </div></details>}
         {tunnel && !tunnel.public_domain && <p className="helper">此服务未绑定域名；需要网页访问时，请创建新服务。</p>}
       </fieldset></div>
-      <footer className="modal-actions">{!isPortProtocol(draft.protocol) && <div className="service-submit-preview"><span>访问地址</span><code>{finalAddress}</code></div>}{error && <p id="service-form-error" className="form-error" role="alert">{error}</p>}<button type="button" className="secondary-button desktop-modal-cancel modal-dismiss" onClick={close} disabled={busy}>取消</button><button type="submit" className="primary-button" disabled={busy || (direct && !nodeData.data?.nodes.some(node => node.id === draft.node_ids[0] && node.approved && node.enabled && node.reverse_proxy_selectable && node.reverse_proxy_supported)) || (!direct && !devices.length) || (!isPortProtocol(draft.protocol) && !data.domains.length)}>{busy ? "保存中…" : "保存服务"}</button></footer>
+      <footer className="modal-actions">{!isPortProtocol(draft.protocol) && <div className="service-submit-preview"><span>访问地址</span><code>{finalAddress}</code></div>}{error && <p id="service-form-error" className="form-error" role="alert">{error}</p>}<button type="button" className="secondary-button desktop-modal-cancel modal-dismiss" onClick={close} disabled={busy}>取消</button><button type="submit" className="primary-button" disabled={busy || iconProcessing || (direct && !nodeData.data?.nodes.some(node => node.id === draft.node_ids[0] && node.approved && node.enabled && node.reverse_proxy_selectable && node.reverse_proxy_supported)) || (!direct && !devices.length) || (!isPortProtocol(draft.protocol) && !data.domains.length)}>{busy ? "保存中…" : "保存服务"}</button></footer>
     </form>}
   </Modal>;
 }
@@ -392,11 +404,45 @@ function BatchDomainEditor({ items, domains, csrf, onSaved, onClose, onComplete 
   </Modal>;
 }
 
+const serviceViewKey = "nexo.services.view";
+const distributionLabels: Record<string, string> = { single: "单节点", dns: "DNS 分流", latency: "回源延迟优先", manual: "主备切换" };
+const nodeName = (item: Tunnel, id: string) => item.node_statuses?.find(node => node.node_id === id)?.node_name ?? (id === "local" ? "内置节点" : id);
+
+/** 入口主值只取 Server 已确认的写入记录。配置节点和选择目标作为明确标注的辅助信息，
+ * 保留部分写入失败的事实；旧接口不以健康候选推断已同步，避免把待切换节点当成当前入口。
+ */
+function ServiceEntrySummary({ item }: { item: Tunnel }) {
+  const ids = item.node_ids?.length ? item.node_ids : ["local"];
+  const configured = ids.map(id => nodeName(item, id)).join("、");
+  const entry = item.node_entry;
+  const state = !item.enabled ? "disabled" : entry?.sync_status;
+  const recorded = state && !["disabled", "unmanaged"].includes(state) ? entry?.entries ?? [] : [];
+  const text = recorded.length ? recorded.map(node => node.node_name ?? node.ipv4).join("、")
+    : state === "synced" ? "暂无可用 IPv4 入口" : state === "pending" ? "等待入口同步" : state === "failed" ? "暂无已记录入口" : configured;
+  const hint = state === "synced" ? "已同步" : state === "pending" ? `${recorded.length ? "最近记录 · " : ""}待同步`
+    : state === "failed" ? `${recorded.length ? "最近记录 · " : ""}同步失败` : state ? "配置节点" : "入口状态未提供";
+  const strategy = item.distribution_mode ?? "single";
+  const preferred = item.preferred_node_id && item.node_statuses?.some(node => node.node_id === item.preferred_node_id && node.healthy) ? item.preferred_node_id : null;
+  const selected = strategy === "single" ? ids[0] : strategy === "manual" && preferred ? preferred : ["latency", "manual"].includes(strategy) ? item.node_selection?.node_id : null;
+  const target = state === "pending" && selected && ids.includes(selected) && !recorded.some(node => node.node_id === selected) ? nodeName(item, selected) : null;
+  const time = entry?.synced_at ? `最近完整同步：${new Date(entry.synced_at * 1000).toLocaleString()}` : undefined;
+  return <div className="service-entry" data-sync-status={state ?? "unknown"}>
+    <span className="sr-only">{item.ipv6_direct_enabled ? "IPv4 入口：" : "公网入口："}</span>
+    <span className="service-entry-names">{text}</span>
+    <small className="service-entry-hint" title={time}>{item.ipv6_direct_enabled && "IPv4 · "}{hint}</small>
+    {target && <small className="service-entry-target">目标：{target}</small>}
+    {!recorded.length && (state === "pending" || state === "failed") && !target && <small className="service-entry-target">配置：{configured}</small>}
+  </div>;
+}
+
 /** 列表在二级详情和其他页之间保持挂载，保存筛选、选择和表单草稿。 */
-export function ServicesPage({ route, active, csrf }: { route: string; active: boolean; admin?: boolean; csrf?: string | null; back?: string }) {
+export function ServicesPage({ route, active, admin, csrf }: { route: string; active: boolean; admin?: boolean; csrf?: string | null; back?: string }) {
   const request = useApi();
   const navigation = useContext(PageNavigationContext);
   const workspaceHeader = useContext(WorkspaceHeaderContext);
+  // 视图是本浏览器的显示偏好；存储不可用时仍可切换，不影响服务配置。
+  const [view, setView] = useState<"list" | "icons">(() => { try { return localStorage.getItem(serviceViewKey) === "icons" ? "icons" : "list"; } catch { return "list"; } });
+  useEffect(() => { try { localStorage.setItem(serviceViewKey, view); } catch { /* 本次会话继续使用所选视图。 */ } }, [view]);
   const [protocol, setProtocol] = useState("all"); const [agent, setAgent] = useState("all");
   const [query, setQuery] = useState(""); const [filter, setFilter] = useState("all"); const [selecting, setSelecting] = useState(false); const [selected, setSelected] = useState<string[]>([]);
   const [pressing, setPressing] = useState<string | null>(null);
@@ -487,7 +533,7 @@ export function ServicesPage({ route, active, csrf }: { route: string; active: b
     window.addEventListener("pointerdown", anotherPointer);
     window.addEventListener("blur", scroll);
     return () => { cancelPress(); window.removeEventListener("scroll", scroll, true); window.removeEventListener("pointerdown", anotherPointer); window.removeEventListener("blur", scroll); };
-  }, [active, navigation?.desktop, detailId, data, query, filter, protocol, agent]);
+  }, [active, navigation?.desktop, detailId, data, query, filter, protocol, agent, view]);
   const addProxyButton = <button className="secondary-button service-add-proxy" onClick={() => create("new-proxy")}><Plus size={18} aria-hidden="true" /><span>添加反向代理</span></button>;
   const merge = (updated: Tunnel) => resource.setData(current => current && ({ ...current, tunnels: current.tunnels.some(item => item.id === updated.id) ? current.tunnels.map(item => item.id === updated.id ? updated : item) : [updated, ...current.tunnels] }));
   async function toggle(items: Tunnel[], enabled: boolean) {
@@ -519,19 +565,20 @@ export function ServicesPage({ route, active, csrf }: { route: string; active: b
     {data && <>
       {tunnels.length > 0 && <div className="toolbar service-toolbar">
         {!topSearch && searchRow}
-        <div className="toolbar-row">
+        <div className="service-filters-row"><div className="toolbar-row">
           <div className="service-filter-control" data-active={filter !== "all"}><select aria-label="服务筛选" value={filter} onChange={e => setFilter(e.target.value)}>{[["all", "全部状态"], ["attention", "需处理"], ["enabled", "已启用"], ["disabled", "已关闭"]].map(([value, label]) => <option key={value} value={value}>{label}{navigation?.desktop ? ` ${matching.filter(item => matchesFilter(item, value)).length}` : ""}</option>)}</select><ChevronDown size={14} aria-hidden="true" /></div>
           <div className="service-filter-control" data-active={protocol !== "all"}><select aria-label="类型筛选" value={protocol} onChange={e => setProtocol(e.target.value)}><option value="all">全部类型</option><option value="web">网页服务</option><option value="tcp">TCP 服务</option><option value="udp">UDP 服务</option><option value="tcp_udp">TCP+UDP</option></select><ChevronDown size={14} aria-hidden="true" /></div>
           <div className="service-filter-control" data-active={agent !== "all"}><select aria-label="设备筛选" title={agent === "all" ? "全部设备" : data.devices.find(item => item.id === agent)?.name} value={agent} onChange={e => setAgent(e.target.value)}><option value="all">{navigation?.desktop ? "全部设备" : "全部设备"}</option>{data.devices.map(item => <option key={item.id} value={item.id}>{item.name}</option>)}</select><ChevronDown size={14} aria-hidden="true" /></div>
-          {visible.length > 0 && (query || filter !== "all" || protocol !== "all" || agent !== "all") && <div className="service-filter-result"><span role="status">找到 {visible.length} 个服务</span><button className="text-button" onClick={() => { setQuery(""); setFilter("all"); setProtocol("all"); setAgent("all"); }}>清除筛选</button></div>}
-        </div>
+        </div><div className="service-view-toggle" role="group" aria-label="服务视图">{([["list", "列表"], ["icons", "图标"]] as const).map(([value, label]) => <button type="button" key={value} aria-label={`${label}视图`} aria-pressed={view === value} onClick={() => { cancelPress(); longPressed.current = false; setView(value); }}>{label}</button>)}</div></div>
+        {visible.length > 0 && (query || filter !== "all" || protocol !== "all" || agent !== "all") && <div className="service-filter-result"><span role="status">找到 {visible.length} 个服务</span><button className="text-button" onClick={() => { setQuery(""); setFilter("all"); setProtocol("all"); setAgent("all"); }}>清除筛选</button></div>}
       </div>}
-      {!visible.length ? <Empty kind={tunnels.length ? "search" : "services"} title={tunnels.length ? "没有匹配的服务" : "还没有服务"} detail={tunnels.length ? "更换关键词或清除筛选。" : !data.domains.length ? "TCP/UDP 服务可直接创建，网页服务需先配置域名。" : "通过内网穿透或反向代理访问应用。"}>{tunnels.length ? <button className="secondary-button" onClick={() => { setQuery(""); setFilter("all"); setProtocol("all"); setAgent("all"); }}>清除筛选</button> : <><button className="primary-button" onClick={() => setEditor("new")}>创建服务</button>{addProxyButton}{!data.domains.length && <a href="#/domains" className="text-button">配置网页域名</a>}</>}</Empty> : <section className={`service-list ${selecting ? "selectable" : ""}`} aria-label="服务列表">{visible.map(item => <article className="service-row" key={item.id} onClick={openCard} data-opens-application={!selecting && item.enabled && Boolean(item.public_address)} data-pressing={pressing === item.id} data-selected={selecting && selected.includes(item.id)} onPointerDown={event => startPress(event, item.id)} onPointerMove={event => { const current = press.current; if (current && (current.pointer !== event.pointerId || Math.hypot(event.clientX - current.x, event.clientY - current.y) > 10)) cancelPress(); }} onPointerUp={cancelPress} onPointerCancel={cancelPress} onPointerLeave={cancelPress} onContextMenu={event => { if (longPressed.current || press.current) event.preventDefault(); }} onClickCapture={event => { if (longPressed.current) { longPressed.current = false; event.preventDefault(); event.stopPropagation(); } else if (selecting && event.target instanceof Element && !event.target.closest("input,label")) { event.preventDefault(); event.stopPropagation(); toggleSelected(item.id); } }}><div className="application-launch">
+      {!visible.length ? <Empty kind={tunnels.length ? "search" : "services"} title={tunnels.length ? "没有匹配的服务" : "还没有服务"} detail={tunnels.length ? "更换关键词或清除筛选。" : !data.domains.length ? "TCP/UDP 服务可直接创建，网页服务需先配置域名。" : "通过内网穿透或反向代理访问应用。"}>{tunnels.length ? <button className="secondary-button" onClick={() => { setQuery(""); setFilter("all"); setProtocol("all"); setAgent("all"); }}>清除筛选</button> : <><button className="primary-button" onClick={() => setEditor("new")}>创建服务</button>{addProxyButton}{!data.domains.length && <a href="#/domains" className="text-button">配置网页域名</a>}</>}</Empty> : <section className={`service-list ${selecting ? "selectable" : ""}`} data-view={view} aria-label="服务列表">{view === "list" && <div className="service-list-heading" aria-hidden="true"><span>服务</span><span>公网入口</span><span>模式</span><span>状态</span></div>}{visible.map(item => <article className="service-row" key={item.id} onClick={openCard} data-opens-application={!selecting && item.enabled && Boolean(item.public_address)} data-pressing={pressing === item.id} data-selected={selecting && selected.includes(item.id)} onPointerDown={event => startPress(event, item.id)} onPointerMove={event => { const current = press.current; if (current && (current.pointer !== event.pointerId || Math.hypot(event.clientX - current.x, event.clientY - current.y) > 10)) cancelPress(); }} onPointerUp={cancelPress} onPointerCancel={cancelPress} onPointerLeave={cancelPress} onContextMenu={event => { if (longPressed.current || press.current) event.preventDefault(); }} onClickCapture={event => { if (longPressed.current) { longPressed.current = false; event.preventDefault(); event.stopPropagation(); } else if (selecting && event.target instanceof Element && !event.target.closest("input,label")) { event.preventDefault(); event.stopPropagation(); toggleSelected(item.id); } }}><div className="application-launch">
         {selecting && <label className="check"><input type="checkbox" aria-label={`选择${item.name}`} checked={selected.includes(item.id)} disabled={busy} onChange={() => toggleSelected(item.id)} /></label>}
         {!item.enabled || !item.public_address ? <button type="button" className="application-unavailable" aria-disabled="true" aria-label={`${isPortProtocol(item.protocol) ? "复制" : "打开"}${item.name}`}><ServiceIcon id={item.icon_id} protocol={item.protocol} /></button> : isPortProtocol(item.protocol) ? <CopyButton value={item.public_address} label={`复制${item.name}地址`}><ServiceIcon id={item.icon_id} protocol={item.protocol} /></CopyButton> : <a className="service-open" href={item.public_address} target="_blank" rel="noopener noreferrer" aria-label={`打开${item.name}`}><ServiceIcon id={item.icon_id} protocol={item.protocol} /></a>}
-        {(!item.enabled || item.apply_status !== "ready" || !item.public_address) && <Status badge kind={item.service_mode === "reverse_proxy" ? "reverse_proxy" : "service"} value={!item.enabled ? "disabled" : item.apply_status === "ready" && !item.public_address ? "waiting_address" : item.apply_status} />}
+        {view === "icons" && (!item.enabled || item.apply_status !== "ready" || !item.public_address) && <Status badge kind={item.service_mode === "reverse_proxy" ? "reverse_proxy" : "service"} value={!item.enabled ? "disabled" : item.apply_status === "ready" && !item.public_address ? "waiting_address" : item.apply_status} />}
       </div>
-      <a className="service-name" href={`#/services/${encodeURIComponent(item.id)}`} onClick={event => openDetail(event, item)} title={`${item.name} · 查看详情`}><strong>{item.name}</strong></a>
+      <div className="service-identity"><a className="service-name" href={`#/services/${encodeURIComponent(item.id)}`} onClick={event => openDetail(event, item)} title={`${item.name} · 查看详情`}><strong>{item.name}</strong></a>{view === "list" && <small className="service-device" title={`${protocolLabel(item.protocol)}${item.device_name ? ` · ${item.device_name}` : ""}`}>{protocolLabel(item.protocol)}{item.device_name && ` · ${item.device_name}`}</small>}</div>
+      {view === "list" && <><ServiceEntrySummary item={item} /><div className="service-modes"><span><span className="sr-only">服务方式：</span>{item.service_mode === "reverse_proxy" ? "反向代理" : "内网穿透"}</span><small><span className="sr-only">节点策略：</span>{distributionLabels[item.distribution_mode ?? "single"] ?? "未知策略"}</small>{item.ipv6_direct_enabled && <small className="service-direct-label">IPv6 直连</small>}</div><Status kind={item.service_mode === "reverse_proxy" ? "reverse_proxy" : "service"} value={!item.enabled ? "disabled" : item.apply_status === "ready" && !item.public_address ? "waiting_address" : item.apply_status} /></>}
       </article>)}</section>}
       {selecting && selectedProxy && <p className="helper" role="status">选择中包含反向代理，不能修改设备。</p>}
       {selecting && <div className="batch-actions"><div className="batch-selection"><span aria-live="polite">已选择 {selected.length} 项</span><button className="text-button" disabled={busy || !visible.length} onClick={() => setSelected(selected.length === visible.length ? [] : visible.map(item => item.id))}>{visible.length > 0 && selected.length === visible.length ? "取消全选" : "全选"}</button>{!navigation?.desktop && <button className="text-button" disabled={busy} onClick={() => { setSelecting(false); setSelected([]); }}>完成</button>}</div><div className="batch-commands"><button className="secondary-button" title={selectedProxy ? "反向代理不能修改设备，请仅选择内网穿透服务" : undefined} disabled={!selected.length || busy || !data.devices.length || selectedProxy} onClick={() => { setActionError(null); setMessage(null); setChangingAgent(tunnels.filter(item => selected.includes(item.id))); }}><Server size={20} aria-hidden="true" /><span>修改设备</span></button><button className="secondary-button" disabled={busy || !tunnels.some(item => selected.includes(item.id) && hasServiceDomain(item))} onClick={() => { setActionError(null); setMessage(null); setChangingDomain(tunnels.filter(item => selected.includes(item.id))); }}><Globe size={20} aria-hidden="true" /><span>修改域名</span></button><button className="secondary-button" disabled={!selected.length || busy} onClick={() => void toggle(tunnels.filter(item => selected.includes(item.id)), true)}><Power size={20} aria-hidden="true" /><span>启用</span></button><button className="secondary-button" disabled={!selected.length || busy} onClick={() => void toggle(tunnels.filter(item => selected.includes(item.id)), false)}><PowerOff size={20} aria-hidden="true" /><span>关闭</span></button><button className="danger-button" disabled={!selected.length || busy} onClick={() => setDeleting(tunnels.filter(item => selected.includes(item.id)))}><Trash2 size={20} aria-hidden="true" /><span>删除</span></button></div></div>}
@@ -573,7 +620,7 @@ export function ServicesPage({ route, active, csrf }: { route: string; active: b
       <button aria-label="创建服务" onClick={() => create("new")}><Server size={22} aria-hidden="true" /><span>创建服务<small>通过设备访问内网服务</small></span><ChevronRight size={18} aria-hidden="true" /></button>
       <button aria-label="添加反向代理" onClick={() => create("new-proxy")}><Globe size={22} aria-hidden="true" /><span>添加反向代理<small>直接转发到目标地址</small></span><ChevronRight size={18} aria-hidden="true" /></button>
     </div></Modal>}
-    {editor && data && <ServiceEditor key={typeof editor === "string" ? editor : editor.id} mode={editor === "new-proxy" ? "reverse_proxy" : "tunnel"} active={active} tunnel={typeof editor === "string" ? undefined : editor} data={data} csrf={csrf} onClose={() => setEditor(null)} onSaved={item => { merge(item); setMessage("配置已保存"); }} />}
+    {editor && data && <ServiceEditor key={typeof editor === "string" ? editor : editor.id} mode={editor === "new-proxy" ? "reverse_proxy" : "tunnel"} active={active} admin={admin} tunnel={typeof editor === "string" ? undefined : editor} data={data} csrf={csrf} onClose={() => setEditor(null)} onSaved={item => { merge(item); setMessage("配置已保存"); }} />}
     {changingAgent && active && data && <BatchAgentEditor items={changingAgent} devices={data.devices} csrf={csrf} onSaved={item => { merge(item); setSelected(current => current.filter(id => id !== item.id)); }} onComplete={() => setMessage(`已完成 ${changingAgent.length} 个服务的设备配置`)} onClose={() => setChangingAgent(null)} />}
     {changingDomain && active && data && <BatchDomainEditor items={changingDomain} domains={data.domains} csrf={csrf} onSaved={item => { merge(item); setSelected(current => current.filter(id => id !== item.id)); }} onComplete={(completed, skipped) => { setMessage(`已保存 ${completed} 个服务的域名配置${skipped ? `，跳过 ${skipped} 个无域名服务` : ""}`); setSelected(current => current.filter(id => !changingDomain.some(item => item.id === id))); }} onClose={() => setChangingDomain(null)} />}
     {deleting && active && <Confirm title={deleting.length === 1 ? `删除 ${deleting[0].name}？` : `删除 ${deleting.length} 个服务？`} description="删除后将立即停止新的连接，此操作无法撤销。" label="删除服务" onClose={() => setDeleting(null)} onConfirm={() => remove(deleting.filter(item => tunnels.some(current => current.id === item.id)))} />}

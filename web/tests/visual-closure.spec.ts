@@ -14,6 +14,7 @@ test("应用图标自适应列数，图标访问与名称详情分开", async ({
   for (const width of [1440, 320, 375, 812]) {
     await page.setViewportSize({ width, height: 900 });
     await page.goto("/#/services");
+    await page.getByRole("button", { name: "图标视图", exact: true }).click();
     const rows = page.locator(".page-slot:not([hidden]) .service-row");
     await expect(rows).toHaveCount(2);
     const columns = await page.locator(".service-list").evaluate(el => getComputedStyle(el).gridTemplateColumns.split(" ").length);

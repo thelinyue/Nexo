@@ -7,6 +7,7 @@ export async function installApiMocks(page: Page, options: { empty?: boolean; an
     authenticated: !options.anonymous,
     initialized: true,
     authRole: "system_admin" as "system_admin" | "tenant",
+    sharedIcons: [] as {id: string; name: string; created_at: number; data_url: string}[],
     users: [{ id: "admin", username: "admin", role: "system_admin", workspace_id: "default", workspace_name: "admin的工作空间", enabled: true, devices: 2, services: 1, domains: 1 }, { id: "alice", username: "alice", role: "tenant", workspace_id: "alice-space", workspace_name: "alice 的工作空间", enabled: true, devices: 1, services: 1, domains: 0 }],
     accessKey: "nexo_join_shared-test-key",
     agentRelease: { version: "0.2.14", release_url: "https://github.com/thelinyue/Nexo/releases/tag/v0.2.14" } as { version: string | null; release_url: string | null },
@@ -26,11 +27,34 @@ export async function installApiMocks(page: Page, options: { empty?: boolean; an
   };
   await page.route("**/api/v1/**", async route => {
     const req = route.request(); const path = new URL(req.url()).pathname; const method = req.method(); const body = req.postData() ? req.postDataJSON() : null;
-    state.calls.push({ method, path, body });
+    state.calls.push({ method, path, body: structuredClone(body) });
     const respond = (value: unknown, status = 200) => route.fulfill({ status, contentType: "application/json", body: JSON.stringify(value) });
+    const saveIcon = () => {
+      if (!body?.icon_upload) return;
+      const id = `upload/${crypto.randomUUID()}`;
+      state.sharedIcons.unshift({ ...body.icon_upload, id, created_at: Math.floor(Date.now()/1000) });
+      delete body.icon_upload;
+      body.icon_id = id;
+    };
     const failure = state.failures.get(`${method} ${path}`);
     if (failure) { const status = state.failureStatuses.get(`${method} ${path}`) ?? 503; return respond({ error: failure, ...(status === 401 && !path.endsWith("/login") && !path.endsWith("/recover") ? { code: "session_expired" } : {}) }, status); }
     if (state.delay && method === "GET") await new Promise(resolve => setTimeout(resolve, state.delay));
+    if (path === "/api/v1/service-icons" && method === "GET") return respond(state.sharedIcons.map(({data_url, ...icon}) => icon));
+    if (path === "/api/v1/service-icons/preview") {
+      if (state.authRole !== "system_admin" && body.url.includes("192.168.")) return respond({error:"内网图片仅允许管理员导入"},400);
+      return respond({ name: "链接图标.png", data_url: "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAgAAAAICAYAAADED76LAAAAFklEQVR4nGMUm5b5nwEPYMInOXwUAAAnjQIk3eIgUgAAAABJRU5ErkJggg==" });
+    }
+    const sharedIcon = path.match(/^\/api\/v1\/service-icons\/([^/]+)(\/image)?$/);
+    if (sharedIcon) {
+      const icon = state.sharedIcons.find(icon => icon.id === `upload/${sharedIcon[1]}`);
+      if (!icon) return respond({error:"共享图标不存在"},404);
+      if (sharedIcon[2]) return route.fulfill({contentType:"image/png",body:Buffer.from(icon.data_url.split(',')[1],"base64")});
+      if (method === "DELETE") {
+        if (state.authRole !== "system_admin") return respond({error:"此操作需要管理员权限"},403);
+        if (state.tunnels.some(tunnel => tunnel.icon_id === icon.id)) return respond({error:"图标正在被服务使用，请先更换这些服务的图标"},409);
+        state.sharedIcons = state.sharedIcons.filter(item => item.id !== icon.id); return respond({deleted:true});
+      }
+    }
     if (path.endsWith("/node-update-jobs")) return respond([]);
     if (path.endsWith("/node-releases")) return respond([{ version: "0.2.12", architectures: ["aarch64", "x86_64"] }]);
     if (path.endsWith("/node-groups")) return respond([]);
@@ -122,12 +146,13 @@ export async function installApiMocks(page: Page, options: { empty?: boolean; an
     if (path === "/api/v1/public-domain-runtime-events") return respond({ events: state.domainEvents.filter(event => !new URL(req.url()).searchParams.has("domain_id") || event.domain_id === new URL(req.url()).searchParams.get("domain_id")), next_cursor: null });
     if (path.startsWith("/api/v1/public-domains/") && method === "DELETE") { state.domains = state.domains.filter(item => item.id !== path.split("/").pop()); return respond({}); }
     if (path === "/api/v1/tunnels" && method === "GET") return respond(state.tunnels);
-    if (path === "/api/v1/tunnels" && method === "POST") { const item = { access_mode: "public", lan_redirect_enabled: false, ...body, id: "t-new", public_address: "new.example.com", public_domain: state.domains.find(domain => domain.id === body.public_domain_id)?.domain ?? null, apply_status: "checking" }; delete item.access_password; state.tunnels.push(item); return respond(item, 201); }
+    if (path === "/api/v1/tunnels" && method === "POST") { saveIcon(); const item = { access_mode: "public", lan_redirect_enabled: false, ...body, id: "t-new", public_address: "new.example.com", public_domain: state.domains.find(domain => domain.id === body.public_domain_id)?.domain ?? null, apply_status: "checking" }; delete item.access_password; state.tunnels.push(item); return respond(item, 201); }
     if (path === "/api/v1/tunnels/batch" && method === "DELETE") { state.tunnels = state.tunnels.filter(item => !body.tunnel_ids.includes(item.id)); return respond({ deleted_ids: body.tunnel_ids }); }
     if (/^\/api\/v1\/tunnels\/batch\/(enable|disable)$/.test(path)) { const items = state.tunnels.filter(item => body.tunnel_ids.includes(item.id)); items.forEach(item => Object.assign(item, { enabled: path.endsWith("/enable"), apply_status: path.endsWith("/enable") ? "checking" : "disabled" })); return respond(items); }
     const toggle = path.match(/^\/api\/v1\/tunnels\/([^/]+)\/(enable|disable)$/);
     if (toggle) { const item = state.tunnels.find(item => item.id === toggle[1]); Object.assign(item, { enabled: toggle[2] === "enable", apply_status: toggle[2] === "enable" ? "checking" : "disabled" }); return respond(item); }
     if (path.startsWith("/api/v1/tunnels/") && method === "PUT") {
+      saveIcon();
       const item = state.tunnels.find(item => item.id === path.split("/").pop())!;
       const domain = state.domains.find(domain => domain.id === body.public_domain_id);
       if (domain && domain.domain !== item.public_domain) {

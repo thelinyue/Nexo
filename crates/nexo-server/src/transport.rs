@@ -1873,6 +1873,7 @@ mod tests {
             distribution_mode: None,
             preferred_node_id: None,
             icon_id: None,
+            icon_upload: None,
             https_port: None,
             ipv6_direct_enabled: None,
             http_redirect_enabled: None,

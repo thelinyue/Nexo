@@ -1,8 +1,7 @@
 {
-  "version": "0.2.21",
+  "version": "0.2.22",
   "node_version": "0.2.21",
   "components": [
-    "server",
-    "node"
+    "server"
   ]
 }

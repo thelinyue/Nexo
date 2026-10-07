@@ -1,8 +1,9 @@
-//! 应用图标只是服务展示元数据；仅允许内置 HD-Icons 目录中的相对路径。
+//! 应用图标只是服务展示元数据；目录图标与共享上传图标共用 icon_id。
 //! 区分省略与 null，确保旧客户端和批量换设备不会清除用户已选图标。
 
 use crate::*;
 use std::{collections::HashSet, sync::OnceLock};
+pub mod uploads;
 
 pub fn deserialize<'de, D: serde::Deserializer<'de>>(
     deserializer: D,
@@ -18,6 +19,7 @@ pub fn migrate(db: &Connection) -> Result<()> {
     )? {
         db.execute("ALTER TABLE tunnels ADD COLUMN icon_id TEXT", [])?;
     }
+    db.execute_batch("CREATE TABLE IF NOT EXISTS service_icons (id TEXT PRIMARY KEY, name TEXT NOT NULL, created_at INTEGER NOT NULL)")?;
     Ok(())
 }
 
@@ -30,10 +32,22 @@ pub fn save(db: &Connection, tenant: &str, id: &str, input: &TunnelInput) -> Res
         serde_json::from_str(include_str!("../../../web/src/data/hd-icons.json"))
             .expect("内置应用图标目录格式错误")
     });
-    if icon.as_ref().is_some_and(|icon| !catalog.contains(icon)) {
+    let valid = match icon {
+        None => true,
+        Some(icon) if catalog.contains(icon) => true,
+        Some(icon) if icon.starts_with("upload/") => db
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM service_icons WHERE id=?1)",
+                [icon.strip_prefix("upload/").unwrap()],
+                |r| r.get::<_, bool>(0),
+            )
+            .map_err(db_error)?,
+        Some(_) => false,
+    };
+    if !valid {
         return Err(ApiError::new(
             StatusCode::BAD_REQUEST,
-            "请选择图标目录中的应用图标",
+            "请选择图标目录或共享图标库中的应用图标",
         ));
     }
     db.execute(
@@ -57,7 +71,7 @@ mod tests {
         serde_json::from_value(value).unwrap()
     }
 
-    fn fixture() -> (AppState, HeaderMap) {
+    pub(super) fn fixture() -> (AppState, HeaderMap) {
         let (state, headers) = crate::tests::domain_fixture();
         state.db.lock().unwrap().execute_batch("INSERT INTO public_domains(id,tenant_id,domain,https_enabled,created_at,updated_at) VALUES('domain','default','example.com',0,0,0); INSERT INTO domain_settings(domain_id,verification_token,certificate_mode,verified) VALUES('domain','proof','cloudflare_dns',1);").unwrap();
         (state, headers)

@@ -180,6 +180,8 @@ Agent 身份保存在 `data/nexo-agent`。接入成功后可清空 `NEXO_ENROLLM
 
 ## 配置与备份
 
+服务图标支持本地图片上传、HTTP/HTTPS 图片链接导入和共享选择，格式为 PNG、JPG、WebP，原图最大 2 MiB、宽高各不超过 4096 像素。保存服务后图片才加入共享图标库，所有登录用户均可使用；仅管理员可导入 Server 能访问的内网图片及删除未被服务使用的图标。共享图片统一保存在 Server 数据目录的 `service-icons/` 下，备份时须与 `nexo.db` 一同保留。更换或删除服务不会删除共享图片。
+
 启动参数从数据目录中的 TOML 读取，修改后重启对应组件。`--config` 可指定独立配置文件，`--data-dir` 指定持久化目录；相对文件路径按 TOML 所在目录解析。Server 首次初始化支持非空 `NEXO_ADMIN_USERNAME` / `NEXO_ADMIN_PASSWORD`；Agent 支持非空 `NEXO_SERVER_URL` / `NEXO_ENROLLMENT_TOKEN` / `NEXO_DEVICE_NAME` 逐项覆盖 TOML。其他 `NEXO_*` 启动环境变量不生效，`TZ` 保留。
 
 管理入口域名与可选公网 IP 在“账号设置 → 管理员功能 → 服务器设置”保存到 SQLite，由内置 Caddy 自动应用。首次 Agent 接入使用页面生成的 Compose 配置或 docker run 命令；环境变量不回写 TOML。接入成功后可清空 `NEXO_ENROLLMENT_TOKEN`，保留 Server 地址及数据目录，重启复用身份。

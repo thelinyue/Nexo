@@ -7,6 +7,7 @@ use std::net::Ipv4Addr;
 pub mod certificates;
 pub mod control;
 pub mod dns;
+pub mod entry;
 pub mod groups;
 pub mod health;
 pub mod quota;

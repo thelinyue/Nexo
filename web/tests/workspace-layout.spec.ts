@@ -32,8 +32,9 @@ test("页面工具栏从首行开始，桌面账号入口只出现一次", async
       const contentTop = await activePage(page).evaluate(element => element.getBoundingClientRect().top + parseFloat(getComputedStyle(element).borderTopWidth) + parseFloat(getComputedStyle(element).paddingTop));
       expect(Math.abs(contentTop - searchControl.y)).toBeLessThan(1);
       expect(Math.abs(searchControl.y - create.y)).toBeLessThan(1);
-      if (width >= 1200) expect(Math.abs(filter.y - searchControl.y)).toBeLessThan(1);
-      else expect(filter.y).toBeGreaterThanOrEqual(search.y + search.height);
+      expect(filter.y).toBeGreaterThanOrEqual(search.y + search.height);
+      const view = (await page.getByRole("group", { name: "服务视图" }).boundingBox())!;
+      expect(Math.abs(filter.y + filter.height / 2 - view.y - view.height / 2)).toBeLessThan(1);
       expect(create.x + create.width).toBeLessThanOrEqual(width - 24);
       // 原生 select 会无提示截断选中值，除了页面不溢出，还要给默认标签和箭头留足空间。
       for (const select of await page.locator(".service-filter-control select").all()) {

@@ -14,7 +14,7 @@ test("网页类型包含 HTTP 和 HTTPS，内网 IPv6 地址单行展示并完�
   await expect(filter.locator("option")).toHaveText(["全部类型", "网页服务", "TCP 服务", "UDP 服务", "TCP+UDP"]);
   await filter.selectOption("web");
   await expect(page.locator(".service-row")).toHaveCount(2);
-  await expect(page.locator(".service-row .status")).toHaveCount(0);
+  await expect(page.locator(".service-row .status")).toHaveText(["运行中", "运行中"]);
   await page.getByRole("link", { name: "媒体中心", exact: true }).click();
   const field = page.locator(".detail-field", { has: page.getByText("内网地址", { exact: true }) });
   const code = field.locator("code");

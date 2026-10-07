@@ -193,6 +193,8 @@ struct Tunnel {
     node_ids: Vec<String>,
     distribution_mode: String,
     node_statuses: serde_json::Value,
+    #[serde(default)]
+    node_entry: Option<nodes::entry::NodeEntry>,
     icon_id: Option<String>,
     #[serde(default)]
     protocol_statuses: std::collections::BTreeMap<String, nexo_protocol::ProtocolStatus>,
@@ -232,6 +234,8 @@ struct TunnelInput {
     /// 省略保留原图标，显式 null 恢复协议默认图标。
     #[serde(default, deserialize_with = "service_icons::deserialize")]
     icon_id: Option<Option<String>>,
+    /// 上传内容只用于本次提交；保存成功后转换为所有用户可选择的共享图标编号。
+    icon_upload: Option<service_icons::uploads::Upload>,
     access_mode: Option<String>,
     access_password: Option<String>,
     service_mode: Option<String>,
@@ -511,10 +515,30 @@ fn router(state: AppState) -> Router {
         .route("/api/v1/agent/register", post(access_keys::register))
         .route("/api/v1/agent/enroll", post(agent_enroll))
         .route("/api/v1/agent/enroll/{id}/poll", post(agent_poll))
-        .route("/api/v1/tunnels", get(list_tunnels).post(create_tunnel))
+        .route("/api/v1/service-icons", get(service_icons::uploads::list))
+        .route(
+            "/api/v1/service-icons/preview",
+            post(service_icons::uploads::preview),
+        )
+        .route(
+            "/api/v1/service-icons/{uuid}/image",
+            get(service_icons::uploads::image),
+        )
+        .route(
+            "/api/v1/service-icons/{uuid}",
+            delete(service_icons::uploads::delete),
+        )
+        .route(
+            "/api/v1/tunnels",
+            get(list_tunnels)
+                .post(create_tunnel)
+                .layer(axum::extract::DefaultBodyLimit::max(4 * 1024 * 1024)),
+        )
         .route(
             "/api/v1/tunnels/{id}",
-            put(update_tunnel).delete(delete_tunnel),
+            put(update_tunnel)
+                .layer(axum::extract::DefaultBodyLimit::max(4 * 1024 * 1024))
+                .delete(delete_tunnel),
         )
         .route("/api/v1/tunnels/{id}/enable", post(enable_tunnel))
         .route("/api/v1/tunnels/{id}/disable", post(disable_tunnel))
@@ -749,6 +773,7 @@ async fn list_tunnels(
     headers: HeaderMap,
 ) -> Result<Json<Vec<Tunnel>>, ApiError> {
     let session = require_session(&state, &headers)?;
+    let local_ipv4 = server_settings::relay_ipv4(&state)?;
     let connection = state.db.lock().map_err(|_| db_error("数据库锁不可用"))?;
     query_tunnels(
         &connection,
@@ -756,6 +781,7 @@ async fn list_tunnels(
         None,
         &headers,
         state.config.caddy.http_port(),
+        local_ipv4,
     )
     .map(Json)
     .map_err(db_error)
@@ -767,6 +793,7 @@ async fn create_tunnel(
 ) -> Result<Json<Tunnel>, ApiError> {
     let session = require_write(&state, &headers)?;
     let access_hash = service_access::password_hash(&mut input).await?;
+    let mut icon_upload = service_icons::uploads::prepare(&state, &mut input).await?;
     let id = Uuid::new_v4().to_string();
     {
         let db = state.db.lock().map_err(|_| db_error("数据库锁不可用"))?;
@@ -791,10 +818,16 @@ async fn create_tunnel(
             params![id, input.ipv6_direct_enabled.unwrap_or(false)],
         )
         .map_err(db_error)?;
+        if let Some(upload) = &icon_upload {
+            upload.register(&db)?;
+        }
         service_icons::save(&db, &session.tenant_id, &id, &input)?;
         service_access::save(&db, &id, &input, access_hash.as_deref())?;
         accounts::audit(&db, &session, "service_created", "service", &id)?;
         db.commit().map_err(db_error)?;
+        if let Some(upload) = &mut icon_upload {
+            upload.commit();
+        }
     }
     reverse_proxy::changed(
         &state,
@@ -811,6 +844,7 @@ async fn update_tunnel(
 ) -> Result<Json<Tunnel>, ApiError> {
     let session = require_write(&state, &headers)?;
     let access_hash = service_access::password_hash(&mut input).await?;
+    let mut icon_upload = service_icons::uploads::prepare(&state, &mut input).await?;
     let runtime_changed;
     {
         let _dns_guard = state.tunnel_runtime.direct.dns_lock.lock().await;
@@ -888,10 +922,16 @@ async fn update_tunnel(
             params![id, input.ipv6_direct_enabled.unwrap_or(false)],
         )
         .map_err(db_error)?;
+        if let Some(upload) = &icon_upload {
+            upload.register(&db)?;
+        }
         service_icons::save(&db, &session.tenant_id, &id, &input)?;
         service_access::save(&db, &id, &input, access_hash.as_deref())?;
         accounts::audit(&db, &session, "service_updated", "service", &id)?;
         db.commit().map_err(db_error)?;
+        if let Some(upload) = &mut icon_upload {
+            upload.commit();
+        }
     }
     if runtime_changed {
         reverse_proxy::changed(
@@ -930,6 +970,7 @@ fn read_tunnel(
     id: &str,
     headers: &HeaderMap,
 ) -> Result<Tunnel, ApiError> {
+    let local_ipv4 = server_settings::relay_ipv4(state)?;
     let db = state.db.lock().map_err(|_| db_error("数据库锁不可用"))?;
     query_tunnels(
         &db,
@@ -937,6 +978,7 @@ fn read_tunnel(
         Some(id),
         headers,
         state.config.caddy.http_port(),
+        local_ipv4,
     )
     .map_err(db_error)?
     .into_iter()
@@ -1033,6 +1075,7 @@ async fn batch_set_tunnels_enabled(
     if any_changed {
         reverse_proxy::changed(&state, has_tunnels).await?;
     }
+    let local_ipv4 = server_settings::relay_ipv4(&state)?;
     let db = state.db.lock().map_err(|_| db_error("数据库锁不可用"))?;
     Ok(Json(
         query_tunnels(
@@ -1041,6 +1084,7 @@ async fn batch_set_tunnels_enabled(
             None,
             &headers,
             state.config.caddy.http_port(),
+            local_ipv4,
         )
         .map_err(db_error)?
         .into_iter()
@@ -1301,6 +1345,7 @@ fn query_tunnels(
     only: Option<&str>,
     headers: &HeaderMap,
     http_port: u16,
+    local_ipv4: Option<std::net::Ipv4Addr>,
 ) -> rusqlite::Result<Vec<Tunnel>> {
     // Host 仅用于当前响应的地址展示，不参与监听或身份校验；不猜测 127.0.0.1 为公网地址。
     let authority = headers
@@ -1340,6 +1385,7 @@ fn query_tunnels(
                 node_ids: nodes::services::ids(connection,&row.get::<_,String>(0)?)?,
                 distribution_mode: connection.query_row("SELECT distribution_mode FROM tunnels WHERE id=?1",[row.get::<_,String>(0)?],|r|r.get(0))?,
                 node_statuses: nodes::services::statuses(connection,&row.get::<_,String>(0)?)?,
+                node_entry: nodes::entry::summary(connection, tenant, &row.get::<_,String>(0)?, local_ipv4)?,
                 icon_id: row.get(25)?,
                 protocol_statuses: serde_json::from_str(&row.get::<_, String>(21)?)
                     .unwrap_or_default(),
@@ -1581,7 +1627,7 @@ mod tests {
             ('tcp','default','tcp','tcp','127.0.0.1',1234,20000,NULL,NULL,0,0),
             ('web','default','web','https','127.0.0.1',8080,NULL,'app','domain',0,0);").unwrap();
         headers.insert("host", "[2001:db8::1]:8280".parse().unwrap());
-        let tunnels = query_tunnels(&db, "default", None, &headers, 80).unwrap();
+        let tunnels = query_tunnels(&db, "default", None, &headers, 80, None).unwrap();
         assert_eq!(
             tunnels
                 .iter()

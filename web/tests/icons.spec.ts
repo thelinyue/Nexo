@@ -3,6 +3,7 @@ import { installApiMocks } from "./api-mocks";
 
 test("外部图标服务不可用时，导航、操作与状态图标在明暗主题下仍完整显示", async ({ page }, info) => {
   test.skip(info.project.name !== "desktop-dark", "单项目覆盖桌面、手机及明暗主题");
+  await page.addInitScript(() => localStorage.setItem("nexo.services.view", "icons"));
   const iconRequests: string[] = [];
   await page.route(/^https?:\/\/(?!127\.0\.0\.1(?::|\/))/, route => {
     if (/iconify\.(design|api|net)/.test(new URL(route.request().url()).hostname)) iconRequests.push(route.request().url());

@@ -2,6 +2,8 @@ import { expect, test } from "@playwright/test";
 import { installApiMocks } from "./api-mocks";
 import { openServiceEditor } from "./service-actions";
 
+test.beforeEach(async ({ page }) => { await page.addInitScript(() => localStorage.setItem("nexo.services.view", "icons")); });
+
 test("卡片空白打开网页一次，详情与不可访问服务不触发新窗口", async ({ page, context }) => {
   const state = await installApiMocks(page);
   state.tunnels.push(
