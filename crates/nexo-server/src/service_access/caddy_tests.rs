@@ -68,6 +68,7 @@ async fn real_caddy_access_password_cookie_proxy_and_lan_priority() {
     };
     for (id, protocol) in [("web", "https"), ("plain", "http"), ("public", "https")] {
         domain.services.push(WebService {
+            relay: None,
             relay_probe_revision: Some(1),
             https_port: https.port(),
             management: false,
@@ -81,6 +82,7 @@ async fn real_caddy_access_password_cookie_proxy_and_lan_priority() {
     }
     let config = |domain: DomainSpec| {
         let mut value = build_config(&cfg, &[domain]).unwrap();
+        value["apps"]["pki"] = json!({"certificate_authorities":{"local":{"install_trust":false}}});
         value["apps"]["tls"]["automation"]["policies"] =
             json!([{"issuers":[{"module":"internal"}]}]);
         value
@@ -281,6 +283,9 @@ async fn real_caddy_access_password_cookie_proxy_and_lan_priority() {
             .header("Cookie", format!("app=kept; {cookie}"))
             .header("Authorization", "Bearer application-token")
             .header("X-Nexo-Access-Service", "forged")
+            .header("X-Nexo-Access-Relay-Node", "forged-node")
+            .header("X-Nexo-Access-Relay-Target", "8.8.8.8:443")
+            .header("X-Nexo-Access-Relay-Revision", "999")
             .body("payload-original")
             .send()
             .await

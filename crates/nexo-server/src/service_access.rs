@@ -84,6 +84,8 @@ pub fn save(
 #[derive(Clone)]
 struct AccessState {
     default_https_port: u16,
+    http_port: u16,
+    relay_ipv4: Option<std::net::Ipv4Addr>,
     db: Arc<Mutex<Connection>>,
     security: Arc<crate::security::Security>,
 }
@@ -113,6 +115,8 @@ impl Runtime {
                 protected(response)
             }))
             .with_state(AccessState {
+                http_port: state.config.caddy.http_port(),
+                relay_ipv4: state.config.direct.relay_ipv4,
                 default_https_port: state
                     .domain_runtime
                     .supervisor
@@ -173,6 +177,39 @@ fn service(state: &AccessState, db: &Connection, headers: &HeaderMap) -> Result<
         return Err(ApiError::new(StatusCode::BAD_REQUEST, "访问地址无效"));
     }
     service.origin = format!("{protocol}://{authority}");
+    if !value(headers, "x-nexo-access-relay-node").is_empty() {
+        // Caddy 固定写入目标元数据。即使新配置加载失败，也不能按旧节点、旧版本或旧 IP 转发。
+        let target = crate::reverse_proxy::relay::target(db, id, state.http_port)
+            .map_err(db_error)?
+            .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "反向代理授权已撤销"))?;
+        if value(headers, "x-nexo-access-relay-node") != target.node_id
+            || value(headers, "x-nexo-access-relay-target") != target.address.to_string()
+            || value(headers, "x-nexo-access-relay-revision") != target.revision.to_string()
+        {
+            return Err(ApiError::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "反向代理入口已变更，请稍后重试",
+            ));
+        }
+        let settings = state.security.settings()?;
+        let ip = *target.address.ip();
+        if crate::transport::public_ipv4(ip.into()).is_none()
+            || state.relay_ipv4 == Some(ip)
+            || settings.relay_ipv4 == Some(ip)
+            || settings.public_ips.contains(&ip.into())
+        {
+            return Err(ApiError::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "节点地址不能指向管理端或本机，已阻止循环转发",
+            ));
+        }
+        if !crate::reverse_proxy::relay::ready(db, id, &target).map_err(db_error)? {
+            return Err(ApiError::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "反向代理节点尚未就绪或转发已暂停，请稍后重试",
+            ));
+        }
+    }
     Ok(service)
 }
 fn cookie_name(service: &Service) -> String {
@@ -216,6 +253,21 @@ async fn check(State(state): State<AccessState>, headers: HeaderMap) -> Response
 fn check_inner(state: &AccessState, headers: &HeaderMap) -> Result<Response, ApiError> {
     let db = state.db.lock().map_err(|_| db_error("数据库锁不可用"))?;
     let service = service(state, &db, headers)?;
+    if !value(headers, "x-nexo-access-relay-node").is_empty() {
+        // 此跳只检查路由授权；密码认证与认证 Cookie 清理由最终节点完成。
+        // 登录仍在管理端原流程处理，以真实访客 IP 限流，不能提前清掉节点所需的 Cookie。
+        let cookies = headers
+            .get_all(header::COOKIE)
+            .iter()
+            .filter_map(|v| v.to_str().ok())
+            .collect::<Vec<_>>()
+            .join("; ");
+        return Ok((
+            StatusCode::NO_CONTENT,
+            [("x-nexo-upstream-cookie", cookies)],
+        )
+            .into_response());
+    }
     if service.mode == "public" || authenticated(&db, headers, &service)? {
         let clean = headers
             .get_all(header::COOKIE)
@@ -410,6 +462,24 @@ pub fn handlers(address: &str, id: &str) -> (Value, Value) {
     (endpoint, check)
 }
 
+/// 仅供管理端生成的兼容路由使用；内部元数据不会经过公网或节点协议传递。
+pub(crate) fn relay_handlers(
+    endpoint: &mut Value,
+    check: &mut Value,
+    target: Option<&crate::reverse_proxy::relay::Target>,
+) {
+    for handler in [endpoint, check] {
+        let headers = &mut handler["headers"]["request"]["set"];
+        // 管理端的普通入口也覆盖这些值；节点继续使用原 handlers，不新增协议或配置要求。
+        headers["X-Nexo-Access-Relay-Node"] =
+            json!([target.map(|t| t.node_id.clone()).unwrap_or_default()]);
+        headers["X-Nexo-Access-Relay-Target"] =
+            json!([target.map(|t| t.address.to_string()).unwrap_or_default()]);
+        headers["X-Nexo-Access-Relay-Revision"] =
+            json!([target.map(|t| t.revision.to_string()).unwrap_or_default()]);
+    }
+}
+
 /// 管理连接已验证设备和服务版本；仅桥接原认证流程，禁止转发任意 URL 或应用请求体。
 pub async fn direct_request(
     state: &AppState,
@@ -476,6 +546,8 @@ pub async fn remote_request(
     headers.insert("x-nexo-access-host", HeaderValue::from_str(hostname)?);
     headers.insert("x-nexo-access-proto", HeaderValue::from_str(protocol)?);
     let access = AccessState {
+        http_port: state.config.caddy.http_port(),
+        relay_ipv4: state.config.direct.relay_ipv4,
         db: state.db.clone(),
         security: state.security.clone(),
         default_https_port: 443,

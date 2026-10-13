@@ -1,6 +1,8 @@
 //! 反代只复用服务存储与域名入口，不参与 Agent 状态、监听或穿透额度。
 use crate::*;
 
+pub(crate) mod relay;
+
 pub const MODE: &str = "reverse_proxy";
 
 pub fn existing(db: &Connection, session: &auth::Session, id: &str) -> Result<bool, ApiError> {

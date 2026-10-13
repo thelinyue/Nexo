@@ -20,6 +20,9 @@ use std::{
 use x509_parser::{extensions::GeneralName, pem::parse_x509_pem};
 
 #[cfg(test)]
+#[path = "domain_runtime_relay_tests.rs"]
+mod relay_tests;
+#[cfg(test)]
 #[path = "domain_runtime_reverse_proxy_tests.rs"]
 pub(crate) mod reverse_proxy_tests;
 #[cfg(test)]
@@ -121,6 +124,7 @@ struct DomainSpec {
 }
 #[derive(Debug, Clone)]
 struct WebService {
+    relay: Option<crate::reverse_proxy::relay::Target>,
     relay_probe_revision: Option<i64>,
     https_port: u16,
     management: bool,
@@ -237,6 +241,7 @@ fn specifications(
                 None
             };
             domain.services.push(WebService {
+                relay: None,
                 relay_probe_revision: if !direct && crate::nodes::dns::managed(&connection, &id)? {
                     Some(row.get(11)?)
                 } else {
@@ -262,6 +267,32 @@ fn specifications(
                 lan_redirect,
             });
         }
+        // 独立节点的精确 A 生效前，访客可能仍缓存指向管理端的泛解析。
+        // 兼容入口只转发到当前单节点，绝不在管理端解释节点的 127.0.0.1 回源地址。
+        let mut query = connection.prepare("SELECT t.id,t.hostname,t.protocol,t.https_port,t.http_redirect_enabled FROM tunnels t WHERE t.public_domain_id=?1 AND t.tenant_id=?2 AND t.service_mode='reverse_proxy' AND t.enabled=1 AND t.deleted_at IS NULL AND EXISTS(SELECT 1 FROM service_nodes s WHERE s.service_id=t.id AND s.node_id!='local')")?;
+        let mut rows = query.query(params![domain.id, domain.tenant_id])?;
+        while let Some(row) = rows.next()? {
+            let id: String = row.get(0)?;
+            if let Some(target) = crate::reverse_proxy::relay::target(
+                &connection,
+                &id,
+                state.config.caddy.http_port(),
+            )? {
+                let protocol: String = row.get(2)?;
+                domain.services.push(WebService {
+                    upstream: Some(format!("{protocol}://{}", target.address)),
+                    relay: Some(target),
+                    relay_probe_revision: None,
+                    https_port: row.get(3)?,
+                    management: false,
+                    http_redirect_enabled: row.get(4)?,
+                    hostname: format!("{}.{}", row.get::<_, String>(1)?, domain.name),
+                    protocol,
+                    id,
+                    lan_redirect: None,
+                });
+            }
+        }
     }
     // 管理入口只增加专用路由，不伪造普通服务，沿用所选域名的证书策略。
     let management = crate::server_settings::load(&connection)?.management_entry;
@@ -271,6 +302,7 @@ fn specifications(
             .find(|domain| domain.id == entry.domain_id)
         {
             domain.services.push(WebService {
+                relay: None,
                 relay_probe_revision: None,
                 https_port: 443,
                 management: true,
@@ -380,8 +412,25 @@ fn build_config(settings: &CaddyRuntimeConfig, domains: &[DomainSpec]) -> Result
                 https.entry(443).or_default().push(json!({"match":[{"host":[service.hostname]}],"handle":[handler],"terminal":true}));
                 continue;
             }
-            let (access_endpoint, access_check) =
+            let (mut access_endpoint, mut access_check) =
                 crate::service_access::handlers(&settings.access_address, &service.id);
+            crate::service_access::relay_handlers(
+                &mut access_endpoint,
+                &mut access_check,
+                service.relay.as_ref(),
+            );
+            if service.relay.is_some() {
+                if service.protocol == "https" {
+                    handler["transport"]["tls"]["server_name"] = json!(service.hostname);
+                }
+                // 撤销或切换兼容路由时立即关闭旧流，不能沿用普通穿透的延迟关闭。
+                handler
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("stream_close_delay");
+                handler["headers"]["request"]["delete"] =
+                    json!(["X-Nexo-Access-*", "X-Nexo-Upstream-Cookie"]);
+            }
             let route =
                 json!({"match":[{"host":[service.hostname]}],"handle":[access_check,handler]});
             let routes = if service.protocol == "https" {
@@ -1007,6 +1056,7 @@ mod tests {
             token_reference: Some("{file./test/token}".into()),
             dns: crate::domains::DnsSettings::default(),
             services: vec![WebService {
+                relay: None,
                 relay_probe_revision: None,
                 https_port: 443,
                 management: false,
@@ -1243,6 +1293,7 @@ mod tests {
         let mut d = domain();
         d.services.extend([
             WebService {
+                relay: None,
                 relay_probe_revision: None,
                 https_port: 443,
                 management: false,
@@ -1254,6 +1305,7 @@ mod tests {
                 lan_redirect: None,
             },
             WebService {
+                relay: None,
                 relay_probe_revision: None,
                 https_port: 443,
                 management: false,
@@ -1265,6 +1317,7 @@ mod tests {
                 lan_redirect: None,
             },
             WebService {
+                relay: None,
                 relay_probe_revision: None,
                 https_port: 443,
                 management: false,
@@ -1276,6 +1329,7 @@ mod tests {
                 lan_redirect: None,
             },
             WebService {
+                relay: None,
                 relay_probe_revision: None,
                 https_port: 443,
                 management: false,
@@ -1312,6 +1366,7 @@ mod tests {
             }
             let subjects = d.subjects();
             d.services.push(WebService {
+                relay: None,
                 relay_probe_revision: None,
                 https_port: 443,
                 management: false,

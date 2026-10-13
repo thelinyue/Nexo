@@ -34,9 +34,93 @@ fn request_headers(id: &str) -> HeaderMap {
 fn access_state(state: &AppState) -> AccessState {
     AccessState {
         default_https_port: 443,
+        http_port: state.config.caddy.http_port(),
+        relay_ipv4: state.config.direct.relay_ipv4,
         db: state.db.clone(),
         security: state.security.clone(),
     }
+}
+
+/// 缓存旧入口时，授权依据当前绑定；不能把过去的 Caddy 成功加载结果当成授权。
+#[test]
+fn relay_check_keeps_cookies_and_blocks_stale_or_unavailable_targets() {
+    let (state, _) = fixture();
+    let now = unix_now();
+    {
+        let db = state.db.lock().unwrap();
+        db.execute_batch("INSERT INTO relay_nodes(id,name,public_ipv4,approved,reverse_proxy_supported,traffic_quota_supported,created_at) VALUES('remote','节点','8.8.4.4',1,1,1,0);
+            INSERT INTO relay_nodes(id,name,public_ipv4,approved,reverse_proxy_supported,traffic_quota_supported,created_at) VALUES('other','另一节点','8.8.8.8',1,1,1,0);
+            INSERT INTO relay_node_grants VALUES('remote','default');
+            INSERT INTO tunnels(id,tenant_id,name,protocol,local_address,local_port,hostname,public_domain_id,service_mode,access_mode,created_at,updated_at) VALUES('relay','default','反代','http','127.0.0.1',3000,'app','00000000-0000-4000-8000-000000000001','reverse_proxy','password',0,0);
+            DELETE FROM service_nodes WHERE service_id='relay'; INSERT INTO service_nodes VALUES('relay','remote');").unwrap();
+        db.execute(
+            "UPDATE relay_nodes SET last_seen=?1 WHERE id='remote'",
+            [now],
+        )
+        .unwrap();
+        db.execute("INSERT INTO relay_service_health(node_id,service_id,revision,healthy,checked_at) VALUES('remote','relay',1,1,?1)",[now]).unwrap();
+    }
+    let mut headers = request_headers("relay");
+    for (name, val) in [
+        ("x-nexo-access-relay-node", "remote".to_owned()),
+        (
+            "x-nexo-access-relay-target",
+            format!("8.8.4.4:{}", state.config.caddy.http_port()),
+        ),
+        ("x-nexo-access-relay-revision", "1".to_owned()),
+        ("cookie", "app=kept; nexo_access_relay=session".to_owned()),
+    ] {
+        headers.insert(
+            axum::http::HeaderName::from_bytes(name.as_bytes()).unwrap(),
+            val.parse().unwrap(),
+        );
+    }
+    let access = access_state(&state);
+    let response = check_inner(&access, &headers).unwrap();
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    assert_eq!(
+        response.headers()["x-nexo-upstream-cookie"],
+        "app=kept; nexo_access_relay=session"
+    );
+    // 不执行协调，保留旧路由元数据，模拟 Caddy 拒绝新配置的窗口。
+    for (change, restore, status) in [
+        ("UPDATE service_nodes SET node_id='other' WHERE service_id='relay'", "UPDATE service_nodes SET node_id='remote' WHERE service_id='relay'", StatusCode::SERVICE_UNAVAILABLE),
+        ("UPDATE tunnels SET apply_revision=2 WHERE id='relay'", "UPDATE tunnels SET apply_revision=1 WHERE id='relay'", StatusCode::SERVICE_UNAVAILABLE),
+        ("UPDATE relay_nodes SET public_ipv4='8.8.8.8' WHERE id='remote'", "UPDATE relay_nodes SET public_ipv4='8.8.4.4' WHERE id='remote'", StatusCode::SERVICE_UNAVAILABLE),
+        ("UPDATE relay_nodes SET maintenance=1 WHERE id='remote'", "UPDATE relay_nodes SET maintenance=0 WHERE id='remote'", StatusCode::SERVICE_UNAVAILABLE),
+        ("UPDATE relay_nodes SET last_seen=0 WHERE id='remote'", "UPDATE relay_nodes SET last_seen=unixepoch() WHERE id='remote'", StatusCode::SERVICE_UNAVAILABLE),
+        ("UPDATE relay_service_health SET checked_at=0", "UPDATE relay_service_health SET checked_at=unixepoch()", StatusCode::SERVICE_UNAVAILABLE),
+        ("UPDATE relay_service_health SET healthy=0", "UPDATE relay_service_health SET healthy=1", StatusCode::SERVICE_UNAVAILABLE),
+        ("UPDATE relay_nodes SET enabled=0 WHERE id='remote'", "UPDATE relay_nodes SET enabled=1 WHERE id='remote'", StatusCode::NOT_FOUND),
+        ("UPDATE tunnels SET enabled=0 WHERE id='relay'", "UPDATE tunnels SET enabled=1 WHERE id='relay'", StatusCode::NOT_FOUND),
+        ("UPDATE tunnels SET deleted_at=unixepoch() WHERE id='relay'", "UPDATE tunnels SET deleted_at=NULL WHERE id='relay'", StatusCode::NOT_FOUND),
+        ("UPDATE tenants SET enabled=0 WHERE id='default'", "UPDATE tenants SET enabled=1 WHERE id='default'", StatusCode::NOT_FOUND),
+        ("UPDATE tunnels SET protocol='https' WHERE id='relay'; UPDATE public_domains SET https_enabled=0", "UPDATE tunnels SET protocol='http' WHERE id='relay'; UPDATE public_domains SET https_enabled=1", StatusCode::NOT_FOUND),
+        ("UPDATE users SET role='tenant'; DELETE FROM relay_node_grants WHERE node_id='remote'", "INSERT INTO relay_node_grants VALUES('remote','default'); UPDATE users SET role='system_admin'", StatusCode::NOT_FOUND),
+        ("INSERT INTO node_traffic_limits(node_id,monthly_limit_bytes) VALUES('remote',1); INSERT INTO node_traffic_months(node_id,month,used_bytes) VALUES('remote',unixepoch(strftime('%Y-%m-01','now','+8 hours'),'-8 hours'),1)", "DELETE FROM node_traffic_limits; DELETE FROM node_traffic_months", StatusCode::SERVICE_UNAVAILABLE),
+    ] {
+        state.db.lock().unwrap().execute_batch(change).unwrap();
+        assert_eq!(check_inner(&access, &headers).unwrap_err().status, status,"{change}");
+        state.db.lock().unwrap().execute_batch(restore).unwrap();
+    }
+    state.security.configuration.write().unwrap().public_ips = vec!["8.8.4.4".parse().unwrap()];
+    assert_eq!(
+        check_inner(&access, &headers).unwrap_err().status,
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+    state
+        .security
+        .configuration
+        .write()
+        .unwrap()
+        .public_ips
+        .clear();
+    // 没有兼容元数据时仍执行密码认证，不能因增加转发分支改变旧入口安全边界。
+    headers.remove("x-nexo-access-relay-node");
+    assert_eq!(
+        check_inner(&access, &headers).unwrap().status(),
+        StatusCode::UNAUTHORIZED
+    );
 }
 
 #[test]
