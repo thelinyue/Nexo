@@ -12,7 +12,8 @@ permissions:
 jobs:
   quality:
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    # 完整浏览器矩阵约需 24 分钟，为 Rust 构建和节点安装验收保留时间。
+    timeout-minutes: 45
     steps:
       - name: 检出源码
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
