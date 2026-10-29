@@ -342,6 +342,7 @@ pub struct CaddySupervisor {
     log_events: Arc<Mutex<Vec<CaddyLogEvent>>>,
     /// 保存无法启动、端口占用等进程错误，管理接口不可达时仍能提供具体原因。
     process_error: Arc<Mutex<Option<String>>>,
+    analytics: std::sync::OnceLock<Arc<nexo_core::telemetry::Hub>>,
 }
 
 impl CaddySupervisor {
@@ -355,6 +356,7 @@ impl CaddySupervisor {
             token_digest: Arc::new(Mutex::new(None)),
             log_events: Arc::new(Mutex::new(Vec::new())),
             process_error: Arc::new(Mutex::new(None)),
+            analytics: Default::default(),
         }
     }
 
@@ -372,6 +374,10 @@ impl CaddySupervisor {
 
     pub fn config(&self) -> &CaddyRuntimeConfig {
         &self.config
+    }
+
+    pub fn set_analytics(&self, hub: Arc<nexo_core::telemetry::Hub>) {
+        let _ = self.analytics.set(hub);
     }
 
     /// 启动独立 Caddy 子进程；二进制或 Admin 不可用时只影响 Web Service。
@@ -471,6 +477,7 @@ impl CaddySupervisor {
                 "stdout",
                 self.config.cloudflare_token_root.clone(),
                 self.process_error.clone(),
+                self.analytics.get().cloned(),
             );
         }
         if let Some(stderr) = child.stderr.take() {
@@ -480,6 +487,7 @@ impl CaddySupervisor {
                 "stderr",
                 self.config.cloudflare_token_root.clone(),
                 self.process_error.clone(),
+                self.analytics.get().cloned(),
             );
         }
         *self.child.lock().await = Some(child);
@@ -786,6 +794,7 @@ fn spawn_caddy_log_reader<R>(
     stream: &'static str,
     token_root: PathBuf,
     process_error: Arc<Mutex<Option<String>>>,
+    analytics: Option<Arc<nexo_core::telemetry::Hub>>,
 ) where
     R: AsyncRead + Unpin + Send + 'static,
 {
@@ -800,6 +809,9 @@ fn spawn_caddy_log_reader<R>(
                     break;
                 }
             };
+            if analytics.as_ref().is_some_and(|hub| hub.access_line(&line)) {
+                continue;
+            }
             let Some(mut event) = parse_caddy_log_line(&line) else {
                 continue;
             };

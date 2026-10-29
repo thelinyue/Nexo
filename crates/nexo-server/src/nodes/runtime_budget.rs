@@ -140,21 +140,29 @@ pub(super) async fn copy<A: AsyncRead + AsyncWrite + Unpin, B: AsyncRead + Async
             }
         }
     };
+    let observation = (service.protocol == "tcp").then(|| {
+        Arc::new(std::sync::Mutex::new(
+            runtime.analytics.session(&service.id, "tcp"),
+        ))
+    });
     let transfer = async {
+        let mut public =
+            nexo_tunnel::observation::Observed::new(public, observation.clone(), false);
+        let mut origin = nexo_tunnel::observation::Observed::new(origin, observation.clone(), true);
         if let Some(q) = &quota {
             anyhow::ensure!(!q.exhausted, "节点本月流量额度已用尽");
-            let (public_read, public_write) = tokio::io::split(public);
-            let (origin_read, origin_write) = tokio::io::split(origin);
+            let (public_read, public_write) = tokio::io::split(&mut public);
+            let (origin_read, origin_write) = tokio::io::split(&mut origin);
             tokio::try_join!(
                 pump(public_read, origin_write, &runtime, service, q, true),
                 pump(origin_read, public_write, &runtime, service, q, false)
             )?;
         } else {
-            tokio::io::copy_bidirectional(public, origin).await?;
+            tokio::io::copy_bidirectional(&mut public, &mut origin).await?;
         }
         anyhow::Ok(())
     };
-    tokio::select! {result=transfer=>result,result=invalidated=>{result?;anyhow::bail!("节点流量策略或服务授权已更新，关闭旧连接")}}
+    tokio::select! {result=transfer=>{nexo_tunnel::observation::finish(&observation,if result.is_ok(){"closed"}else{"network_error"});result},result=invalidated=>{nexo_tunnel::observation::finish(&observation,"authorization_revoked");result?;anyhow::bail!("节点流量策略或服务授权已更新，关闭旧连接")}}
 }
 
 #[cfg(test)]
@@ -204,6 +212,7 @@ mod tests {
         });
         let runtime = Arc::new(Runtime {
             snapshot,
+            analytics: Default::default(),
             sessions: Default::default(),
             connections: Default::default(),
             health: Default::default(),

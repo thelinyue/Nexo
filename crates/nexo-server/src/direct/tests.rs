@@ -29,6 +29,89 @@ pub(crate) fn fixture() -> (AppState, String) {
     (state, domain)
 }
 
+#[tokio::test]
+async fn analytics_sync_and_replay_follow_authenticated_device_ownership() {
+    let (state, _) = fixture();
+    let batch = || nexo_core::telemetry::Batch {
+        events: vec![nexo_core::telemetry::Event {
+            id: Uuid::new_v4().simple().to_string(),
+            service: "media".into(),
+            at: unix_now(),
+            kind: "request".into(),
+            protocol: "https".into(),
+            status: 206,
+            path: "/video?token=private".into(),
+            to_public: 3,
+            ..Default::default()
+        }],
+        dropped: 0,
+    };
+    let first = batch();
+    let response = handle(
+        &state,
+        "agent",
+        Request::Sync {
+            addresses: vec!["2001:4860::123".into()],
+            reports: vec![],
+            analytics: Some(first.clone()),
+        },
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        response,
+        DirectResponse::Services {
+            analytics_supported: true,
+            ..
+        }
+    ));
+    let response = handle(
+        &state,
+        "agent",
+        Request::Analytics {
+            batch: first.clone(),
+        },
+    )
+    .await
+    .unwrap();
+    assert!(
+        matches!(response, DirectResponse::AnalyticsAck { id: Some(id) } if id == first.events[0].id)
+    );
+    // 使用新主键测试越权，不能让主键去重掩盖设备归属校验缺失。
+    handle(&state, "other", Request::Analytics { batch: batch() })
+        .await
+        .unwrap();
+    state
+        .db
+        .lock()
+        .unwrap()
+        .execute(
+            "UPDATE tunnels SET ipv6_direct_enabled=0 WHERE id='media'",
+            [],
+        )
+        .unwrap();
+    handle(&state, "agent", Request::Analytics { batch: batch() })
+        .await
+        .unwrap();
+    let db = state.db.lock().unwrap();
+    let (count, node, payload): (i64, String, String) = db
+        .query_row(
+            "SELECT COUNT(*),MIN(node_id),MIN(payload) FROM analytics_events",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(count, 1);
+    assert_eq!(node, "direct:agent");
+    assert!(!payload.contains("private"));
+    assert_eq!(
+        db.query_row("SELECT SUM(requests) FROM analytics_hours", [], |r| r
+            .get::<_, i64>(0))
+            .unwrap(),
+        1
+    );
+}
+
 #[test]
 fn ipv6_candidates_exclude_nonpublic_and_automatically_select_multiple_addresses() {
     for ip in [

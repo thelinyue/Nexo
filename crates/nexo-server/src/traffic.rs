@@ -11,6 +11,7 @@ use std::{
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 const RETENTION: i64 = 7 * 86400;
+pub mod analytics;
 pub mod quota;
 mod usage;
 pub use usage::{admin_reset, admin_usage, own_usage};
@@ -297,6 +298,9 @@ impl Collector {
             interval.tick().await;
             if let Err(error) = state.tunnel_runtime.traffic.sample(&state, false) {
                 tracing::error!("流量统计保存失败，将自动重试：{error:#}");
+            }
+            if let Err(error) = analytics::collect(&state).await {
+                tracing::error!("天眼统计保存失败，将自动重试：{error:#}");
             }
         }
     }

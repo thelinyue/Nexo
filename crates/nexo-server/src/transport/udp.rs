@@ -164,6 +164,7 @@ async fn forward(
     peer: Arc<Peer>,
     mut packets: mpsc::Receiver<Packet>,
 ) -> Result<()> {
+    let mut observation = state.tunnel_runtime.analytics.session(&service.id, "udp");
     let quota = state.tunnel_runtime.quotas.get(&state, &service.tenant)?;
     let quota_cancel = quota.connection().context("UDP 流量额度不足")?;
     let meter = state
@@ -185,17 +186,17 @@ async fn forward(
     tokio::pin!(idle);
     loop {
         tokio::select! {
-            _=quota_cancel.cancelled()=>return Ok(()),
-            _=&mut idle=>return Ok(()),
-            _=recv.read_u8()=>return Ok(()),
+            _=quota_cancel.cancelled()=>{observation.finish("quota_exhausted");return Ok(());},
+            _=&mut idle=>{observation.finish("idle_timeout");return Ok(());},
+            _=recv.read_u8()=>{observation.finish("closed");return Ok(());},
             packet=packets.recv()=>{
                 let Some(packet)=packet else{return Ok(());};
-                if let Some(count)=quota.datagram(packet.bytes.len(),&quota_cancel,||peer.send(id,&packet.bytes).0){meter.record(unix_now(),true,count);}
+                if let Some(count)=quota.datagram(packet.bytes.len(),&quota_cancel,||peer.send(id,&packet.bytes).0){meter.record(unix_now(),true,count);observation.record(true,count);}
                 idle.as_mut().reset(tokio::time::Instant::now()+IDLE);
             },
             packet=route.receiver.recv()=>{
                 let Some(packet)=packet else{return Ok(());};
-                if let Some(count)=quota.datagram(packet.bytes.len(),&quota_cancel,||socket.try_send_to(&packet.bytes,address).unwrap_or(0)){meter.record(unix_now(),false,count);}
+                if let Some(count)=quota.datagram(packet.bytes.len(),&quota_cancel,||socket.try_send_to(&packet.bytes,address).unwrap_or(0)){meter.record(unix_now(),false,count);observation.record(false,count);}
                 idle.as_mut().reset(tokio::time::Instant::now()+IDLE);
             }
         }

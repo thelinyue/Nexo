@@ -506,6 +506,77 @@ async fn real_caddy_direct_range_upload_upgrade_authorization_and_revoke() {
             .unwrap(),
         "media:2"
     );
+    // 直连入口复用同一采集器；真实 TLS、上传和升级连接都应产生脱敏的服务事件。
+    let observations = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let batch = process.analytics.batch();
+            if batch.events.iter().any(|e| e.protocol == "websocket") {
+                break batch.events;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(observations.iter().any(|e| e.protocol == "https"
+        && e.status == 206
+        && e.path == "/video"
+        && e.to_public == 3));
+    assert!(observations
+        .iter()
+        .any(|e| e.method == "POST" && e.path == "/upload" && e.to_origin == 1024 * 1024));
+    assert!(observations.iter().any(|e| e.status == 403));
+    assert!(observations.iter().all(|e| e.service == "media"
+        && !e.path.contains('?')
+        && !e.path.starts_with("/.nexo-")
+        && e.host != "unknown.direct.test"));
+    // 可选的跨进程验收：将同一回环入口的事实映射到夹具服务，通过生产 mTLS/Yamux 客户端上报。
+    // 重连后重发原批次模拟 ACK 丢失；控制器必须去重，且不能接受非直连服务的事件。
+    if let Ok(path) = std::env::var("NEXO_TEST_DIRECT_IDENTITY") {
+        let saved: DeviceIdentity = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+        let service = std::env::var("NEXO_TEST_DIRECT_SERVICE").unwrap();
+        let rejected = std::env::var("NEXO_TEST_DIRECT_REJECTED_SERVICE").unwrap();
+        let mut events = observations.clone();
+        for event in &mut events {
+            event.service.clone_from(&service);
+        }
+        let mut forbidden = events[0].clone();
+        forbidden.id = "f".repeat(32);
+        forbidden.service = rejected;
+        let mut batch = nexo_core::telemetry::Batch {
+            events: events.clone(),
+            dropped: 0,
+        };
+        batch.events.push(forbidden);
+        for _ in 0..2 {
+            let connector = TlsConnector::from(
+                identity::client_config(&saved.ca_pem, &saved.certificate_pem, &saved.key_pem)
+                    .unwrap(),
+            );
+            let endpoint = TunnelDataEndpoint {
+                address: std::env::var("NEXO_TEST_DIRECT_ENDPOINT").unwrap(),
+                server_name: "nexo-server".into(),
+            };
+            let (sender, receiver) = mpsc::channel(4);
+            let worker = tokio::spawn(connection(connector, endpoint, receiver));
+            let reply = Client { sender }
+                .call(Request::Analytics {
+                    batch: batch.clone(),
+                })
+                .await
+                .unwrap();
+            assert!(
+                matches!(reply, Response::AnalyticsAck { id: Some(id) } if id == batch.events.last().unwrap().id)
+            );
+            worker.abort();
+            let _ = worker.await;
+        }
+        fs::write(
+            std::env::var("NEXO_TEST_DIRECT_REPORT").unwrap(),
+            serde_json::to_vec(&events).unwrap(),
+        )
+        .unwrap();
+    }
     process.child.kill().await.unwrap();
     assert!(process.apply(config).await.is_err());
     rpc.abort();

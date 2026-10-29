@@ -88,7 +88,7 @@ test("首页概览、管理员用户与隧道筛选、时间图表和手机导�
   const panel = page.getByRole("region", { name: "流量监控", exact: true });
   await expect(panel.getByLabel("统计用户", { exact: true })).toHaveValue("");
   await expect(panel.getByLabel("统计隧道")).toHaveCount(0);
-  await expect(panel.getByRole("img")).toBeVisible();
+  await expect(panel.getByRole("img", {name:"双向速率趋势，点按图表或使用键盘选择时间点", exact:true})).toBeVisible();
   await expect(panel.locator(".traffic-usage strong")).toHaveText(["2 KiB", "20 KiB", "200 KiB"]);
   await expect(panel.getByRole("button", { name: "重置统计", exact: true })).toHaveCount(0);
   await expect(page.locator(".home-summaries")).toContainText("穿透运行 1 · 反代生效 0");
@@ -101,11 +101,11 @@ test("首页概览、管理员用户与隧道筛选、时间图表和手机导�
   await expect.poll(() => queries.some(url => url.searchParams.get("user_id") === "alice" && url.searchParams.get("tunnel_id") === "t-1")).toBeTruthy();
   await panel.getByRole("button", { name: "7 天", exact: true }).click();
   await expect.poll(() => queries.some(url => url.searchParams.get("range") === "7d" && url.searchParams.get("tunnel_id") === "t-1")).toBeTruthy();
-  await expect(panel.getByRole("slider")).toHaveAttribute("max", "167");
+  await expect(panel.getByRole("slider", {name:"查看流量时间点", exact:true})).toHaveAttribute("max", "167");
   expect(queries.filter(url => url.pathname.endsWith("/usage")).every(url => !url.searchParams.has("tunnel_id") && !url.searchParams.has("range"))).toBeTruthy();
   await expect(panel.locator(".traffic-usage strong")).toHaveText(["2 KiB", "20 KiB", "200 KiB"]);
-  await panel.getByRole("slider").focus(); await panel.getByRole("slider").press("Home");
-  await expect(panel.getByRole("slider")).toHaveValue("0");
+  await panel.getByRole("slider", {name:"查看流量时间点", exact:true}).focus(); await panel.getByRole("slider", {name:"查看流量时间点", exact:true}).press("Home");
+  await expect(panel.getByRole("slider", {name:"查看流量时间点", exact:true})).toHaveValue("0");
   await panel.getByLabel("统计用户", { exact: true }).selectOption("");
   await expect(panel.getByLabel("统计隧道")).toHaveCount(0);
   await expect.poll(() => queries.at(-1)?.searchParams.has("user_id")).toBeFalsy();
@@ -183,9 +183,9 @@ test("首页空状态、零流量与缺口、窄屏主题与辅助功能", async
   await page.goto("/");
   await page.getByRole("button", { name: "流量筛选", exact: true }).click();
   await expect(page.getByRole("link", { name: "创建服务", exact: true })).toBeVisible();
-  await page.getByRole("slider").focus(); await page.getByRole("slider").press("Home"); await page.getByRole("slider").press("ArrowRight");
+  await page.getByRole("slider", {name:"查看流量时间点", exact:true}).focus(); await page.getByRole("slider", {name:"查看流量时间点", exact:true}).press("Home"); await page.getByRole("slider", {name:"查看流量时间点", exact:true}).press("ArrowRight");
   await expect(page.locator(".chart-reading")).toContainText("此时段未采集");
-  await page.getByRole("slider").press("Home");
+  await page.getByRole("slider", {name:"查看流量时间点", exact:true}).press("Home");
   await expect(page.locator(".chart-reading")).toContainText("0 B/s");
   for (const theme of ["light", "dark"] as const) for (const [width, height] of [[320, 568], [390, 844], [812, 375], [1440, 900]]) {
     await page.emulateMedia({ colorScheme: theme, reducedMotion: "reduce", contrast: "more" });

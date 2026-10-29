@@ -1,5 +1,11 @@
 /* 首页使用独立样式，避免改变服务、节点及公共弹窗的视觉层级。 */
 .home-page { display:grid; gap:16px; min-width:0; }
+.home-page .home-overview { display:grid; grid-template-columns:minmax(0,1fr); }
+.home-page .home-traffic { padding:0; grid-column:auto; grid-row:auto; }
+.home-page .home-attention { grid-column:auto; grid-row:auto; }
+.home-legacy-traffic { padding:18px; margin-top:16px; }
+.home-traffic>.home-section-heading { margin-bottom:0; }
+.home-traffic>.traffic-usage-section { background:var(--surface); padding:18px; border:1px solid var(--border); border-radius:14px; }
 .home-page .panel,.app-shell .home-page .page-header { margin-bottom:0; }
 .app-shell .page-slot:has(>.home-page) { background:none; border-color:transparent; box-shadow:none; padding:8px 0; }
 .home-workspace { margin:0; color:var(--secondary); font-size:.8125rem; overflow-wrap:anywhere; }

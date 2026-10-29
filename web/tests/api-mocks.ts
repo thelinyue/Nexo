@@ -90,6 +90,18 @@ export async function installApiMocks(page: Page, options: { empty?: boolean; an
       return respond({ timezone: "Asia/Shanghai", sampled_at: now, started_at: now - 40 * 86400, reset_at, reset_users: reset_at ? 1 : user ? 0 : state.trafficResets.size, today: period(0, 1024), week: period(3, 10240), month: period(15, 102400) });
     }
     if (path.endsWith("/traffic/realtime")) return respond({ sampled_at: Math.floor(Date.now() / 1000), status: "ready", rates: { to_origin: 2048, to_public: 8192 } });
+    if (path.endsWith("/traffic/analytics/summary")) {
+      const now = Math.floor(Date.now() / 1000);
+      const total = { requests: 742, errors: 31, sessions: 4, duration_ms: 122430, session_ms: 24000, to_origin: 317440, to_public: 17825792, peak: 12 };
+      return respond({ sampled_at: now, started_at: now - 40 * 86400, uptime: 57004, status: "ready", start: now - 86400, end: now, step: 3600, partial: false, dropped: 0, geo_available: false, totals: total, qps: 12.4, active: 3, uv_daily_sum: 24, p50_ms: 100, p95_ms: 500,
+        series: Array.from({length: 24}, (_, i) => ({ at: now - (24 - i) * 3600, covered: i !== 5, partial: false, p50_ms: 100, p95_ms: 500, totals: {...total, to_origin: (Math.sin(i / 2) + 1) * 10240, to_public: (Math.sin(i / 3) + 1) * 102400, requests: 10 + i * 2, errors: i % 3} })),
+        services: [{id: "t-1", name: "媒体中心", mode: "tunnel", requests: 742, bytes: 18143232, errors: 31}], protocols: {https: 742, tcp: 4},
+        breakdowns: {status: [{label:"200",count:711},{label:"404",count:20},{label:"502",count:11}], device:[{label:"电脑",count:680},{label:"手机",count:62}], browser:[{label:"Chrome",count:660},{label:"Safari",count:82}], os:[{label:"Windows",count:660},{label:"iOS",count:82}], country:[{label:"未知",count:742}], source:[{label:"203.0.113.0/24",count:600},{label:"2001:db8:1::/48",count:142}], path:[{label:"/media",count:312},{label:"/api/items",count:230}], domain:[{label:"media.example.com",count:742}], reason:[{label:"closed",count:4}]} });
+    }
+    if (path.endsWith("/traffic/analytics/requests") || path.endsWith("/traffic/analytics/sessions")) {
+      const now = Math.floor(Date.now() / 1000);
+      return respond({ items: [{ id: "request-1", at: now, service: "t-1", name: "媒体中心", node: "local", protocol: "https", method: "GET", path: "/media", status: 200, duration_ms: 165, to_origin: 1024, to_public: 20480, source: "203.0.113.0/24", country: "未知", browser: "Chrome", os: "Windows", device: "电脑", reason: "closed" }], next_cursor: null, retention_days: 7 });
+    }
     if (path.endsWith("/traffic/history")) {
       const range = new URL(req.url()).searchParams.get("range");
       const step = range === "1h" ? 60 : range === "7d" ? 3600 : 300;

@@ -18,8 +18,9 @@ test("首页默认概览、图内选点与键盘读数跨主题可用", async ({
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBeTruthy();
   if (info.project.name === "desktop-dark") {
     const attention = (await page.locator(".home-attention").boundingBox())!;
-    expect(attention.x).toBeGreaterThan(bounds.x + bounds.width);
-    expect(bounds.y + bounds.height).toBeLessThan(900);
+    const eye = (await page.locator(".eye-throughput").boundingBox())!;
+    expect(attention.y).toBeGreaterThan(eye.y + eye.height);
+    expect(eye.y + eye.height).toBeLessThan(900);
   } else {
     await expect(page.getByRole("button", { name: "展开", exact: true })).toHaveAttribute("aria-expanded", "false");
     await page.getByRole("button", { name: "展开", exact: true }).click();
@@ -38,10 +39,11 @@ test("首页默认概览、图内选点与键盘读数跨主题可用", async ({
     if (info.project.name === "desktop-dark") await page.mouse.move(box.x + position.x, box.y + position.y);
     else await plot.tap({ position });
     await expect(page.locator(".chart-tooltip")).toBeVisible();
+    const currentBox = (await plot.boundingBox())!;
     const tip = (await page.locator(".chart-tooltip").boundingBox())!;
-    expect(tip.x).toBeGreaterThanOrEqual(box.x);
-    expect(tip.x + tip.width).toBeLessThanOrEqual(box.x + box.width + 1);
-    expect(tip.y + tip.height).toBeLessThanOrEqual(box.y + box.height);
+    expect(tip.x).toBeGreaterThanOrEqual(currentBox.x);
+    expect(tip.x + tip.width).toBeLessThanOrEqual(currentBox.x + currentBox.width + 1);
+    expect(tip.y + tip.height).toBeLessThanOrEqual(currentBox.y + currentBox.height);
   }
   await page.screenshot({ path: info.outputPath("home-inspect.png"), fullPage: true, animations: "disabled" });
   if (info.project.name === "desktop-dark") await page.mouse.move(0, 0);
@@ -76,7 +78,7 @@ test("渐变不跨越缺口，缺失、部分采集、单点和零流量保持�
   const areas = await page.locator(".chart-area").evaluateAll(paths => paths.map(path => { const b = (path as SVGPathElement).getBBox(); return { left: b.x, right: b.x + b.width }; }));
   expect(areas.length).toBe(4);
   expect(areas.every(area => area.right < leftGap || area.left > rightGap)).toBeTruthy();
-  const slider = page.getByRole("slider");
+  const slider = page.getByRole("slider", {name:"查看流量时间点", exact:true});
   await slider.focus(); await slider.press("Home");
   await expect(slider).toHaveAttribute("aria-valuetext", /0 B\/s/);
   await slider.press("ArrowRight"); await slider.press("ArrowRight");

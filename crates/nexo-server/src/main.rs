@@ -290,7 +290,10 @@ async fn main() -> Result<()> {
         .with_target(false)
         .compact()
         .init();
-    let cli = Cli::parse();
+    run(Cli::parse()).await
+}
+
+async fn run(cli: Cli) -> Result<()> {
     let data_dir = nexo_core::config::absolute(&cli.data_dir)?;
     if let Some(CliCommand::Node {
         server_url,
@@ -340,6 +343,20 @@ async fn main() -> Result<()> {
     connection.execute("UPDATE devices SET status='offline'", [])?;
     // 启动配置可能改变内置节点公网地址或监听端口，不能沿用重启前的入口探测。
     connection.execute("DELETE FROM relay_public_health WHERE node_id='local'", [])?;
+    let mut tunnel_runtime = transport::Runtime::new(config.public_bind);
+    tunnel_runtime.analytics = Arc::new(nexo_core::telemetry::Hub::persistent(&data_dir)?);
+    // 真实进程冒烟复用正常启动流程；DNS 替身仅编译进测试程序，正式二进制不接受此入口。
+    #[cfg(test)]
+    if let Ok(endpoint) = std::env::var("NEXO_TEST_DNS_ENDPOINT") {
+        let mut zone = dns_provider::Zone::mock(
+            dns_provider::Credential::Cloudflare {
+                token: "smoke-only".into(),
+            },
+            endpoint,
+        );
+        zone.name = "nexo-smoke.localhost".into();
+        *tunnel_runtime.direct.test_zone.lock().await = Some(zone);
+    }
     let state = AppState {
         agent_releases: Arc::new(agent_release::Catalog::default()),
         security: Arc::new(security::Security::new(server_settings::load_for_runtime(
@@ -347,7 +364,7 @@ async fn main() -> Result<()> {
             config.http_addr,
         )?)),
         authority,
-        tunnel_runtime: Arc::new(transport::Runtime::new(config.public_bind)),
+        tunnel_runtime: Arc::new(tunnel_runtime),
         db: Arc::new(Mutex::new(connection)),
         domain_runtime: Arc::new(domain_runtime::DomainRuntimeManager::new(
             caddy::CaddyRuntimeConfig::new(&data_dir, &config.caddy),
@@ -413,6 +430,9 @@ async fn main() -> Result<()> {
     if let Err(error) = tunnel_runtime.traffic.sample(&traffic_state, true) {
         tracing::error!("退出时保存流量统计失败：{error:#}");
     }
+    if let Err(error) = traffic::analytics::collect(&traffic_state).await {
+        tracing::error!("退出时保存天眼统计失败：{error:#}");
+    }
     runtime.supervisor.shutdown().await?;
     serving?;
     Ok(())
@@ -442,6 +462,30 @@ fn router(state: AppState) -> Router {
         .merge(nodes::routes())
         .route("/health", get(health))
         .route("/api/v1/traffic/realtime", get(traffic::own_realtime))
+        .route(
+            "/api/v1/traffic/analytics/summary",
+            get(traffic::analytics::own),
+        )
+        .route(
+            "/api/v1/traffic/analytics/requests",
+            get(traffic::analytics::own_requests),
+        )
+        .route(
+            "/api/v1/traffic/analytics/sessions",
+            get(traffic::analytics::own_sessions),
+        )
+        .route(
+            "/api/v1/admin/traffic/analytics/summary",
+            get(traffic::analytics::admin),
+        )
+        .route(
+            "/api/v1/admin/traffic/analytics/requests",
+            get(traffic::analytics::admin_requests),
+        )
+        .route(
+            "/api/v1/admin/traffic/analytics/sessions",
+            get(traffic::analytics::admin_sessions),
+        )
         .route("/api/v1/traffic/history", get(traffic::own_history))
         .route("/api/v1/traffic/usage", get(traffic::own_usage))
         .route("/api/v1/traffic/quota", get(traffic::quota::own_quota))
@@ -635,6 +679,7 @@ fn initialize_database(connection: &Connection, is_new: bool) -> Result<()> {
     direct::migrate(connection)?;
     service_icons::migrate(connection)?;
     nodes::migrate(connection)?;
+    traffic::analytics::migrate(connection)?;
     server_settings::load(connection).context("无法读取服务器设置")?;
     connection.prepare("SELECT enabled FROM tenants")?;
     connection.prepare("SELECT service_mode,protocol_statuses,access_mode FROM tunnels")?;
@@ -1617,6 +1662,20 @@ fn desired_tunnels(state: &AppState, device_id: &str) -> Result<Vec<TunnelDesire
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Python 冒烟使用的真实 Server 进程入口；只替换 DNS Zone，保留认证、协调和转发流程。
+    #[tokio::test]
+    #[ignore = "仅供隔离冒烟脚本启动，需要 NEXO_TEST_SMOKE_DATA_DIR 和本地 DNS 夹具"]
+    async fn smoke_server_process() {
+        tracing_subscriber::fmt().with_test_writer().try_init().ok();
+        let directory = std::env::var("NEXO_TEST_SMOKE_DATA_DIR").expect("冒烟临时数据目录");
+        assert!(std::env::var("NEXO_TEST_DNS_ENDPOINT")
+            .unwrap()
+            .starts_with("http://127.0.0.1:"));
+        run(Cli::parse_from(["nexo-server", "--data-dir", &directory]))
+            .await
+            .unwrap();
+    }
 
     #[test]
     fn tunnel_addresses_use_service_domains_and_preserve_ipv6_brackets() {

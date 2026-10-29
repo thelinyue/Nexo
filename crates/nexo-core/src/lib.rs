@@ -2,5 +2,6 @@
 
 pub mod config;
 pub mod enrollment;
+pub mod telemetry;
 
 pub use enrollment::{EnrollmentError, EnrollmentStatus, EnrollmentToken, PendingEnrollment};

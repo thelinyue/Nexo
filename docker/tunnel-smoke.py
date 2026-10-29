@@ -22,6 +22,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
+import urllib.parse
 import uuid
 
 
@@ -65,7 +66,7 @@ class Origin(http.server.BaseHTTPRequestHandler):
                 self.wfile.flush()
             self.close_connection = True
             return
-        payload = b"nexo-real-origin\n" if self.path != "/large" else bytes(range(256)) * 32768
+        payload = b"nexo-real-origin\n" if urllib.parse.urlsplit(self.path).path != "/large" else bytes(range(256)) * 32768
         self.send_response(200)
         self.send_header("Content-Length", str(len(payload)))
         self.end_headers()
@@ -78,6 +79,42 @@ class Origin(http.server.BaseHTTPRequestHandler):
 class EchoServer(socketserver.ThreadingTCPServer):
     daemon_threads = True
     allow_reuse_address = True
+
+
+class LocalDns(http.server.BaseHTTPRequestHandler):
+    """仅供 Rust 测试程序使用的 DNS API；记录保留在内存，重启/备份恢复仍走真实协调。"""
+    def do_GET(self):
+        self.dispatch()
+
+    do_POST = do_PUT = do_DELETE = do_GET
+
+    def dispatch(self):
+        url = urllib.parse.urlsplit(self.path)
+        prefix = "/client/v4/zones/zone/dns_records"
+        if not (url.path == prefix or url.path.startswith(prefix + "/")) or self.headers.get("Authorization") != "Bearer smoke-only":
+            self.send_error(403)
+            return
+        with self.server.records_lock:
+            record_id = url.path.removeprefix(prefix).strip("/")
+            if self.command == "GET":
+                name = urllib.parse.parse_qs(url.query).get("name", [""])[0]
+                result = [r for r in self.server.records.values() if r["name"] == name]
+            elif self.command == "DELETE":
+                result = self.server.records.pop(record_id)
+            else:
+                result = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+                assert result["name"].endswith(".nexo-smoke.localhost")
+                result["id"] = record_id or str(uuid.uuid4())
+                self.server.records[result["id"]] = result
+            payload = json.dumps({"success": True, "result": result}).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+    def log_message(self, *args):
+        pass
 
 
 def port():
@@ -118,7 +155,7 @@ class Harness:
     def __init__(self, args):
         self.args = args
         self.root = Path(tempfile.mkdtemp(prefix="nexo-e2e-"))
-        self.ports = {key: port() for key in ["api", "control", "data", "admin", "http", "https", "public"]}
+        self.ports = {key: port() for key in ["api", "control", "data", "admin", "http", "https", "https_default", "public"]}
         assert len(set(self.ports.values())) == len(self.ports)
         self.url = f"http://127.0.0.1:{self.ports['api']}"
         self.opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar()))
@@ -128,6 +165,13 @@ class Harness:
         self.checks = []
         self.server = None
         self.agent = None
+        self.server_test_bin = getattr(args, "server_test_bin", None) or os.environ.get("NEXO_SMOKE_SERVER_TEST_BIN")
+        self.dns = None
+        if self.server_test_bin:
+            self.dns = http.server.ThreadingHTTPServer(("127.0.0.1", 0), LocalDns)
+            self.dns.records = {}
+            self.dns.records_lock = threading.Lock()
+            threading.Thread(target=self.dns.serve_forever, daemon=True).start()
 
     def check(self, text):
         self.checks.append(text)
@@ -136,6 +180,38 @@ class Harness:
     def before_restart(self, device, tcp, secure):
         """可由证书续签验收复用当前真实转发环境。"""
         pass
+
+    def verify_direct_analytics(self, device, tcp, secure):
+        binary = getattr(self.args, "agent_test_bin", None) or os.environ.get("NEXO_SMOKE_AGENT_TEST_BIN")
+        if not binary:
+            return
+        def summary(service):
+            return self.api(f"traffic/analytics/summary?range=1h&tunnel_id={service['id']}")["totals"]
+        before = summary(secure)
+        tcp_before = summary(tcp)
+        report = self.root / "direct-observations.json"
+        with sqlite3.connect(self.root / "server/nexo.db") as db:
+            db.execute("UPDATE tunnels SET ipv6_direct_enabled=1 WHERE id=?", (secure["id"],))
+        try:
+            environment = dict(os.environ, NEXO_TEST_CADDY_BIN=str(Path(self.args.caddy_bin).resolve()),
+                NEXO_TEST_DIRECT_IDENTITY=str(self.root / "agent/identity.json"), NEXO_TEST_DIRECT_SERVICE=secure["id"],
+                NEXO_TEST_DIRECT_REJECTED_SERVICE=tcp["id"], NEXO_TEST_DIRECT_ENDPOINT=f"127.0.0.1:{self.ports['data']}",
+                NEXO_TEST_DIRECT_REPORT=str(report))
+            subprocess.run([str(Path(binary).resolve()), "--ignored", "--exact", "direct::tests::real_caddy_direct_range_upload_upgrade_authorization_and_revoke", "--nocapture"], env=environment, check=True, timeout=90)
+            facts = json.loads(report.read_text())
+            after = summary(secure)
+            assert after["requests"] - before["requests"] == len(facts), "重连重放导致重复计数或漏报"
+            for key in ("to_origin", "to_public"):
+                assert after[key] - before[key] == sum(e[key] for e in facts), key
+            assert summary(tcp) == tcp_before, "非直连服务接受了伪造的直连事件"
+            entries = self.api(f"traffic/analytics/requests?tunnel_id={secure['id']}")["items"]
+            direct = [e for e in entries if e["node"] == f"direct:{device}"]
+            assert len(direct) == len(facts)
+            assert all("?" not in e["path"] and "visitor" not in e for e in direct)
+            self.check("IPv6 回环 Caddy 事实经真实 Agent mTLS/Yamux 上报，重连重放去重、服务权限和双向字节一致")
+        finally:
+            with sqlite3.connect(self.root / "server/nexo.db") as db:
+                db.execute("UPDATE tunnels SET ipv6_direct_enabled=0 WHERE id=?", (secure["id"],))
 
     def api(self, path, method="GET", body=None):
         request = urllib.request.Request(self.url + "/api/v1/" + path, data=json.dumps(body).encode() if body is not None else None, method=method, headers={"Content-Type": "application/json", "x-nexo-csrf": self.csrf})
@@ -151,7 +227,13 @@ class Harness:
         if component == "server":
             config["runtime_dir"] = str(self.root / "runtime")
         (directory / f"{component}.toml").write_text("\n".join(f"{key} = {json.dumps(value, ensure_ascii=False)}" for key, value in config.items()), encoding="utf-8")
-        process = subprocess.Popen([str(Path(binary).resolve()), "--data-dir", str(directory)], env=os.environ.copy(), stdout=log, stderr=subprocess.STDOUT, creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0)
+        command = [str(Path(binary).resolve()), "--data-dir", str(directory)]
+        environment = os.environ.copy()
+        if component == "server" and self.server_test_bin:
+            command = [str(Path(self.server_test_bin).resolve()), "--ignored", "--exact", "tests::smoke_server_process", "--nocapture"]
+            environment.update(NEXO_TEST_SMOKE_DATA_DIR=str(directory), NEXO_TEST_DNS_ENDPOINT=f"http://127.0.0.1:{self.dns.server_port}")
+            environment["NEXO_TEST_SMOKE_CA"] = str(self.root / "server/caddy-storage/pki/authorities/local/root.crt")
+        process = subprocess.Popen(command, env=environment, stdout=log, stderr=subprocess.STDOUT, creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0)
         self.processes.append(process)
         return process
 
@@ -179,7 +261,9 @@ class Harness:
         shutil.copytree(storage / "certificates/local", storage / "certificates/acme-v02.api.letsencrypt.org-directory")
 
     def configure_local_domain(self, domain):
-        """仅在隔离数据库设置归属和假凭据，配合预置证书验证 DNS 模式的转发路径。"""
+        """归属和证书使用本地夹具；DNS 协调通过测试程序内的替身，禁止假凭据外发。"""
+        if not self.dns:
+            raise RuntimeError("DNS 冒烟需要 --server-test-bin 或 NEXO_SMOKE_SERVER_TEST_BIN；请先 cargo test -p nexo-server --no-run，不能把假凭据发往公网")
         directory = self.root / "server/secrets/public-domains" / domain["id"]
         directory.mkdir(parents=True, mode=0o700, exist_ok=True)
         credential = f"credential-{uuid.uuid4()}.token"
@@ -197,9 +281,10 @@ class Harness:
             "control_addr": f"127.0.0.1:{self.ports['control']}", "tunnel_addr": f"127.0.0.1:{self.ports['data']}",
             "udp_addr": f"127.0.0.1:{self.ports['data']}", "udp_endpoint": f"127.0.0.1:{self.ports['data']}",
             "tunnel_endpoint": f"127.0.0.1:{self.ports['data']}", "public_bind": "127.0.0.1",
+            "direct.relay_ipv4": "127.0.0.1",
             "caddy.binary": str(Path(self.args.caddy_bin).resolve()), "caddy.enabled": True,
             "caddy.admin_url": f"http://127.0.0.1:{self.ports['admin']}",
-            "caddy.http_listen": f"127.0.0.1:{self.ports['http']}", "caddy.https_listen": f"127.0.0.1:{self.ports['https']}",
+            "caddy.http_listen": f"127.0.0.1:{self.ports['http']}", "caddy.https_listen": f"127.0.0.1:{self.ports['https_default']}",
         })
         def started():
             assert self.server.poll() is None, f"Server 已退出，请查看 {self.logs[-1].name}"
@@ -237,7 +322,8 @@ class Harness:
             ca = self.root / "server/caddy-storage/pki/authorities/local/root.crt"
             stream = ssl.create_default_context(cafile=str(ca)).wrap_socket(stream, server_hostname=host)
         with stream:
-            stream.sendall(f"GET {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n".encode())
+            authority = f"{host}:{self.ports['https']}" if secure else host
+            stream.sendall(f"GET {path} HTTP/1.1\r\nHost: {authority}\r\nConnection: close\r\n\r\n".encode())
             response = http.client.HTTPResponse(stream)
             response.begin()
             return response.status, response.read()
@@ -262,13 +348,13 @@ class Harness:
             # 归属验证由独立测试覆盖；本地固定夹具不查询公网 DNS、不触发公网 ACME。
             self.configure_local_domain(domain)
             def create(protocol, name, local_port, public_port=None):
-                return self.api("tunnels", "POST", {"name": name, "protocol": protocol, "device_id": device, "local_address": "127.0.0.1", "local_port": local_port, "enabled": True, "public_port": public_port, "hostname": name if protocol != "tcp" else None, "public_domain_id": domain["id"] if protocol != "tcp" else None})
+                return self.api("tunnels", "POST", {"name": name, "protocol": protocol, "device_id": device, "local_address": "127.0.0.1", "local_port": local_port, "enabled": True, "public_port": public_port, "https_port": self.ports["https"], "hostname": name if protocol != "tcp" else None, "public_domain_id": domain["id"] if protocol != "tcp" else None})
             tcp = create("tcp", "echo", echo.server_address[1], self.ports["public"])
             web = create("http", "web", origin.server_address[1])
             secure = create("https", "secure", origin.server_address[1])
             assert tcp["public_address"] == f"127.0.0.1:{self.ports['public']}"
             assert web["public_address"] == f"http://web.nexo-smoke.localhost:{self.ports['http']}"
-            assert secure["public_address"] == "https://secure.nexo-smoke.localhost"
+            assert secure["public_address"] == f"https://secure.nexo-smoke.localhost:{self.ports['https']}"
             for tunnel in [tcp, web, secure]:
                 wait_for(lambda: self.ready(tunnel["id"]), f"{tunnel['protocol']} 服务就绪")
             if os.name != "nt":
@@ -302,6 +388,18 @@ class Harness:
             wait_for(lambda: all(traffic(item)["total"]["to_origin"] > 0 and traffic(item)["total"]["to_public"] > 0 for item in [tcp, web, secure]), "三个协议均产生流量统计")
             assert traffic(tcp)["total"]["to_origin"] == 9 * 1024 * 1024
             assert traffic(tcp)["total"]["to_public"] == 9 * 1024 * 1024 + len(TAIL) * 9
+            def analytics(tunnel):
+                return self.api(f"traffic/analytics/summary?range=1h&tunnel_id={tunnel['id']}")
+            wait_for(lambda: all(analytics(item)["totals"]["requests"] > 0 for item in [web, secure]), "天眼 HTTP/HTTPS 请求采集")
+            wait_for(lambda: analytics(tcp)["totals"]["sessions"] >= 9, "天眼 TCP 会话采集")
+            assert analytics(tcp)["totals"]["to_origin"] == 9 * 1024 * 1024
+            assert analytics(tcp)["totals"]["to_public"] == 9 * 1024 * 1024 + len(TAIL) * 9
+            assert self.web("web.nexo-smoke.localhost", False, "/?private_token=nexo-private-acceptance")[0] == 200
+            wait_for(lambda: analytics(web)["totals"]["requests"] >= 2, "带查询参数的请求完成采集")
+            entries = self.api(f"traffic/analytics/requests?tunnel_id={web['id']}")["items"]
+            assert entries and all("?" not in entry["path"] and "visitor" not in entry for entry in entries)
+            assert "nexo-private-acceptance" not in json.dumps(entries)
+            self.check("天眼真实 HTTP/HTTPS 请求、TCP 双向精确计数、会话和查询参数脱敏")
             baseline = traffic()
             direct = http.client.HTTPConnection("127.0.0.1", origin.server_address[1], timeout=10)
             direct.request("GET", "/")
@@ -396,7 +494,7 @@ class Harness:
                 assert response[2:] == payload
             self.check("WebSocket Upgrade 与帧转发")
             for protocol in ["http", "https"]:
-                self.api(f"tunnels/{secure['id']}", "PUT", {"name": "secure", "protocol": protocol, "device_id": device, "local_address": "127.0.0.1", "local_port": origin.server_address[1], "enabled": True, "hostname": "secure", "public_domain_id": domain["id"]})
+                self.api(f"tunnels/{secure['id']}", "PUT", {"name": "secure", "protocol": protocol, "device_id": device, "local_address": "127.0.0.1", "local_port": origin.server_address[1], "enabled": True, "hostname": "secure", "public_domain_id": domain["id"], "https_port": self.ports["https"]})
                 wait_for(lambda: self.ready(secure["id"]), f"切换公网协议为 {protocol}")
                 assert self.web("secure.nexo-smoke.localhost", protocol == "https")[0] == 200
             self.check("HTTP / HTTPS 协议切换后，状态等待 Caddy 新路由加载")
@@ -483,6 +581,7 @@ class Harness:
                     return db.execute("SELECT COALESCE(SUM(to_origin),0),COALESCE(SUM(to_public),0) FROM traffic_minutes").fetchone()
             # 续签钩子也会重启 Server；在任何强制结束之前等待本轮大流量落库。
             wait_for(lambda: persisted_traffic()[0] >= 9 * 1024 * 1024, "流量分钟批次落库", timeout=75)
+            self.verify_direct_analytics(device, tcp, secure)
             self.before_restart(device, tcp, secure)
             before = (self.root / "agent/identity.json").read_bytes()
             self.agent.terminate()
@@ -496,6 +595,9 @@ class Harness:
             saved_traffic = persisted_traffic()
             with sqlite3.connect(self.root / "server/nexo.db") as db:
                 saved_quota = db.execute("SELECT COALESCE(SUM(used_bytes),0) FROM traffic_quota_months").fetchone()[0]
+                saved_analytics = {r[0] for r in db.execute("SELECT id FROM analytics_events")}
+                saved_requests = db.execute("SELECT COALESCE(SUM(requests),0) FROM analytics_hours").fetchone()[0]
+            analytics_key = (self.root / "server/analytics.key").read_bytes()
             assert saved_quota > 0
             limit_to(saved_quota + 1024 * 1024 * 1024)
             self.stop_server()
@@ -527,6 +629,11 @@ class Harness:
             assert quota["used_bytes"] >= saved_quota
             assert quota["monthly_limit_bytes"] == saved_quota + 1024 * 1024 * 1024
             self.check("Server 重启恢复独立月额度消耗与配置")
+            with sqlite3.connect(self.root / "server/nexo.db") as db:
+                assert saved_analytics <= {r[0] for r in db.execute("SELECT id FROM analytics_events")}
+                assert db.execute("SELECT COALESCE(SUM(requests),0) FROM analytics_hours").fetchone()[0] >= saved_requests > 0
+            assert (self.root / "server/analytics.key").read_bytes() == analytics_key
+            self.check("离线备份恢复保留天眼事实、小时聚合和访客隐私密钥")
             self.api(f"tunnels/{web['id']}", "DELETE")
             wait_for(lambda: self.web("web.nexo-smoke.localhost")[0] != 200, "删除 HTTP 撤销路由")
             if os.name != "nt":
@@ -549,11 +656,16 @@ class Harness:
         self.stop_server()
         for log in self.logs:
             log.close()
+        if self.dns:
+            self.dns.shutdown()
+            self.dns.server_close()
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--server-bin", required=True)
+    parser.add_argument("--server-test-bin", help="cargo test --no-run 生成的 nexo-server 测试程序；仅此程序支持本地 DNS 夹具")
+    parser.add_argument("--agent-test-bin", help="可选的 Agent 测试程序，追加 IPv6 回环采集到控制器的跨进程验收")
     parser.add_argument("--agent-bin", required=True)
     parser.add_argument("--caddy-bin", required=True)
     parser.add_argument("--report")

@@ -212,9 +212,32 @@ pub async fn session(
 }
 async fn handle(state: &AppState, device: &str, request: Request) -> Result<DirectResponse> {
     match request {
-        Request::Sync { addresses, reports } => Ok(DirectResponse::Services {
-            services: sync(state, device, addresses, reports)?,
-        }),
+        Request::Analytics { batch } => {
+            crate::traffic::analytics::ingest(state, &batch, "direct", Some(device))?;
+            Ok(DirectResponse::AnalyticsAck {
+                id: Some(
+                    batch
+                        .events
+                        .last()
+                        .map(|e| e.id.clone())
+                        .unwrap_or_default(),
+                ),
+            })
+        }
+        Request::Sync {
+            addresses,
+            reports,
+            analytics,
+        } => {
+            let services = sync(state, device, addresses, reports)?;
+            if let Some(batch) = analytics {
+                crate::traffic::analytics::ingest(state, &batch, "direct", Some(device))?;
+            }
+            Ok(DirectResponse::Services {
+                services,
+                analytics_supported: true,
+            })
+        }
         Request::Certificate {
             service_id,
             revision,

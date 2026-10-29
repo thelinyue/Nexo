@@ -91,6 +91,7 @@ impl DomainRuntimeManager {
     pub async fn run(state: AppState) {
         let startup_guard = state.domain_runtime.reconcile_lock.lock().await;
         let supervisor = state.domain_runtime.supervisor.clone();
+        supervisor.set_analytics(state.tunnel_runtime.analytics.clone());
         let start = build_config(supervisor.config(), &[])
             .and_then(|config| supervisor.write_startup_config(&config));
         if let Err(error) = start {
@@ -505,6 +506,13 @@ fn build_config(settings: &CaddyRuntimeConfig, domains: &[DomainSpec]) -> Result
         config["apps"]["tls"] =
             json!({"certificates":{"automate":subjects},"automation":{"policies":policies}});
     }
+    let hosts = domains
+        .iter()
+        .flat_map(|d| d.services.iter())
+        .filter(|s| !s.management && s.relay.is_none())
+        .map(|s| (s.hostname.clone(), s.id.clone()))
+        .collect::<Vec<_>>();
+    nexo_core::telemetry::configure(&mut config, &hosts);
     Ok(config)
 }
 /// 已由当前 Caddy 持有的监听可复用；新监听只做本机占用检查，不发起公网连接。

@@ -1199,6 +1199,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "ipnetwork"
+version = "0.20.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bf466541e9d546596ee94f9f69590f89473455f88372423e0008fc1a7daf100e"
+dependencies = [
+ "serde",
+]
+
+[[package]]
 name = "is_terminal_polyfill"
 version = "1.70.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1357,6 +1366,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "47e1ffaa40ddd1f3ed91f717a33c8c0ee23fff369e3aa8772b9605cc1d22f4c3"
 
 [[package]]
+name = "maxminddb"
+version = "0.24.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d6087e5d8ea14861bb7c7f573afbc7be3798d3ef0fae87ec4fd9a4de9a127c3c"
+dependencies = [
+ "ipnetwork",
+ "log",
+ "memchr",
+ "serde",
+]
+
+[[package]]
 name = "memchr"
 version = "2.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1427,7 +1448,7 @@ dependencies = [
 
 [[package]]
 name = "nexo-agent"
-version = "0.2.23"
+version = "0.2.24"
 dependencies = [
  "anyhow",
  "axum",
@@ -1454,14 +1475,17 @@ dependencies = [
 
 [[package]]
 name = "nexo-core"
-version = "0.2.23"
+version = "0.2.24"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
  "hex",
+ "hmac",
  "ipnet",
+ "maxminddb",
  "rand 0.8.8",
  "serde",
+ "serde_json",
  "serde_path_to_error",
  "sha2",
  "tempfile",
@@ -1471,7 +1495,7 @@ dependencies = [
 
 [[package]]
 name = "nexo-protocol"
-version = "0.2.23"
+version = "0.2.24"
 dependencies = [
  "bytes",
  "nexo-core",
@@ -1481,7 +1505,7 @@ dependencies = [
 
 [[package]]
 name = "nexo-server"
-version = "0.2.23"
+version = "0.2.24"
 dependencies = [
  "anyhow",
  "argon2",
@@ -1525,13 +1549,14 @@ dependencies = [
 
 [[package]]
 name = "nexo-tunnel"
-version = "0.2.23"
+version = "0.2.24"
 dependencies = [
  "anyhow",
  "bytes",
  "chrono",
  "futures-io",
  "futures-util",
+ "nexo-core",
  "quinn",
  "rcgen",
  "rustls",

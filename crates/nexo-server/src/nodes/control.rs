@@ -96,14 +96,18 @@ pub async fn session(state: AppState, stream: TlsStream<TcpStream>, id: String) 
                 authorized(&state,&id,&cert)?;
                 refresh_quota_health(&state,&id)?;
                 let snapshot=snapshot(&state,&id)?;
-                if last.as_ref()!=Some(&snapshot){identity::write_message(&mut write,&Response::State{snapshot:snapshot.clone(),command:None}).await?;last=Some(snapshot);}
+                if last.as_ref()!=Some(&snapshot){identity::write_message(&mut write,&Response::State{analytics_ack:None,snapshot:snapshot.clone(),command:None}).await?;last=Some(snapshot);}
             },
             incoming=lines.next()=>{
                 let line=incoming.context("节点控制通道断开")??;
                 authorized(&state,&id,&cert)?;
                 let request:Request=serde_json::from_str(&line)?;
                 match request{
-                    Request::Poll{version,os,architecture,connections,services,update,reverse_proxy_supported,traffic_quota_supported}=>{
+                    Request::Analytics{batch}=>{
+                        let ack=match crate::traffic::analytics::ingest(&state,&batch,&id,None){Ok(())=>Some(batch.events.last().map(|e|e.id.clone()).unwrap_or_default()),Err(error)=>{tracing::warn!("节点统计暂未保存，将重试：{error:#}");None}};
+                        identity::write_message(&mut write,&Response::AnalyticsAck{id:ack}).await?;
+                    },
+                    Request::Poll{analytics,version,os,architecture,connections,services,update,reverse_proxy_supported,traffic_quota_supported}=>{
                         anyhow::ensure!(version.len()<64&&os.len()<128&&architecture.len()<32&&services.len()<10000,"节点报告过大");
                         deadline.as_mut().reset(tokio::time::Instant::now()+Duration::from_secs(45));
                         refresh_quota_health(&state,&id)?;
@@ -115,9 +119,15 @@ pub async fn session(state: AppState, stream: TlsStream<TcpStream>, id: String) 
                                 record_health(&db, &id, report, unix_now())?;
                             }
                         }
+                        let analytics_ack=if let Some(batch)=analytics {
+                            match crate::traffic::analytics::ingest(&state,&batch,&id,None){
+                                Ok(())=>Some(batch.events.last().map(|e|e.id.clone()).unwrap_or_default()),
+                                Err(error)=>{tracing::warn!("节点天眼统计写入失败：{error:#}");None}
+                            }
+                        }else{None};
                         let command=super::updates::advance(&state,&id,&version,connections,&update)?;
                         let next=snapshot(&state,&id)?;
-                        identity::write_message(&mut write,&Response::State{snapshot:next.clone(),command}).await?;last=Some(next);
+                        identity::write_message(&mut write,&Response::State{analytics_ack,snapshot:next.clone(),command}).await?;last=Some(next);
                     },
                     Request::Budget{request_id,service_id,service_revision,quota_revision,month,bytes}=>{
                         let (grant_id,bytes)={let db=state.db.lock().map_err(|_|anyhow::anyhow!("数据库锁不可用"))?;

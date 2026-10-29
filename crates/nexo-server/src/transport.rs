@@ -81,6 +81,7 @@ pub struct Runtime {
     pub direct: crate::direct::Runtime,
     udp_budget: nexo_tunnel::udp::Budget,
     pub traffic: crate::traffic::Collector,
+    pub analytics: Arc<nexo_core::telemetry::Hub>,
     pub quotas: crate::traffic::quota::Manager,
     transfers: TaskTracker,
     bind: IpAddr,
@@ -94,6 +95,7 @@ impl Runtime {
             udp_budget: Default::default(),
             direct: Default::default(),
             traffic: crate::traffic::Collector::default(),
+            analytics: Default::default(),
             quotas: crate::traffic::quota::Manager::default(),
             transfers: TaskTracker::new(),
             bind,
@@ -838,6 +840,7 @@ async fn data_session(
             let Some(quota_cancel) = quota.connection() else { continue; };
             let stream = tokio::time::timeout(Duration::from_secs(10), nexo_tunnel::new_outbound(&mut connection)).await.context("隧道开流超时")??;
             let meter = state.tunnel_runtime.traffic.meter(&command.service.tenant, &command.service.id);
+            let observed=matches!(command.service.protocol.as_str(),"tcp"|"tcp_udp").then(||Arc::new(std::sync::Mutex::new(state.tunnel_runtime.analytics.session(&command.service.id,"tcp"))));
             copies.spawn(state.tunnel_runtime.transfers.track_future(async move {
                 let mut stream = nexo_tunnel::into_tokio_io(stream);
                 let transfer = async {
@@ -845,10 +848,16 @@ async fn data_session(
                     tokio::time::timeout(Duration::from_secs(10), nexo_tunnel::write_logical_header(&mut stream, &header)).await??;
                     let mut stream = crate::traffic::Counted::new(stream, meter.clone(), true).with_quota(quota.clone(), quota_cancel.clone());
                     let mut socket = crate::traffic::Counted::new(&mut command.socket, meter, false).with_quota(quota, quota_cancel.clone());
+                    let mut stream=nexo_tunnel::observation::Observed::new(&mut stream,observed.clone(),true);
+                    let mut socket=nexo_tunnel::observation::Observed::new(&mut socket,observed.clone(),false);
                     tokio::io::copy_bidirectional(&mut socket, &mut stream).await?;
                     anyhow::Ok(())
                 };
-                tokio::select! { _ = command.cancel.cancelled() => {}, _ = quota_cancel.cancelled() => {}, result = transfer => if let Err(error) = result { tracing::debug!("隧道转发结束：{error:#}"); } }
+                tokio::select! {
+                    _ = command.cancel.cancelled() => nexo_tunnel::observation::finish(&observed,"authorization_revoked"),
+                    _ = quota_cancel.cancelled() => nexo_tunnel::observation::finish(&observed,"quota_exhausted"),
+                    result = transfer => {nexo_tunnel::observation::finish(&observed,if result.is_ok(){"closed"}else{"network_error"});if let Err(error)=result{tracing::debug!("隧道转发结束：{error:#}");}}
+                }
             }));
         }
         inbound = nexo_tunnel::next_inbound(&mut connection) => match inbound? {
@@ -1327,6 +1336,7 @@ mod tests {
             let sent = write_message(
                 &mut stream,
                 &DirectRequest::Sync {
+                    analytics: None,
                     addresses: vec!["2001:4860::1".into()],
                     reports: vec![],
                 },

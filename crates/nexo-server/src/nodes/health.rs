@@ -36,6 +36,12 @@ pub async fn probe(
     service: &str,
     revision: i64,
 ) -> Result<()> {
+    // 隔离进程冒烟只信任它自行生成的 CA；不修改系统信任或正式二进制的 TLS 行为。
+    #[cfg(test)]
+    if let Some(path) = std::env::var_os("NEXO_TEST_SMOKE_CA") {
+        let root = reqwest::Certificate::from_pem(&std::fs::read(path)?)?;
+        return probe_with_roots(target, host, port, service, revision, &[root]).await;
+    }
     probe_with_roots(target, host, port, service, revision, &[]).await
 }
 

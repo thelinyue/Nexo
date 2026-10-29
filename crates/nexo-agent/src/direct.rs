@@ -337,10 +337,13 @@ struct Process {
     client: reqwest::Client,
     last: Value,
     reload: bool,
+    analytics: Arc<nexo_core::telemetry::Hub>,
+    log_task: tokio::task::JoinHandle<()>,
 }
 impl Drop for Process {
     fn drop(&mut self) {
         let _ = self.child.start_kill();
+        self.log_task.abort();
     }
 }
 impl Process {
@@ -360,15 +363,32 @@ impl Process {
             .args(["run", "--config"])
             .arg(path)
             .stdin(Stdio::null())
-            .stdout(Stdio::null())
+            .stdout(Stdio::piped())
             .stderr(Stdio::from(log))
             .kill_on_drop(true);
         #[cfg(windows)]
         command.creation_flags(0x08000000);
-        let child = command
+        let mut child = command
             .spawn()
             .context("无法启动直连 Caddy，请检查客户端安装及 caddy_binary 配置")?;
+        let analytics = Arc::new(nexo_core::telemetry::Hub::persistent(root)?);
+        let log_hub = analytics.clone();
+        let stdout = child.stdout.take().context("直连统计日志管道不可用")?;
+        let log_task = tokio::spawn(async move {
+            use futures_util::StreamExt;
+            let mut lines = tokio_util::codec::FramedRead::new(
+                stdout,
+                tokio_util::codec::LinesCodec::new_with_max_length(65536),
+            );
+            while let Some(line) = lines.next().await {
+                if let Ok(line) = line {
+                    log_hub.access_line(&line);
+                }
+            }
+        });
         let mut process = Self {
+            analytics,
+            log_task,
             child,
             admin: format!("http://{address}"),
             client: reqwest::Client::builder()
@@ -450,7 +470,13 @@ fn configuration(root: &Path, services: &[(Service, String)], access: &str) -> V
             .unwrap()
             .push(json!({"handle":[{"handler":"static_response","status_code":404}]}));
     }
-    json!({"storage":{"module":"file_system","root":root.join("storage")},"apps":{"http":{"servers":servers},"tls":{"certificates":{"load_files":certificates}}}})
+    let mut config = json!({"storage":{"module":"file_system","root":root.join("storage")},"apps":{"http":{"servers":servers},"tls":{"certificates":{"load_files":certificates}}}});
+    let hosts = services
+        .iter()
+        .map(|(s, _)| (s.hostname.clone(), s.tunnel.tunnel_id.clone()))
+        .collect::<Vec<_>>();
+    nexo_core::telemetry::configure(&mut config, &hosts);
+    config
 }
 
 pub async fn run(
@@ -492,6 +518,8 @@ async fn session(
         Ok(())
     });
     let mut process: Option<Process> = None;
+    let mut analytics_supported = false;
+    let mut analytics_tick = tokio::time::interval(Duration::from_secs(1));
     let mut running = HashMap::<String, (Service, Forwarder)>::new();
     let mut reports = Vec::new();
     let mut tick = tokio::time::interval(Duration::from_secs(10));
@@ -507,11 +535,24 @@ async fn session(
                 access.services.lock().await.retain(|_,service|desired.borrow().tunnels.contains(&service.tunnel));
                 tick.reset_immediately();
             }
+            _=analytics_tick.tick(),if analytics_supported&&process.is_some()=>{
+                let hub=process.as_ref().unwrap().analytics.clone();
+                let batch=hub.batch();
+                if !batch.events.is_empty(){
+                    match client.call(Request::Analytics{batch:batch.clone()}).await {
+                        Ok(Response::AnalyticsAck{id}) if id.as_deref()==Some(batch.events.last().map(|e|e.id.as_str()).unwrap_or(""))=>hub.ack(&batch),
+                        _=>tracing::warn!("直连天眼统计暂未保存，将自动重试"),
+                    }
+                }
+            },
             _=tick.tick()=>{
                 // 整轮协调有上限，管理通道故障时不能因逐服务等待而保留旧连接。
                 tokio::time::timeout(Duration::from_secs(35), async {
                 let addresses=addresses()?;
-                let Response::Services {services}=client.call(Request::Sync {addresses:addresses.clone(),reports:std::mem::take(&mut reports)}).await? else {anyhow::bail!("直连配置响应错误");};
+                let analytics=process.as_ref().map(|p|p.analytics.batch());
+                let Response::Services {services,analytics_supported:supported}=client.call(Request::Sync {analytics:analytics.clone(),addresses:addresses.clone(),reports:std::mem::take(&mut reports)}).await? else {anyhow::bail!("直连配置响应错误");};
+                analytics_supported=supported;
+                if let (Some(process),Some(batch))=(&process,&analytics){process.analytics.ack(batch);}
                 running.retain(|_,(service,_)|services.contains(service) && addresses.contains(&service.ipv6));
                 let mut loaded=Vec::new();let mut allowed=HashMap::new();
                 for service in services {

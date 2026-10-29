@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+nexo-core = { path = "../nexo-core" }
 chrono.workspace = true
 quinn.workspace = true
 x509-parser = "0.18"

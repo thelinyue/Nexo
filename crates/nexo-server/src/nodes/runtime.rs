@@ -49,6 +49,7 @@ struct Session {
 /// 所有监听和会话受同一个快照约束；更新配置会取消旧服务的已有连接。
 struct Runtime {
     snapshot: watch::Sender<Snapshot>,
+    analytics: Arc<nexo_core::telemetry::Hub>,
     sessions: AsyncMutex<HashMap<String, Session>>,
     connections: Arc<AtomicU64>,
     health: AsyncMutex<Vec<wire::ServiceHealth>>,
@@ -144,6 +145,7 @@ pub async fn run(
     let (snapshot, _) = watch::channel(Snapshot::default());
     let runtime = Arc::new(Runtime {
         snapshot,
+        analytics: Arc::new(nexo_core::telemetry::Hub::persistent(&directory)?),
         sessions: Default::default(),
         connections: Default::default(),
         health: Default::default(),
@@ -250,6 +252,9 @@ async fn control_session(runtime: &Arc<Runtime>, saved: &NodeIdentity) -> Result
     *runtime.usage.lock().await = Some(usage_sender);
     let mut requests = HashMap::new();
     let mut sequence = 0u64;
+    let mut pending_analytics = None;
+    let mut analytics_supported = false;
+    let mut analytics_tick = tokio::time::interval(Duration::from_secs(1));
     let deadline = tokio::time::sleep(Duration::from_secs(45));
     tokio::pin!(deadline);
     loop {
@@ -266,15 +271,36 @@ async fn control_session(runtime: &Arc<Runtime>, saved: &NodeIdentity) -> Result
             Some(report)=usage.recv()=>{
                 tokio::time::timeout_at(deadline.deadline(),identity::write_message(&mut write,&report)).await.context("节点流量结算发送超时")??;
             },
+            _=analytics_tick.tick(),if analytics_supported&&pending_analytics.is_none()=>{
+                let batch=runtime.analytics.batch();
+                if !batch.events.is_empty(){
+                    tokio::time::timeout_at(deadline.deadline(),identity::write_message(&mut write,&wire::Request::Analytics{batch:batch.clone()})).await??;
+                    pending_analytics=Some(batch);
+                }
+            },
             _=interval.tick()=>{
                 let services=runtime.health.lock().await.clone();
-                tokio::time::timeout_at(deadline.deadline(), identity::write_message(&mut write,&wire::Request::Poll{traffic_quota_supported:true,reverse_proxy_supported:true,version:env!("CARGO_PKG_VERSION").into(),os:operating_system(),architecture:std::env::consts::ARCH.into(),connections:runtime.connections.load(Ordering::Relaxed),services,update:update_report()})).await.context("节点管理通道发送超时，停止转发")??;
+                let analytics=if pending_analytics.is_none(){Some(runtime.analytics.batch())}else{None};
+                tokio::time::timeout_at(deadline.deadline(), identity::write_message(&mut write,&wire::Request::Poll{analytics:analytics.clone(),traffic_quota_supported:true,reverse_proxy_supported:true,version:env!("CARGO_PKG_VERSION").into(),os:operating_system(),architecture:std::env::consts::ARCH.into(),connections:runtime.connections.load(Ordering::Relaxed),services,update:update_report()})).await.context("节点管理通道发送超时，停止转发")??;
+                if analytics.is_some(){pending_analytics=analytics;}
             },
             line=lines.next()=>{
                 let line=line.context("管理连接关闭")??;
                 deadline.as_mut().reset(tokio::time::Instant::now()+Duration::from_secs(45));
                 match serde_json::from_str::<wire::Response>(&line)?{
-                    wire::Response::State{snapshot,command}=>{if let Some(command)=command{submit_update(command)?;}runtime.snapshot.send_if_modified(|old|if *old!=snapshot{runtime.configured.store(false,Ordering::Release);*old=snapshot;true}else{false});},
+                    wire::Response::AnalyticsAck{id}=>{
+                        if let Some(batch)=pending_analytics.take(){
+                            if id.as_deref()==Some(batch.events.last().map(|e|e.id.as_str()).unwrap_or("")){runtime.analytics.ack(&batch);}
+                        }
+                    },
+                    wire::Response::State{analytics_ack,snapshot,command}=>{
+                        if analytics_ack.is_some(){analytics_supported=true;}
+                        if pending_analytics.as_ref().is_some_and(|b:&nexo_core::telemetry::Batch|Some(b.events.last().map(|e|e.id.as_str()).unwrap_or(""))==analytics_ack.as_deref()) {
+                            if let Some(batch)=pending_analytics.take(){runtime.analytics.ack(&batch);}
+                        }
+                        if analytics_ack.is_none() {pending_analytics=None;}
+                        if let Some(command)=command{submit_update(command)?;}
+                        runtime.snapshot.send_if_modified(|old|if *old!=snapshot{runtime.configured.store(false,Ordering::Release);*old=snapshot;true}else{false});},
                     wire::Response::Error{message}=>anyhow::bail!("控制器拒绝：{message}"),
                     response@wire::Response::Access{request_id,..}|response@wire::Response::Budget{request_id,..}=>{if let Some(reply)=requests.remove(&request_id){let _=reply.send(response);}},
                 }
@@ -413,6 +439,7 @@ async fn listeners(runtime: Arc<Runtime>, directory: PathBuf, node_id: String) -
         crate::caddy::CaddyRuntimeConfig::new(&directory, &settings),
     ));
     let empty = json!({"admin":{"listen":"127.0.0.1:8290"},"apps":{"http":{"servers":{}}}});
+    caddy.set_analytics(runtime.analytics.clone());
     caddy.write_startup_config(&empty)?;
     caddy.clone().start().await?;
     *runtime.caddy.lock().await = Some(caddy.clone());
@@ -645,7 +672,13 @@ async fn listeners(runtime: Arc<Runtime>, directory: PathBuf, node_id: String) -
                 error,
             });
         }
-        let config = json!({"admin":{"listen":"127.0.0.1:8290"},"apps":{"http":{"servers":servers},"tls":{"certificates":{"load_files":certificates}}}});
+        let mut config = json!({"admin":{"listen":"127.0.0.1:8290"},"apps":{"http":{"servers":servers},"tls":{"certificates":{"load_files":certificates}}}});
+        let hosts = next
+            .services
+            .iter()
+            .filter_map(|s| s.hostname.as_ref().map(|h| (h.clone(), s.id.clone())))
+            .collect::<Vec<_>>();
+        nexo_core::telemetry::configure(&mut config, &hosts);
         if applied != config {
             match caddy.apply_json(&config).await {
                 Ok(()) => applied = config,

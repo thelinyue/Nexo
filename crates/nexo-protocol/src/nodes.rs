@@ -76,7 +76,12 @@ pub struct UpdateReport {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Request {
+    Analytics {
+        batch: nexo_core::telemetry::Batch,
+    },
     Poll {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        analytics: Option<nexo_core::telemetry::Batch>,
         #[serde(default)]
         traffic_quota_supported: bool,
         /// 旧节点缺省为 false，控制器绝不向其下发直接回源服务。
@@ -115,12 +120,17 @@ pub enum Request {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Response {
+    AnalyticsAck {
+        id: Option<String>,
+    },
     Budget {
         request_id: u64,
         grant_id: String,
         bytes: u64,
     },
     State {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        analytics_ack: Option<String>,
         snapshot: Snapshot,
         command: Option<UpdateCommand>,
     },

@@ -16,6 +16,7 @@ use tokio_util::compat::{Compat, FuturesAsyncReadCompatExt, TokioAsyncReadCompat
 
 pub mod control_diagnostics;
 pub mod identity;
+pub mod observation;
 pub mod udp;
 
 pub const PROTOCOL_VERSION: u8 = 2;

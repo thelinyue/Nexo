@@ -19,6 +19,7 @@ import subprocess
 import threading
 import time
 import urllib.error
+import urllib.request
 
 spec = importlib.util.spec_from_file_location("tunnel_smoke", Path(__file__).with_name("tunnel-smoke.py"))
 smoke = importlib.util.module_from_spec(spec)
@@ -26,6 +27,17 @@ spec.loader.exec_module(smoke)
 
 
 class NodeHarness(smoke.Harness):
+    def close(self):
+        super().close()
+        # Windows 强制结束节点不会运行 Drop；只在本夹具通过端口独占检查并启动节点后清理其 Caddy。
+        if getattr(self, "node_process", None) is not None:
+            try:
+                request = urllib.request.Request("http://127.0.0.1:8290/stop", data=b"", method="POST")
+                with self.opener.open(request, timeout=3):
+                    pass
+            except (OSError, urllib.error.URLError):
+                pass
+
     def api(self, path, method="GET", body=None):
         try:
             return super().api(path, method, body)
@@ -107,6 +119,7 @@ class NodeHarness(smoke.Harness):
             self.logs.append(log)
             environment = dict(os.environ, NEXO_CADDY_BINARY=str(Path(self.args.caddy_bin).resolve()))
             node = subprocess.Popen([str(Path(self.args.server_bin).resolve()), "--data-dir", str(node_dir), "node"], env=environment, stdout=log, stderr=subprocess.STDOUT)
+            self.node_process = node
             self.processes.append(node)
             smoke.wait_for(lambda: self.request_node("web.nexo-smoke.localhost")[0] == 200, "HTTP 节点转发", timeout=75)
             assert self.request_node("web.nexo-smoke.localhost")[2] == b"nexo-real-origin\n"
@@ -117,12 +130,31 @@ class NodeHarness(smoke.Harness):
             status, headers, _ = self.request_node("secure.nexo-smoke.localhost", path="/probe?q=1")
             assert status in (301, 302, 307, 308)
             assert headers["Location"] == f"https://secure.nexo-smoke.localhost:{self.args.https_port}/probe?q=1"
-            self.check("HTTP 跳转保留 HTTPS 8443 及原始路径和参数")
+            self.check(f"HTTP 跳转保留 HTTPS {self.args.https_port} 及原始路径和参数")
             def healthy():
                 with sqlite3.connect(self.root / "server/nexo.db") as db:
                     return db.execute("SELECT COUNT(*) FROM relay_public_health WHERE node_id=? AND healthy=1", (node_id,)).fetchone()[0] == 2
             smoke.wait_for(healthy, "管理 Server 在自定义端口完成连续三次公网入口探测", timeout=90)
             self.check("管理 Server 在实际 HTTP/HTTPS 端口完成健康探测")
+            for service in services:
+                host = f"{service['name']}.nexo-smoke.localhost"
+                secure = service["protocol"] == "https"
+                # 完成日志异步上报；用唯一的大响应事实核对字节，避免依赖心跳批次的到达顺序。
+                def observed():
+                    result = self.api(f"traffic/analytics/requests?tunnel_id={service['id']}")["items"]
+                    return result if result and all(e["node"] == node_id for e in result) else None
+                smoke.wait_for(observed, "独立节点访问事实回传控制器")
+                before = self.api(f"traffic/analytics/summary?range=1h&tunnel_id={service['id']}")["totals"]["requests"]
+                assert self.request_node(host, secure, "/large?token=node-private")[2] == bytes(range(256)) * 32768
+                def large_request():
+                    items = self.api(f"traffic/analytics/requests?tunnel_id={service['id']}")["items"]
+                    return next((e for e in items if e["path"] == "/large"), None)
+                fact = smoke.wait_for(large_request, "独立节点大响应和查询参数脱敏")
+                assert fact["node"] == node_id and fact["to_public"] == 8 * 1024 * 1024
+                assert fact["status"] == 200 and "visitor" not in fact
+                assert self.api(f"traffic/analytics/summary?range=1h&tunnel_id={service['id']}")["totals"]["requests"] >= before + 1
+                assert all(not e["path"].startswith("/.nexo-") and "node-private" not in json.dumps(e) for e in observed())
+            self.check("独立节点 HTTP/HTTPS 完成日志经 mTLS 回传，8 MiB 字节、节点归属、探测排除和查询脱敏正确")
             ca = self.root / "server/caddy-storage/pki/authorities/local/root.crt"
             print("READY_PUBLIC " + json.dumps({"ip":self.args.node_ip, "http_port":self.args.http_port, "https_port":self.args.https_port, "ca_file":str(ca)}), flush=True)
             time.sleep(self.args.hold_seconds)
@@ -135,6 +167,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     for name in ("server-bin", "agent-bin", "caddy-bin"):
         parser.add_argument("--"+name, required=True)
+    parser.add_argument("--server-test-bin", help="隔离 DNS 夹具所需的 Server 测试程序")
     parser.add_argument("--node-ip", default="127.0.0.1")
     parser.add_argument("--http-port", type=int, default=8080)
     parser.add_argument("--https-port", type=int, default=8443)

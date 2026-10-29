@@ -7,6 +7,7 @@ import type { Auth, Device, Domain, Tunnel } from "./ui";
 import { PageNavigationContext, useResourceDeletions } from "./navigation";
 import { bytes, QuotaSummary } from "./traffic-quota";
 import "./home.css";
+import { TrafficEye } from "./traffic-eye";
 
 type User = { id: string; username: string; workspace_id: string; enabled: boolean };
 type Rates = { to_origin: number; to_public: number };
@@ -167,7 +168,7 @@ function TrafficUsage({ active, admin, user, csrf }: { active: boolean; admin: b
 function TrafficPanel({ active, auth, managed, ownTunnels }: { active: boolean; auth: Auth; managed: ManagedWorkspace | null; ownTunnels: ReturnType<typeof useResource<Tunnel[]>> }) {
   const admin = auth.role === "system_admin";
   const users = useResource(() => request<User[]>("/api/v1/admin/users"), active && admin);
-  const [choice, setChoice] = useState<string | null>(managed ? null : "");
+  const [choice, setChoice] = useState<string | null>(managed ? null : new URLSearchParams(location.search).get("eye_user") ?? "");
   const [search, setSearch] = useState("");
   const [filtersOpen, setFiltersOpen] = useState(false);
   const filterId = useId();
@@ -179,10 +180,15 @@ function TrafficPanel({ active, auth, managed, ownTunnels }: { active: boolean; 
     if (users.data && selected && !selectedUser) { setChoice(""); setNotice("所选用户已删除，已返回全部用户。"); }
     if (users.data && choice === null && !selectedUser) { setChoice(""); setNotice("该空间已无对应用户，已返回全部用户。"); }
   }, [users.data, selected, selectedUser, choice]);
+  useEffect(() => {
+    const url = new URL(location.href);
+    if (selected) url.searchParams.set("eye_user", selected); else url.searchParams.delete("eye_user");
+    history.replaceState(history.state, "", url);
+  }, [selected]);
   const scopeReady = !admin || selected === "" || Boolean(selectedUser);
-  return <section className="panel home-traffic" aria-label="流量监控">
+  return <section className="home-traffic" aria-label="流量监控">
     <div className="home-section-heading"><h2>流量监控</h2><div className="traffic-filter-heading"><span>{admin ? selectedUser?.username ?? (selected === "" ? "全部用户" : "读取用户中…") : "我的流量"}</span><button className="text-button" aria-label="流量筛选" aria-expanded={filtersOpen} aria-controls={`${filterId}-users ${filterId}-tunnels`} onClick={() => setFiltersOpen(!filtersOpen)}>筛选<ChevronDown size={15} /></button></div></div>
-    <div id={`${filterId}-users`} hidden={!filtersOpen}>{admin && <div className="traffic-user-filter"><label>搜索统计用户<input type="search" placeholder="输入用户名" value={search} onChange={event => setSearch(event.target.value)} /></label><label>统计用户<select aria-label="统计用户" value={selected ?? ""} disabled={!users.data} onChange={event => { setChoice(event.target.value); setNotice(null); }}><option value="">全部用户</option>{users.data?.filter(item => item.id === selected || item.username.toLowerCase().includes(search.trim().toLowerCase())).map(item => <option key={item.id} value={item.id}>{item.username}{item.id === auth.user_id ? "（我）" : ""}{!item.enabled ? "（已停用）" : ""}</option>)}</select></label></div>}</div>
+    <div id={`${filterId}-users`} hidden={!filtersOpen}>{admin && <div className="traffic-user-filter"><label>搜索统计用户<input type="search" placeholder="输入用户名" value={search} onChange={event => setSearch(event.target.value)} /></label><label>统计用户<select aria-label="统计用户" value={selected ?? ""} disabled={!users.data} onChange={event => { setChoice(event.target.value); setNotice(null); const url = new URL(location.href); url.searchParams.delete("eye_tunnel"); history.replaceState(history.state, "", url); }}><option value="">全部用户</option>{users.data?.filter(item => item.id === selected || item.username.toLowerCase().includes(search.trim().toLowerCase())).map(item => <option key={item.id} value={item.id}>{item.username}{item.id === auth.user_id ? "（我）" : ""}{!item.enabled ? "（已停用）" : ""}</option>)}</select></label></div>}</div>
     {admin && <Notice error={users.error} updatedAt={users.updatedAt} onRetry={() => void users.reload()} />}
     {notice && <p className="helper" role="status">{notice}</p>}
     {scopeReady && <TrafficScope key={admin ? selected : "own"} active={active} admin={admin} user={selectedUser} range={range} ownTunnels={ownTunnels} ownWorkspace={managed?.id ?? auth.workspace_id} filtersOpen={filtersOpen} filterId={`${filterId}-tunnels`} rangeControl={<div className="traffic-ranges" role="group" aria-label="流量时间范围">{ranges.map(([value, label]) => <button aria-label={label} key={value} aria-pressed={range === value} onClick={() => setRange(value)}>{label.replaceAll(" ", "")}</button>)}</div>} />}
@@ -191,20 +197,26 @@ function TrafficPanel({ active, auth, managed, ownTunnels }: { active: boolean; 
 }
 
 function TrafficScope({ active, admin, user, range, ownTunnels, ownWorkspace, filtersOpen, filterId, rangeControl }: { active: boolean; admin: boolean; user?: User; range: Range; ownTunnels: ReturnType<typeof useResource<Tunnel[]>>; ownWorkspace?: string; filtersOpen: boolean; filterId: string; rangeControl: ReactNode }) {
-  const [tunnel, setTunnel] = useState("");
+  const [tunnel, setTunnel] = useState(new URLSearchParams(location.search).get("eye_tunnel") ?? "");
   const canSelect = !admin || Boolean(user);
   // 当前展示空间复用概览请求；其他空间保持独立生命周期，避免跨空间迟到结果混入。
   const shared = !admin || Boolean(user && user.workspace_id === ownWorkspace);
   const otherTunnels = useResource(() => request<Tunnel[]>(`/api/v1/admin/workspaces/${encodeURIComponent(user!.workspace_id)}/tunnels`), active && canSelect && !shared);
   const tunnels = shared ? ownTunnels : otherTunnels;
   useEffect(() => { if (tunnel && tunnels.data && !tunnels.data.some(item => item.id === tunnel && item.service_mode !== "reverse_proxy")) setTunnel(""); }, [tunnels.data, tunnel]);
+  useEffect(() => {
+    const url = new URL(location.href);
+    if (tunnel) url.searchParams.set("eye_tunnel", tunnel); else url.searchParams.delete("eye_tunnel");
+    history.replaceState(history.state, "", url);
+  }, [tunnel]);
   const query = new URLSearchParams();
   if (user) query.set("user_id", user.id);
   if (tunnel) query.set("tunnel_id", tunnel);
   return <>
     {canSelect && <><p className="traffic-scope-label">统计隧道 · {tunnel ? tunnels.data?.find(item => item.id === tunnel)?.name : "全部隧道"}</p><Notice error={tunnels.error} updatedAt={tunnels.updatedAt} onRetry={() => void tunnels.reload()} /></>}
     <div id={filterId} hidden={!filtersOpen}>{canSelect && <label className="traffic-tunnel-filter">统计隧道<select aria-label="统计隧道" value={tunnel} onChange={event => setTunnel(event.target.value)}><option value="">全部隧道</option>{tunnels.data?.filter(item => item.service_mode !== "reverse_proxy").map(item => <option key={item.id} value={item.id}>{item.name}</option>)}</select></label>}</div>
-    <TrafficReadings key={`${tunnel}:${range}`} active={active} base={admin ? "/api/v1/admin/traffic" : "/api/v1/traffic"} query={query.toString()} range={range} rangeControl={rangeControl} />
+    <TrafficEye key={`eye:${tunnel}`} active={active} base={admin ? "/api/v1/admin/traffic" : "/api/v1/traffic"} query={query.toString()} />
+    <div className="panel home-legacy-traffic"><TrafficReadings key={`${tunnel}:${range}`} active={active} base={admin ? "/api/v1/admin/traffic" : "/api/v1/traffic"} query={query.toString()} range={range} rangeControl={rangeControl} /></div>
   </>;
 }
 
@@ -276,7 +288,7 @@ export function HomePage({ active, auth, managed }: { active: boolean; auth: Aut
   return <div className="home-page">
     <PageHeader title="首页" topContent={<span className="home-workspace" title={spaceLabel}>{spaceLabel}</span>} />
     {!topHeader && <p className="home-workspace">当前空间：{spaceLabel}</p>}
-    <div className="home-summaries">
+    <div className="home-summaries home-resource-links" style={{ order: 2 }}>
       <a className="panel" href="#/services"><span>服务</span><strong>{tunnels.data?.length ?? "—"}</strong><small>{tunnels.data ? `穿透运行 ${tunnels.data.filter(item => item.service_mode !== "reverse_proxy" && item.enabled && item.apply_status === "ready").length} · 反代生效 ${tunnels.data.filter(item => item.service_mode === "reverse_proxy" && item.enabled && item.apply_status === "ready").length}` : "正在加载"}</small></a>
       <a className="panel" href="#/agents"><span>设备</span><strong>{devices.data ? `${devices.data.filter(item => item.status === "online").length} / ${devices.data.length}` : "—"}</strong><small>在线 / 总数</small></a>
       <a className="panel" href="#/domains"><span>域名</span><strong>{domains.data?.length ?? "—"}</strong><small>{domains.data ? `${items.filter(item => item.id.startsWith("d-")).length} 个需关注` : "总数"}</small></a>
@@ -284,8 +296,8 @@ export function HomePage({ active, auth, managed }: { active: boolean; auth: Aut
     <Notice error={tunnels.error} updatedAt={tunnels.updatedAt} onRetry={() => void tunnels.reload()} /><Notice error={devices.error} updatedAt={devices.updatedAt} onRetry={() => void devices.reload()} /><Notice error={domains.error} updatedAt={domains.updatedAt} onRetry={() => void domains.reload()} />
     {complete && !tunnels.data!.length ? <div className="panel home-onboarding"><div><strong>创建第一个服务</strong><p>内网穿透需要设备；反向代理可直接使用自己的已审批节点或管理员授权的节点。网页访问需先配置域名。</p></div><a className="primary-button" href="#/services">创建服务</a></div> : null}
     <div className="home-overview">
-      <AttentionPanel items={items} complete={complete} spaceLabel={spaceLabel} />
       <TrafficPanel key={workspace ?? "own"} active={visible} auth={auth} managed={managed} ownTunnels={tunnels} />
+      <AttentionPanel items={items} complete={complete} spaceLabel={spaceLabel} />
     </div>
   </div>;
 }

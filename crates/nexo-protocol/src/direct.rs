@@ -25,7 +25,12 @@ pub struct Report {
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Request {
+    Analytics {
+        batch: nexo_core::telemetry::Batch,
+    },
     Sync {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        analytics: Option<nexo_core::telemetry::Batch>,
         addresses: Vec<String>,
         reports: Vec<Report>,
     },
@@ -49,7 +54,12 @@ pub enum Request {
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Response {
+    AnalyticsAck {
+        id: Option<String>,
+    },
     Services {
+        #[serde(default)]
+        analytics_supported: bool,
         services: Vec<Service>,
     },
     Certificate {

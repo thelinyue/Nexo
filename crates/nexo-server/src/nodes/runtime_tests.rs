@@ -103,6 +103,7 @@ async fn mtls_scenario(metered: bool) {
         });
         let runtime = Arc::new(Runtime {
             snapshot,
+            analytics: Default::default(),
             sessions: Default::default(),
             connections: Default::default(),
             health: Default::default(),
@@ -269,6 +270,7 @@ async fn proxy_scenario(metered: bool) {
     });
     let runtime = Arc::new(Runtime {
         snapshot,
+        analytics: Default::default(),
         sessions: Default::default(),
         connections: Default::default(),
         health: Default::default(),
