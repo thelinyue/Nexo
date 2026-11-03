@@ -1,5 +1,5 @@
 //! Agent 持久化设备身份，通过 mTLS 接收完整服务配置，并以 Yamux 承载真实双向流量。
-//! 公网 HTTPS 在 Caddy 终止；本地默认使用普通 TCP/HTTP，明确配置 HTTPS 回源时校验证书。
+//! 公网 HTTPS 在 Caddy 终止；本地 HTTPS 默认验证身份，仅在服务明确配置时跳过验证。
 use anyhow::{Context, Result};
 use clap::Parser;
 use futures_util::StreamExt;
@@ -22,6 +22,7 @@ mod node_budget;
 mod nodes;
 #[cfg(test)]
 mod origin_tests;
+mod origin_tls;
 mod udp;
 
 #[derive(Parser)]
@@ -769,36 +770,7 @@ async fn connect_origin(tunnel: &TunnelDesiredState) -> Result<Box<dyn OriginIo>
         tunnel.origin_protocol.as_deref() == Some("https"),
         "本地回源协议无效"
     );
-    let roots = match tunnel
-        .origin_tls_verification
-        .as_deref()
-        .unwrap_or("system")
-    {
-        "custom_ca" => identity::roots(
-            tunnel
-                .origin_ca_pem
-                .as_deref()
-                .context("本地 HTTPS 缺少自定义 CA")?,
-        )?,
-        "system" => {
-            let mut roots = rustls::RootCertStore::empty();
-            let native = rustls_native_certs::load_native_certs();
-            for cert in native.certs {
-                roots.add(cert)?;
-            }
-            anyhow::ensure!(
-                !roots.is_empty(),
-                "无法加载系统 CA，不能验证本地 HTTPS 证书"
-            );
-            roots
-        }
-        _ => anyhow::bail!("本地 HTTPS 证书校验方式不受支持"),
-    };
-    let connector = TlsConnector::from(Arc::new(
-        rustls::ClientConfig::builder()
-            .with_root_certificates(roots)
-            .with_no_client_auth(),
-    ));
+    let connector = TlsConnector::from(Arc::new(origin_tls::client_config(tunnel)?));
     let name = rustls::pki_types::ServerName::try_from(
         tunnel
             .origin_tls_server_name
@@ -807,11 +779,17 @@ async fn connect_origin(tunnel: &TunnelDesiredState) -> Result<Box<dyn OriginIo>
             .to_owned(),
     )
     .context("本地 HTTPS TLS 名称无效")?;
+    let handshake_error =
+        if tunnel.origin_tls_verification.as_deref() == Some("insecure_skip_verify") {
+            "本地 HTTPS 握手失败"
+        } else {
+            "本地 HTTPS 证书验证失败"
+        };
     Ok(Box::new(
         tokio::time::timeout(Duration::from_secs(5), connector.connect(name, stream))
             .await
             .context("本地 HTTPS 握手超时")?
-            .context("本地 HTTPS 证书验证失败")?,
+            .context(handshake_error)?,
     ))
 }
 /// 定期检查仍覆盖全部服务；编辑推送只探测变更的回源，公网协议、域名或版本变化不重查相同目标。

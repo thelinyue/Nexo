@@ -45,6 +45,7 @@ mod https_ports;
 mod identity_runtime;
 mod lan_redirect;
 mod nodes;
+mod origin_ca;
 mod reverse_proxy;
 mod security;
 mod server_settings;
@@ -208,6 +209,8 @@ struct Tunnel {
     protocol: String,
     /// 内网回源协议独立于公网协议；TCP 不使用，网页服务默认 HTTP。
     origin_protocol: Option<String>,
+    origin_tls_verification: String,
+    origin_ca_pem: Option<String>,
     local_address: String,
     local_port: u16,
     public_port: Option<u16>,
@@ -244,6 +247,9 @@ struct TunnelInput {
     protocol: String,
     /// 内网回源协议独立于公网协议；TCP 不使用，网页服务默认 HTTP。
     origin_protocol: Option<String>,
+    origin_tls_verification: Option<String>,
+    #[serde(default, deserialize_with = "service_icons::deserialize")]
+    origin_ca_pem: Option<Option<String>>,
     local_address: String,
     local_port: u16,
     public_port: Option<u16>,
@@ -678,6 +684,7 @@ fn initialize_database(connection: &Connection, is_new: bool) -> Result<()> {
     domains::migrate(connection)?;
     direct::migrate(connection)?;
     service_icons::migrate(connection)?;
+    origin_ca::migrate(connection)?;
     nodes::migrate(connection)?;
     traffic::analytics::migrate(connection)?;
     server_settings::load(connection).context("无法读取服务器设置")?;
@@ -846,6 +853,7 @@ async fn create_tunnel(
         reverse_proxy::prepare(&db, &session, &id, &mut input)?;
         nodes::services::prepare(&db, &session.tenant_id, &id, &mut input)?;
         prepare_tunnel(&db, &session.tenant_id, &id, &mut input)?;
+        origin_ca::prepare(&db, &session.tenant_id, &id, &mut input)?;
         https_ports::prepare(&state, &db, &session.tenant_id, &id, &mut input)?;
         direct::prepare(&db, &session.tenant_id, &id, &mut input)?;
         service_access::prepare(
@@ -856,6 +864,7 @@ async fn create_tunnel(
             access_hash.as_deref(),
         )?;
         db.execute("INSERT INTO tunnels (id,tenant_id,device_id,name,protocol,local_address,local_port,public_port,hostname,enabled,apply_status,apply_revision,public_domain_id,created_at,updated_at,lan_redirect_enabled,origin_protocol,service_mode,http_redirect_enabled) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,'checking',1,?11,?12,?12,?13,?14,?15,?16)",params![id,session.tenant_id,input.device_id,input.name.trim(),input.protocol,input.local_address.trim(),input.local_port,input.public_port,input.hostname,input.enabled.unwrap_or(true),input.public_domain_id,unix_now(),input.lan_redirect_enabled.unwrap_or(false),input.origin_protocol,input.service_mode,input.http_redirect_enabled.unwrap_or(false)]).map_err(db_error)?;
+        origin_ca::save(&db, &session.tenant_id, &id, &input)?;
         nodes::services::save(&db, &id, &input)?;
         https_ports::save(&db, &id, &input)?;
         db.execute(
@@ -868,6 +877,7 @@ async fn create_tunnel(
         }
         service_icons::save(&db, &session.tenant_id, &id, &input)?;
         service_access::save(&db, &id, &input, access_hash.as_deref())?;
+        origin_ca::check_snapshot(&state, &db, input.device_id.as_deref())?;
         accounts::audit(&db, &session, "service_created", "service", &id)?;
         db.commit().map_err(db_error)?;
         if let Some(upload) = &mut icon_upload {
@@ -899,6 +909,7 @@ async fn update_tunnel(
         reverse_proxy::prepare(&db, &session, &id, &mut input)?;
         nodes::services::prepare(&db, &session.tenant_id, &id, &mut input)?;
         prepare_tunnel(&db, &session.tenant_id, &id, &mut input)?;
+        origin_ca::prepare(&db, &session.tenant_id, &id, &mut input)?;
         https_ports::prepare(&state, &db, &session.tenant_id, &id, &mut input)?;
         input.ipv6_direct_enabled = Some(
             input.ipv6_direct_enabled.unwrap_or(
@@ -920,11 +931,11 @@ async fn update_tunnel(
         // 回源、入口和直连分别判断；重定向与节点选择只同步配置，不清零未变链路的健康样本。
         // 名称、图标和认证不改变链路，认证更新仍由既有数据库触发器撤销旧会话。
         let (origin_unchanged, entry_unchanged, redirect_unchanged, direct_unchanged, device_unchanged, revision): (bool, bool, bool, bool, bool, i64) = db.query_row(
-            "SELECT device_id IS ?2 AND (protocol=?3 OR protocol IN ('http','https') AND ?3 IN ('http','https')) AND local_address=?4 AND local_port=?5 AND enabled=?8 AND COALESCE(origin_protocol,'http')=COALESCE(?11,'http'),
+            "SELECT device_id IS ?2 AND (protocol=?3 OR protocol IN ('http','https') AND ?3 IN ('http','https')) AND local_address=?4 AND local_port=?5 AND enabled=?8 AND COALESCE(origin_protocol,'http')=COALESCE(?11,'http') AND origin_tls_verification=?16 AND origin_ca_pem IS ?17,
                 protocol=?3 AND public_port IS ?6 AND hostname IS ?7 AND enabled=?8 AND public_domain_id IS ?9 AND (protocol!='https' OR https_port=?14),
                 lan_redirect_enabled=?10 AND (protocol!='https' OR http_redirect_enabled=?13),
                 ipv6_direct_enabled=?15, device_id IS ?2, apply_revision FROM tunnels WHERE id=?1",
-            params![id,input.device_id,input.protocol,input.local_address.trim(),input.local_port,input.public_port,input.hostname,input.enabled.unwrap_or(true),input.public_domain_id,input.lan_redirect_enabled.unwrap_or(false),input.origin_protocol,input.service_mode,input.http_redirect_enabled.unwrap_or(false),input.https_port.unwrap_or(443),input.ipv6_direct_enabled.unwrap_or(false)],
+            params![id,input.device_id,input.protocol,input.local_address.trim(),input.local_port,input.public_port,input.hostname,input.enabled.unwrap_or(true),input.public_domain_id,input.lan_redirect_enabled.unwrap_or(false),input.origin_protocol,input.service_mode,input.http_redirect_enabled.unwrap_or(false),input.https_port.unwrap_or(443),input.ipv6_direct_enabled.unwrap_or(false),input.origin_tls_verification,input.origin_ca_pem.as_ref().and_then(|value| value.as_ref())],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?)),
         ).map_err(db_error)?;
         let selection_changed = db.query_row("SELECT distribution_mode IS NOT ?2 OR preferred_node_id IS NOT ?3 OR node_group_id IS NOT NULLIF(?4,'') FROM tunnels WHERE id=?1",params![id,input.distribution_mode,input.preferred_node_id,input.node_group_id],|r|r.get::<_,bool>(0)).map_err(db_error)?;
@@ -940,6 +951,7 @@ async fn update_tunnel(
             direct::prepare(&db, &session.tenant_id, &id, &mut input)?;
         }
         db.execute("UPDATE tunnels SET device_id=?1,name=?2,protocol=?3,local_address=?4,local_port=?5,public_port=?6,hostname=?7,enabled=?8,apply_revision=apply_revision+?17,apply_status=CASE WHEN ?17 THEN CASE WHEN ?8 THEN 'checking' ELSE 'disabled' END ELSE apply_status END,updated_at=?9,public_domain_id=?12,lan_redirect_enabled=?13,origin_protocol=?14,service_mode=?15,http_redirect_enabled=?16 WHERE id=?10 AND tenant_id=?11 AND deleted_at IS NULL",params![input.device_id,input.name.trim(),input.protocol,input.local_address.trim(),input.local_port,input.public_port,input.hostname,input.enabled.unwrap_or(true),unix_now(),id,session.tenant_id,input.public_domain_id,input.lan_redirect_enabled.unwrap_or(false),input.origin_protocol,input.service_mode,input.http_redirect_enabled.unwrap_or(false),revision_changed]).map_err(db_error)?;
+        origin_ca::save(&db, &session.tenant_id, &id, &input)?;
         nodes::services::save(&db, &id, &input)?;
         if revision_changed {
             // 只迁移仍匹配旧版本的未变链路，不改时间戳、成功/失败计数或错误；过期结果不能续命。
@@ -972,6 +984,7 @@ async fn update_tunnel(
         }
         service_icons::save(&db, &session.tenant_id, &id, &input)?;
         service_access::save(&db, &id, &input, access_hash.as_deref())?;
+        origin_ca::check_snapshot(&state, &db, input.device_id.as_deref())?;
         accounts::audit(&db, &session, "service_updated", "service", &id)?;
         db.commit().map_err(db_error)?;
         if let Some(upload) = &mut icon_upload {
@@ -1397,7 +1410,7 @@ fn query_tunnels(
         .get(axum::http::header::HOST)
         .and_then(|value| value.to_str().ok())
         .and_then(|host| host.parse::<axum::http::uri::Authority>().ok());
-    let sql="SELECT t.id,t.tenant_id,t.device_id,d.name,t.name,t.protocol,t.local_address,t.local_port,t.public_port,t.hostname,t.enabled,t.apply_status,t.apply_error,t.apply_revision,t.public_domain_id,t.deleted_at,p.domain,t.lan_redirect_enabled,CASE WHEN t.protocol IN ('tcp','udp','tcp_udp') THEN NULL ELSE COALESCE(t.origin_protocol,'http') END,t.service_mode,t.access_mode,t.protocol_statuses,t.http_redirect_enabled,t.https_port,t.ipv6_direct_enabled,t.icon_id FROM tunnels t LEFT JOIN devices d ON d.id=t.device_id LEFT JOIN public_domains p ON p.id=t.public_domain_id WHERE t.tenant_id=?1 AND t.deleted_at IS NULL AND (?2 IS NULL OR t.id=?2) ORDER BY t.created_at DESC";
+    let sql="SELECT t.id,t.tenant_id,t.device_id,d.name,t.name,t.protocol,t.local_address,t.local_port,t.public_port,t.hostname,t.enabled,t.apply_status,t.apply_error,t.apply_revision,t.public_domain_id,t.deleted_at,p.domain,t.lan_redirect_enabled,CASE WHEN t.protocol IN ('tcp','udp','tcp_udp') THEN NULL ELSE COALESCE(t.origin_protocol,'http') END,t.service_mode,t.access_mode,t.protocol_statuses,t.http_redirect_enabled,t.https_port,t.ipv6_direct_enabled,t.icon_id,t.origin_tls_verification,t.origin_ca_pem FROM tunnels t LEFT JOIN devices d ON d.id=t.device_id LEFT JOIN public_domains p ON p.id=t.public_domain_id WHERE t.tenant_id=?1 AND t.deleted_at IS NULL AND (?2 IS NULL OR t.id=?2) ORDER BY t.created_at DESC";
     let mut q = connection.prepare(sql)?;
     let rows = q
         .query_map(params![tenant, only], |row| {
@@ -1443,6 +1456,8 @@ fn query_tunnels(
                 name: row.get(4)?,
                 protocol,
                 origin_protocol: row.get(18)?,
+                origin_tls_verification: row.get(26)?,
+                origin_ca_pem: row.get(27)?,
                 local_address: row.get(6)?,
                 local_port: row.get(7)?,
                 public_port: port,
@@ -1641,7 +1656,14 @@ fn desired_tunnels(state: &AppState, device_id: &str) -> Result<Vec<TunnelDesire
         .db
         .lock()
         .map_err(|_| anyhow::anyhow!("数据库锁不可用"))?;
-    let mut q=connection.prepare("SELECT id,protocol,local_address,local_port,hostname,origin_protocol,origin_tls_server_name,origin_tls_verification,apply_revision,enabled FROM tunnels WHERE device_id=?1 AND service_mode='tunnel' AND deleted_at IS NULL AND EXISTS(SELECT 1 FROM tenants w WHERE w.id=tunnels.tenant_id AND w.enabled=1)")?;
+    desired_tunnels_from_db(&connection, device_id)
+}
+
+fn desired_tunnels_from_db(
+    connection: &Connection,
+    device_id: &str,
+) -> Result<Vec<TunnelDesiredState>> {
+    let mut q=connection.prepare("SELECT id,protocol,local_address,local_port,hostname,origin_protocol,origin_tls_server_name,origin_tls_verification,origin_ca_pem,apply_revision,enabled FROM tunnels WHERE device_id=?1 AND service_mode='tunnel' AND deleted_at IS NULL AND EXISTS(SELECT 1 FROM tenants w WHERE w.id=tunnels.tenant_id AND w.enabled=1)")?;
     let mapped = q.query_map(params![device_id], |row| {
         Ok(TunnelDesiredState {
             tunnel_id: row.get(0)?,
@@ -1652,9 +1674,9 @@ fn desired_tunnels(state: &AppState, device_id: &str) -> Result<Vec<TunnelDesire
             origin_protocol: row.get(5)?,
             origin_tls_server_name: row.get(6)?,
             origin_tls_verification: row.get(7)?,
-            origin_ca_pem: None,
-            revision: row.get(8)?,
-            enabled: row.get::<_, i64>(9)? != 0,
+            origin_ca_pem: row.get(8)?,
+            revision: row.get(9)?,
+            enabled: row.get::<_, i64>(10)? != 0,
         })
     })?;
     Ok(mapped.collect::<Result<Vec<_>, _>>()?)

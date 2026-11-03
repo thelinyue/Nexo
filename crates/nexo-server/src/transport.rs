@@ -1669,6 +1669,37 @@ mod tests {
     }
 
     #[test]
+    fn local_origin_certificate_failure_remains_available_in_node_details() {
+        let (state, headers) = crate::tests::domain_fixture();
+        populate(&state);
+        {
+            let db = state.db.lock().unwrap();
+            db.execute("INSERT INTO tunnel_applied_states(tunnel_id,revision,status,error_message,updated_at) VALUES('own',2,'failed','本地 HTTPS 证书验证失败: UnknownIssuer',?1)", [unix_now()]).unwrap();
+        }
+        refresh_status(
+            &state,
+            &HashMap::from([("own".into(), None)]),
+            &["mine".into()],
+            &["mine".into()],
+            &HashMap::new(),
+        )
+        .unwrap();
+        let db = state.db.lock().unwrap();
+        let tunnel = crate::query_tunnels(&db, "default", Some("own"), &headers, 80, None)
+            .unwrap()
+            .remove(0);
+        let local = tunnel
+            .node_statuses
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|node| node["node_id"] == "local")
+            .unwrap();
+        assert_eq!(local["error"], "本地 HTTPS 证书验证失败: UnknownIssuer");
+        assert!(local["public_probe"]["checked_at"].is_null());
+    }
+
+    #[test]
     fn combined_status_is_not_published_before_udp_is_aggregated() {
         let (state, _) = crate::tests::domain_fixture();
         populate(&state);
@@ -1894,6 +1925,8 @@ mod tests {
             name: "test".into(),
             protocol: "tcp".into(),
             origin_protocol: None,
+            origin_tls_verification: None,
+            origin_ca_pem: None,
             local_address: "127.0.0.1".into(),
             local_port: 1234,
             public_port: Some(port),

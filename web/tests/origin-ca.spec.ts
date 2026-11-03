@@ -1,0 +1,115 @@
+import { expect, test } from "@playwright/test";
+import { installApiMocks } from "./api-mocks";
+import { openServiceEditor, selectServiceOption } from "./service-actions";
+
+// 这里仅验证界面和请求；实际 PEM/TLS 校验由 Rust 测试覆盖。
+const pem = "-----BEGIN CERTIFICATE-----\nY2VydGlmaWNhdGU=\n-----END CERTIFICATE-----";
+
+test("HTTPS 回源默认严格校验，可上传服务专属证书并回填", async ({ page }, info) => {
+  const state = await installApiMocks(page);
+  await page.goto("/#/services");
+  await openServiceEditor(page);
+  const dialog = page.getByRole("dialog", { name: "创建服务" });
+  await dialog.getByLabel("服务名称").fill("内网 HTTPS");
+  await dialog.getByLabel("内网地址", { exact: true }).fill("192.168.1.10");
+  await dialog.getByLabel("内网端口").fill("8006");
+  await dialog.getByLabel("主机名").fill("private");
+  const origin = dialog.getByRole("combobox", { name: "内网协议", exact: true });
+  await selectServiceOption(origin, "HTTPS");
+  const verification = dialog.getByRole("combobox", { name: "验证方式", exact: true });
+  await expect(verification).toHaveAttribute("value", "system");
+  await expect(dialog.getByLabel("CA 公钥证书", { exact: true })).toHaveCount(0);
+  await selectServiceOption(verification, "自定义受信任证书");
+  const certificate = dialog.getByLabel("CA 公钥证书", { exact: true });
+  await certificate.fill("粘贴的草稿");
+  await dialog.getByLabel("选择 CA 证书文件").setInputFiles({ name: "origin-ca.pem", mimeType: "application/x-pem-file", buffer: Buffer.from(pem) });
+  await expect(certificate).toHaveValue(pem);
+  await selectServiceOption(origin, "HTTP");
+  await expect(certificate).toHaveCount(0);
+  await selectServiceOption(origin, "HTTPS");
+  await expect(certificate).toHaveValue(pem);
+  expect(await dialog.evaluate(el => el.scrollWidth <= el.clientWidth)).toBe(true);
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
+  await certificate.scrollIntoViewIfNeeded();
+  await page.screenshot({ path: info.outputPath("origin-ca-editor.png"), animations: "disabled" });
+  await dialog.getByRole("button", { name: "保存服务" }).click();
+  await expect(dialog).toBeHidden();
+  expect(state.calls.find(call => call.method === "POST" && call.path === "/api/v1/tunnels")?.body).toMatchObject({ origin_protocol: "https", origin_tls_verification: "custom_ca", origin_ca_pem: pem });
+  await page.getByRole("link", { name: "内网 HTTPS", exact: true }).click();
+  await page.getByRole("button", { name: "编辑服务" }).click();
+  const editor = page.getByRole("dialog", { name: "编辑服务" });
+  await expect(editor.getByRole("combobox", { name: "验证方式", exact: true })).toHaveAttribute("value", "custom_ca");
+  await expect(editor.getByLabel("CA 公钥证书", { exact: true })).toHaveValue(pem);
+  await selectServiceOption(editor.getByRole("combobox", { name: "验证方式", exact: true }), "系统信任的证书");
+  await editor.getByRole("button", { name: "保存服务" }).click();
+  await expect(editor).toBeHidden();
+  expect(state.calls.find(call => call.method === "PUT" && call.path === "/api/v1/tunnels/t-new")?.body).toMatchObject({ origin_tls_verification: "system", origin_ca_pem: null });
+});
+
+test("缺少证书和服务端拒绝时显示错误并保留草稿", async ({ page }) => {
+  const state = await installApiMocks(page);
+  await page.goto("/#/services");
+  await openServiceEditor(page);
+  const dialog = page.getByRole("dialog", { name: "创建服务" });
+  await dialog.getByLabel("服务名称").fill("内网 HTTPS");
+  await dialog.getByLabel("内网地址", { exact: true }).fill("192.168.1.10");
+  await dialog.getByLabel("内网端口").fill("8006");
+  await dialog.getByLabel("主机名").fill("private");
+  await selectServiceOption(dialog.getByRole("combobox", { name: "内网协议", exact: true }), "HTTPS");
+  await selectServiceOption(dialog.getByRole("combobox", { name: "验证方式", exact: true }), "自定义受信任证书");
+  await dialog.getByRole("button", { name: "保存服务" }).click();
+  await expect(dialog.getByRole("alert")).toContainText("请提供受信任的 CA 证书");
+  expect(state.calls.filter(call => call.method === "POST" && call.path === "/api/v1/tunnels")).toHaveLength(0);
+  const certificate = dialog.getByLabel("CA 公钥证书", { exact: true });
+  await certificate.fill(pem);
+  state.failures.set("POST /api/v1/tunnels", "请填写有效的 PEM 公钥证书，不要包含私钥");
+  state.failureStatuses.set("POST /api/v1/tunnels", 400);
+  await dialog.getByRole("button", { name: "保存服务" }).click();
+  await expect(dialog.getByRole("alert")).toContainText("不要包含私钥");
+  await expect(certificate).toHaveValue(pem);
+});
+
+test("仅显式选择后跳过验证，提示风险和 Agent 升级并可恢复", async ({ page }) => {
+  const state = await installApiMocks(page);
+  Object.assign(state.tunnels[0], { origin_protocol: "https", origin_tls_verification: "system" });
+  await page.goto("/#/services/t-1");
+  await page.getByRole("button", { name: "编辑服务", exact: true }).click();
+  const editor = page.getByRole("dialog", { name: "编辑服务" });
+  const verification = editor.getByRole("combobox", { name: "验证方式", exact: true });
+  await expect(verification).toHaveAttribute("value", "system");
+  await selectServiceOption(verification, "自定义受信任证书");
+  await editor.getByLabel("CA 公钥证书", { exact: true }).fill(pem);
+  await selectServiceOption(verification, "跳过验证（不安全）");
+  await expect(editor.getByLabel("CA 公钥证书", { exact: true })).toHaveCount(0);
+  const warning = editor.getByRole("status").filter({ hasText: "中间人攻击" });
+  await expect(warning).toContainText("泄露登录凭据");
+  await expect(warning).toContainText("升级 Agent");
+  expect(await editor.evaluate(el => el.scrollWidth <= el.clientWidth)).toBe(true);
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
+  await editor.getByRole("button", { name: "保存服务" }).click();
+  await expect(editor).toBeHidden();
+  expect(state.calls.filter(call => call.method === "PUT" && call.path === "/api/v1/tunnels/t-1").at(-1)?.body).toMatchObject({ origin_protocol: "https", origin_tls_verification: "insecure_skip_verify", origin_ca_pem: null });
+  const detail = page.getByRole("dialog", { name: "媒体中心", exact: true });
+  await expect(detail).toContainText("内网证书验证已关闭");
+  await detail.getByRole("button", { name: "编辑服务", exact: true }).click();
+  await expect(verification).toHaveAttribute("value", "insecure_skip_verify");
+  await expect(editor.getByRole("status").filter({ hasText: "中间人攻击" })).toBeVisible();
+  await selectServiceOption(verification, "系统信任的证书");
+  await expect(editor.getByRole("status").filter({ hasText: "中间人攻击" })).toHaveCount(0);
+  await editor.getByRole("button", { name: "保存服务" }).click();
+  await expect(editor).toBeHidden();
+  expect(state.calls.filter(call => call.method === "PUT" && call.path === "/api/v1/tunnels/t-1").at(-1)?.body).toMatchObject({ origin_tls_verification: "system", origin_ca_pem: null });
+  await expect(detail).not.toContainText("内网证书验证已关闭");
+});
+
+test("本地节点回源错误在公网探测尚未完成时仍可见", async ({ page }) => {
+  const state = await installApiMocks(page);
+  state.tunnels[0].node_ids = ["local"];
+  state.tunnels[0].node_statuses = [{ node_id: "local", healthy: false, error: "本地 HTTPS 证书验证失败: UnknownIssuer", public_probe: { kind: "https", healthy: false, checked_at: null, error: null } }];
+  await page.goto("/#/services/t-1");
+  const connections = page.getByRole("dialog", { name: "媒体中心" }).locator(".service-detail-connections");
+  await expect(connections).toContainText("内置节点");
+  await expect(connections).toContainText("本地 HTTPS 证书验证失败");
+  await connections.getByText("本地 HTTPS 证书验证失败", { exact: true }).click();
+  await expect(connections).toContainText("UnknownIssuer");
+});

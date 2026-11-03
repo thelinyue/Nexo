@@ -91,7 +91,7 @@ CREATE TABLE "tunnels" (
     protocol TEXT NOT NULL CHECK(protocol IN ('tcp','http','https','udp','tcp_udp')), local_address TEXT NOT NULL,
     local_port INTEGER NOT NULL, public_port INTEGER, https_port INTEGER NOT NULL DEFAULT 443 CHECK(https_port BETWEEN 1 AND 65535), hostname TEXT, enabled INTEGER NOT NULL DEFAULT 1,
     apply_status TEXT NOT NULL DEFAULT 'checking', apply_error TEXT, apply_revision INTEGER NOT NULL DEFAULT 1,
-    origin_protocol TEXT, origin_tls_server_name TEXT, origin_tls_verification TEXT NOT NULL DEFAULT 'system',
+    origin_protocol TEXT, origin_tls_server_name TEXT, origin_tls_verification TEXT NOT NULL DEFAULT 'system', origin_ca_pem TEXT,
     public_domain_id TEXT REFERENCES public_domains(id) ON DELETE SET NULL,
     deleted_at INTEGER, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
 , http_redirect_enabled INTEGER NOT NULL DEFAULT 0, service_mode TEXT NOT NULL DEFAULT 'tunnel' CHECK(service_mode IN ('tunnel','reverse_proxy')), lan_redirect_enabled INTEGER NOT NULL DEFAULT 0, access_mode TEXT NOT NULL DEFAULT 'public' CHECK(access_mode IN ('public','password')), access_password_hash TEXT, protocol_statuses TEXT NOT NULL DEFAULT '{}');

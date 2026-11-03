@@ -199,6 +199,10 @@ pub fn agent_nodes(state: &AppState, device: &str) -> Result<Vec<AgentNode>> {
         .db
         .lock()
         .map_err(|_| anyhow::anyhow!("数据库锁不可用"))?;
+    agent_nodes_from_db(&db, device)
+}
+
+pub fn agent_nodes_from_db(db: &Connection, device: &str) -> Result<Vec<AgentNode>> {
     let mut q=db.prepare("SELECT n.id,n.public_ipv4,n.control_port,t.id FROM relay_nodes n JOIN authorized_service_nodes s ON s.node_id=n.id JOIN tunnels t ON t.id=s.service_id JOIN relay_node_authorizations g ON g.node_id=n.id AND g.tenant_id=t.tenant_id JOIN tenants w ON w.id=t.tenant_id WHERE t.device_id=?1 AND t.enabled=1 AND t.deleted_at IS NULL AND w.enabled=1 AND n.enabled=1 AND n.approved=1 AND n.removed_at IS NULL AND n.id!='local' ORDER BY n.id,t.id")?;
     let mut result: Vec<AgentNode> = Vec::new();
     for row in q.query_map([device], |r| {

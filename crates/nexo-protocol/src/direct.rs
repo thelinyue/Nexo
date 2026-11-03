@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 
 pub const CAPABILITY: &str = "ipv6-direct-v1";
 pub const ALPN: &[u8] = b"nexo-direct/1";
+pub const MAX_FRAME_SIZE: usize = 128 * 1024;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Service {

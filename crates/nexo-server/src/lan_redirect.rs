@@ -138,6 +138,402 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn private_origin_ca_reaches_agent_without_changing_other_services() {
+        let (state, headers, mut body) = web_fixture().await;
+        state.db.lock().unwrap().execute("INSERT INTO devices(id,tenant_id,name,created_at,updated_at) VALUES('origin-agent','default','Agent',0,0)", []).unwrap();
+        let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+        params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        let ca = params
+            .self_signed(&rcgen::KeyPair::generate().unwrap())
+            .unwrap()
+            .pem();
+        body["device_id"] = json!("origin-agent");
+        body["origin_protocol"] = json!("https");
+        body["origin_tls_verification"] = json!("custom_ca");
+        body["origin_ca_pem"] = json!(ca);
+        let Json(created) = crate::create_tunnel(
+            State(state.clone()),
+            headers.clone(),
+            Json(serde_json::from_value(body.clone()).unwrap()),
+        )
+        .await
+        .unwrap();
+        let desired = crate::desired_tunnels(&state, "origin-agent").unwrap();
+        let desired = desired
+            .iter()
+            .find(|item| item.tunnel_id == created.id)
+            .unwrap();
+        assert_eq!(
+            desired.origin_tls_verification.as_deref(),
+            Some("custom_ca")
+        );
+        assert_eq!(desired.origin_ca_pem.as_deref(), Some(ca.trim()));
+        assert_eq!(created.origin_tls_verification, "custom_ca");
+        assert_eq!(created.origin_ca_pem.as_deref(), Some(ca.trim()));
+
+        // 旧客户端或批量操作省略新字段时，不得清除已配置的 CA。
+        body.as_object_mut()
+            .unwrap()
+            .remove("origin_tls_verification");
+        body.as_object_mut().unwrap().remove("origin_ca_pem");
+        body["name"] = json!("renamed");
+        let Json(renamed) = crate::update_tunnel(
+            State(state.clone()),
+            headers.clone(),
+            Path(created.id.clone()),
+            Json(serde_json::from_value(body.clone()).unwrap()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(renamed.apply_revision, created.apply_revision);
+        assert_eq!(renamed.origin_ca_pem.as_deref(), Some(ca.trim()));
+
+        // 同一设备的其他服务仍使用系统信任库。
+        body["hostname"] = json!("other");
+        let Json(other) = crate::create_tunnel(
+            State(state.clone()),
+            headers.clone(),
+            Json(serde_json::from_value(body.clone()).unwrap()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(other.origin_tls_verification, "system");
+        assert!(other.origin_ca_pem.is_none());
+
+        let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+        params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        let replacement = params
+            .self_signed(&rcgen::KeyPair::generate().unwrap())
+            .unwrap()
+            .pem();
+        body["hostname"] = json!("nas");
+        body["origin_tls_verification"] = json!("custom_ca");
+        body["origin_ca_pem"] = json!(replacement);
+        let Json(changed) = crate::update_tunnel(
+            State(state.clone()),
+            headers.clone(),
+            Path(created.id.clone()),
+            Json(serde_json::from_value(body.clone()).unwrap()),
+        )
+        .await
+        .unwrap();
+        assert!(changed.apply_revision > renamed.apply_revision);
+        assert_eq!(changed.origin_ca_pem.as_deref(), Some(replacement.trim()));
+        body["origin_tls_verification"] = json!("insecure_skip_verify");
+        body.as_object_mut().unwrap().remove("origin_ca_pem");
+        let Json(skipped) = crate::update_tunnel(
+            State(state.clone()),
+            headers.clone(),
+            Path(created.id.clone()),
+            Json(serde_json::from_value(body.clone()).unwrap()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(skipped.origin_tls_verification, "insecure_skip_verify");
+        assert!(skipped.origin_ca_pem.is_none());
+        assert!(skipped.apply_revision > changed.apply_revision);
+        body["origin_tls_verification"] = json!("system");
+        body["origin_ca_pem"] = Value::Null;
+        let Json(cleared) = crate::update_tunnel(
+            State(state.clone()),
+            headers,
+            Path(created.id),
+            Json(serde_json::from_value(body).unwrap()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(cleared.origin_tls_verification, "system");
+        assert!(cleared.origin_ca_pem.is_none());
+        assert!(cleared.apply_revision > skipped.apply_revision);
+    }
+
+    #[tokio::test]
+    async fn private_origin_ca_rejects_invalid_input_and_unknown_modes() {
+        let (state, headers, mut body) = web_fixture().await;
+        state.db.lock().unwrap().execute("INSERT INTO devices(id,tenant_id,name,created_at,updated_at) VALUES('origin-agent','default','Agent',0,0)", []).unwrap();
+        body["device_id"] = json!("origin-agent");
+        body["origin_protocol"] = json!("https");
+        for (mode, pem) in [
+            ("custom_ca", None),
+            ("custom_ca", Some("not a certificate")),
+            (
+                "custom_ca",
+                Some("-----BEGIN PRIVATE KEY-----\nabc\n-----END PRIVATE KEY-----"),
+            ),
+            ("insecure", None),
+        ] {
+            body["origin_tls_verification"] = json!(mode);
+            if let Some(pem) = pem {
+                body["origin_ca_pem"] = json!(pem);
+            } else {
+                body.as_object_mut().unwrap().remove("origin_ca_pem");
+            }
+            let result = crate::create_tunnel(
+                State(state.clone()),
+                headers.clone(),
+                Json(serde_json::from_value(body.clone()).unwrap()),
+            )
+            .await;
+            assert_eq!(
+                result.expect_err("invalid CA must be rejected").status,
+                axum::http::StatusCode::BAD_REQUEST
+            );
+        }
+        let count: i64 = state
+            .db
+            .lock()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM tunnels", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[tokio::test]
+    async fn insecure_origin_is_explicit_per_service_and_can_be_reverted() {
+        let (state, headers, mut body) = web_fixture().await;
+        state.db.lock().unwrap().execute("INSERT INTO devices(id,tenant_id,name,created_at,updated_at) VALUES('origin-agent','default','Agent',0,0)", []).unwrap();
+        body["device_id"] = json!("origin-agent");
+        body["origin_protocol"] = json!("https");
+        body["origin_tls_verification"] = json!("insecure_skip_verify");
+        let Json(created) = crate::create_tunnel(
+            State(state.clone()),
+            headers.clone(),
+            Json(serde_json::from_value(body.clone()).unwrap()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(created.origin_tls_verification, "insecure_skip_verify");
+        assert!(created.origin_ca_pem.is_none());
+        let desired = crate::desired_tunnels(&state, "origin-agent").unwrap();
+        assert_eq!(
+            desired[0].origin_tls_verification.as_deref(),
+            Some("insecure_skip_verify")
+        );
+
+        // 旧客户端省略设置时不改变该服务，其他新服务仍默认验证证书。
+        body.as_object_mut()
+            .unwrap()
+            .remove("origin_tls_verification");
+        body["name"] = json!("renamed");
+        let Json(renamed) = crate::update_tunnel(
+            State(state.clone()),
+            headers.clone(),
+            Path(created.id.clone()),
+            Json(serde_json::from_value(body.clone()).unwrap()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(renamed.origin_tls_verification, "insecure_skip_verify");
+        assert_eq!(renamed.apply_revision, created.apply_revision);
+        body["hostname"] = json!("other");
+        let Json(other) = crate::create_tunnel(
+            State(state.clone()),
+            headers.clone(),
+            Json(serde_json::from_value(body.clone()).unwrap()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(other.origin_tls_verification, "system");
+
+        body["hostname"] = json!("nas");
+        body["origin_protocol"] = json!("http");
+        let Json(http) = crate::update_tunnel(
+            State(state.clone()),
+            headers.clone(),
+            Path(created.id.clone()),
+            Json(serde_json::from_value(body.clone()).unwrap()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(http.origin_tls_verification, "system");
+        body["origin_protocol"] = json!("https");
+        let Json(https) = crate::update_tunnel(
+            State(state.clone()),
+            headers.clone(),
+            Path(created.id.clone()),
+            Json(serde_json::from_value(body.clone()).unwrap()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            https.origin_tls_verification, "system",
+            "切回 HTTPS 时不得隐式跳过验证"
+        );
+        body["origin_tls_verification"] = json!("insecure_skip_verify");
+        let Json(skipped_again) = crate::update_tunnel(
+            State(state.clone()),
+            headers.clone(),
+            Path(created.id.clone()),
+            Json(serde_json::from_value(body.clone()).unwrap()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            skipped_again.origin_tls_verification,
+            "insecure_skip_verify"
+        );
+        body["origin_tls_verification"] = json!("system");
+        let Json(restored) = crate::update_tunnel(
+            State(state.clone()),
+            headers.clone(),
+            Path(created.id.clone()),
+            Json(serde_json::from_value(body.clone()).unwrap()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(restored.origin_tls_verification, "system");
+        assert!(restored.apply_revision > skipped_again.apply_revision);
+        body["origin_tls_verification"] = json!("insecure_skip_verify");
+        body["origin_protocol"] = json!("http");
+        let error = crate::update_tunnel(
+            State(state.clone()),
+            headers.clone(),
+            Path(created.id.clone()),
+            Json(serde_json::from_value(body.clone()).unwrap()),
+        )
+        .await
+        .expect_err("HTTP 回源不能显式跳过 TLS 验证");
+        assert_eq!(error.status, axum::http::StatusCode::BAD_REQUEST);
+        body["origin_protocol"] = json!("https");
+        body["origin_ca_pem"] = json!("unexpected certificate");
+        let error = crate::update_tunnel(
+            State(state.clone()),
+            headers,
+            Path(created.id),
+            Json(serde_json::from_value(body).unwrap()),
+        )
+        .await
+        .expect_err("跳过验证不应保存 CA");
+        assert_eq!(error.status, axum::http::StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn private_origin_ca_survives_protocol_and_enable_switches() {
+        let (state, headers, mut body) = web_fixture().await;
+        state.db.lock().unwrap().execute("INSERT INTO devices(id,tenant_id,name,created_at,updated_at) VALUES('origin-agent','default','Agent',0,0)", []).unwrap();
+        let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+        params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        let ca = params
+            .self_signed(&rcgen::KeyPair::generate().unwrap())
+            .unwrap()
+            .pem();
+        body["device_id"] = json!("origin-agent");
+        body["origin_protocol"] = json!("https");
+        body["origin_tls_verification"] = json!("custom_ca");
+        body["origin_ca_pem"] = json!(ca);
+        let Json(created) = crate::create_tunnel(
+            State(state.clone()),
+            headers.clone(),
+            Json(serde_json::from_value(body.clone()).unwrap()),
+        )
+        .await
+        .unwrap();
+
+        let Json(disabled) = crate::disable_tunnel(
+            State(state.clone()),
+            headers.clone(),
+            Path(created.id.clone()),
+        )
+        .await
+        .unwrap();
+        let Json(enabled) = crate::enable_tunnel(
+            State(state.clone()),
+            headers.clone(),
+            Path(created.id.clone()),
+        )
+        .await
+        .unwrap();
+        assert!(!disabled.enabled && enabled.enabled);
+        assert_eq!(enabled.origin_ca_pem.as_deref(), Some(ca.trim()));
+
+        // 旧客户端不发送新字段；切回 HTTPS 时仍能继续使用原信任配置。
+        body.as_object_mut()
+            .unwrap()
+            .remove("origin_tls_verification");
+        body.as_object_mut().unwrap().remove("origin_ca_pem");
+        for protocol in ["http", "tcp", "https"] {
+            if protocol == "tcp" {
+                body["protocol"] = json!("tcp");
+                body["origin_protocol"] = Value::Null;
+            } else {
+                body["protocol"] = json!("http");
+                body["origin_protocol"] = json!(protocol);
+                body["hostname"] = json!("nas");
+            }
+            let Json(updated) = crate::update_tunnel(
+                State(state.clone()),
+                headers.clone(),
+                Path(created.id.clone()),
+                Json(serde_json::from_value(body.clone()).unwrap()),
+            )
+            .await
+            .unwrap();
+            assert_eq!(updated.origin_tls_verification, "custom_ca");
+            assert_eq!(updated.origin_ca_pem.as_deref(), Some(ca.trim()));
+        }
+
+        body["origin_protocol"] = json!("http");
+        body["origin_tls_verification"] = json!("custom_ca");
+        body["origin_ca_pem"] = json!(ca);
+        let error = crate::update_tunnel(
+            State(state.clone()),
+            headers,
+            Path(created.id),
+            Json(serde_json::from_value(body).unwrap()),
+        )
+        .await
+        .expect_err("HTTP cannot explicitly configure a CA");
+        assert_eq!(error.status, axum::http::StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn oversized_ca_snapshot_rolls_back_service_creation() {
+        let (state, headers, mut body) = web_fixture().await;
+        let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+        params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        let ca = params
+            .self_signed(&rcgen::KeyPair::generate().unwrap())
+            .unwrap()
+            .pem()
+            .repeat(20);
+        let count = {
+            let db = state.db.lock().unwrap();
+            db.execute("INSERT INTO devices(id,tenant_id,name,created_at,updated_at) VALUES('origin-agent','default','Agent',0,0)", []).unwrap();
+            let mut index = 0;
+            loop {
+                db.execute("INSERT INTO tunnels(id,tenant_id,device_id,name,protocol,origin_protocol,origin_tls_verification,origin_ca_pem,local_address,local_port,created_at,updated_at) VALUES(?1,'default','origin-agent','test','https','https','custom_ca',?2,'127.0.0.1',8006,0,0)", params![format!("s{index}"), ca]).unwrap();
+                if crate::origin_ca::check_snapshot(&state, &db, Some("origin-agent")).is_err() {
+                    db.execute(
+                        "DELETE FROM tunnels WHERE id=?1",
+                        params![format!("s{index}")],
+                    )
+                    .unwrap();
+                    break index;
+                }
+                index += 1;
+            }
+        };
+        body["device_id"] = json!("origin-agent");
+        body["origin_protocol"] = json!("https");
+        body["origin_tls_verification"] = json!("custom_ca");
+        body["origin_ca_pem"] = json!(ca);
+        let error = crate::create_tunnel(
+            State(state.clone()),
+            headers,
+            Json(serde_json::from_value(body).unwrap()),
+        )
+        .await
+        .expect_err("oversized snapshot must be rejected");
+        assert_eq!(error.status, axum::http::StatusCode::BAD_REQUEST);
+        let db = state.db.lock().unwrap();
+        let actual: i64 = db
+            .query_row("SELECT COUNT(*) FROM tunnels", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(actual, count);
+        assert!(crate::origin_ca::check_snapshot(&state, &db, Some("origin-agent")).is_ok());
+    }
+
+    #[tokio::test]
     async fn origin_protocol_roundtrips_independently_and_reaches_agent() {
         for public in ["http", "https"] {
             for origin in ["http", "https"] {

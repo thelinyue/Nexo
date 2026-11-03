@@ -191,7 +191,7 @@ pub async fn session(
                 tasks.spawn(async move {
                     let mut stream = nexo_tunnel::into_tokio_io(stream);
                     let operation = async {
-                        let mut reader = FramedRead::new(&mut stream,LinesCodec::new_with_max_length(128*1024));
+                        let mut reader = FramedRead::new(&mut stream,LinesCodec::new_with_max_length(nexo_protocol::direct::MAX_FRAME_SIZE));
                         let line = reader.next().await.context("管理请求为空")??;
                         let request: Request = serde_json::from_str(&line)?;
                         drop(reader);

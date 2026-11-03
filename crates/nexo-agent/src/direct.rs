@@ -64,7 +64,7 @@ async fn connection(
                     let operation=async {
                         let mut stream=nexo_tunnel::into_tokio_io(stream);
                         identity::write_message(&mut stream,&request).await?;
-                        let mut reader=FramedRead::new(stream,LinesCodec::new_with_max_length(128*1024));
+                        let mut reader=FramedRead::new(stream,LinesCodec::new_with_max_length(nexo_protocol::direct::MAX_FRAME_SIZE));
                         let line=reader.next().await.context("直连管理响应为空")??;
                         Ok(serde_json::from_str(&line)?)
                     };
