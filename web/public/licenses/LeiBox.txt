@@ -1,0 +1,20 @@
+LeiBox component source notices
+
+Source provider: LeiBox
+Source packages: https://leibox.pantoria.cn/ai/packages/{component}/react.json
+
+Glass Tab Menu (glass-tab-menu)
+Documentation: https://leibox.pantoria.cn/docs/animations/glass-tab-menu
+Design author: solutionb
+Design reference: https://x.com/SolutionB2u/status/2113575003341881728/video/1
+Source notice: Retain source notices and design-reference attribution; no blanket license is assigned by the catalog.
+
+Collection Layout Morph (collection-layout-morph)
+Documentation: https://leibox.pantoria.cn/docs/animations/collection-layout-morph
+Design author: Previous Leon
+Design reference: https://x.com/shawn_kel/status/2087937950424129978/video/1
+Source notice: Original layout/code license not supplied or independently verified; original illustrations and reference video are not redistributed. Reused existing Claude/Codex vectors retain Lobe Icons Copyright (c) 2023 LobeHub and MIT notice. Grok Bot artwork source is recorded separately without claiming an MIT license for it.
+
+Nexo adaptation
+The fixed demonstration stage, embedded Inter font, demonstration SVG artwork and generic demonstration surface runtime are removed. The original asset notices are retained as provenance in the source component's NOTICE.md; the removed assets are not bundled or displayed by Nexo.
+These source notices do not grant a blanket MIT or Nexo AGPL license to upstream component code or design references. GSAP and Flip retain their own Standard License; see GSAP.txt and https://gsap.com/standard-license/.

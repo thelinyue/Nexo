@@ -3,6 +3,74 @@ import { installApiMocks } from "./api-mocks";
 
 const activePage = (page: import("@playwright/test").Page) => page.locator(".page-slot:not([hidden])");
 
+test("手机视图切换并入搜索首行，筛选不挤压且键盘选择入口可达", async ({ page }, info) => {
+  test.skip(info.project.name === "desktop-dark", "手机紧凑工具栏");
+  const state = await installApiMocks(page);
+  state.tunnels = ["媒体中心", "文件管理", "下载助手", "家庭相册", "音乐库", "笔记", "设备面板", "备用服务"].map((name, index) => ({ ...state.tunnels[0], id: `layout-${index}`, name }));
+  await page.goto("/#/services");
+  await expect(page.locator(".service-row")).toHaveCount(8);
+  const toggle = page.getByRole("group", { name: "服务视图", exact: true });
+  const search = page.locator(".workspace-topbar .search");
+  const filters = page.locator(".service-filter-control select");
+  const sizes = info.project.name === "mobile-light" ? [320, 375, 390, 812] : [page.viewportSize()!.width];
+  for (const width of sizes) {
+    await page.setViewportSize({ width, height: width === 812 ? 375 : 812 });
+    await expect(toggle).toHaveCount(1);
+    const field = (await search.boundingBox())!;
+    const view = (await toggle.boundingBox())!;
+    expect(Math.abs(field.y + field.height / 2 - view.y - view.height / 2)).toBeLessThan(1);
+    expect(field.width).toBeGreaterThanOrEqual(120);
+    expect(view.x).toBeGreaterThanOrEqual(field.x + field.width);
+    for (const button of await toggle.getByRole("button").all()) {
+      const box = (await button.boundingBox())!;
+      expect(box.width).toBeGreaterThanOrEqual(44); expect(box.height).toBeGreaterThanOrEqual(44);
+    }
+    const first = (await filters.first().boundingBox())!;
+    for (const select of await filters.all()) {
+      expect((await select.boundingBox())!.y).toBe(first.y);
+      expect(await select.evaluate(element => {
+        const control = element as HTMLSelectElement; const style = getComputedStyle(control);
+        const context = document.createElement("canvas").getContext("2d")!; context.font = style.font;
+        return control.clientWidth >= context.measureText(control.selectedOptions[0].text).width + parseFloat(style.paddingLeft) + parseFloat(style.paddingRight);
+      })).toBe(true);
+    }
+    const list = (await page.locator(".service-list").boundingBox())!;
+    expect(list.y - first.y - first.height).toBeLessThan(28);
+    expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
+  }
+  await toggle.getByRole("button", { name: "图标视图", exact: true }).click();
+  await expect(page.locator(".service-list")).toHaveAttribute("data-moving", "false");
+  if (info.project.name === "mobile-light") {
+    for (const colorScheme of ["light", "dark"] as const) {
+      await page.setViewportSize({ width: 375, height: 812 });
+      await page.emulateMedia({ colorScheme });
+      await page.screenshot({ path: info.outputPath(`services-compact-${colorScheme}.png`), scale: "css", animations: "disabled" });
+    }
+    await page.setViewportSize({ width: 320, height: 568 });
+    await page.emulateMedia({ colorScheme: "light" });
+    await page.screenshot({ path: info.outputPath("services-compact-320.png"), scale: "css", animations: "disabled" });
+    await page.emulateMedia({ colorScheme: "light", contrast: "more" });
+    await page.evaluate(() => { document.documentElement.style.fontSize = "200%"; });
+    const field = (await search.boundingBox())!; const view = (await toggle.boundingBox())!;
+    expect(Math.abs(field.y + field.height / 2 - view.y - view.height / 2)).toBeLessThan(1);
+    await page.screenshot({ path: info.outputPath("services-compact-320-large-text.png"), scale: "css", animations: "disabled" });
+  }
+  await page.getByLabel("搜索服务", { exact: true }).focus();
+  await page.keyboard.press("Tab");
+  await expect(toggle.getByRole("button", { name: "列表视图", exact: true })).toBeFocused();
+  await page.keyboard.press("Tab");
+  await expect(toggle.getByRole("button", { name: "图标视图", exact: true })).toBeFocused();
+  await page.keyboard.press("Tab");
+  const select = page.getByRole("button", { name: "选择", exact: true });
+  await expect(select).toBeFocused();
+  await expect(select).toBeInViewport({ ratio: 1 });
+  await expect(select).toHaveCSS("clip-path", "none");
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
+  await page.keyboard.press("Enter");
+  await expect(page.locator(".batch-actions")).toBeVisible();
+  expect(state.calls.filter(call => ["POST", "PUT", "PATCH", "DELETE"].includes(call.method))).toHaveLength(0);
+});
+
 test("页面工具栏从首行开始，桌面账号入口只出现一次", async ({ page }, info) => {
   test.skip(info.project.name !== "desktop-dark", "桌面布局矩阵");
   const state = await installApiMocks(page);

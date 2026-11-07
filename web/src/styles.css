@@ -68,7 +68,8 @@ button,a { transition:background-color 160ms ease,color 160ms ease,box-shadow 16
 .page-back { margin-left:-8px; }
 /* 四项导航和主添加入口共享同一高度；空操作槽退出布局，安全区只计算一次。 */
 .mobile-dock { position:fixed; z-index:20; inset:auto auto var(--nav-gap) 50%; transform:translateX(-50%); width:min(480px,calc(100% - 32px - env(safe-area-inset-left) - env(safe-area-inset-right))); display:flex; align-items:center; gap:8px; }
-.bottom-nav { flex:1; min-width:0; min-height:64px; display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:4px; padding:5px; border:1px solid var(--glass-edge); border-radius:999px; background:var(--glass); box-shadow:var(--glass-shadow); -webkit-backdrop-filter:blur(28px) saturate(180%); backdrop-filter:blur(28px) saturate(180%); }
+.bottom-nav { position:relative; isolation:isolate; flex:1; min-width:0; min-height:64px; display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:4px; padding:5px; border:1px solid var(--glass-edge); border-radius:999px; background:var(--glass); box-shadow:var(--glass-shadow); -webkit-backdrop-filter:blur(28px) saturate(180%); backdrop-filter:blur(28px) saturate(180%); }
+.bottom-nav-indicator { position:absolute; z-index:-1; inset:5px auto 5px 0; width:0; border-radius:999px; background:var(--nav-selected); box-shadow:inset 0 1px 0 var(--glass-highlight),0 1px 3px #00000008; pointer-events:none; }
 .mobile-create-slot { flex:none; }
 .mobile-create-slot:empty { display:none; }
 .mobile-create-slot .page-create { position:static; display:flex; align-items:center; justify-content:center; width:52px; height:52px; min-height:52px; padding:0; border:1px solid transparent; border-radius:50%; background:var(--primary); color:var(--primary-on); box-shadow:0 3px 10px #0002; }
@@ -76,7 +77,7 @@ button,a { transition:background-color 160ms ease,color 160ms ease,box-shadow 16
 .mobile-create-slot .page-create span { display:none; }
 .mobile-create-slot .page-create:active:not(:disabled) { transform:scale(.97); }
 .bottom-nav>a,.bottom-nav>button { border:0; background:transparent; display:flex; flex-direction:column; align-items:center; justify-content:center; gap:3px; min-height:52px; min-width:44px; padding:3px 0; font-size:.75rem; font-weight:600; color:var(--text); border-radius:999px; }
-.bottom-nav>a.active,.bottom-nav>button.active { color:var(--primary); background:var(--nav-selected); box-shadow:inset 0 1px 0 var(--glass-highlight),0 1px 3px #00000008; }
+.bottom-nav>a.active,.bottom-nav>button.active { color:var(--primary); }
 .bottom-nav>a:active,.bottom-nav>button:active { background:var(--surface-raised); transform:scale(.97); }
 /* 服务创建使用轻量玻璃圆钮，保留独立触控热区，减少对服务内容的遮挡。 */
 .page-actions .icon-button,.page-back { border:1px solid var(--glass-edge); background:var(--glass); box-shadow:0 2px 8px #00000008,inset 0 1px 0 var(--glass-highlight); -webkit-backdrop-filter:blur(20px) saturate(160%); backdrop-filter:blur(20px) saturate(160%); }
@@ -974,6 +975,9 @@ dd>code { display:block; margin-bottom:10px; user-select:text; font-size:.9375re
 /* 更多面板使用不透明底色，减少 iOS PWA 顶层浮层与页面顶部的背景模糊合成。
    低高度横屏允许内部滚动，安全区始终留在底栏下方。 */
 .mobile-more { position:fixed; inset:auto max(16px,env(safe-area-inset-right)) calc(var(--nav-gap) + 76px) auto; margin:0; width:max-content; max-width:calc(100vw - max(16px,env(safe-area-inset-left)) - max(16px,env(safe-area-inset-right))); max-height:calc(100dvh - var(--nav-gap) - 100px); overflow:auto; padding:8px; border:1px solid var(--glass-edge); border-radius:22px; background:var(--surface); color:var(--text); box-shadow:var(--glass-shadow); }
+/* 离散过渡只延长原生顶层的绘制寿命，开关与焦点即时生效；弹簧负责实际呈现值。 */
+.mobile-more { opacity:var(--glass-menu-opacity,1); transform:translateY(var(--glass-menu-offset,0px)) scale(var(--glass-menu-scale,1)); transition:display .4s allow-discrete,overlay .4s allow-discrete; }
+.mobile-more:not(:popover-open) { pointer-events:none; }
 .mobile-more nav { display:grid; gap:2px; }
 .mobile-more a { min-height:50px; display:flex; align-items:center; gap:12px; padding:10px 12px; border-radius:14px; font-size:.9375rem; }
 .mobile-more a span { flex:1; min-width:0; overflow-wrap:anywhere; }

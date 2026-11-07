@@ -13,6 +13,7 @@
     "@iconify-icons/tabler": "^2.0.3",
     "@iconify/react": "^6.0.2",
     "@vitejs/plugin-react": "latest",
+    "gsap": "3.12.7",
     "motion": "^13.4.4",
     "react": "latest",
     "react-dom": "latest",

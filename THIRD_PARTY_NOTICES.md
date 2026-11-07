@@ -15,3 +15,13 @@ This file is a navigation index; authoritative license texts remain with each up
 ## HD-Icons
 
 应用图标目录来自 [xushier/HD-Icons](https://github.com/xushier/HD-Icons)，使用 MIT 许可证。完整版权及许可声明位于 `web/public/licenses/HD-Icons.txt`，部署后可通过 `/licenses/HD-Icons.txt` 查看。Nexo 内置图标索引，图片按需在线加载；图标中的品牌与商标属于各自权利人。
+
+## LeiBox 交互组件
+
+手机导航和服务视图切换分别适配自 LeiBox 的 [Glass Tab Menu](https://leibox.pantoria.cn/docs/animations/glass-tab-menu) 与 [Collection Layout Morph](https://leibox.pantoria.cn/docs/animations/collection-layout-morph) React 源码包。设计参考作者分别为 solutionb 和 Previous Leon，链接及上游声明保留在 `web/src/components/leibox/` 各组件的 `NOTICE.md` 和 `web/public/licenses/LeiBox.txt` 中。
+
+LeiBox 目录未为组件授予统一许可证，列表布局组件的原始代码许可未提供或独立核实；不将其标为 MIT，也不以 Nexo 的 AGPL 声明覆盖上游权利。固定演示画布、内嵌 Inter 字体、Claude/Codex/Grok 演示 SVG 和通用演示运行层均已移除，原 SVG 来源记录仅作为溯源说明保留，不随适配组件展示或分发这些资源。
+
+## GSAP 与 Flip
+
+服务页面的布局动画使用 GSAP 3.12.7 及其随包提供的 Flip 插件，仅随服务页面代码加载。GSAP 采用自有 [Standard License](https://gsap.com/standard-license/)，不是 MIT 或 Nexo 的 AGPL；保留上游版权声明，许可文本见 `web/public/licenses/GSAP.txt`，部署后可通过 `/licenses/GSAP.txt` 查看。导航使用本地轻量弹簧，不加载 GSAP；动画不通过 CDN 在运行时下载。

@@ -1,6 +1,7 @@
 import { lazy, Suspense, useId, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { ChevronRight, Ellipsis, Globe2, House, Network, Server, Settings, Users } from "./icons";
 import { AccountMenu } from "./account-menu";
+import { GlassTabMenu } from "./components/leibox/glass-tab-menu/GlassTabMenu";
 import type { ManagedWorkspace } from "./accounts";
 import { Loading, MobileCreateContext, WorkspaceHeaderContext, PageLoadBoundary, Notice, PageHeader, WorkspaceContext, WorkspaceLabelContext, rememberInteraction, request } from "./ui";
 import type { Auth } from "./ui";
@@ -48,10 +49,11 @@ function MobileNavigation({ route, desktop, admin, standalone }: { route: string
     document.addEventListener("keydown", closeOnEscape, true);
     return () => document.removeEventListener("keydown", closeOnEscape, true);
   }, [open]);
-  return <><nav className="bottom-nav" aria-label="底部导航">
+  const index = resources.slice(0, 3).findIndex(item => active(item.route));
+  return <><GlassTabMenu selectedIndex={selected || open ? 3 : index < 0 ? null : index} enabled={!desktop} popover={menu} trigger={trigger}>
     {resources.slice(0, 3).map(item => { const Icon = item.icon; return <a key={item.route} href={item.route} aria-current={active(item.route) ? "page" : undefined} className={active(item.route) ? "active" : ""}><Icon size={22} /><span>{item.label}</span></a>; })}
     <button ref={trigger} type="button" className={selected || open ? "active" : ""} popoverTarget={id} aria-expanded={open} aria-controls={id} aria-label="更多功能" onClick={event => { keyboard.current = event.detail === 0; }}><Ellipsis size={22} /><span>更多</span></button>
-  </nav><div ref={menu} id={id} popover="auto" className="mobile-more" onToggle={event => {
+  </GlassTabMenu><div ref={menu} id={id} popover="auto" className="mobile-more" onToggle={event => {
     const shown = event.currentTarget.matches(":popover-open");
     setOpen(shown);
     if (shown && keyboard.current) menu.current?.querySelector<HTMLAnchorElement>("a")?.focus({ preventScroll: true });

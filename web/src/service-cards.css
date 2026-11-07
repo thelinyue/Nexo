@@ -1,5 +1,5 @@
 /* 应用单元只有图标和名称；以 rem 定义最小列宽，放大文字时自然减少列数。 */
-.service-list { --app-icon-size:72px; grid-template-columns:repeat(auto-fill,minmax(min(100%,6rem),1fr)); gap:20px 16px; border:0; border-radius:0; overflow:visible; }
+.service-list { --app-icon-size:72px; grid-template-columns:repeat(auto-fill,minmax(min(100%,6rem),1fr)); align-content:start; gap:20px 16px; border:0; border-radius:0; overflow:visible; }
 .service-list .service-row,.service-list .service-row:last-child { position:relative; display:flex; flex-direction:column; align-items:center; gap:4px; padding:12px 0 0; border:0; border-radius:0; background:transparent; box-shadow:none; min-width:0; }
 .service-row[data-opens-application=true] { cursor:pointer; }
 .service-list .service-row[data-selected=true] { background:transparent; box-shadow:none; }
@@ -124,6 +124,12 @@
   .page-slot>.service-toolbar>.service-filters-row { grid-column:1 / -1; grid-row:calc(var(--service-toolbar-row) + 1); }
 }
 @media (max-width:900px) {
+  /* 视图切换并入搜索首行，不挤压三项筛选；键盘唤出选择按钮时允许它换行。 */
+  .workspace-topbar .service-search-row { flex-wrap:wrap; }
+  .workspace-topbar .service-search-row>.search { flex-basis:100px; }
+  .service-view-toggle { margin-left:0; padding:0; }
+  .service-view-toggle button { display:grid; place-items:center; min-width:44px; width:44px; padding:0; border-radius:10px; }
+  .service-view-toggle button>span { display:none; }
   .service-list[data-view=list] { border-radius:14px; }
   .service-list[data-view=list] .service-list-heading { display:none; }
   .service-list[data-view=list] .service-row { grid-template-columns:48px minmax(0,1fr) auto; padding:12px; gap:5px 12px; }
