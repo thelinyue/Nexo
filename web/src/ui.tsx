@@ -74,7 +74,7 @@ export function EnrollmentDevice({ item }: { item: Enrollment }) {
   return <div className="enrollment-device"><strong>{item.device_name || "尚未收到主机名"}</strong><p>{[item.os, item.architecture, item.agent_version && `设备 ${item.agent_version}`].filter(Boolean).join(" · ") || "等待设备信息"}</p><small>设备自报信息，请在批准前与目标主机核对。</small></div>;
 }
 
-export function Brand() { return <div className="brand"><img className="brand-icon" src="/brand/mole-head.webp" width="38" height="38" alt="" aria-hidden="true" /><span><strong>Nexo</strong><small>联巢 · 内网穿透</small></span></div>; }
+export function Brand() { return <div className="brand"><img className="brand-icon" src="/brand/mole-head.webp" width="38" height="38" alt="" aria-hidden="true" /><strong>Nexo</strong></div>; }
 
 /** 默认头像只由登录账号的真实角色决定，代管其他空间时不会改变管理员本人的身份。 */
 export function UserAvatar({ role, size = 32 }: { role?: string; size?: 28 | 32 | 48 }) {

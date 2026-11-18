@@ -27,7 +27,8 @@ function AuthForm({ initial, message, onAuth, reauth = false, recoveryCode }: { 
   }
   return <>
     {!reauth && <><Brand /><h1>{mode === "recover" ? "找回账号" : "登录"}</h1></>}
-    {(mode !== "login" || reauth) && <p className="auth-copy">{mode === "recover" ? recoveryCode ? "设置新密码，恢复账号访问。" : "请联系管理员获取恢复链接。" : "重新登录后继续操作，当前填写的内容会保留。"}</p>}
+    {mode === "recover" && !recoveryCode && <p className="auth-copy">请联系管理员获取恢复链接。</p>}
+    {mode === "login" && reauth && <p className="auth-copy">重新登录后可继续编辑当前草稿。</p>}
     {(notice || message) && <p className="action-status" role="status">{notice || message}</p>}
     {mode === "recover" && <details className="recovery-help"><summary>管理员如何恢复账号</summary><p>在 Server 所在主机运行：</p><code>docker compose exec nexo-server nexo --data-dir /data/nexo admin recover</code><p>直接运行二进制时使用 <code>nexo-server admin recover</code>，并用 --data-dir 指定原数据目录。恢复码有效期 15 分钟，重新生成后旧码失效。</p></details>}
     <form className="auth-form" onSubmit={submit}>

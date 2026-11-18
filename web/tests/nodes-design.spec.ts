@@ -29,6 +29,18 @@ async function openDetail(page: Page) {
   return page.getByRole("dialog", { name: "香港 VPS", exact: true });
 }
 
+test("节点卡片的移除、更新和管理操作使用同级排版", async ({ page }) => {
+  await setup(page);
+  await page.goto("/#/nodes");
+  const actions = ["移除节点", "更新版本", "管理"].map(name => page.getByRole("button", { name, exact: true }).first());
+  const styles = await Promise.all(actions.map(action => action.evaluate(button => {
+    const { fontFamily, fontSize, fontWeight, lineHeight } = getComputedStyle(button);
+    return { fontFamily, fontSize, fontWeight, lineHeight };
+  })));
+  expect(styles[0]).toEqual(styles[1]);
+  expect(styles[2]).toEqual(styles[1]);
+});
+
 test("批量模式清理筛选和刷新后的选择，只提交仍可更新的节点", async ({ page }) => {
   const { state } = await setup(page);
   let submitted: unknown;

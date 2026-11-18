@@ -105,11 +105,11 @@ function TrafficChart({ history }: { history: History }) {
           return <text key={i} x={x(at)} y={size.height - 5} textAnchor={i === 0 ? "start" : i === tickCount - 1 ? "end" : "middle"} className="chart-axis chart-time">{tickText(at)}</text>;
         })}
         {selected !== null && point && <g className="chart-selection"><line x1={cursorX} x2={cursorX} y1={top} y2={bottom} className="chart-cursor" />{point.rates && <><circle cx={cursorX} cy={y(point.rates.to_origin)} r="4" className="chart-origin-dot chart-selected-dot" /><circle cx={cursorX} cy={y(point.rates.to_public)} r="4" className="chart-public-dot chart-selected-dot" /></>}</g>}
-      </svg> : <p className="traffic-empty">尚无采集记录，开始采集后会显示趋势。</p>}
+      </svg> : <p className="traffic-empty">尚无采集记录</p>}
       {point && <input className="chart-keyboard sr-only" type="range" min="0" max={points.length - 1} value={index} aria-label="查看流量时间点" aria-describedby={`${id}-hint`} aria-valuetext={reading} onFocus={() => { setSelected(index); setShowTip(true); }} onBlur={() => setShowTip(false)} onChange={event => { setSelected(Number(event.target.value)); setShowTip(true); }} onKeyDown={event => { if (event.key === "Escape") setShowTip(false); }} />}
       {showTip && point && <div ref={tooltip} className="chart-tooltip" style={{ left: tipLeft }} aria-hidden="true"><time>{dateText(point.at)}</time>{point.rates ? <><span>发往内网 <strong>{bytes(point.rates.to_origin, true)}</strong></span><span>返回公网 <strong>{bytes(point.rates.to_public, true)}</strong></span>{point.covered_seconds < point.seconds - 1 && <small>部分时间未采集</small>}</> : <span>此时段未采集</span>}</div>}
     </div>
-    <p id={`${id}-hint`} className="chart-hint">点按图表查看，键盘可用方向键选择时间点</p>
+    {point && <p id={`${id}-hint`} className="chart-hint">点按图表或用方向键选择时间点</p>}
     {selected !== null && point && <p className="chart-reading">{reading}</p>}
   </div>;
 }
@@ -287,7 +287,7 @@ export function HomePage({ active, auth, managed }: { active: boolean; auth: Aut
   const spaceLabel = managed?.name ?? `${auth.username}的工作空间`;
   return <div className="home-page">
     <PageHeader title="首页" topContent={<span className="home-workspace" title={spaceLabel}>{spaceLabel}</span>} />
-    {!topHeader && <p className="home-workspace">当前空间：{spaceLabel}</p>}
+    {!topHeader && <p className="home-workspace">{spaceLabel}</p>}
     <div className="home-summaries home-resource-links" style={{ order: 2 }}>
       <a className="panel" href="#/services"><span>服务</span><strong>{tunnels.data?.length ?? "—"}</strong><small>{tunnels.data ? `穿透运行 ${tunnels.data.filter(item => item.service_mode !== "reverse_proxy" && item.enabled && item.apply_status === "ready").length} · 反代生效 ${tunnels.data.filter(item => item.service_mode === "reverse_proxy" && item.enabled && item.apply_status === "ready").length}` : "正在加载"}</small></a>
       <a className="panel" href="#/agents"><span>设备</span><strong>{devices.data ? `${devices.data.filter(item => item.status === "online").length} / ${devices.data.length}` : "—"}</strong><small>在线 / 总数</small></a>

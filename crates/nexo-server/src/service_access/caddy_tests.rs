@@ -238,7 +238,7 @@ async fn real_caddy_access_password_cookie_proxy_and_lan_priority() {
             .await
             .unwrap();
         assert_eq!(page.status(), StatusCode::OK);
-        assert!(page.text().await.unwrap().contains("输入密码以访问"));
+        assert!(page.text().await.unwrap().contains("type=\"password\""));
         let denied = client
             .post(format!("{base}/.nexo-access/login"))
             .header("Origin", "http://evil.test")

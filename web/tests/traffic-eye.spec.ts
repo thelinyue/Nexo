@@ -14,8 +14,8 @@ test("首页呈现完整天眼布局并可打开单服务统计与会话明细",
   }
   await expect(page.getByRole("heading", {name:"状态码分布",exact:true})).toBeVisible();
   await expect(page.getByRole("heading", {name:"访客画像",exact:true})).toBeVisible();
-  await expect(page.getByRole("heading", {name:"TOP 来源国家 / 地区",exact:true})).toBeVisible();
-  await expect(page.getByRole("heading", {name:"TOP 域名",exact:true})).toBeVisible();
+  await expect(page.getByRole("heading", {name:"来源国家 / 地区",exact:true})).toBeVisible();
+  await expect(page.getByRole("heading", {name:"访问域名",exact:true})).toBeVisible();
   const requests = page.getByRole("region", {name:"实时请求流",exact:true});
   await requests.scrollIntoViewIfNeeded(); await expect(requests).toContainText("/media");
   await page.locator(".eye-services").getByRole("button",{name:"媒体中心",exact:true}).click();
@@ -123,6 +123,15 @@ test("天眼在小屏与放大文字下保留触控热区且不溢出", async ({
   await page.goto("/");
   await page.evaluate(() => { document.documentElement.style.fontSize = "200%"; });
   await expect(page.locator(".eye-kpis").first()).toContainText("742");
+  const trend = page.locator(".eye-secondary-grid .eye-trend").first();
+  await expect(trend.locator("svg")).toBeVisible();
+  await expect.poll(() => trend.evaluate(chart => {
+    const bounds = chart.getBoundingClientRect();
+    return [...chart.querySelectorAll("svg text")].every(label => {
+      const box = label.getBoundingClientRect();
+      return box.left >= bounds.left - 1 && box.right <= bounds.right + 1;
+    });
+  })).toBe(true);
   const stream = page.getByRole("region", { name: "实时请求流", exact: true });
   await stream.scrollIntoViewIfNeeded();
   await expect(stream).toContainText("/media");
