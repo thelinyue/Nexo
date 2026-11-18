@@ -89,7 +89,12 @@ export function mountGlassTabMenu(target, { popover, trigger }) {
   }
   function preference() { if (media.matches || document.hidden) settle(); }
   // 添加入口由页面投递，挂载时会改变底栏可用宽度；这是重定向，不是跨断点重置。
-  const observer = new ResizeObserver(() => { measure(); wake(); });
+  // 尺寸通知期间回写指示器会使 WebKit 在同一轮再次布局，延至下一帧合并处理。
+  let measureFrame = 0;
+  const observer = new ResizeObserver(() => {
+    cancelAnimationFrame(measureFrame);
+    measureFrame = requestAnimationFrame(() => { measure(); wake(); });
+  });
   observer.observe(target);
   popover.addEventListener("beforetoggle", beforeToggle);
   media.addEventListener("change", preference);
@@ -105,7 +110,7 @@ export function mountGlassTabMenu(target, { popover, trigger }) {
       if (first) settle(); else wake();
     },
     destroy() {
-      destroyed = true; cancelAnimationFrame(frame); observer.disconnect();
+      destroyed = true; cancelAnimationFrame(frame); cancelAnimationFrame(measureFrame); observer.disconnect();
       popover.removeEventListener("beforetoggle", beforeToggle);
       media.removeEventListener("change", preference);
       document.removeEventListener("visibilitychange", preference);
