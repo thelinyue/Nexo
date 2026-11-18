@@ -38,12 +38,8 @@ export function useResourceDeletions(onRemoved: (routes: string[]) => void) {
   }, [events]);
 }
 
-/** 页面实例按路由保留搜索、筛选和滚动位置，与导航入口的呈现无关。
- * 地址栏是唯一启动入口；缓存只存在于内存，用户或空间切换由外壳 key 重建，断点变化不重挂载表单。
- */
-export function useWorkspaceNavigation() {
-  const [desktop, setDesktop] = useState(() => matchMedia("(min-width:901px)").matches);
-  const [accountRequest, setAccountRequest] = useState(() => accountRoute(window.location.hash) ? 1 : 0);
+/** 认证页和工作空间共用浏览器及 iOS 主屏幕安装态。 */
+export function useStandalone() {
   const [standalone, setStandalone] = useState(() => matchMedia("(display-mode: standalone)").matches || (navigator as Navigator & { standalone?: boolean }).standalone === true);
   // 安装态只改变入口呈现，不重建页面；与启动屏使用相同的浏览器和 iOS 判断。
   useEffect(() => {
@@ -52,6 +48,15 @@ export function useWorkspaceNavigation() {
     media.addEventListener("change", update);
     return () => media.removeEventListener("change", update);
   }, []);
+  return standalone;
+}
+
+/** 页面实例按路由保留搜索、筛选和滚动位置，与导航入口的呈现无关。
+ * 地址栏是唯一启动入口；缓存只存在于内存，用户或空间切换由外壳 key 重建，断点变化不重挂载表单。
+ */
+export function useWorkspaceNavigation(standalone: boolean) {
+  const [desktop, setDesktop] = useState(() => matchMedia("(min-width:901px)").matches);
+  const [accountRequest, setAccountRequest] = useState(() => accountRoute(window.location.hash) ? 1 : 0);
   const [state, setState] = useState<NavigationState>(() => {
     const route = normalizeRoute(window.location.hash);
     return { route, pages: [{ route, back: routeInfo(route).parent }] };

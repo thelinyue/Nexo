@@ -1070,8 +1070,8 @@ async fn set_tunnel_enabled(
         let connection = state.db.lock().map_err(|_| db_error("数据库锁不可用"))?;
         let connection = connection.unchecked_transaction().map_err(db_error)?;
         is_proxy = reverse_proxy::existing(&connection, &session, &id)?;
-        if enabled && is_proxy {
-            nodes::services::authorize_proxy_enable(&connection, &session.tenant_id, &id)?;
+        if enabled {
+            nodes::services::authorize_enable(&connection, &session.tenant_id, &id, is_proxy)?;
         }
         changed = connection.execute("UPDATE tunnels SET enabled=?1,apply_status=CASE WHEN ?1=1 THEN 'checking' ELSE 'disabled' END,apply_revision=apply_revision+1,updated_at=?2 WHERE id=?3 AND tenant_id=?4 AND deleted_at IS NULL AND enabled!=?1",params![enabled,unix_now(),id,session.tenant_id]).map_err(db_error)? > 0;
         if changed {
@@ -1118,8 +1118,8 @@ async fn batch_set_tunnels_enabled(
         let tx = db.unchecked_transaction().map_err(db_error)?;
         for id in &input.tunnel_ids {
             let is_proxy = reverse_proxy::existing(&tx, &session, id)?;
-            if enabled && is_proxy {
-                nodes::services::authorize_proxy_enable(&tx, &session.tenant_id, id)?;
+            if enabled {
+                nodes::services::authorize_enable(&tx, &session.tenant_id, id, is_proxy)?;
             }
             let changed = tx.execute("UPDATE tunnels SET enabled=?1,apply_status=CASE WHEN ?1=1 THEN 'checking' ELSE 'disabled' END,apply_revision=apply_revision+1,updated_at=?2 WHERE id=?3 AND tenant_id=?4 AND deleted_at IS NULL AND enabled!=?1", params![enabled,unix_now(),id,session.tenant_id]).map_err(db_error)? > 0;
             if changed {
@@ -1537,9 +1537,9 @@ fn prepare_tunnel(
             input.public_port = db.query_row("SELECT public_port FROM tunnels WHERE id=?1 AND tenant_id=?2 AND protocol IN ('tcp','udp','tcp_udp')",params![id,tenant],|r|r.get::<_,Option<u16>>(0)).optional().map_err(db_error)?.flatten();
         }
         if input.public_port.is_none() {
-            let mut used = db.prepare("SELECT public_port FROM tunnels WHERE public_port IS NOT NULL AND deleted_at IS NULL AND id!=?2 AND (protocol=?1 OR protocol='tcp_udp' OR ?1='tcp_udp') AND (EXISTS(SELECT 1 FROM service_nodes sn WHERE sn.service_id=tunnels.id AND sn.node_id IN (SELECT value FROM json_each(?4))) OR (NOT EXISTS(SELECT 1 FROM service_nodes sn WHERE sn.service_id=tunnels.id) AND EXISTS(SELECT 1 FROM json_each(?4) WHERE value='local')))").map_err(db_error)?.query_map(params![input.protocol,id,0,node_scope], |r|r.get::<_,u16>(0)).map_err(db_error)?.collect::<rusqlite::Result<std::collections::HashSet<_>>>().map_err(db_error)?;
+            let mut used = db.prepare("SELECT public_port FROM tunnels WHERE public_port IS NOT NULL AND deleted_at IS NULL AND id!=?2 AND (protocol=?1 OR protocol='tcp_udp' OR ?1='tcp_udp') AND EXISTS(SELECT 1 FROM service_nodes sn WHERE sn.service_id=tunnels.id AND sn.node_id IN (SELECT value FROM json_each(?4)))").map_err(db_error)?.query_map(params![input.protocol,id,0,node_scope], |r|r.get::<_,u16>(0)).map_err(db_error)?.collect::<rusqlite::Result<std::collections::HashSet<_>>>().map_err(db_error)?;
             if input.protocol != "udp" {
-                used.extend(db.prepare("SELECT https_port FROM tunnels WHERE protocol='https' AND deleted_at IS NULL AND id!=?1 AND (EXISTS(SELECT 1 FROM service_nodes sn WHERE sn.service_id=tunnels.id AND sn.node_id IN (SELECT value FROM json_each(?4))) OR (NOT EXISTS(SELECT 1 FROM service_nodes sn WHERE sn.service_id=tunnels.id) AND EXISTS(SELECT 1 FROM json_each(?4) WHERE value='local')))").map_err(db_error)?.query_map(params![id,0,0,node_scope],|r|r.get::<_,u16>(0)).map_err(db_error)?.collect::<rusqlite::Result<Vec<_>>>().map_err(db_error)?);
+                used.extend(db.prepare("SELECT https_port FROM tunnels WHERE protocol='https' AND deleted_at IS NULL AND id!=?1 AND EXISTS(SELECT 1 FROM service_nodes sn WHERE sn.service_id=tunnels.id AND sn.node_id IN (SELECT value FROM json_each(?4)))").map_err(db_error)?.query_map(params![id,0,0,node_scope],|r|r.get::<_,u16>(0)).map_err(db_error)?.collect::<rusqlite::Result<Vec<_>>>().map_err(db_error)?);
             }
             input.public_port = (20000..=29999).find(|port| !used.contains(port));
         }
@@ -1549,7 +1549,7 @@ fn prepare_tunnel(
                 "没有可用公网端口，请指定有效端口",
             ));
         }
-        let occupied: bool = db.query_row("SELECT EXISTS(SELECT 1 FROM tunnels WHERE public_port=?1 AND id!=?2 AND deleted_at IS NULL AND (protocol=?3 OR protocol='tcp_udp' OR ?3='tcp_udp') AND (EXISTS(SELECT 1 FROM service_nodes sn WHERE sn.service_id=tunnels.id AND sn.node_id IN (SELECT value FROM json_each(?4))) OR (NOT EXISTS(SELECT 1 FROM service_nodes sn WHERE sn.service_id=tunnels.id) AND EXISTS(SELECT 1 FROM json_each(?4) WHERE value='local'))))",params![input.public_port,id,input.protocol,node_scope],|r|r.get(0)).map_err(db_error)?;
+        let occupied: bool = db.query_row("SELECT EXISTS(SELECT 1 FROM tunnels WHERE public_port=?1 AND id!=?2 AND deleted_at IS NULL AND (protocol=?3 OR protocol='tcp_udp' OR ?3='tcp_udp') AND EXISTS(SELECT 1 FROM service_nodes sn WHERE sn.service_id=tunnels.id AND sn.node_id IN (SELECT value FROM json_each(?4))))",params![input.public_port,id,input.protocol,node_scope],|r|r.get(0)).map_err(db_error)?;
         if occupied {
             return Err(ApiError::new(
                 StatusCode::CONFLICT,

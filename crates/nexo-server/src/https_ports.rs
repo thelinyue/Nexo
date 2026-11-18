@@ -130,7 +130,7 @@ pub fn prepare(
                 "HTTPS 公网端口与服务器已有监听冲突",
             ));
         }
-        let occupied: bool = db.query_row("SELECT EXISTS(SELECT 1 FROM tunnels WHERE id!=?1 AND deleted_at IS NULL AND protocol IN ('tcp','tcp_udp') AND public_port=?2 AND (EXISTS(SELECT 1 FROM service_nodes sn WHERE sn.service_id=tunnels.id AND sn.node_id IN (SELECT value FROM json_each(?4))) OR (NOT EXISTS(SELECT 1 FROM service_nodes sn WHERE sn.service_id=tunnels.id) AND EXISTS(SELECT 1 FROM json_each(?4) WHERE value='local'))))", params![id, port,0,node_scope], |r| r.get(0)).map_err(db_error)?;
+        let occupied: bool = db.query_row("SELECT EXISTS(SELECT 1 FROM tunnels WHERE id!=?1 AND deleted_at IS NULL AND protocol IN ('tcp','tcp_udp') AND public_port=?2 AND EXISTS(SELECT 1 FROM service_nodes sn WHERE sn.service_id=tunnels.id AND sn.node_id IN (SELECT value FROM json_each(?4))))", params![id, port,0,node_scope], |r| r.get(0)).map_err(db_error)?;
         if occupied {
             return Err(ApiError::new(
                 StatusCode::CONFLICT,
@@ -138,7 +138,7 @@ pub fn prepare(
             ));
         }
     } else if matches!(input.protocol.as_str(), "tcp" | "tcp_udp") {
-        let occupied: bool = db.query_row("SELECT EXISTS(SELECT 1 FROM tunnels WHERE id!=?1 AND deleted_at IS NULL AND protocol='https' AND https_port=?2 AND (EXISTS(SELECT 1 FROM service_nodes sn WHERE sn.service_id=tunnels.id AND sn.node_id IN (SELECT value FROM json_each(?4))) OR (NOT EXISTS(SELECT 1 FROM service_nodes sn WHERE sn.service_id=tunnels.id) AND EXISTS(SELECT 1 FROM json_each(?4) WHERE value='local'))))", params![id, input.public_port,0,node_scope], |r| r.get(0)).map_err(db_error)?;
+        let occupied: bool = db.query_row("SELECT EXISTS(SELECT 1 FROM tunnels WHERE id!=?1 AND deleted_at IS NULL AND protocol='https' AND https_port=?2 AND EXISTS(SELECT 1 FROM service_nodes sn WHERE sn.service_id=tunnels.id AND sn.node_id IN (SELECT value FROM json_each(?4))))", params![id, input.public_port,0,node_scope], |r| r.get(0)).map_err(db_error)?;
         if occupied {
             return Err(ApiError::new(
                 StatusCode::CONFLICT,

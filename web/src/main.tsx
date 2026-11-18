@@ -1,8 +1,8 @@
-import { lazy, Suspense, useEffect, useState } from "react";
+import { lazy, Suspense, useEffect, useLayoutEffect, useState } from "react";
 import type { ManagedWorkspace } from "./accounts";
 import { AuthScreen, Reauthenticate } from "./auth";
 import { createRoot } from "react-dom/client";
-import { homeRoute } from "./navigation";
+import { homeRoute, useStandalone } from "./navigation";
 import { Brand, Loading, PageLoadBoundary, Notice, errorText, request, resumeSession } from "./ui";
 import type { Auth } from "./ui";
 import { WebUpdateNotice } from "./web-update";
@@ -37,6 +37,29 @@ function readEntryLink() {
 }
 
 function App() {
+  const standalone = useStandalone();
+  useLayoutEffect(() => {
+    const root = document.documentElement;
+    root.toggleAttribute("data-standalone", standalone);
+    if (!standalone) return;
+    const viewport = window.visualViewport;
+    // 仅当输入控件获得焦点且可见高度明显缩小时收起底栏，外接键盘和双指缩放不触发。
+    const resize = () => {
+      const editing = document.activeElement?.matches("input:not([type=checkbox],[type=radio],[type=file]),textarea,[contenteditable=true]");
+      root.toggleAttribute("data-software-keyboard", !!(editing && viewport && viewport.scale === 1 && innerHeight - viewport.height > 100));
+    };
+    const blur = () => root.removeAttribute("data-software-keyboard");
+    resize();
+    viewport?.addEventListener("resize", resize);
+    document.addEventListener("focusin", resize);
+    document.addEventListener("focusout", blur);
+    return () => {
+      root.removeAttribute("data-standalone"); blur();
+      viewport?.removeEventListener("resize", resize);
+      document.removeEventListener("focusin", resize);
+      document.removeEventListener("focusout", blur);
+    };
+  }, [standalone]);
   const [auth, setAuth] = useState<Auth | null>(null); const [error, setError] = useState<string | null>(null); const [message, setMessage] = useState<string | null>(null);
   const [expired, setExpired] = useState(false);
   const [managed, setManaged] = useState<ManagedWorkspace | null>(null);
@@ -54,7 +77,7 @@ function App() {
   if (entry?.kind === "invite") return <InvitationScreen token={entry.token} auth={auth} onAuth={authenticated} onCancel={() => setEntry(null)} />;
   if (!auth.authenticated) return <AuthScreen key={entry?.token ?? "auth"} initial={auth} message={message} recoveryCode={entry?.kind === "recover" ? entry.token : undefined} onAuth={authenticated} />;
   if (entry?.kind === "recover") return <main className="auth-shell"><section className="auth-panel"><Brand /><h1>重设密码</h1><p>当前登录为 {auth.username}，请先退出再使用恢复链接。</p><Notice error={error} /><button className="primary-button" onClick={async () => { try { await request("/api/v1/auth/logout", { method: "POST" }, auth.csrf_token); setAuth({ ...auth, authenticated: false }); } catch (e) { setError(errorText(e)); } }}>退出并继续</button><button className="text-button" onClick={() => setEntry(null)}>返回</button></section></main>;
-  return <><Workspace key={`${auth.user_id ?? auth.username}:${managed?.id ?? "own"}`} managed={managed} onManage={setManaged} message={message} onRenamed={username => { setMessage(`用户名已改为 ${username}，请使用新用户名重新登录。`); setManaged(null); setExpired(false); setAuth({ ...auth, username, authenticated: false }); }} onDeleted={(workspace, notice) => { setMessage(notice); if (managed?.id === workspace) setManaged(null); }} auth={auth} onAuth={value => { if (!value.authenticated) setManaged(null); setExpired(false); setAuth(value); }} onExpired={() => { setMessage("会话已失效，请重新登录"); setExpired(false); setAuth({ ...auth, authenticated: false }); }} />{expired && <Reauthenticate auth={auth} onAuth={authenticated} onAbandon={() => { setExpired(false); setAuth({ ...auth, authenticated: false }); }} />}</>;
+  return <><Workspace standalone={standalone} key={`${auth.user_id ?? auth.username}:${managed?.id ?? "own"}`} managed={managed} onManage={setManaged} message={message} onRenamed={username => { setMessage(`用户名已改为 ${username}，请使用新用户名重新登录。`); setManaged(null); setExpired(false); setAuth({ ...auth, username, authenticated: false }); }} onDeleted={(workspace, notice) => { setMessage(notice); if (managed?.id === workspace) setManaged(null); }} auth={auth} onAuth={value => { if (!value.authenticated) setManaged(null); setExpired(false); setAuth(value); }} onExpired={() => { setMessage("会话已失效，请重新登录"); setExpired(false); setAuth({ ...auth, authenticated: false }); }} />{expired && <Reauthenticate auth={auth} onAuth={authenticated} onAbandon={() => { setExpired(false); setAuth({ ...auth, authenticated: false }); }} />}</>;
 }
 
 export default App;

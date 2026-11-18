@@ -112,6 +112,147 @@ fn latency_filters_other_workspaces_and_marks_stale_and_revoked() {
     assert_eq!(latencies(&db, "hk", "alice", false).unwrap(), json!([]));
 }
 
+#[tokio::test]
+async fn removal_of_group_detaches_other_users_services_and_keeps_only_independent_grants() {
+    let (state, admin) = crate::tests::domain_fixture();
+    let alice = tenant(&state, "alice");
+    nodes(&state);
+    {
+        let db = state.db.lock().unwrap();
+        db.execute_batch("INSERT INTO relay_node_groups VALUES('g','亚洲入口',0);
+            INSERT INTO relay_group_members VALUES('g','hk'),('g','jp');
+            INSERT INTO relay_group_grants VALUES('g','alice');
+            INSERT INTO tunnels(id,tenant_id,name,protocol,local_address,local_port,node_group_id,enabled,created_at,updated_at)
+            VALUES('s','alice','媒体中心','tcp','127.0.0.1',80,'g',1,0,0),
+                  ('archive','alice','历史记录','tcp','127.0.0.1',80,'g',0,0,0),
+                  ('other','default','备用服务','tcp','127.0.0.1',80,'g',1,0,0);
+            UPDATE tunnels SET deleted_at=1 WHERE id='archive';
+            INSERT INTO relay_group_grants VALUES('g','default');
+            INSERT INTO relay_node_grants VALUES('jp','default');
+            DELETE FROM service_nodes WHERE service_id IN ('s','other');
+            INSERT INTO service_nodes VALUES('s','hk'),('s','jp'),('other','hk'),('other','jp');
+            UPDATE tunnels SET distribution_mode='manual',preferred_node_id='hk' WHERE id IN ('s','other');").unwrap();
+    }
+    let delete = |headers| groups::remove(State(state.clone()), headers, Path("g".into()));
+    assert_eq!(
+        delete(alice).await.unwrap_err().status,
+        StatusCode::FORBIDDEN
+    );
+    let mut no_csrf = admin.clone();
+    no_csrf.remove("x-nexo-csrf");
+    assert!(delete(no_csrf).await.is_err());
+    assert_eq!(delete(admin).await.unwrap().0["removed"], true);
+    let db = state.db.lock().unwrap();
+    assert!(services::ids(&db, "s").unwrap().is_empty());
+    assert!(services::authorize_enable(&db, "alice", "s", false).is_err());
+    let mut edit: TunnelInput = serde_json::from_value(
+        json!({"name":"媒体中心","protocol":"tcp","local_address":"127.0.0.1","local_port":80}),
+    )
+    .unwrap();
+    assert!(services::prepare(&db, "alice", "s", &mut edit).is_err());
+    assert_eq!(services::ids(&db, "other").unwrap(), vec!["jp"]);
+    assert!(db.query_row("SELECT node_group_id IS NULL AND enabled=0 AND deleted_at IS NULL FROM tunnels WHERE id='s'", [], |r| r.get::<_,bool>(0)).unwrap());
+    assert!(db.query_row("SELECT enabled=1 AND distribution_mode='single' AND preferred_node_id IS NULL FROM tunnels WHERE id='other'", [], |r| r.get::<_,bool>(0)).unwrap());
+    assert!(db
+        .query_row(
+            "SELECT deleted_at=1 AND node_group_id IS NULL FROM tunnels WHERE id='archive'",
+            [],
+            |r| r.get::<_, bool>(0)
+        )
+        .unwrap());
+    assert!(groups::members(&db, "g").unwrap().is_empty());
+    assert!(!visible(&db, "hk", "alice", false).unwrap());
+    assert!(visible(&db, "hk", "default", true).unwrap());
+}
+
+#[tokio::test]
+async fn removal_of_offline_node_checks_groups_before_revoking_identity() {
+    use std::future::IntoFuture;
+    let (state, admin) = crate::tests::domain_fixture();
+    nodes(&state);
+    {
+        let db = state.db.lock().unwrap();
+        db.execute_batch("UPDATE relay_nodes SET certificate_pem='old',last_seen=0 WHERE id='jp';
+            INSERT INTO relay_node_groups VALUES('asia','亚洲入口',0),('backup','备用组',0);
+            INSERT INTO relay_group_members VALUES('asia','hk'),('asia','jp'),('asia','us'),('backup','hk'),('backup','jp');
+            INSERT INTO tunnels(id,tenant_id,name,protocol,local_address,local_port,node_group_id,distribution_mode,preferred_node_id,created_at,updated_at)
+            VALUES('s','default','媒体中心','tcp','127.0.0.1',80,'asia','manual','jp',0,0);
+            DELETE FROM service_nodes WHERE service_id='s';
+            INSERT INTO service_nodes VALUES('s','hk'),('s','jp'),('s','us');").unwrap();
+    }
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/api/v1/nodes/jp", listener.local_addr().unwrap());
+    let server = tokio::spawn(axum::serve(listener, router(state.clone())).into_future());
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .default_headers(admin)
+        .build()
+        .unwrap();
+    let delete = || client.delete(&url).send();
+    let conflict = delete().await.unwrap();
+    assert_eq!(conflict.status(), StatusCode::CONFLICT);
+    assert!(conflict.text().await.unwrap().contains("备用组"));
+    {
+        let db = state.db.lock().unwrap();
+        assert_eq!(
+            groups::members(&db, "asia").unwrap(),
+            vec!["hk", "jp", "us"]
+        );
+        db.execute("INSERT INTO relay_group_members VALUES('backup','us')", [])
+            .unwrap();
+    }
+    {
+        let db = state.db.lock().unwrap();
+        db.execute(
+            "INSERT INTO relay_group_grants VALUES('asia','default')",
+            [],
+        )
+        .unwrap();
+        db.execute_batch("INSERT INTO node_update_jobs(id,actor,target_version,status,created_at) VALUES('job','u','1','paused',0);
+            INSERT INTO node_update_items(job_id,node_id,position,stage) VALUES('job','jp',0,'unknown');").unwrap();
+    }
+    assert_eq!(delete().await.unwrap().status(), StatusCode::CONFLICT);
+    state
+        .db
+        .lock()
+        .unwrap()
+        .execute_batch(
+            "UPDATE node_update_jobs SET status='cancelled' WHERE id='job';
+        UPDATE relay_nodes SET last_seen=unixepoch() WHERE id='jp';",
+        )
+        .unwrap();
+    // 确认框显示离线后又收到心跳，删除必须重新核实在线状态。
+    let conflict = delete().await.unwrap();
+    assert_eq!(conflict.status(), StatusCode::CONFLICT);
+    assert!(conflict.text().await.unwrap().contains("节点仍在线"));
+    state
+        .db
+        .lock()
+        .unwrap()
+        .execute("UPDATE relay_nodes SET last_seen=0 WHERE id='jp'", [])
+        .unwrap();
+    let response = delete().await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.json::<Value>().await.unwrap()["removed"], true);
+    assert_eq!(
+        client.get(&url).send().await.unwrap().status(),
+        StatusCode::NOT_FOUND
+    );
+    server.abort();
+    let db = state.db.lock().unwrap();
+    assert_eq!(groups::members(&db, "asia").unwrap(), vec!["hk", "us"]);
+    assert_eq!(groups::members(&db, "backup").unwrap(), vec!["hk", "us"]);
+    assert_eq!(services::ids(&db, "s").unwrap(), vec!["hk", "us"]);
+    assert!(db.query_row("SELECT node_group_id='asia' AND distribution_mode='latency' AND preferred_node_id IS NULL FROM tunnels WHERE id='s'", [], |r| r.get::<_,bool>(0)).unwrap());
+    assert!(db
+        .query_row(
+            "SELECT removed_at IS NOT NULL AND certificate_pem='' FROM relay_nodes WHERE id='jp'",
+            [],
+            |r| r.get::<_, bool>(0)
+        )
+        .unwrap());
+}
+
 #[test]
 fn migration_does_not_rebind_revoked_services_to_local() {
     let (state, _) = crate::tests::domain_fixture();

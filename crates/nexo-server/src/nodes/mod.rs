@@ -581,35 +581,44 @@ async fn remove(
     if id == "local" {
         return Err(invalid("内置节点不能移除"));
     }
-    let _dns_guard = state.tunnel_runtime.direct.dns_lock.lock().await;
-    let db = state.db.lock().map_err(db_error)?;
-    let tx = db.unchecked_transaction().map_err(db_error)?;
-    if updates::busy(&tx, &id).map_err(db_error)? {
-        return Err(ApiError::new(StatusCode::CONFLICT, "请先结束节点维护任务"));
-    }
-    if tx
-        .query_row(
-            "SELECT EXISTS(SELECT 1 FROM relay_group_members WHERE node_id=?1)",
-            [&id],
-            |r| r.get::<_, bool>(0),
-        )
-        .map_err(db_error)?
     {
-        return Err(invalid("请先将节点移出节点组，再移除节点"));
+        let _dns_guard = state.tunnel_runtime.direct.dns_lock.lock().await;
+        let db = state.db.lock().map_err(db_error)?;
+        let tx = db.unchecked_transaction().map_err(db_error)?;
+        if updates::busy(&tx, &id).map_err(db_error)? {
+            return Err(ApiError::new(
+                StatusCode::CONFLICT,
+                "节点有未结束的维护任务，请在节点列表的维护任务中核对进度并处理。",
+            ));
+        }
+        groups::detach_for_removal(&tx, &id)?;
+        if tx.execute("UPDATE relay_nodes SET enabled=0,removed_at=?2,certificate_pem='',token_digest=NULL WHERE id=?1 AND removed_at IS NULL",params![id,unix_now()]).map_err(db_error)?==0{return Err(missing());}
+        let affected = tx.prepare("SELECT t.id FROM tunnels t JOIN service_nodes s ON s.service_id=t.id WHERE s.node_id=?1 AND t.deleted_at IS NULL")
+        .map_err(db_error)?.query_map([&id], |r| r.get::<_,String>(0)).map_err(db_error)?.collect::<rusqlite::Result<Vec<_>>>().map_err(db_error)?;
+        for service in affected {
+            services::retain_authorized_bindings(&tx, &service)?;
+        }
+        tx.execute("DELETE FROM service_nodes WHERE node_id=?1", [&id])
+            .map_err(db_error)?;
+        tx.execute("DELETE FROM relay_node_grants WHERE node_id=?1", [&id])
+            .map_err(db_error)?;
+        event(
+            &tx,
+            &id,
+            &actor.user_id,
+            "移除节点并撤销身份；保留 VPS 上的数据",
+        )?;
+        tx.commit().map_err(db_error)?;
     }
-    if tx.execute("UPDATE relay_nodes SET enabled=0,removed_at=?2,certificate_pem='',token_digest=NULL WHERE id=?1 AND removed_at IS NULL",params![id,unix_now()]).map_err(db_error)?==0{return Err(missing());}
-    tx.execute("DELETE FROM service_nodes WHERE node_id=?1", [&id])
-        .map_err(db_error)?;
-    tx.execute("DELETE FROM relay_node_grants WHERE node_id=?1", [&id])
-        .map_err(db_error)?;
-    event(
-        &tx,
-        &id,
-        &actor.user_id,
-        "移除节点并撤销身份；保留 VPS 上的数据",
-    )?;
-    tx.commit().map_err(db_error)?;
+    refresh_after_removal(&state).await;
     Ok(Json(json!({"removed":true})))
+}
+
+/// 删除已提交。运行配置同步失败由现有协调循环重试，避免界面把已删除资源当成可重试的删除。
+async fn refresh_after_removal(state: &AppState) {
+    if let Err(error) = reverse_proxy::changed(state, true).await {
+        tracing::warn!("删除已完成，入口配置将在下一轮同步：{}", error.message);
+    }
 }
 
 #[cfg(test)]

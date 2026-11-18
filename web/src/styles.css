@@ -1066,3 +1066,35 @@ dd>code { display:block; margin-bottom:10px; user-select:text; font-size:.9375re
   .app-shell[data-top-header=true] .service-toolbar { display:block; }
 }
 @media (prefers-reduced-motion:reduce) { .pwa-account:active { transform:none; } }
+
+/* 手机主屏应用没有浏览器工具栏；登录页、工作空间和顶层弹窗共用同一组安全区。 */
+@media (max-width:900px) {
+  html[data-standalone] {
+    --phone-left:max(16px,env(safe-area-inset-left));
+    --phone-right:max(16px,env(safe-area-inset-right));
+    scroll-padding-block:calc(68px + env(safe-area-inset-top)) calc(84px + env(safe-area-inset-bottom));
+  }
+  html[data-standalone] #root :is(input:not([type=checkbox],[type=radio],[type=file],[type=range]),textarea,select) {
+    font-size:max(1rem,16px);
+  }
+  html[data-standalone] .workspace-topbar { left:0; right:0; padding-inline:var(--phone-left) var(--phone-right); }
+  html[data-standalone] .mobile-dock {
+    left:var(--phone-left); right:var(--phone-right); margin-inline:auto; transform:none;
+    width:auto; max-width:480px;
+  }
+  html[data-standalone] .modal {
+    left:env(safe-area-inset-left); right:env(safe-area-inset-right); margin-inline:auto;
+    max-width:calc(100% - env(safe-area-inset-left) - env(safe-area-inset-right));
+  }
+  html[data-standalone] .modal-body { overflow-wrap:anywhere; }
+  html[data-standalone] .modal:has(.modal-actions) { padding-bottom:0; }
+  html[data-standalone] .modal .modal-actions { padding-bottom:max(12px,env(safe-area-inset-bottom)); }
+  html[data-software-keyboard] .mobile-dock { display:none; }
+  html[data-software-keyboard] { scroll-padding-bottom:16px; }
+}
+@media (max-width:900px) and (max-height:500px) and (orientation:landscape) {
+  html[data-standalone] .bottom-nav { min-height:52px; padding-block:3px; }
+  html[data-standalone] .bottom-nav>:is(a,button) { flex-direction:row; min-height:44px; gap:6px; }
+  html[data-standalone] .auth-shell { padding-block:max(12px,env(safe-area-inset-top)) max(12px,env(safe-area-inset-bottom)); }
+  html[data-standalone] .short-modal:not(.application-modal) { max-height:calc(var(--visible-height,100dvh) - max(8px,env(safe-area-inset-top))); }
+}

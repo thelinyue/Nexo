@@ -68,9 +68,9 @@ function MobileNavigation({ route, desktop, admin, standalone }: { route: string
 }
 
 /** 同一业务页面实例跨桌面/手机保留；桌面侧栏和手机底栏仅改变导航呈现。 */
-export function Workspace({ auth, onAuth, onExpired, managed, onManage, message, onRenamed, onDeleted }: { auth: Auth; onAuth: (value: Auth) => void; onExpired: () => void; managed: ManagedWorkspace | null; onManage: (value: ManagedWorkspace | null) => void; message: string | null; onRenamed: (username: string) => void; onDeleted: (workspace: string, message: string) => void }) {
-  const navigation = useWorkspaceNavigation();
-  const { route, desktop, standalone } = navigation;
+export function Workspace({ standalone, auth, onAuth, onExpired, managed, onManage, message, onRenamed, onDeleted }: { standalone: boolean; auth: Auth; onAuth: (value: Auth) => void; onExpired: () => void; managed: ManagedWorkspace | null; onManage: (value: ManagedWorkspace | null) => void; message: string | null; onRenamed: (username: string) => void; onDeleted: (workspace: string, message: string) => void }) {
+  const navigation = useWorkspaceNavigation(standalone);
+  const { route, desktop } = navigation;
   const [createTarget, setCreateTarget] = useState<HTMLDivElement | null>(null);
   const [headerTarget, setHeaderTarget] = useState<HTMLDivElement | null>(null);
   const [accountTarget, setAccountTarget] = useState<HTMLDivElement | null>(null);

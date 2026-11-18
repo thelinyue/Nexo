@@ -14,6 +14,7 @@ async function setup(page: Page) {
       state.writes.push({ method: req.method(), path, body: req.postData() ? req.postDataJSON() : null });
       if (state.saveFailure) return route.fulfill({ status: 503, json: { error: "保存失败，请重试" } });
       if (req.method() === "PUT") Object.assign(state.nodes.find(node => path.endsWith(`/${node.id}`))!, req.postDataJSON());
+      if (req.method() === "DELETE") state.nodes = state.nodes.filter(node => !path.endsWith(`/${node.id}`));
       return route.fulfill({ json: {} });
     }
     state.reads++;
@@ -134,6 +135,24 @@ test("空列表、筛选无结果和请求失败提供不同恢复入口", async
   await page.getByRole("button", { name: "添加节点", exact: true }).click();
   await expect(page.getByRole("dialog", { name: "添加节点" })).toBeVisible();
   await page.getByRole("button", { name: "关闭", exact: true }).click();
+});
+
+test("管理员从离线节点卡片确认移除并刷新列表", async ({ page }) => {
+  const { state } = await setup(page);
+  await page.goto("/#/nodes");
+  const card = page.getByRole("article", { name: "日本 VPS" });
+  const trigger = card.getByRole("button", { name: "移除节点" });
+  await trigger.click();
+  const confirm = page.getByRole("dialog", { name: "移除节点", exact: true });
+  await expect(confirm).toContainText("日本 VPS");
+  await expect(confirm).toContainText("媒体中心");
+  await confirm.getByRole("button", { name: "取消", exact: true }).click();
+  expect(state.writes).toHaveLength(0);
+  await trigger.click();
+  await confirm.getByRole("button", { name: "确认移除" }).click();
+  await expect(confirm).toBeHidden();
+  await expect(card).toHaveCount(0);
+  expect(state.writes).toEqual([{ method: "DELETE", path: "/api/v1/nodes/jp", body: null }]);
 });
 
 test("本地节点支持反代授权配置，窄屏和主题变化不遮挡信息与操作", async ({ page }, info) => {

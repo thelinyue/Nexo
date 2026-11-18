@@ -420,8 +420,8 @@ const nodeName = (item: Tunnel, id: string) => item.node_statuses?.find(node => 
  * 保留部分写入失败的事实；旧接口不以健康候选推断已同步，避免把待切换节点当成当前入口。
  */
 function ServiceEntrySummary({ item }: { item: Tunnel }) {
-  const ids = item.node_ids?.length ? item.node_ids : ["local"];
-  const configured = ids.map(id => nodeName(item, id)).join("、");
+  const ids = item.node_ids ?? ["local"];
+  const configured = ids.map(id => nodeName(item, id)).join("、") || "未绑定节点";
   const entry = item.node_entry;
   const state = !item.enabled ? "disabled" : entry?.sync_status;
   const recorded = state && !["disabled", "unmanaged"].includes(state) ? entry?.entries ?? [] : [];

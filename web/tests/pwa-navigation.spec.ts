@@ -32,6 +32,72 @@ test.describe("PWA 手机导航", () => {
     await installedPwa(page);
   });
 
+  test("登录、业务页面和设置共用手机视口与输入字号", async ({ page }, info) => {
+    await installApiMocks(page, { anonymous: true });
+    if (info.project.name === "mobile-light") await page.setViewportSize({ width: 320, height: 568 });
+    await page.goto("/");
+    const username = page.getByLabel("用户名", { exact: true });
+    await expect(username).toBeVisible();
+    const smallFields = () => page.locator('input:not([type=checkbox],[type=radio],[type=file],[type=hidden]), textarea, select').evaluateAll(elements =>
+      elements.filter(el => el.getClientRects().length && parseFloat(getComputedStyle(el).fontSize) < 16).map(el => el.outerHTML.split(">")[0].slice(0, 100)));
+    expect(await smallFields()).toEqual([]);
+    await username.fill("admin");
+    await page.getByLabel("密码", { exact: true }).fill("test-password");
+    await page.getByRole("button", { name: "登录", exact: true }).click();
+    await expect(page.locator(".workspace-topbar")).toBeVisible();
+    for (const route of ["home", "services", "agents", "nodes", "domains", "users", "settings/server", "settings/sessions", "agents/a-1", "domains/d-1"]) {
+      await page.goto(`/#/${route}`);
+      await expect(current(page)).toHaveAttribute("id", `page-${encodeURIComponent(`#/${route}`)}`);
+      await expect(page.locator(".workspace-topbar .page-header h1"), route).toBeAttached();
+      await expect(current(page).locator(".skeleton-list")).toHaveCount(0);
+      expect(await smallFields(), route).toEqual([]);
+      expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), route).toBe(true);
+      await expect(page.locator(".workspace-topbar")).toBeInViewport({ ratio: 1 });
+    }
+  });
+
+  test("搜索时软键盘收起底栏，恢复可见高度后保留输入和导航", async ({ page }) => {
+    await installApiMocks(page);
+    await page.goto("/#/nodes");
+    const search = page.getByRole("searchbox", { name: "搜索节点名称或 IP" });
+    await search.fill("香港");
+    const dock = page.locator(".mobile-dock");
+    await expect(dock).toBeVisible();
+    await page.evaluate(() => {
+      const viewport = window.visualViewport!;
+      Object.defineProperty(viewport, "height", { configurable: true, value: innerHeight - 190 });
+      viewport.dispatchEvent(new Event("resize"));
+    });
+    await expect(dock).toBeHidden();
+    await page.evaluate(() => {
+      Reflect.deleteProperty(window.visualViewport!, "height");
+      window.visualViewport!.dispatchEvent(new Event("resize"));
+    });
+    await expect(dock).toBeVisible();
+    await expect(search).toHaveValue("香港");
+  });
+
+  test("横屏刘海和主屏指示条避开导航与弹窗操作", async ({ page }, info) => {
+    test.skip(info.project.name !== "mobile-landscape", "使用 Chromium 模拟非对称安全区");
+    await installApiMocks(page);
+    const session = await page.context().newCDPSession(page);
+    await session.send("Emulation.setSafeAreaInsetsOverride", { insets: { left: 48, right: 12, bottom: 21 } });
+    await page.goto("/#/nodes");
+    const dock = page.locator(".mobile-dock");
+    await expect(dock).toBeVisible();
+    const visible = page.viewportSize()!;
+    const safe = async (el: import("@playwright/test").Locator) => {
+      await expect(el).toBeInViewport({ ratio: 1 });
+      const box = (await el.boundingBox())!;
+      expect(box.x).toBeGreaterThanOrEqual(48);
+      expect(box.x + box.width).toBeLessThanOrEqual(visible.width - 12);
+      expect(box.y + box.height).toBeLessThanOrEqual(visible.height - 21);
+    };
+    await safe(dock);
+    await page.getByRole("button", { name: "节点组", exact: true }).tap();
+    await safe(page.getByRole("dialog").getByRole("button", { name: "创建", exact: true }));
+  });
+
   for (const role of ["system_admin", "tenant"] as const) {
     test(`${role} 的添加入口位于底栏旁，关闭后保持滚动和焦点`, async ({ page }, info) => {
       // 本用例遍历主题、页面和滚动位置；Linux WebKit 的完整矩阵需要更长执行时间。

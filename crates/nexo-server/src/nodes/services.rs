@@ -32,13 +32,6 @@ pub fn prepare(
     }
     input.node_group_id = group;
     let existing = ids(db, id).map_err(db_error)?;
-    let nodes = input.node_ids.get_or_insert_with(|| {
-        if existing.is_empty() {
-            vec!["local".into()]
-        } else {
-            existing
-        }
-    });
     let previous: Option<String> = db
         .query_row(
             "SELECT distribution_mode FROM tunnels WHERE id=?1",
@@ -47,6 +40,14 @@ pub fn prepare(
         )
         .optional()
         .map_err(db_error)?;
+    // 只有新服务可默认绑定内置节点。旧服务被管理员解绑后必须显式重选。
+    let nodes = input.node_ids.get_or_insert_with(|| {
+        if previous.is_none() {
+            vec!["local".into()]
+        } else {
+            existing
+        }
+    });
     let mode = input.distribution_mode.get_or_insert_with(|| {
         if let Some(previous) = previous {
             return previous;
@@ -149,10 +150,59 @@ pub fn authorize_proxy(db: &Connection, tenant: &str, node: &str) -> Result<(), 
 }
 
 /// 删除和停用不依赖节点权限；重新启用必须重新验证，不能利用旧绑定绕过撤权。
-pub fn authorize_proxy_enable(db: &Connection, tenant: &str, id: &str) -> Result<(), ApiError> {
-    for node in ids(db, id).map_err(db_error)? {
-        authorize_proxy(db, tenant, &node)?;
+pub fn authorize_enable(
+    db: &Connection,
+    tenant: &str,
+    id: &str,
+    proxy: bool,
+) -> Result<(), ApiError> {
+    let nodes = ids(db, id).map_err(db_error)?;
+    if nodes.is_empty() {
+        return Err(invalid("服务已无绑定节点，请先编辑服务并选择节点。"));
     }
+    if proxy {
+        for node in nodes {
+            authorize_proxy(db, tenant, &node)?;
+        }
+    }
+    Ok(())
+}
+
+/// 撤销授权后只从原绑定中保留仍获授权的节点。失去最后一个入口时停用服务，
+/// 保留域名、端口和回源配置，供工作空间重新选择节点。
+pub(super) fn retain_authorized_bindings(db: &Connection, id: &str) -> Result<(), ApiError> {
+    db.execute(
+        "DELETE FROM service_nodes WHERE service_id=?1 AND node_id NOT IN (
+        SELECT a.node_id FROM authorized_service_nodes a JOIN relay_nodes n ON n.id=a.node_id
+        WHERE a.service_id=?1 AND n.removed_at IS NULL)",
+        [id],
+    )
+    .map_err(db_error)?;
+    let remaining = ids(db, id).map_err(db_error)?;
+    for table in [
+        "relay_service_health",
+        "relay_public_health",
+        "relay_selection",
+        "relay_selection_pending",
+    ] {
+        db.execute(
+            &format!(
+                "DELETE FROM {table} WHERE service_id=?1 AND node_id NOT IN
+            (SELECT node_id FROM service_nodes WHERE service_id=?1)"
+            ),
+            [id],
+        )
+        .map_err(db_error)?;
+    }
+    db.execute("UPDATE tunnels SET
+        distribution_mode=CASE WHEN ?2<=1 THEN 'single' WHEN distribution_mode='manual' AND preferred_node_id NOT IN
+            (SELECT node_id FROM service_nodes WHERE service_id=?1) THEN 'latency' ELSE distribution_mode END,
+        preferred_node_id=CASE WHEN ?2>1 AND preferred_node_id IN
+            (SELECT node_id FROM service_nodes WHERE service_id=?1) THEN preferred_node_id END,
+        enabled=CASE WHEN ?2=0 THEN 0 ELSE enabled END,
+        apply_revision=apply_revision+(?2=0 AND enabled=1),
+        apply_status=CASE WHEN ?2=0 THEN 'disabled' ELSE apply_status END,
+        updated_at=?3 WHERE id=?1", params![id,remaining.len(),unix_now()]).map_err(db_error)?;
     Ok(())
 }
 

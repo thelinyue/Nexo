@@ -60,9 +60,13 @@ export function NodesPage({ admin, active, csrf }: { admin: boolean; active: boo
   const [selected, setSelected] = useState<string[]>([]); const [creating, setCreating] = useState(false);
   const [selecting, setSelecting] = useState(false);
   const [detail, setDetail] = useState<RelayNode | null>(null); const [update, setUpdate] = useState<RelayNode[] | null>(null);
+  const [removing, setRemoving] = useState<RelayNode | null>(null);
   const [error, setError] = useState<string | null>(null);
   const data = resource.data;
   const available = (n: RelayNode) => canUpdate(n, releases.data);
+  useEffect(() => {
+    if (groupFilter && groups.data && !groups.data.some(group => group.id === groupFilter)) setGroupFilter("");
+  }, [groupFilter, groups.data]);
   useEffect(() => {
     setSelected(current => {
       const next = current.filter(id => data?.nodes.some(node => node.id === id && canUpdate(node, releases.data)));
@@ -91,13 +95,18 @@ export function NodesPage({ admin, active, csrf }: { admin: boolean; active: boo
         {node.status === "offline" && <p className="node-context">最近在线 {dateText(node.last_seen)}</p>}
         {node.update && <p className="node-context" role="status">{stages[node.update.stage] ?? node.update.stage} · v{node.update.target_version}</p>}
         <Notice error={node.update?.error ?? node.error} />
-        <footer><span className="node-footer-note">{node.id === "local" ? "本地节点" : available(node) && admin ? "有新版本" : "远程节点"}</span><div>{admin && available(node) && !selecting && <button className="node-update-button" onClick={() => setUpdate([node])}>更新版本<ArrowUpRight size={14} aria-hidden="true" /></button>}<button className="node-manage-button" onClick={() => void open(node)}>{admin && node.id !== "local" ? "管理" : "详情"}<ChevronRight size={15} aria-hidden="true" /></button></div></footer>
+        <footer><span className="node-footer-note">{node.id === "local" ? "本地节点" : available(node) && admin ? "有新版本" : "远程节点"}</span><div>
+          {admin && node.id !== "local" && node.status === "offline" && !selecting && <button className="text-button danger-text" onClick={() => setRemoving(node)}>移除节点</button>}
+          {admin && available(node) && !selecting && <button className="node-update-button" onClick={() => setUpdate([node])}>更新版本<ArrowUpRight size={14} aria-hidden="true" /></button>}<button className="node-manage-button" onClick={() => void open(node)}>{admin && node.id !== "local" ? "管理" : "详情"}<ChevronRight size={15} aria-hidden="true" /></button></div></footer>
       </article>;
     })}</div>}
     {data && !nodes.length && <section className="node-empty"><Server size={32} aria-hidden="true" /><h2>{data.nodes.length ? "没有符合筛选条件的节点" : "尚未接入节点"}</h2><p className="helper">{data.nodes.length ? "试试其他名称、IP 或筛选条件。" : "添加一台 VPS，生成安装命令后即可接入。"}</p>{data.nodes.length ? <button className="secondary-button" onClick={() => { setSearch(""); setFilter(""); setGroupFilter(""); setSelected([]); }}>清除筛选</button> : <button className="primary-button" onClick={() => setCreating(true)}>添加节点</button>}</section>}
     {groupDialog && <NodeGroupsDialog groups={groups.data ?? []} nodes={data?.nodes ?? []} csrf={csrf} onClose={() => { setGroupDialog(false); void groups.reload(); void resource.reload(); }} />}
     {creating && <NodeCreate csrf={csrf} onClose={() => { setCreating(false); void resource.reload(); }} />}
-    {detail && <NodeDetail node={detail} admin={admin} csrf={csrf} onClose={() => { setDetail(null); void resource.reload(); }} />}
+    {detail && <NodeDetail node={detail} admin={admin} csrf={csrf} onRemove={setRemoving} onClose={() => { setDetail(null); void resource.reload(); }} />}
+    {removing && <NodeRemoval node={removing} groups={groups.data ?? []} csrf={csrf} onClose={() => setRemoving(null)} onRemoved={() => {
+      setRemoving(null); setDetail(null); void resource.reload(); void groups.reload();
+    }} />}
     {update && data && <NodeUpdate nodes={update} releases={releases.data ?? []} version={data.server_version} csrf={csrf} onClose={() => { setUpdate(null); setSelected([]); setSelecting(false); void resource.reload(); void jobs.reload(); }} />}
   </div>;
 }
@@ -127,9 +136,9 @@ function NodeCreate({ csrf, onClose }: { csrf?: string | null; onClose: () => vo
 }
 
 /** 概览读取实时数据，配置草稿只在打开时初始化；轮询不会覆盖输入，关闭复用公共草稿保护。 */
-function NodeDetail({ node, admin, csrf, onClose }: { node: RelayNode; admin: boolean; csrf?: string | null; onClose: () => void }) {
+function NodeDetail({ node, admin, csrf, onClose, onRemove }: { node: RelayNode; admin: boolean; csrf?: string | null; onClose: () => void; onRemove: (node: RelayNode) => void }) {
   const api = useApi(); const [name, setName] = useState(node.name); const [ip, setIp] = useState(node.public_ipv4); const [port, setPort] = useState(node.control_port); const [grants, setGrants] = useState(node.workspace_ids ?? []); const [enabled, setEnabled] = useState(node.enabled);
-  const [busy, setBusy] = useState(false); const [error, setError] = useState<string | null>(null); const [confirm, setConfirm] = useState(false); const [restart, setRestart] = useState(false); const [interruption, setInterruption] = useState(false);
+  const [busy, setBusy] = useState(false); const [error, setError] = useState<string | null>(null); const [restart, setRestart] = useState(false); const [interruption, setInterruption] = useState(false);
   async function perform(path: string, method: string, body?: unknown) { setBusy(true); setError(null); try { await api(path, { method, body: body === undefined ? undefined : JSON.stringify(body) }, csrf); onClose(); } catch (e) { setError(errorText(e)); } finally { setBusy(false); } }
   const path = `/api/v1/nodes/${encodeURIComponent(node.id)}`;
   const live = useResource(() => api<RelayNode>(path), true, 3000, true);
@@ -171,7 +180,7 @@ function NodeDetail({ node, admin, csrf, onClose }: { node: RelayNode; admin: bo
           {node.id !== "local" && <section className="node-form-fields"><h3>基本信息</h3><label>节点名称<input value={name} onChange={e => setName(e.target.value)} required maxLength={80} /></label><div className="node-field-pair"><label>公网 IPv4<input required value={ip} onChange={e => setIp(e.target.value)} /></label><label>数据端口<input type="number" min={1} max={65535} value={port} onChange={e => setPort(Number(e.target.value))} /></label></div><label className="node-check"><input type="checkbox" checked={enabled} onChange={e => setEnabled(e.target.checked)} />启用节点</label></section>}
           {node.id === "local" && <p className="helper">为以下工作空间授权内置节点反向代理，包括访问 Server 本机及其可达内网。穿透权限不受影响。</p>}
           {tab === "config" && <WorkspaceChoices value={grants} onChange={setGrants} />}
-          {node.id !== "local" && <section className="node-section node-maintenance"><h3>维护操作</h3><div><span>重启 Nexo 节点服务<small>有健康备用时先切流，再等待连接结束</small></span><button type="button" className="text-button" disabled={busy || !!current.update || current.status !== "online"} onClick={() => { setError(null); setInterruption(false); setRestart(true); }}>重启节点服务</button></div><div><span>移除节点<small>撤销身份，保留 VPS 数据</small></span><button type="button" className="text-button danger-text" disabled={busy || !!current.update} onClick={() => { setError(null); setConfirm(true); }}>移除节点</button></div></section>}
+          {node.id !== "local" && <section className="node-section node-maintenance"><h3>维护操作</h3><div><span>重启 Nexo 节点服务<small>有健康备用时先切流，再等待连接结束</small></span><button type="button" className="text-button" disabled={busy || !!current.update || current.status !== "online"} onClick={() => { setError(null); setInterruption(false); setRestart(true); }}>重启节点服务</button></div><div><span>移除节点<small>{current.update ? "请先在节点列表中处理未结束的维护任务" : "撤销身份，保留 VPS 数据"}</small></span><button type="button" className="text-button danger-text" disabled={busy || !!current.update} onClick={() => onRemove(current)}>移除节点</button></div></section>}
           <Notice error={error ?? live.error} />
         </div>
         <footer className="modal-actions"><button className={current.approved ? "primary-button" : "secondary-button"} disabled={busy || !!current.update}>保存配置</button>{!current.approved && <button type="button" className="primary-button" disabled={busy || !!current.update || !current.registered} onClick={event => { if (event.currentTarget.form?.reportValidity()) void approve(); }}>批准并保存配置</button>}</footer>
@@ -179,8 +188,37 @@ function NodeDetail({ node, admin, csrf, onClose }: { node: RelayNode; admin: bo
     </Modal>
     {quotaEditing && <NodeQuotaForm node={current} csrf={csrf} onClose={() => setQuotaEditing(false)} onSaved={() => { setQuotaEditing(false); void live.reload(); }} />}
     {restart && <Modal className="node-modal" title="重启节点服务" busy={busy} onClose={() => setRestart(false)}><div className="modal-body node-form-fields"><h3>{current.name}</h3><p className="helper">{current.version ? `v${current.version} · ` : ""}仅重启 Nexo 节点服务。有健康备用的服务先切流；无备用的服务保留 DNS，重启期间会中断。影响 {current.services.filter(service => service.enabled !== false).length} 个服务。</p><NodeImpact node={current} /><label className="node-check"><input type="checkbox" checked={interruption} onChange={e => setInterruption(e.target.checked)} />没有其他健康 IPv4 入口时，我接受服务中断</label><Notice error={error} /></div><footer className="modal-actions"><button className="secondary-button modal-dismiss" disabled={busy} onClick={() => setRestart(false)}>取消</button><button className="primary-button" disabled={busy || !!current.update || current.status !== "online" || (!interruption && needsInterruption(current))} onClick={() => void perform("/api/v1/node-update-jobs", "POST", { operation: "restart", node_ids: [node.id], target_version: current.version, accept_interruption: interruption })}>确认重启 Nexo 服务</button></footer></Modal>}
-    {confirm && <Modal className="node-modal" title="移除节点" busy={busy} onClose={() => setConfirm(false)}><div className="modal-body node-form-fields"><h3>{current.name}</h3><p>移除将撤销身份并关闭服务连接，VPS 上的数据保留。</p><NodeImpact node={current} /><Notice error={error} /></div><footer className="modal-actions"><button className="secondary-button modal-dismiss" disabled={busy} onClick={() => setConfirm(false)}>取消</button><button className="danger-button" disabled={busy || !!current.update} onClick={() => void perform(path, "DELETE")}>确认移除</button></footer></Modal>}
   </>;
+}
+
+function NodeRemoval({ node, groups, csrf, onClose, onRemoved }: { node: RelayNode; groups: NodeGroup[]; csrf?: string | null; onClose: () => void; onRemoved: () => void }) {
+  const api = useApi();
+  const path = `/api/v1/nodes/${encodeURIComponent(node.id)}`;
+  const live = useResource(() => api<RelayNode>(path), true, 3000, true);
+  const current = live.data ?? node;
+  const memberOf = groups.filter(group => group.node_ids.includes(node.id));
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  async function remove() {
+    setBusy(true); setError(null);
+    try { await api(path, { method: "DELETE" }, csrf); onRemoved(); }
+    catch (e) { setError(errorText(e)); }
+    finally { setBusy(false); }
+  }
+  return <Modal className="node-modal" title="移除节点" onClose={onClose} busy={busy}>
+    <div className="modal-body node-form-fields">
+      <h3>{current.name}</h3><NodeStatus node={current} />
+      <p>移除将撤销节点身份并解除各工作空间的服务绑定。失去全部节点的服务将停用，VPS 数据和服务配置会保留。</p>
+      {!!memberOf.length && <p>所属节点组：{memberOf.map(group => group.name).join("、")}。离线节点会同时移出这些组，每组需至少保留两个节点。</p>}
+      <NodeImpact node={current} />
+      {current.update && <p className="helper">请先在节点列表中处理未结束的维护任务。</p>}
+      <Notice error={error ?? live.error} />
+    </div>
+    <footer className="modal-actions">
+      <button className="secondary-button modal-dismiss" disabled={busy} onClick={onClose}>取消</button>
+      <button className="danger-button" disabled={busy || !!current.update} onClick={() => void remove()}>{busy ? "正在移除…" : "确认移除"}</button>
+    </footer>
+  </Modal>;
 }
 
 const needsInterruption = (node: RelayNode) => node.services.some(service => service.enabled !== false && !service.alternatives?.length);

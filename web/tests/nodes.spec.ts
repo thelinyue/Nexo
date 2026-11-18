@@ -52,6 +52,8 @@ test("普通用户可读延迟和申请节点，不能操作维护", async ({ pa
   await setup(page, false);
   await page.goto("/#/nodes");
   await expect(page.getByRole("article")).toHaveCount(3);
+  await expect(page.getByRole("button", { name: "移除节点", exact: true })).toHaveCount(0);
+  await expect(page.getByRole("button", { name: "节点组", exact: true })).toHaveCount(0);
   await expect(page.getByRole("button", { name: "更新版本", exact: true })).toHaveCount(0);
   await expect(page.getByRole("button", { name: "批量更新", exact: true })).toHaveCount(0);
   await expect(page.getByRole("checkbox")).toHaveCount(0);
@@ -154,6 +156,37 @@ test("无节点组时直接创建并一次保存成员与分配", async ({ page 
   await dialog.getByRole("button", { name: "创建", exact: true }).click();
   await expect(dialog).toHaveCount(0);
   expect(saved).toEqual({ name: "亚洲入口", node_ids: ["hk", "jp"], workspace_ids: ["default"] });
+});
+
+test("管理员从节点组列表删除当前筛选的组，取消或失败时保留分组", async ({ page }) => {
+  await setup(page);
+  const groups = [{ id: "asia", name: "亚洲入口", node_ids: ["hk", "jp"] }];
+  let attempts = 0;
+  await page.route("**/api/v1/node-groups", route => route.fulfill({ json: groups }));
+  await page.route("**/api/v1/node-groups/asia", route => {
+    expect(route.request().method()).toBe("DELETE");
+    if (++attempts === 1) return route.fulfill({ status: 503, json: { error: "服务暂时不可用" } });
+    groups.pop();
+    return route.fulfill({ json: { removed: true } });
+  });
+  await page.goto("/#/nodes");
+  await page.getByLabel("筛选节点组").selectOption("asia");
+  await page.getByRole("button", { name: "节点组", exact: true }).click();
+  const list = page.getByRole("dialog", { name: "节点组", exact: true });
+  const trigger = list.getByRole("button", { name: "删除亚洲入口" });
+  await trigger.click();
+  const confirm = page.getByRole("dialog", { name: "删除节点组" });
+  await expect(confirm).toContainText("亚洲入口");
+  await confirm.getByRole("button", { name: "取消", exact: true }).click();
+  expect(attempts).toBe(0);
+  await trigger.click();
+  await confirm.getByRole("button", { name: "确认删除" }).click();
+  await expect(confirm.getByRole("alert")).toContainText("服务暂时不可用");
+  await confirm.getByRole("button", { name: "确认删除" }).click();
+  await expect(confirm).toBeHidden();
+  await expect(page.getByLabel("筛选节点组")).toHaveValue("");
+  await expect(page.getByRole("article")).toHaveCount(3);
+  expect(attempts).toBe(2);
 });
 
 test("手机更多选择列表可关闭、导航和区分用户权限", async ({ page }, info) => {

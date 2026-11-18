@@ -7,6 +7,43 @@ pub fn members(db: &Connection, id: &str) -> rusqlite::Result<Vec<String>> {
         .query_map([id], |r| r.get(0))?
         .collect()
 }
+
+/// 永久移除失联节点时可同时退组；保留组至少需要两个成员。
+pub(super) fn detach_for_removal(
+    tx: &rusqlite::Transaction<'_>,
+    node: &str,
+) -> Result<(), ApiError> {
+    let mut query = tx
+        .prepare(
+            "SELECT g.name, n.last_seen > unixepoch()-45,
+                (SELECT count(*) FROM relay_group_members WHERE group_id=g.id)
+         FROM relay_group_members m JOIN relay_node_groups g ON g.id=m.group_id
+         JOIN relay_nodes n ON n.id=m.node_id WHERE m.node_id=?1 ORDER BY g.name,g.id",
+        )
+        .map_err(db_error)?;
+    let mut rows = query.query([node]).map_err(db_error)?;
+    while let Some(row) = rows.next().map_err(db_error)? {
+        let name: String = row.get(0).map_err(db_error)?;
+        let online: Option<bool> = row.get(1).map_err(db_error)?;
+        if online == Some(true) {
+            return Err(ApiError::new(
+                StatusCode::CONFLICT,
+                format!("节点仍在线，请先在节点组「{name}」中移出此节点。"),
+            ));
+        }
+        if row.get::<_, usize>(2).map_err(db_error)? <= 2 {
+            return Err(ApiError::new(
+                StatusCode::CONFLICT,
+                format!(
+                    "节点组「{name}」移除后将不足两个节点。请先添加替代节点，或删除不再使用的组。"
+                ),
+            ));
+        }
+    }
+    tx.execute("DELETE FROM relay_group_members WHERE node_id=?1", [node])
+        .map_err(db_error)?;
+    Ok(())
+}
 #[derive(Deserialize)]
 pub struct Input {
     name: String,
@@ -207,27 +244,37 @@ pub async fn remove(
     Path(id): Path<String>,
 ) -> Result<Json<Value>, ApiError> {
     let actor = admin_write(&state, &headers)?;
-    let db = state.db.lock().map_err(db_error)?;
-    let tx = db.unchecked_transaction().map_err(db_error)?;
-    if tx
-        .query_row(
-            "SELECT EXISTS(SELECT 1 FROM tunnels WHERE node_group_id=?1)",
+    {
+        let _dns_guard = state.tunnel_runtime.direct.dns_lock.lock().await;
+        let db = state.db.lock().map_err(db_error)?;
+        let tx = db.unchecked_transaction().map_err(db_error)?;
+        let affected = tx
+            .prepare("SELECT id FROM tunnels WHERE node_group_id=?1 AND deleted_at IS NULL")
+            .map_err(db_error)?
+            .query_map([&id], |r| r.get::<_, String>(0))
+            .map_err(db_error)?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(db_error)?;
+        // 历史服务同样持有外键；只对仍存在的服务重算删除组后的有效入口。
+        tx.execute(
+            "UPDATE tunnels SET node_group_id=NULL WHERE node_group_id=?1",
             [&id],
-            |r| r.get::<_, bool>(0),
         )
-        .map_err(db_error)?
-    {
-        return Err(invalid("请先解除关联服务与节点组的绑定，再删除节点组"));
+        .map_err(db_error)?;
+        if tx
+            .execute("DELETE FROM relay_node_groups WHERE id=?1", [&id])
+            .map_err(db_error)?
+            == 0
+        {
+            return Err(invalid("节点组不存在"));
+        }
+        for service in affected {
+            services::retain_authorized_bindings(&tx, &service)?;
+        }
+        accounts::audit(&tx, &actor, "node_group_removed", "node_group", &id)?;
+        tx.commit().map_err(db_error)?;
     }
-    if tx
-        .execute("DELETE FROM relay_node_groups WHERE id=?1", [&id])
-        .map_err(db_error)?
-        == 0
-    {
-        return Err(invalid("节点组不存在"));
-    }
-    accounts::audit(&tx, &actor, "node_group_removed", "node_group", &id)?;
-    tx.commit().map_err(db_error)?;
+    refresh_after_removal(&state).await;
     Ok(Json(json!({"removed":true})))
 }
 
