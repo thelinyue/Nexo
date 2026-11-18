@@ -68,9 +68,18 @@ test("真实服务元素连续切换，复用 DOM、选择和显示偏好且不�
     const row = document.querySelector(".service-row")!;
     (window as any).leiboxOriginal = { row, icon: row.querySelector(".application-icon"), name: row.querySelector(".service-name") };
   });
+  // 在页面内记录实际发生的位移，避免跨进程读取时 400ms 动画已结束。
+  await list.evaluate(element => {
+    const observer = new MutationObserver(() => {
+      if (element.dataset.moving === "true" && [...element.querySelectorAll<HTMLElement>(".application-launch")].some(icon => icon.style.transform)) {
+        observer.disconnect();
+        (window as any).leiboxSawIconMotion = true;
+      }
+    });
+    observer.observe(element, { attributes: true, subtree: true, attributeFilter: ["data-moving", "style"] });
+  });
   await switchView(page, "图标视图");
-  await expect(list).toHaveAttribute("data-moving", "true");
-  expect(await list.locator(".application-launch").evaluateAll(elements => elements.some(element => (element as HTMLElement).style.transform !== ""))).toBe(true);
+  await expect.poll(() => page.evaluate(() => (window as any).leiboxSawIconMotion)).toBe(true);
   await switchView(page, "列表视图");
   await switchView(page, "图标视图");
   await expect(list).toHaveAttribute("data-moving", "false");
