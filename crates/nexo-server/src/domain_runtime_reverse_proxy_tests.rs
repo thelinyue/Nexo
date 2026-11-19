@@ -152,12 +152,13 @@ async fn real_caddy_direct_proxy_lifecycle_tls_websocket_and_quota_isolation() {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     let pem = fs::read(cfg.storage_root.join("pki/authorities/local/root.crt")).unwrap();
-    let client = reqwest::Client::builder()
+    let client = nexo_core::http_client_builder()
         .no_proxy()
         .http1_only()
         .pool_max_idle_per_host(0)
         .timeout(Duration::from_secs(5))
-        .add_root_certificate(reqwest::Certificate::from_pem(&pem).unwrap())
+        .tls_backend_rustls()
+        .tls_certs_only([reqwest::Certificate::from_pem(&pem).unwrap()])
         .resolve("app.reverse.localhost", https_address)
         .resolve("manage.reverse.localhost", https_address)
         .build()
@@ -199,7 +200,7 @@ async fn real_caddy_direct_proxy_lifecycle_tls_websocket_and_quota_isolation() {
     assert!(text.contains("x-forwarded-proto: https"));
     assert!(!text.contains("6.6.6.6"));
     // 默认重定向保留 URI，关闭后 HTTP 不能偷偷变成明文代理。
-    let no_redirect = reqwest::Client::builder()
+    let no_redirect = nexo_core::http_client_builder()
         .no_proxy()
         .redirect(reqwest::redirect::Policy::none())
         .timeout(Duration::from_secs(5))
@@ -448,7 +449,7 @@ async fn real_caddy_direct_proxy_lifecycle_tls_websocket_and_quota_isolation() {
     .await
     .unwrap();
     // 服务停用后通过 HTTP 入口验证路由已撤销，共享泛域证书仍保留。
-    let removed = reqwest::Client::builder()
+    let removed = nexo_core::http_client_builder()
         .no_proxy()
         .build()
         .unwrap()
@@ -490,7 +491,7 @@ async fn real_caddy_direct_proxy_lifecycle_tls_websocket_and_quota_isolation() {
         .await
         .unwrap();
     // 删除服务只撤销路由，共享泛域证书仍保留。
-    let removed = reqwest::Client::builder()
+    let removed = nexo_core::http_client_builder()
         .no_proxy()
         .build()
         .unwrap()

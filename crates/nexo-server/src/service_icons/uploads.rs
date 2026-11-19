@@ -342,7 +342,7 @@ async fn download(mut url: reqwest::Url, admin: bool) -> Result<Vec<u8>, ApiErro
                 "图片地址不可访问；内网图片仅允许管理员导入，回环和特殊地址不受支持",
             ));
         }
-        let client = reqwest::Client::builder()
+        let client = nexo_core::http_client_builder()
             .no_proxy()
             .redirect(reqwest::redirect::Policy::none())
             .resolve_to_addrs(&host, &addresses)
@@ -941,7 +941,7 @@ mod tests {
         let api_task = tokio::spawn(async move {
             axum::serve(listener, routes).await.unwrap();
         });
-        let client = reqwest::Client::builder()
+        let client = nexo_core::http_client_builder()
             .no_proxy()
             .default_headers(headers.clone())
             .build()

@@ -1,5 +1,12 @@
 //! 域名归属和自助证书配置。归属验证始终使用 Server DNS，不能信任用户自定义的签发解析器。
 use crate::*;
+use hickory_resolver::{
+    config::{ConnectionConfig, NameServerConfig, ResolverConfig},
+    lookup::Lookup,
+    net::runtime::TokioRuntimeProvider,
+    proto::rr::RData,
+    TokioResolver,
+};
 use serde_json::{json, Value};
 use std::{
     net::{IpAddr, SocketAddr},
@@ -8,6 +15,35 @@ use std::{
 };
 
 pub mod dns_records;
+
+/// 用户配置的解析器只用于 DNS-01 传播检查，域名归属验证始终走系统 DNS。
+pub(super) fn dns01_resolver(addresses: &[String]) -> Result<TokioResolver> {
+    if addresses.is_empty() {
+        return Ok(TokioResolver::builder_tokio()?.build()?);
+    }
+    let mut servers = Vec::with_capacity(addresses.len());
+    for address in addresses {
+        let address: SocketAddr = address
+            .parse()
+            .or_else(|_| address.parse::<IpAddr>().map(|ip| SocketAddr::new(ip, 53)))?;
+        let mut connection = ConnectionConfig::udp();
+        connection.port = address.port();
+        servers.push(NameServerConfig::new(address.ip(), true, vec![connection]));
+    }
+    let config = ResolverConfig::from_name_servers(servers);
+    Ok(TokioResolver::builder_with_config(config, TokioRuntimeProvider::default()).build()?)
+}
+
+pub(super) fn txt_matches(lookup: &Lookup, expected: &str) -> bool {
+    lookup.answers().iter().any(|record| match &record.data {
+        RData::TXT(txt) => txt
+            .txt_data
+            .iter()
+            .flat_map(|chunk| chunk.iter().copied())
+            .eq(expected.bytes()),
+        _ => false,
+    })
+}
 
 /// 升级只调整证书方式，不重新验证归属或清空凭据；整表替换在事务内完成。
 pub fn migrate(db: &Connection) -> Result<()> {
@@ -254,7 +290,8 @@ pub async fn verify(
         .as_ref()
         .and_then(|r| r["value"].as_str())
         .unwrap_or_default();
-    let resolver = hickory_resolver::TokioAsyncResolver::tokio_from_system_conf()
+    let resolver = TokioResolver::builder_tokio()
+        .and_then(|builder| builder.build())
         .map_err(|_| ApiError::new(StatusCode::SERVICE_UNAVAILABLE, "无法读取服务端 DNS 配置"))?;
     let records = tokio::time::timeout(
         Duration::from_secs(8),
@@ -268,10 +305,7 @@ pub async fn verify(
             "尚未查询到归属 TXT 记录，请核对记录并等待 DNS 生效",
         )
     })?;
-    let matches = records
-        .iter()
-        .any(|r| r.txt_data().concat() == expected.as_bytes());
-    if !matches {
+    if !txt_matches(&records, expected) {
         return Err(ApiError::new(
             StatusCode::BAD_REQUEST,
             "TXT 记录与当前工作空间的验证值不一致",
@@ -322,7 +356,7 @@ async fn cloudflare_json(response: reqwest::Response) -> Result<Value, ApiError>
 
 /// 通过实际创建并删除归属 TXT 检查 Zone Read 和 DNS Edit；不改用户的 A/AAAA 访问解析。
 async fn verify_cloudflare(token: &str, domain: &str, proof: &str) -> Result<(), ApiError> {
-    let client = reqwest::Client::builder()
+    let client = nexo_core::http_client_builder()
         .timeout(Duration::from_secs(15))
         .build()
         .map_err(db_error)?;

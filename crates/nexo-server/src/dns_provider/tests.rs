@@ -749,7 +749,7 @@ async fn real_caddy_loads_each_provider_private_file_configuration() {
 async fn acme_dns01_issues_agent_csr_and_keeps_valid_chain_during_renewal_failure() {
     use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
     use hickory_resolver::proto::{
-        op::{Message, MessageType},
+        op::Message,
         rr::{rdata::TXT, RData, Record as DnsRecord},
     };
     #[derive(Clone)]
@@ -869,14 +869,11 @@ async fn acme_dns01_issues_agent_csr_and_keeps_valid_chain_during_renewal_failur
         loop {
             let (len, peer) = socket.recv_from(&mut buffer).await.unwrap();
             let request = Message::from_vec(&buffer[..len]).unwrap();
-            let mut reply = Message::new();
-            reply
-                .set_id(request.id())
-                .set_message_type(MessageType::Response)
-                .set_authoritative(true)
-                .set_recursion_desired(true)
-                .set_recursion_available(true);
-            for query in request.queries() {
+            let mut reply = Message::response(request.metadata.id, request.metadata.op_code);
+            reply.metadata.authoritative = true;
+            reply.metadata.recursion_desired = request.metadata.recursion_desired;
+            reply.metadata.recursion_available = true;
+            for query in &request.queries {
                 reply.add_query(query.clone());
                 for record in dns_records.records.lock().unwrap().iter().filter(|r| {
                     r.kind == "TXT" && format!("{}.", r.name) == query.name().to_string()

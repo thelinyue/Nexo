@@ -340,10 +340,11 @@ async fn proxy_scenario(metered: bool) {
         directory.path().to_owned(),
         "test-node".into(),
     ));
-    let client = reqwest::Client::builder()
+    let client = nexo_core::http_client_builder()
         .no_proxy()
         .redirect(reqwest::redirect::Policy::none())
-        .add_root_certificate(reqwest::Certificate::from_pem(certificate.pem().as_bytes()).unwrap())
+        .tls_backend_rustls()
+        .tls_certs_only([reqwest::Certificate::from_pem(certificate.pem().as_bytes()).unwrap()])
         .resolve(
             "app.localhost",
             (std::net::Ipv4Addr::LOCALHOST, https_port).into(),

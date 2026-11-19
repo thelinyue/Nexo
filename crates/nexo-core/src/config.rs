@@ -28,36 +28,39 @@ pub fn load<T: DeserializeOwned>(path: &Path, template: &str) -> Result<T> {
     }
     let text = std::fs::read_to_string(path)
         .with_context(|| format!("无法读取配置文件：{}", path.display()))?;
-    serde_path_to_error::deserialize(toml::Deserializer::new(&text)).map_err(
-        |error: serde_path_to_error::Error<toml::de::Error>| {
-            let e = error.inner();
-            let offset = e.span().map(|v| v.start).unwrap_or(0).min(text.len());
-            let line = text.as_bytes()[..offset]
-                .iter()
-                .filter(|&&c| c == b'\n')
-                .count()
-                + 1;
-            // 只补充未知字段名，不能直接打印 TOML 错误正文，正文可能含密码等原始值。
-            let mut field = error.path().to_string();
-            if let Some(name) = e
-                .message()
-                .strip_prefix("unknown field `")
-                .and_then(|s| s.split('`').next())
-            {
-                if field == "." {
-                    field.clear();
-                }
-                if !field.is_empty() {
-                    field.push('.');
-                }
-                field.push_str(name);
+    let describe_error = |e: toml::de::Error, mut field: String| {
+        let offset = e.span().map(|v| v.start).unwrap_or(0).min(text.len());
+        let line = text.as_bytes()[..offset]
+            .iter()
+            .filter(|&&c| c == b'\n')
+            .count()
+            + 1;
+        // 只补充未知字段名，不能直接打印 TOML 错误正文，正文可能含密码等原始值。
+        if let Some(name) = e
+            .message()
+            .strip_prefix("unknown field `")
+            .and_then(|s| s.split('`').next())
+        {
+            if field == "." {
+                field.clear();
             }
-            anyhow::anyhow!(
-                "配置文件 {} 第 {} 行字段 {} 格式或类型不正确，请核对模板",
-                path.display(),
-                line,
-                field
-            )
+            if !field.is_empty() {
+                field.push('.');
+            }
+            field.push_str(name);
+        }
+        anyhow::anyhow!(
+            "配置文件 {} 第 {} 行字段 {} 格式或类型不正确，请核对模板",
+            path.display(),
+            line,
+            field
+        )
+    };
+    let document = toml::Deserializer::parse(&text).map_err(|e| describe_error(e, ".".into()))?;
+    serde_path_to_error::deserialize(document).map_err(
+        |error: serde_path_to_error::Error<toml::de::Error>| {
+            let field = error.path().to_string();
+            describe_error(error.into_inner(), field)
         },
     )
 }

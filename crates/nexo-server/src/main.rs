@@ -642,10 +642,11 @@ async fn static_asset_headers(request: axum::extract::Request, next: middleware:
             axum::http::HeaderValue::from_static("no-cache"),
         );
     }
-    response.headers_mut().append(
-        axum::http::header::VARY,
-        axum::http::HeaderValue::from_static("Accept-Encoding"),
-    );
+    // ServeDir 已为预压缩文件响应添加 Vary，这里只补齐 304 等其他响应。
+    response
+        .headers_mut()
+        .entry(axum::http::header::VARY)
+        .or_insert(axum::http::HeaderValue::from_static("accept-encoding"));
     response
 }
 
@@ -1868,7 +1869,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
         let server = tokio::spawn(axum::serve(listener, router(state)).into_future());
-        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let client = nexo_core::http_client_builder().no_proxy().build().unwrap();
         for (encoding, body, compressed) in [
             ("identity", "plain", false),
             ("gzip", "compressed-fixture", true),
@@ -1880,7 +1881,8 @@ mod tests {
                 .send()
                 .await
                 .unwrap();
-            assert_eq!(response.headers()["vary"], "Accept-Encoding");
+            assert_eq!(response.headers()["vary"], "accept-encoding");
+            assert_eq!(response.headers().get_all("vary").iter().count(), 1);
             assert!(response.headers().get("cache-control").is_none());
             assert_eq!(
                 response.headers().get("content-encoding").is_some(),
@@ -1906,8 +1908,21 @@ mod tests {
             let response = client.get(format!("{url}{path}")).send().await.unwrap();
             assert_eq!(response.status(), reqwest::StatusCode::OK);
             assert_eq!(response.headers()["cache-control"], "no-cache");
-            assert_eq!(response.headers()["vary"], "Accept-Encoding");
+            assert_eq!(response.headers()["vary"], "accept-encoding");
         }
+        let worker = client.get(format!("{url}/sw.js")).send().await.unwrap();
+        let cached = client
+            .get(format!("{url}/sw.js"))
+            .header(
+                "If-Modified-Since",
+                worker.headers()["last-modified"].clone(),
+            )
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(cached.status(), reqwest::StatusCode::NOT_MODIFIED);
+        assert_eq!(cached.headers()["vary"], "accept-encoding");
+        assert_eq!(cached.headers()["cache-control"], "no-cache");
         let api = client
             .get(format!("{url}/api/v1/auth/status"))
             .send()

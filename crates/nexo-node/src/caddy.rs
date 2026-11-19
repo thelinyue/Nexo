@@ -394,7 +394,7 @@ impl CaddySupervisor {
     async fn admin_client(&self) -> Result<&Client> {
         self.client
             .get_or_try_init(|| async {
-                Client::builder()
+                nexo_core::http_client_builder()
                     .no_proxy()
                     .timeout(Duration::from_secs(10))
                     .build()

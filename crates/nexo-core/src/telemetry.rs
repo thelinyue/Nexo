@@ -2,8 +2,7 @@
 //! 队列及跨进程上报只包含白名单字段；采集失败不改变业务转发结果。
 mod geoip;
 
-use hmac::{Hmac, Mac};
-use rand::RngCore;
+use hmac::{Hmac, KeyInit, Mac};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::Sha256;
@@ -30,9 +29,7 @@ pub fn day(at: i64) -> i64 {
     (at + 28800).div_euclid(86400) * 86400 - 28800
 }
 fn id() -> String {
-    let mut bytes = [0; 16];
-    rand::thread_rng().fill_bytes(&mut bytes);
-    hex::encode(bytes)
+    hex::encode(rand::random::<[u8; 16]>())
 }
 
 /// 一个事件只属于一个服务。控制器从已认证节点/设备反查空间，绝不相信上报的租户标识。
@@ -98,8 +95,7 @@ impl Default for Hub {
 }
 impl Hub {
     fn with_geo(directory: Option<&Path>) -> Self {
-        let mut secret = [0; 32];
-        rand::thread_rng().fill_bytes(&mut secret);
+        let secret = rand::random();
         let configured = std::env::var_os("NEXO_GEOIP_DATABASE").filter(|path| !path.is_empty());
         let geo = Arc::new(geoip::CountryLookup::open(configured.as_deref(), directory));
         let asn = std::env::var_os("NEXO_GEOIP_ASN_DATABASE")
@@ -302,12 +298,16 @@ impl Hub {
             String::new()
         };
         let operator = ip
-            .and_then(|ip| self.asn.as_ref()?.lookup::<Value>(ip).ok())
-            .and_then(|v| {
-                v["autonomous_system_organization"]
-                    .as_str()
-                    .map(|s| limited(s, 96))
+            .and_then(|ip| {
+                self.asn
+                    .as_ref()?
+                    .lookup(ip)
+                    .ok()?
+                    .decode_path::<&str>(&maxminddb::path!["autonomous_system_organization"])
+                    .ok()
+                    .flatten()
             })
+            .map(|operator| limited(operator, 96))
             .unwrap_or_else(|| "未知".into());
         let protocol = if v["status"].as_u64() == Some(101) {
             "websocket"

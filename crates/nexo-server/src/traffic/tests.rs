@@ -386,7 +386,7 @@ async fn router_enforces_personal_admin_and_tunnel_boundaries() {
     let task = tokio::spawn(async move {
         axum::serve(listener, router(server_state)).await.unwrap();
     });
-    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+    let client = nexo_core::http_client_builder().no_proxy().build().unwrap();
     for suffix in ["realtime", "history"] {
         for (headers, path, status) in [
             (&alice, format!("/api/v1/admin/traffic/{suffix}"), 403),

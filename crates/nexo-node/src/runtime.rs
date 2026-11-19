@@ -116,7 +116,7 @@ pub async fn run(
         let mut params = rcgen::CertificateParams::new(Vec::<String>::new())?;
         params.distinguished_name = rcgen::DistinguishedName::new();
         let csr = params.serialize_request(&key)?.pem()?;
-        let client = reqwest::Client::builder()
+        let client = nexo_core::http_client_builder()
             .timeout(Duration::from_secs(30))
             .redirect(reqwest::redirect::Policy::none())
             .build()?;

@@ -70,7 +70,7 @@ fn includes_agent(version: &str, manifest: Manifest) -> Result<bool> {
 }
 
 async fn fetch() -> Result<Release> {
-    let client = reqwest::Client::builder()
+    let client = nexo_core::http_client_builder()
         .timeout(QUERY_TIMEOUT)
         .user_agent("Nexo-device-version")
         .build()?;
@@ -285,7 +285,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
         let task = tokio::spawn(async { axum::serve(listener, app).await.unwrap() });
-        let client = reqwest::Client::new();
+        let client = nexo_core::http_client_builder().build().unwrap();
         let url = format!("{base}/releases");
         assert_eq!(
             fetch_from(&client, &url, &base).await.unwrap(),

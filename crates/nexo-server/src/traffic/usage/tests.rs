@@ -286,7 +286,7 @@ async fn usage_and_reset_router_enforce_real_identity_csrf_and_user_scope() {
     let task = tokio::spawn(async move {
         axum::serve(listener, router(server_state)).await.unwrap();
     });
-    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+    let client = nexo_core::http_client_builder().no_proxy().build().unwrap();
     for (headers, path, status, count) in [
         (&alice, "/api/v1/traffic/usage", 200, 10),
         (&admin, "/api/v1/traffic/usage", 200, 5),

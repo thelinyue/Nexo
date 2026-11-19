@@ -420,7 +420,10 @@ async fn direct_login_shares_existing_service_session_and_revocation() {
     assert_eq!(status, 204);
     // 真实本机认证 HTTP 接口读取同一会话，证明切换转发路径不需要再次登录。
     let access = crate::service_access::Runtime::start(&state).await.unwrap();
-    let mut request = reqwest::Client::new().get(format!("http://{}/check", access.address));
+    let mut request = nexo_core::http_client_builder()
+        .build()
+        .unwrap()
+        .get(format!("http://{}/check", access.address));
     for (k, v) in &headers {
         request = request.header(k, v);
     }

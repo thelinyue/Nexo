@@ -183,7 +183,7 @@ async fn removal_of_offline_node_checks_groups_before_revoking_identity() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}/api/v1/nodes/jp", listener.local_addr().unwrap());
     let server = tokio::spawn(axum::serve(listener, router(state.clone())).into_future());
-    let client = reqwest::Client::builder()
+    let client = nexo_core::http_client_builder()
         .no_proxy()
         .default_headers(admin)
         .build()

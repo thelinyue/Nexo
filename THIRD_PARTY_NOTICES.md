@@ -28,4 +28,4 @@ LeiBox 目录未为组件授予统一许可证，列表布局组件的原始代�
 
 ## GSAP 与 Flip
 
-服务页面的布局动画使用 GSAP 3.12.7 及其随包提供的 Flip 插件，仅随服务页面代码加载。GSAP 采用自有 [Standard License](https://gsap.com/standard-license/)，不是 MIT 或 Nexo 的 AGPL；保留上游版权声明，许可文本见 `web/public/licenses/GSAP.txt`，部署后可通过 `/licenses/GSAP.txt` 查看。导航使用本地轻量弹簧，不加载 GSAP；动画不通过 CDN 在运行时下载。
+服务页面随页面代码加载 GSAP 3.15.1 和 Flip 插件，导航使用本地轻量弹簧。GSAP 采用 [Standard License](https://gsap.com/standard-license/)，版权和许可文本随 Web 构建分发，源文件位于 `web/public/licenses/GSAP.txt`，部署后可通过 `/licenses/GSAP.txt` 查看。

@@ -300,7 +300,7 @@ async fn load_identity(config: &Config, directory: &std::path::Path) -> Result<D
         }
         Err(error) => return Err(error).context("无法读取待入网设备私钥"),
     };
-    let client = reqwest::Client::builder()
+    let client = nexo_core::http_client_builder()
         .no_proxy()
         .timeout(Duration::from_secs(15))
         .build()?;

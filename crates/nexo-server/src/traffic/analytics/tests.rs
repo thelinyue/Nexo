@@ -347,7 +347,9 @@ async fn real_caddy_access_log_reaches_private_queue() {
     caddy.write_startup_config(&config).unwrap();
     caddy.clone().start().await.unwrap();
     caddy.apply_json(&config).await.unwrap();
-    let response = reqwest::Client::new()
+    let response = nexo_core::http_client_builder()
+        .build()
+        .unwrap()
         .get(format!("http://{address}/api/items?token=private"))
         .header("Host", "app.example.com")
         .header("Cookie", "password=private")

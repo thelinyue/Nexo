@@ -1,6 +1,6 @@
 use anyhow::{ensure, Context, Result};
 use flate2::read::MultiGzDecoder;
-use maxminddb::{geoip2, Reader};
+use maxminddb::{path, Reader};
 use reqwest::{Client, StatusCode};
 use std::{
     ffi::OsStr,
@@ -70,13 +70,18 @@ impl CountryLookup {
 
     pub(super) fn country(&self, ip: IpAddr) -> Option<String> {
         let active = self.active.read().unwrap();
-        let record: geoip2::Country<'_> = active.as_ref()?.reader.lookup(ip).ok()?;
-        let country = record.country?;
-        country
-            .names
-            .and_then(|names| names.get("zh-CN").copied())
+        let record = active.as_ref()?.reader.lookup(ip).ok()?;
+        // 热路径只解码实际展示的字段，保留中文名优先及国家码回退。
+        record
+            .decode_path::<&str>(&path!["country", "names", "zh-CN"])
+            .ok()?
             .filter(|name| !name.is_empty() && name.len() <= 128)
-            .or(country.iso_code)
+            .or_else(|| {
+                record
+                    .decode_path(&path!["country", "iso_code"])
+                    .ok()
+                    .flatten()
+            })
             .map(str::to_owned)
     }
 
@@ -84,7 +89,7 @@ impl CountryLookup {
         self.cache.as_ref()?;
         let lookup = self.clone();
         Some(AbortOnDropHandle::new(tokio::spawn(async move {
-            let client = Client::builder()
+            let client = crate::http_client_builder()
                 .user_agent(concat!("Nexo/", env!("CARGO_PKG_VERSION")))
                 .timeout(Duration::from_secs(60))
                 .redirect(reqwest::redirect::Policy::none())
@@ -247,7 +252,7 @@ fn read_database_bytes(input: impl Read) -> Result<Vec<u8>> {
 fn open_managed(bytes: Vec<u8>) -> Result<Reader<Vec<u8>>> {
     let reader = Reader::from_source(bytes).context("无法解析 GeoIP MMDB")?;
     ensure!(
-        reader.metadata.database_type == "DBIP-Country-Lite",
+        reader.metadata().database_type == "DBIP-Country-Lite",
         "下载内容不是 DB-IP Country Lite 数据库"
     );
     Ok(reader)
@@ -320,7 +325,7 @@ mod tests {
         let data = tempfile::tempdir().unwrap();
         let cache = data.path().join("geoip");
         let lookup = CountryLookup::open(None, Some(data.path()));
-        let client = Client::builder()
+        let client = crate::http_client_builder()
             .no_proxy()
             .timeout(Duration::from_secs(5))
             .build()

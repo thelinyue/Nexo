@@ -648,7 +648,7 @@ pub(crate) mod tests {
                 .unwrap();
         }
         let (url, task) = serve(state.clone()).await;
-        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let client = nexo_core::http_client_builder().no_proxy().build().unwrap();
         let own: Value = client
             .get(format!("{url}/api/v1/public-domains"))
             .headers(alice.clone())
@@ -767,7 +767,7 @@ pub(crate) mod tests {
         assert!((invite["expires_at"].as_i64().unwrap() - unix_now() - 7 * 86400).abs() <= 1);
         let token = invite["token"].as_str().unwrap().to_owned();
         let (url, task) = serve(state.clone()).await;
-        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let client = nexo_core::http_client_builder().no_proxy().build().unwrap();
         let accept = |username: &str| {
             client
                 .post(format!("{url}/api/v1/auth/invitations/accept"))
@@ -939,7 +939,7 @@ pub(crate) mod tests {
             .await
             .unwrap();
         let (url, task) = serve(state.clone()).await;
-        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let client = nexo_core::http_client_builder().no_proxy().build().unwrap();
         let patch = |id: &str, headers: HeaderMap, body: Value| {
             client
                 .patch(format!("{url}/api/v1/admin/users/{id}"))
@@ -1117,7 +1117,7 @@ pub(crate) mod tests {
             .unwrap();
         }
         let (url, task) = serve(state.clone()).await;
-        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let client = nexo_core::http_client_builder().no_proxy().build().unwrap();
         let delete = |id: &str, headers: HeaderMap, name: &str| {
             client
                 .delete(format!("{url}/api/v1/admin/users/{id}"))

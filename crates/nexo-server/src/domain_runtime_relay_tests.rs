@@ -213,21 +213,20 @@ async fn real_caddy_relay_old_ip_tls_password_websocket_and_stale_config() {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     let client = |ip: &str| {
-        reqwest::Client::builder()
+        nexo_core::http_client_builder()
             .no_proxy()
             .http1_only()
             .pool_max_idle_per_host(0)
             .redirect(reqwest::redirect::Policy::none())
             .timeout(Duration::from_secs(5))
-            .add_root_certificate(
+            .tls_backend_rustls()
+            .tls_certs_only([
                 reqwest::Certificate::from_pem(
                     &fs::read(cfg.storage_root.join("pki/authorities/local/root.crt")).unwrap(),
                 )
                 .unwrap(),
-            )
-            .add_root_certificate(
                 reqwest::Certificate::from_pem(&fs::read(&node_ca).unwrap()).unwrap(),
-            )
+            ])
             .resolve(
                 "app.relay.localhost",
                 format!("{ip}:{https_port}").parse().unwrap(),
@@ -366,7 +365,7 @@ async fn real_caddy_relay_old_ip_tls_password_websocket_and_stale_config() {
     manager.apply_json(&manager_config()).await.unwrap();
     let http_address = format!("127.0.0.1:{http_port}");
     // 停用和协议变更会按既有触发器撤销会话；HTTP 场景必须重新登录。
-    let plain = reqwest::Client::builder()
+    let plain = nexo_core::http_client_builder()
         .no_proxy()
         .timeout(Duration::from_secs(5))
         .build()

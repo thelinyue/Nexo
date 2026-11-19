@@ -353,10 +353,11 @@ async fn real_caddy_direct_range_upload_upgrade_authorization_and_revoke() {
         &auth,
     );
     process.apply(config.clone()).await.unwrap();
-    let client = reqwest::Client::builder()
+    let client = nexo_core::http_client_builder()
         .no_proxy()
         .redirect(reqwest::redirect::Policy::none())
-        .add_root_certificate(reqwest::Certificate::from_pem(cert.pem().as_bytes()).unwrap())
+        .tls_backend_rustls()
+        .tls_certs_only([reqwest::Certificate::from_pem(cert.pem().as_bytes()).unwrap()])
         .resolve(&svc.hostname, format!("[::1]:{port}").parse().unwrap())
         .timeout(Duration::from_secs(5))
         .build()
@@ -449,9 +450,10 @@ async fn real_caddy_direct_range_upload_upgrade_authorization_and_revoke() {
     .unwrap();
     assert!(process.reload);
     process.apply(config.clone()).await.unwrap();
-    let renewed = reqwest::Client::builder()
+    let renewed = nexo_core::http_client_builder()
         .no_proxy()
-        .add_root_certificate(reqwest::Certificate::from_pem(replacement.pem().as_bytes()).unwrap())
+        .tls_backend_rustls()
+        .tls_certs_only([reqwest::Certificate::from_pem(replacement.pem().as_bytes()).unwrap()])
         .resolve(&svc.hostname, format!("[::1]:{port}").parse().unwrap())
         .timeout(Duration::from_secs(5))
         .build()
@@ -485,9 +487,10 @@ async fn real_caddy_direct_range_upload_upgrade_authorization_and_revoke() {
         ))
         .await
         .unwrap();
-    let renamed = reqwest::Client::builder()
+    let renamed = nexo_core::http_client_builder()
         .no_proxy()
-        .add_root_certificate(reqwest::Certificate::from_pem(replacement.pem().as_bytes()).unwrap())
+        .tls_backend_rustls()
+        .tls_certs_only([reqwest::Certificate::from_pem(replacement.pem().as_bytes()).unwrap()])
         .resolve(&svc.hostname, format!("[::1]:{port}").parse().unwrap())
         .timeout(Duration::from_secs(5))
         .build()

@@ -393,7 +393,7 @@ impl Process {
             log_task,
             child,
             admin: format!("http://{address}"),
-            client: reqwest::Client::builder()
+            client: nexo_core::http_client_builder()
                 .no_proxy()
                 .timeout(Duration::from_secs(5))
                 .build()?,

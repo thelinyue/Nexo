@@ -5,13 +5,7 @@
 
 use std::path::Path;
 
-use argon2::{
-    password_hash::{
-        rand_core::{OsRng, RngCore},
-        PasswordHash, PasswordHasher, PasswordVerifier, SaltString,
-    },
-    Argon2,
-};
+use argon2::{Argon2, PasswordHash, PasswordHasher, PasswordVerifier};
 use axum::{
     extract::State,
     http::{header, HeaderMap, HeaderValue, Request, StatusCode},
@@ -19,6 +13,7 @@ use axum::{
     response::{IntoResponse, Response},
     Extension, Json,
 };
+use rand::{rngs::SysRng, TryRng};
 use rusqlite::{params, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -110,7 +105,7 @@ pub fn ensure_admin(
     let generated = password.is_none_or(str::is_empty);
     let password = if generated {
         let mut bytes = [0_u8; 24];
-        OsRng
+        SysRng
             .try_fill_bytes(&mut bytes)
             .map_err(|_| anyhow::anyhow!("无法生成管理员密码：系统安全随机源不可用"))?;
         hex::encode(bytes)
@@ -458,7 +453,9 @@ pub fn create_recovery_code(
         "未找到唯一管理员；请用 --username 指定已启用的管理员账号"
     );
     let mut bytes = [0u8; 32];
-    OsRng.fill_bytes(&mut bytes);
+    SysRng
+        .try_fill_bytes(&mut bytes)
+        .map_err(|_| anyhow::anyhow!("无法生成恢复码：系统安全随机源不可用"))?;
     let code = hex::encode(bytes);
     let expires = unix_now() + 900;
     let tx = connection.unchecked_transaction()?;
@@ -580,10 +577,14 @@ pub(crate) fn create_session(
     headers: &HeaderMap,
 ) -> anyhow::Result<(String, String)> {
     let mut bytes = [0_u8; 32];
-    OsRng.fill_bytes(&mut bytes);
+    SysRng
+        .try_fill_bytes(&mut bytes)
+        .map_err(|_| anyhow::anyhow!("无法生成会话：系统安全随机源不可用"))?;
     let raw = hex::encode(bytes);
     let mut csrf_bytes = [0_u8; 32];
-    OsRng.fill_bytes(&mut csrf_bytes);
+    SysRng
+        .try_fill_bytes(&mut csrf_bytes)
+        .map_err(|_| anyhow::anyhow!("无法生成 CSRF 凭证：系统安全随机源不可用"))?;
     let csrf = hex::encode(csrf_bytes);
     let (browser, os) = session_labels(headers);
     connection.execute("INSERT INTO auth_sessions (id,user_id,tenant_id,session_digest,csrf_digest,created_at,last_seen_at,expires_at,browser,os) VALUES (?1,?2,?3,?4,?5,?6,?6,?7,?8,?9)", params![Uuid::new_v4().to_string(), user_id, tenant_id, digest(&raw), digest(&csrf), now, now + SESSION_SECONDS, browser, os])?;
@@ -644,12 +645,12 @@ pub(crate) fn digest(value: &str) -> String {
 }
 pub(crate) fn hash_password(value: &str) -> anyhow::Result<String> {
     Argon2::default()
-        .hash_password(value.as_bytes(), &SaltString::generate(&mut OsRng))
+        .hash_password(value.as_bytes())
         .map(|hash| hash.to_string())
         .map_err(|error| anyhow::anyhow!(error.to_string()))
 }
 pub(crate) fn verify_password(value: &str, hash: &str) -> bool {
-    PasswordHash::new(hash).ok().is_some_and(|parsed| {
+    hash.parse::<PasswordHash>().ok().is_some_and(|parsed| {
         Argon2::default()
             .verify_password(value.as_bytes(), &parsed)
             .is_ok()

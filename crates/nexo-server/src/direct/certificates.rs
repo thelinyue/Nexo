@@ -183,23 +183,7 @@ async fn issue(state: &AppState, device: &str, service: &Service, csr: &str) -> 
         if delay > 0 {
             tokio::time::sleep(Duration::from_secs(delay.into())).await;
         }
-        let mut config = hickory_resolver::config::ResolverConfig::new();
-        for address in resolvers {
-            let address: std::net::SocketAddr = address.parse().or_else(|_| {
-                address
-                    .parse::<std::net::IpAddr>()
-                    .map(|ip| std::net::SocketAddr::new(ip, 53))
-            })?;
-            config.add_name_server(hickory_resolver::config::NameServerConfig::new(
-                address,
-                hickory_resolver::config::Protocol::Udp,
-            ));
-        }
-        let resolver = if config.name_servers().is_empty() {
-            hickory_resolver::TokioAsyncResolver::tokio_from_system_conf()?
-        } else {
-            hickory_resolver::TokioAsyncResolver::tokio(config, Default::default())
-        };
+        let resolver = crate::domains::dns01_resolver(&resolvers)?;
         tokio::time::timeout(Duration::from_secs(timeout.into()), async {
             loop {
                 super::service(state, device, id, revision)?;
@@ -207,11 +191,7 @@ async fn issue(state: &AppState, device: &str, service: &Service, csr: &str) -> 
                 if resolver
                     .txt_lookup(&challenge_name)
                     .await
-                    .is_ok_and(|lookup| {
-                        lookup
-                            .iter()
-                            .any(|txt| txt.txt_data().concat() == value.as_bytes())
-                    })
+                    .is_ok_and(|lookup| crate::domains::txt_matches(&lookup, &value))
                 {
                     return anyhow::Ok(());
                 }

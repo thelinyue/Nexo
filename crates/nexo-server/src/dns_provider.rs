@@ -1,7 +1,7 @@
 //! DNS 提供商适配：记录 ID 和精确值用于撤销，错误不包含凭据或提供商原始响应。
 use anyhow::{Context, Result};
 use base64::Engine;
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -265,7 +265,7 @@ impl Zone {
     #[cfg(test)]
     pub(crate) fn mock(credential: Credential, endpoint: String) -> Self {
         Self {
-            client: reqwest::Client::builder().no_proxy().build().unwrap(),
+            client: nexo_core::http_client_builder().no_proxy().build().unwrap(),
             credential,
             name: "direct.test".into(),
             id: "zone".into(),
@@ -276,7 +276,7 @@ impl Zone {
     pub async fn discover(credential: Credential, domain: &str) -> Result<Self> {
         credential.validate()?;
         let mut zone = Self {
-            client: reqwest::Client::builder()
+            client: nexo_core::http_client_builder()
                 .timeout(Duration::from_secs(20))
                 .build()?,
             credential,
@@ -411,11 +411,12 @@ impl Zone {
                 );
                 let timestamp = now.unix_timestamp();
                 let body = serde_json::to_string(&payload)?;
-                let canonical = format!("POST\n/\n\ncontent-type:application/json; charset=utf-8\nhost:dnspod.tencentcloudapi.com\n\ncontent-type;host\n{:x}",Sha256::digest(body.as_bytes()));
+                let body_digest = hex::encode(Sha256::digest(body.as_bytes()));
+                let canonical = format!("POST\n/\n\ncontent-type:application/json; charset=utf-8\nhost:dnspod.tencentcloudapi.com\n\ncontent-type;host\n{body_digest}");
                 let scope = format!("{date}/dnspod/tc3_request");
                 let to_sign = format!(
-                    "TC3-HMAC-SHA256\n{timestamp}\n{scope}\n{:x}",
-                    Sha256::digest(canonical.as_bytes())
+                    "TC3-HMAC-SHA256\n{timestamp}\n{scope}\n{}",
+                    hex::encode(Sha256::digest(canonical.as_bytes()))
                 );
                 let date_key = mac(format!("TC3{secret_key}").as_bytes(), date.as_bytes());
                 let service_key = mac(&date_key, b"dnspod");

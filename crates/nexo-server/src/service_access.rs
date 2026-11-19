@@ -9,7 +9,7 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use rand::RngCore;
+use rand::{rngs::SysRng, TryRng};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -403,7 +403,9 @@ async fn login_inner(
         return Err(ApiError::new(StatusCode::UNAUTHORIZED, "密码错误，请重试"));
     }
     let mut bytes = [0u8; 32];
-    rand::rngs::OsRng.fill_bytes(&mut bytes);
+    SysRng
+        .try_fill_bytes(&mut bytes)
+        .map_err(|_| db_error("无法生成服务访问凭证：系统安全随机源不可用"))?;
     let raw = hex::encode(bytes);
     let db = state.db.lock().map_err(|_| db_error("数据库锁不可用"))?;
     let current = service(state, &db, headers)?;

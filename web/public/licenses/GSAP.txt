@@ -1,5 +1,5 @@
-GSAP 3.12.7 and Flip
-Copyright 2008-2025 GreenSock. All rights reserved.
+GSAP 3.15.1 and Flip
+Copyright 2008-2026 GreenSock. All rights reserved.
 
 Standard GSAP License
 Source: https://gsap.com/standard-license/

@@ -1733,13 +1733,14 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
         let root_pem = fs::read(cfg.storage_root.join("pki/authorities/local/root.crt")).unwrap();
-        let client = reqwest::Client::builder()
+        let client = nexo_core::http_client_builder()
             .no_proxy()
             .http1_only()
             .pool_max_idle_per_host(0)
             .redirect(reqwest::redirect::Policy::none())
             .timeout(Duration::from_secs(5))
-            .add_root_certificate(reqwest::Certificate::from_pem(&root_pem).unwrap())
+            .tls_backend_rustls()
+            .tls_certs_only([reqwest::Certificate::from_pem(&root_pem).unwrap()])
             .resolve("nas.lan-redirect.localhost", https_address)
             .resolve("http.lan-redirect.localhost", http_address)
             .resolve("other.lan-redirect.localhost", https_address)
@@ -1987,10 +1988,11 @@ mod tests {
         let status = state.domain_runtime.status(&domain.id);
         assert!(status.certificates[0].expires_at.unwrap() > unix_now());
         let root_pem = fs::read(cfg.storage_root.join("pki/authorities/local/root.crt")).unwrap();
-        let client = reqwest::Client::builder()
+        let client = nexo_core::http_client_builder()
             .no_proxy()
             .tls_info(true)
-            .add_root_certificate(reqwest::Certificate::from_pem(&root_pem).unwrap())
+            .tls_backend_rustls()
+            .tls_certs_only([reqwest::Certificate::from_pem(&root_pem).unwrap()])
             .resolve("caddy-integration.localhost", https_address)
             .resolve("nas.caddy-integration.localhost", https_address)
             .resolve("media.caddy-integration.localhost", https_address)

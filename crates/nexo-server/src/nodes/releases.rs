@@ -21,7 +21,7 @@ pub struct Release {
 }
 
 pub async fn catalog() -> Result<Vec<Release>, ApiError> {
-    let response = reqwest::Client::builder()
+    let response = nexo_core::http_client_builder()
         .timeout(std::time::Duration::from_secs(15))
         .build()
         .map_err(db_error)?

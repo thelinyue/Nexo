@@ -15,12 +15,12 @@ jobs:
     timeout-minutes: 45
     steps:
       - name: 检出源码
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: 安装固定 Rust 工具链
         run: |
-          rustup toolchain install 1.89.0 --profile minimal --component rustfmt,clippy
-          rustup default 1.89.0
+          rustup toolchain install 1.100.0 --profile minimal --component rustfmt,clippy
+          rustup default 1.100.0
 
       - name: Rust 格式检查
         run: cargo fmt --all -- --check
@@ -39,9 +39,9 @@ jobs:
           docker run --rm --network none -e NEXO_INSTALLER_TEST=1 -v "$PWD:/src:ro" python:3.12-bookworm python3 /src/docker/test_node_installer.py
       - name: 发布规则测试
         run: python3 -m unittest discover -s .github/scripts -p 'test_*.py'
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
-          node-version: 22.16.0
+          node-version: 26.13.1
           cache: npm
           cache-dependency-path: web/package-lock.json
       - name: 使用宿主机验证部署命令
@@ -58,7 +58,7 @@ jobs:
     outputs:
       version: ${{ steps.lock.outputs.version }}
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: 从锁文件取得 Playwright 版本
         id: lock
         run: echo "version=$(node -p "require('./web/package-lock.json').packages['node_modules/@playwright/test'].version")" >> "$GITHUB_OUTPUT"
@@ -78,10 +78,10 @@ jobs:
       run:
         working-directory: web
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
-          node-version: 22.16.0
+          node-version: 26.13.1
           cache: npm
           cache-dependency-path: web/package-lock.json
       - name: 安装 Web 依赖

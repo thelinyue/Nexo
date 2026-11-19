@@ -4,7 +4,7 @@
 //! 以及日志中只保存摘要，避免服务端持久化可直接入网的秘密。
 
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
-use rand::{rngs::OsRng, RngCore};
+use rand::{rngs::SysRng, TryRng};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -41,6 +41,8 @@ pub enum EnrollmentError {
     Expired,
     #[error("入网凭证不匹配")]
     InvalidToken,
+    #[error("无法生成入网凭证：系统安全随机源不可用")]
+    RandomUnavailable,
 }
 
 impl EnrollmentToken {
@@ -51,7 +53,9 @@ impl EnrollmentToken {
         }
 
         let mut bytes = [0_u8; 32];
-        OsRng.fill_bytes(&mut bytes);
+        SysRng
+            .try_fill_bytes(&mut bytes)
+            .map_err(|_| EnrollmentError::RandomUnavailable)?;
         let secret = URL_SAFE_NO_PAD.encode(bytes);
         Ok(Self {
             digest: Self::digest(&secret),

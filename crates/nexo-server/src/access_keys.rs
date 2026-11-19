@@ -3,10 +3,10 @@
 use crate::*;
 use chacha20poly1305::{
     aead::{Aead, KeyInit, Payload},
-    ChaCha20Poly1305, Nonce,
+    ChaCha20Poly1305,
 };
 use nexo_protocol::AgentRegistrationResponse;
-use rand::{rngs::OsRng, RngCore};
+use rand::{rngs::SysRng, TryRng};
 
 #[derive(Serialize)]
 pub(crate) struct AccessKey {
@@ -28,7 +28,9 @@ fn cipher(state: &AppState, db: &Connection) -> Result<ChaCha20Poly1305> {
                 "接入密钥加密文件缺失，请从服务端数据备份恢复 secrets/agent-access.key"
             );
             let mut key = [0u8; 32];
-            OsRng.fill_bytes(&mut key);
+            SysRng
+                .try_fill_bytes(&mut key)
+                .map_err(|_| anyhow::anyhow!("无法生成接入主密钥：系统安全随机源不可用"))?;
             nexo_tunnel::identity::write_private_file(&path, &key)?;
             key.to_vec()
         }
@@ -49,15 +51,15 @@ fn read_key(
     let Some((bytes, created_at, updated_at)) = row else {
         return Ok(None);
     };
-    if bytes.len() < 12 {
-        return Err(db_error("接入密钥密文损坏"));
-    }
+    let (nonce, encrypted) = bytes
+        .split_first_chunk::<12>()
+        .ok_or_else(|| db_error("接入密钥密文损坏"))?;
     let plain = cipher(state, db)
         .map_err(db_error)?
         .decrypt(
-            Nonce::from_slice(&bytes[..12]),
+            nonce.into(),
             Payload {
-                msg: &bytes[12..],
+                msg: encrypted,
                 aad: tenant.as_bytes(),
             },
         )
@@ -105,13 +107,17 @@ fn save(state: &AppState, headers: &HeaderMap, reset: bool) -> Result<AccessKey,
     }
     let cipher = cipher(state, &db).map_err(db_error)?;
     let mut secret = [0u8; 32];
-    OsRng.fill_bytes(&mut secret);
+    SysRng
+        .try_fill_bytes(&mut secret)
+        .map_err(|_| db_error("无法生成接入密钥：系统安全随机源不可用"))?;
     let token = format!("nexo_join_{}", hex::encode(secret));
     let mut nonce = [0u8; 12];
-    OsRng.fill_bytes(&mut nonce);
+    SysRng
+        .try_fill_bytes(&mut nonce)
+        .map_err(|_| db_error("无法生成接入密钥加密参数：系统安全随机源不可用"))?;
     let encrypted = cipher
         .encrypt(
-            Nonce::from_slice(&nonce),
+            (&nonce).into(),
             Payload {
                 msg: token.as_bytes(),
                 aad: session.tenant_id.as_bytes(),
@@ -440,7 +446,7 @@ mod tests {
         let url = format!("http://{}", listener.local_addr().unwrap());
         let app = router(state.clone());
         let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let client = nexo_core::http_client_builder().no_proxy().build().unwrap();
         let own: serde_json::Value = client
             .post(format!("{url}/api/v1/agent-access-key"))
             .headers(alice.clone())

@@ -57,8 +57,8 @@ cargo test -p nexo-agent real_caddy_direct_range_upload_upgrade_authorization_an
 旧脚本的假 Cloudflare 凭据会触发真实 DNS API，不能靠忽略就绪错误使测试通过。现在使用仅编译进 Rust 测试程序的 DNS Zone 替身和该夹具自行生成的 CA，仍执行真实入口探测、状态协调和转发。正式 Server 二进制没有 DNS 替身或测试 CA 环境变量入口；脚本未提供测试程序时会在写入假凭据之前明确报错。节点及普通 Agent 仍使用正常构建的二进制。测试不会安装系统信任，不使用生产数据库或公网 80/443 端口。
 
 ```powershell
-cargo +1.89.0 build --workspace --locked
-$artifacts = cargo +1.89.0 test -p nexo-server -p nexo-agent --no-run --locked --message-format=json | ForEach-Object { $_ | ConvertFrom-Json }
+cargo +1.100.0 build --workspace --locked
+$artifacts = cargo +1.100.0 test -p nexo-server -p nexo-agent --no-run --locked --message-format=json | ForEach-Object { $_ | ConvertFrom-Json }
 $serverTest = ($artifacts | Where-Object { $_.reason -eq 'compiler-artifact' -and $_.profile.test -and $_.target.name -eq 'nexo-server' } | Select-Object -Last 1).executable
 $agentTest = ($artifacts | Where-Object { $_.reason -eq 'compiler-artifact' -and $_.profile.test -and $_.target.name -eq 'nexo-agent' } | Select-Object -Last 1).executable
 python docker/tunnel-smoke.py --server-bin target/debug/nexo-server.exe --server-test-bin $serverTest --agent-bin target/debug/nexo-agent.exe --agent-test-bin $agentTest --caddy-bin $env:NEXO_TEST_CADDY_BIN --report .edge-screenshot/traffic-eye-runtime/tunnel-report.json
@@ -78,7 +78,7 @@ python docker/node-port-smoke.py --server-bin target/debug/nexo-server.exe --ser
 ```powershell
 $env:NEXO_GEOIP_DATABASE = 'C:\path\to\GeoIP2-Country-Test.mmdb'
 $env:NEXO_GEOIP_ASN_DATABASE = 'C:\path\to\GeoLite2-ASN-Test.mmdb'
-cargo +1.89.0 test -p nexo-core real_mmdb_classification_and_unavailable_database_fallback --locked -- --ignored --nocapture
+cargo +1.100.0 test -p nexo-core real_mmdb_classification_and_unavailable_database_fallback --locked -- --ignored --nocapture
 Remove-Item Env:NEXO_GEOIP_DATABASE, Env:NEXO_GEOIP_ASN_DATABASE
 ```
 

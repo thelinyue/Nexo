@@ -53,14 +53,19 @@ pub(crate) async fn probe_with_roots(
                 .context("公网 TCP 入口连接失败")?;
             return Ok(());
         }
-        let mut builder = reqwest::Client::builder()
+        let builder = nexo_core::http_client_builder();
+        let builder = if roots.is_empty() {
+            builder
+        } else {
+            builder
+                .tls_backend_rustls()
+                .tls_certs_only(roots.iter().cloned())
+        };
+        let builder = builder
             .no_proxy()
             .redirect(reqwest::redirect::Policy::none())
             .timeout(Duration::from_secs(3))
             .resolve(host, SocketAddr::new(ip.into(), port));
-        for root in roots {
-            builder = builder.add_root_certificate(root.clone());
-        }
         let mut url = reqwest::Url::parse(&format!("{}://{host}{PROBE_PATH}", target.kind))?;
         url.set_port(Some(port))
             .map_err(|_| anyhow::anyhow!("公网探测端口无效"))?;

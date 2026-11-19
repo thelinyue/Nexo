@@ -104,13 +104,14 @@ async fn real_caddy_access_password_cookie_proxy_and_lan_priority() {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     let cert = fs::read(cfg.storage_root.join("pki/authorities/local/root.crt")).unwrap();
-    let client = reqwest::Client::builder()
+    let client = nexo_core::http_client_builder()
         .no_proxy()
         .http1_only()
         .pool_max_idle_per_host(0)
         .redirect(reqwest::redirect::Policy::none())
         .timeout(Duration::from_secs(5))
-        .add_root_certificate(reqwest::Certificate::from_pem(&cert).unwrap())
+        .tls_backend_rustls()
+        .tls_certs_only([reqwest::Certificate::from_pem(&cert).unwrap()])
         .resolve("web.access.localhost", https)
         .resolve("public.access.localhost", https)
         .resolve("plain.access.localhost", http)

@@ -13,13 +13,13 @@ yamux.workspace = true
 anyhow.workspace = true
 quinn.workspace = true
 argon2.workspace = true
-chacha20poly1305 = "0.10"
+chacha20poly1305 = "0.11"
 rand.workspace = true
 axum.workspace = true
 clap.workspace = true
 hex.workspace = true
 idna = "1"
-hickory-resolver = "0.24"
+hickory-resolver = "0.26"
 reqwest.workspace = true
 x509-parser = "0.18"
 nexo-core = { path = "../nexo-core" }
@@ -38,8 +38,8 @@ tracing-subscriber.workspace = true
 uuid.workspace = true
 
 instant-acme = { version = "0.8.5", default-features = false, features = ["ring", "hyper-rustls"] }
-hmac = "0.12"
-sha1 = "0.10"
+hmac = "0.13"
+sha1 = "0.11"
 base64.workspace = true
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
 

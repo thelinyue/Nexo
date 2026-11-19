@@ -1,5 +1,5 @@
 # Nexo Server 镜像：Rust API/Web/Tunnel + Caddy 公网入口。
-FROM node:22.16.0-alpine@sha256:41e4389f3d988d2ed55392df4db1420ad048ae53324a8e2b7c6d19508288107e AS web-build
+FROM node:26.13.1-alpine@sha256:6bd9ab43c0ec0190ca7b2d193906cb8b7edf6e7f4afa43ddeccd6452710bffb5 AS web-build
 WORKDIR /src/web
 COPY web/package.json web/package-lock.json ./
 RUN npm ci --ignore-scripts
@@ -7,7 +7,7 @@ COPY web/ ./
 COPY compose.agent.yml /src/compose.agent.yml
 RUN npm run build
 
-FROM rust:1.89-bookworm@sha256:948f9b08a66e7fe01b03a98ef1c7568292e07ec2e4fe90d88c07bb14563c84ff AS rust-build
+FROM rust:1.100.0-bookworm@sha256:ade39a710ef85f3506cffcfec3e8a24ba090badef1dff2fb798f71d878833fea AS rust-build
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY release-manifest.json ./
@@ -17,9 +17,9 @@ COPY migrations ./migrations
 COPY docker/install-node.sh ./docker/install-node.sh
 COPY web/src/data/hd-icons.json ./web/src/data/hd-icons.json
 COPY --from=web-build /src/web/dist ./web/dist
-RUN cargo build --release -p nexo-server
+RUN cargo build --release --locked -p nexo-server
 
-FROM golang:1.27.1-bookworm@sha256:69a7b9788769bec032d238959b61854e9ae87f57be9029ec04e9885fabf99195 AS caddy-base
+FROM golang:1.27.4-bookworm@sha256:4fa7c968ba93f1635670522dbb01a2c78150443e1385746924566079f36570ea AS caddy-base
 ARG CADDY_VERSION=2.11.9
 ARG XCADDY_VERSION=0.4.7
 ENV CGO_ENABLED=0
@@ -44,7 +44,7 @@ RUN /go/bin/xcaddy build "v${CADDY_VERSION}" \
     && /usr/local/bin/caddy version | grep -q "v${CADDY_VERSION}" \
     && /usr/local/bin/caddy list-modules | grep -q "dns.providers.cloudflare"
 
-FROM debian:bookworm-slim@sha256:88200866dfff7ea7f5cbcb6ec7c8a701889efe6fe859fe64d6990e4b07ea4171
+FROM debian:bookworm-slim@sha256:734a72b3d6142a71993b4bc580ca01d8ca687f77a2c422d96a961d3376b179bc
 ARG NEXO_VERSION=0.2.13
 ARG NEXO_REVISION=unknown
 ARG TARGETARCH=amd64

@@ -396,7 +396,7 @@ pub async fn reconcile(state: &AppState) -> Result<()> {
 /// 固定目标 IPv6，保留域名/SNI 和证书校验；失败仅用于诊断，不改变 DNS。
 async fn probe(service: &Service) -> Result<()> {
     let operation = async {
-        let client = reqwest::Client::builder()
+        let client = nexo_core::http_client_builder()
             .no_proxy()
             .redirect(reqwest::redirect::Policy::none())
             .timeout(std::time::Duration::from_secs(5))

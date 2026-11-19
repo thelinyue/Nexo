@@ -1,17 +1,17 @@
 # Nexo Agent 镜像：包含 Tunnel 运行时与按需启动的 IPv6 直连 Caddy。
-FROM rust:1.89-bookworm@sha256:948f9b08a66e7fe01b03a98ef1c7568292e07ec2e4fe90d88c07bb14563c84ff AS rust-build
+FROM rust:1.100.0-bookworm@sha256:ade39a710ef85f3506cffcfec3e8a24ba090badef1dff2fb798f71d878833fea AS rust-build
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
 COPY config ./config
 COPY migrations ./migrations
-RUN cargo build --release -p nexo-agent
+RUN cargo build --release --locked -p nexo-agent
 
-FROM golang:1.27.1-bookworm@sha256:69a7b9788769bec032d238959b61854e9ae87f57be9029ec04e9885fabf99195 AS caddy-build
+FROM golang:1.27.4-bookworm@sha256:4fa7c968ba93f1635670522dbb01a2c78150443e1385746924566079f36570ea AS caddy-build
 RUN go install github.com/caddyserver/xcaddy/cmd/xcaddy@v0.4.7 \
     && /go/bin/xcaddy build v2.11.9 --output /usr/local/bin/caddy
 
-FROM debian:bookworm-slim@sha256:88200866dfff7ea7f5cbcb6ec7c8a701889efe6fe859fe64d6990e4b07ea4171
+FROM debian:bookworm-slim@sha256:734a72b3d6142a71993b4bc580ca01d8ca687f77a2c422d96a961d3376b179bc
 ARG NEXO_VERSION=0.2.13
 ARG NEXO_REVISION=unknown
 RUN apt-get update \

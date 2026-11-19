@@ -266,7 +266,7 @@ async fn router_enforces_scope_csrf_updates_and_reset_independence() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
     let task = tokio::spawn(axum::serve(listener, router(state.clone())).into_future());
-    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+    let client = nexo_core::http_client_builder().no_proxy().build().unwrap();
     for (headers, path, status, used) in [
         (&alice, "/api/v1/traffic/quota", 200, 80),
         (&admin, "/api/v1/traffic/quota", 200, 0),
