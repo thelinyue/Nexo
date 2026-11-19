@@ -31,8 +31,13 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: python3 .github/scripts/release.py scope
 
-  node-packages:
+  verify:
+    name: 发布前检查
     needs: scope
+    uses: ./.github/workflows/ci.yml
+
+  node-packages:
+    needs: [scope, verify]
     if: needs.scope.outputs.node == 'true' && needs.scope.outputs.published == 'false'
     strategy:
       fail-fast: false
@@ -57,7 +62,7 @@ jobs:
           overwrite: true
 
   images:
-    needs: scope
+    needs: [scope, verify]
     if: needs.scope.outputs.images != '[]'
     strategy:
       fail-fast: false
@@ -147,11 +152,11 @@ jobs:
           overwrite: true
 
   publish:
-    needs: [scope, node-packages, images]
-    # 所选构建必须成功，跳过的组件不阻塞发布。
+    needs: [scope, verify, node-packages, images]
+    # 发布前检查和选中的构建都必须成功，跳过的组件不阻塞发布。
     if: >-
       ${{
-        !cancelled() && needs.scope.result == 'success' &&
+        !cancelled() && needs.scope.result == 'success' && needs.verify.result == 'success' &&
         (needs.scope.outputs.images == '[]' || needs.images.result == 'success') &&
         (needs.scope.outputs.node == 'false' || needs.scope.outputs.published == 'true' || needs.node-packages.result == 'success')
       }}
