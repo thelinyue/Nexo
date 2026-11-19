@@ -2,8 +2,6 @@ import { openServiceEditor, selectServiceOption } from "./service-actions";
 import { expect, test } from "@playwright/test";
 import { installApiMocks } from "./api-mocks";
 
-const visiblePage = (page: import("@playwright/test").Page) => page.locator(".page-slot:not([hidden])");
-
 test("网页类型包含 HTTP 和 HTTPS，内网 IPv6 地址单行展示并完整复制", async ({ page }, info) => {
   const state = await installApiMocks(page);
   const ip = "fd12:3456:789a:bcde:1234:5678:90ab:cdef";
@@ -57,24 +55,6 @@ test("导航入口、旧链接和不存在的详情均可返回", async ({ page 
   await expect(page.getByRole("heading", { level: 1 })).toHaveText("首页");
 });
 
-test("详情显示完整地址，返回保留搜索与滚动位置", async ({ page }) => {
-  const state = await installApiMocks(page);
-  state.tunnels = Array.from({ length: 20 }, (_, index) => ({ ...state.tunnels[0], id: `t-${index}`, name: `媒体中心 ${index}` }));
-  await page.goto("/#/services");
-  await page.getByRole("textbox", { name: "搜索服务" }).fill("媒体");
-  const target = page.getByRole("link", { name: "媒体中心 12", exact: true });
-  // 名称进入视口中部，避免底部浮层遮挡后由自动点击额外滚动。
-  await target.evaluate(el => el.scrollIntoView({ block: "center" }));
-  const scroll = await page.evaluate(() => window.scrollY);
-  await target.click();
-  await expect(page.getByRole("dialog", { name: "媒体中心 12", exact: true })).toBeVisible();
-  await expect(page.locator(".detail-field code").first()).toHaveText(state.tunnels[0].public_address);
-  await page.keyboard.press("Escape");
-  await expect(page.getByRole("dialog")).toHaveCount(0);
-  await expect(page.getByRole("textbox", { name: "搜索服务" })).toHaveValue("媒体");
-  await expect.poll(() => page.evaluate(() => window.scrollY)).toBeCloseTo(scroll, -1);
-});
-
 test("服务详情的地址复制和操作区保持紧凑", async ({ page }, testInfo) => {
   await installApiMocks(page);
   await page.goto("/#/services/t-1");
@@ -100,7 +80,7 @@ test("服务详情的地址复制和操作区保持紧凑", async ({ page }, tes
   await page.screenshot({ path: testInfo.outputPath("service-detail.png") });
 });
 
-test("小屏服务详情滚动后仍可操作", async ({ page }, testInfo) => {
+test("小屏服务详情滚动后仍可操作", { tag: "@mobile" }, async ({ page }, testInfo) => {
   test.skip(testInfo.project.name !== "mobile-light", "只验证最窄的手机布局");
   const state = await installApiMocks(page);
   state.tunnels[0].name = "一个很长很长的家庭内网服务名称";
@@ -143,19 +123,6 @@ for (const protocol of ["tcp", "http", "https"]) {
     expect(call.body.public_domain_id).toBe(protocol === "tcp" ? null : "d-1");
   });
 }
-
-test("编辑预填域名，保存不丢失原配置", async ({ page }) => {
-  const state = await installApiMocks(page);
-  await page.goto("/#/services/t-1");
-  await page.getByRole("button", { name: "编辑服务" }).click();
-  const dialog = page.getByRole("dialog", { name: "编辑服务" });
-  await expect(dialog.getByRole("combobox", { name: "根域名", exact: true })).toContainText("example.com");
-  await expect(dialog.getByRole("combobox", { name: "根域名", exact: true })).toBeEnabled();
-  await dialog.getByLabel("服务名称").fill("改名的服务");
-  await dialog.getByRole("button", { name: "保存服务" }).click();
-  await expect(visiblePage(page).locator(".service-detail h2")).toHaveText("改名的服务");
-  expect(state.calls.find(item => item.method === "PUT")?.body.public_domain_id).toBe("d-1");
-});
 
 test("未保存保护、弹层焦点约束与关闭后恢复", async ({ page }) => {
   await installApiMocks(page);
@@ -242,37 +209,6 @@ test("复制失败有说明，服务启停失败不伪报成功", async ({ page 
   await expect(page.getByRole("button", { name: "关闭服务", exact: true })).toBeEnabled();
 });
 
-test("公网 HTTP 页面可复制服务地址和弹窗内的 Compose 配置", async ({ page, browserName }) => {
-  test.skip(browserName !== "chromium", "验证 Chromium 中非安全上下文的同步复制回退");
-  await page.route("http://copy.example.test:4173/**", async route => {
-    const response = await route.fetch({ url: route.request().url().replace("copy.example.test", "127.0.0.1") });
-    await route.fulfill({ response });
-  });
-  await page.addInitScript(() => {
-    const original = document.execCommand.bind(document);
-    document.execCommand = command => {
-      if (command === "copy") (window as any).copiedFallback = (document.activeElement as HTMLTextAreaElement).value;
-      return original(command);
-    };
-  });
-  const state = await installApiMocks(page);
-  await page.goto("http://copy.example.test:4173/#/services");
-  expect(await page.evaluate(() => window.isSecureContext)).toBe(false);
-  await page.getByRole("link", { name: "媒体中心", exact: true }).click();
-  await page.getByRole("button", { name: "复制公网地址", exact: true }).click();
-  await expect(page.getByRole("status")).toHaveText("已复制");
-  expect(await page.evaluate(() => (window as any).copiedFallback)).toBe(state.tunnels[0].public_address);
-
-  await page.keyboard.press("Escape");
-  await expect(page.locator(".application-modal")).toHaveCount(0);
-  await page.goto("http://copy.example.test:4173/#/agents");
-  await page.getByRole("button", { name: "添加设备", exact: true }).click();
-  const dialog = page.getByRole("dialog", { name: "添加设备" });
-  await dialog.getByRole("button", { name: "复制 Compose 配置", exact: true }).click();
-  await expect(dialog.getByRole("status")).toHaveText("已复制");
-  expect(await page.evaluate(() => (window as any).copiedFallback)).toContain("nexo_join_shared-test-key");
-});
-
 test("设备离线可见，批准表单和删除错误可重试", async ({ page }) => {
   const state = await installApiMocks(page);
   await page.goto("/#/agents");
@@ -291,17 +227,6 @@ test("设备离线可见，批准表单和删除错误可重试", async ({ page 
   state.failures.clear();
   await confirm.getByRole("button", { name: "删除设备", exact: true }).click();
   await expect(page.getByRole("heading", { level: 1 })).toHaveText("设备");
-});
-
-test("共享接入密钥可复制且不写入浏览器存储", async ({ page }) => {
-  await installApiMocks(page);
-  await page.goto("/#/agents");
-  await page.getByRole("button", { name: "添加设备", exact: true }).click();
-  await expect(page.locator(".token")).toContainText("nexo_join_");
-  await page.getByText("高级：接入密钥", { exact: true }).click();
-  await expect(page.getByRole("button", { name: "复制接入密钥" })).toBeVisible();
-  const stored = await page.evaluate(() => JSON.stringify({ ...localStorage, ...sessionStorage }));
-  expect(stored).not.toContain("nexo_join_");
 });
 
 test("密码错误保留输入，成功后返回登录；会话列表失败可重试", async ({ page }) => {
@@ -367,36 +292,6 @@ test("登录使用可自动填充的单栏表单且不再提供网页初始化",
   expect(state.calls.some(call => call.path === "/api/v1/auth/initialize")).toBeFalsy();
   expect(state.calls.some(call => call.path === "/api/v1/auth/login")).toBeTruthy();
   await expect(page.getByRole("heading", { level: 1 })).toHaveText("首页");
-});
-
-test("浏览器返回不能切走正在编辑的表单", async ({ page }) => {
-  await installApiMocks(page);
-  await page.goto("/#/home");
-  const nav = page.locator((page.viewportSize()?.width ?? 0) <= 900 ? ".bottom-nav" : ".sidebar nav");
-  await nav.getByRole("link", { name: "服务", exact: true }).click();
-  await openServiceEditor(page);
-  const editor = page.getByRole("dialog", { name: "创建服务" });
-  await editor.getByLabel("服务名称").fill("未保存内容");
-  await page.goBack();
-  await expect(page).toHaveURL(/#\/services$/);
-  await expect(editor.getByLabel("服务名称")).toHaveValue("未保存内容");
-  await expect(page.getByRole("dialog", { name: "放弃未保存的修改？" })).toHaveCount(0);
-  await editor.getByRole("button", { name: "取消", exact: true }).click();
-  await page.getByRole("button", { name: "放弃修改", exact: true }).click();
-  await expect(editor).toBeHidden();
-});
-
-test("尚无设备时禁止保存并说明如何接入设备", async ({ page }) => {
-  const state = await installApiMocks(page); state.devices = [];
-  await page.goto("/#/services");
-  await openServiceEditor(page);
-  const editor = page.getByRole("dialog", { name: "创建服务" });
-  await editor.getByLabel("服务名称").fill("等待设备的服务");
-  await expect(editor.getByRole("button", { name: "保存服务" })).toBeDisabled();
-  await expect(editor.getByText("请关闭表单，到设备页添加设备。", { exact: true })).toBeVisible();
-  await page.evaluate(() => { window.location.hash = "#/agents"; });
-  await expect(page).toHaveURL(/#\/services$/);
-  await expect(editor.getByLabel("服务名称")).toHaveValue("等待设备的服务");
 });
 
 test("域名操作失败保留表单，删除失败可重试", async ({ page }) => {

@@ -11,6 +11,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import secrets
 import shutil
 import socket
 import sqlite3
@@ -50,14 +51,22 @@ class NodeHarness(smoke.Harness):
             config["caddy.http_listen"] = f":{self.args.http_port}"
         return super().launch(name, binary, config)
 
-    def request_node(self, host, secure=False, path="/"):
+    def request_node(self, host, secure=False, path="/", *, payload=None, headers=None):
         port = self.args.https_port if secure else self.args.http_port
         stream = socket.create_connection((self.args.node_ip, port), timeout=5)
         if secure:
             ca = self.root / "server/caddy-storage/pki/authorities/local/root.crt"
             stream = ssl.create_default_context(cafile=str(ca)).wrap_socket(stream, server_hostname=host)
         with stream:
-            stream.sendall(f"GET {path} HTTP/1.1\r\nHost: {host}:{port}\r\nConnection: close\r\n\r\n".encode())
+            method = "GET"
+            body = b""
+            fields = {"Host": f"{host}:{port}", "Connection": "close", **(headers or {})}
+            if payload is not None:
+                method = "POST"
+                body = json.dumps(payload).encode()
+                fields.update({"Content-Type": "application/json", "Content-Length": str(len(body))})
+            head = "".join(f"{name}: {value}\r\n" for name, value in fields.items())
+            stream.sendall(f"{method} {path} HTTP/1.1\r\n{head}\r\n".encode() + body)
             response = http.client.HTTPResponse(stream)
             response.begin()
             return response.status, dict(response.getheaders()), response.read()
@@ -86,6 +95,13 @@ class NodeHarness(smoke.Harness):
                 services.append(self.api("tunnels", "POST", {"name":host, "protocol":protocol, "device_id":device, "local_address":"127.0.0.1", "local_port":origin.server_address[1], "hostname":host, "public_domain_id":domain["id"], "https_port":self.args.https_port, "compression_enabled": protocol == "https"}))
             tcp = self.api("tunnels", "POST", {"name":"tcp", "protocol":"tcp", "device_id":device,
                 "local_address":"127.0.0.1", "local_port":origin.server_address[1], "compression_enabled":True})
+            access_password = secrets.token_urlsafe(9)
+            protected = self.api("tunnels", "POST", {
+                "name": "locked", "protocol": "http", "device_id": device,
+                "local_address": "127.0.0.1", "local_port": origin.server_address[1],
+                "hostname": "locked", "public_domain_id": domain["id"],
+                "access_mode": "password", "access_password": access_password,
+            })
             assert services[0]["public_address"] == f"http://web.nexo-smoke.localhost:{self.args.http_port}"
             assert services[1]["public_address"] == f"https://secure.nexo-smoke.localhost:{self.args.https_port}"
             self.check("服务地址显示自定义 HTTP/HTTPS 公网端口")
@@ -111,7 +127,7 @@ class NodeHarness(smoke.Harness):
             with sqlite3.connect(self.root / "server/nexo.db") as db:
                 db.execute("UPDATE relay_nodes SET public_ipv4=? WHERE id=?", (self.args.node_ip, node_id))
                 db.execute("INSERT INTO relay_node_grants VALUES(?,?)", (node_id, services[0]["tenant_id"]))
-                for service in [*services, tcp]:
+                for service in [*services, tcp, protected]:
                     db.execute("DELETE FROM service_nodes WHERE service_id=?", (service["id"],))
                     db.execute("INSERT INTO service_nodes VALUES(?,?)", (service["id"], node_id))
                 # 覆盖节点跳转路由；隧道表单当前未开放强制 HTTPS，此处仅设置测试快照。
@@ -119,8 +135,10 @@ class NodeHarness(smoke.Harness):
                 db.execute("INSERT INTO relay_certificates(service_id,hostname,chain,expires_at,retry_at) VALUES(?,?,?,?,?)", (services[1]["id"], "secure.nexo-smoke.localhost", (cert_dir / "secure.nexo-smoke.localhost.crt").read_text(), int(time.time())+3600, int(time.time())+86400))
             log = open(self.root / "node.log", "wb")
             self.logs.append(log)
-            environment = dict(os.environ, NEXO_CADDY_BINARY=str(Path(self.args.caddy_bin).resolve()))
-            node = subprocess.Popen([str(Path(self.args.server_bin).resolve()), "--data-dir", str(node_dir), "node"], env=environment, stdout=log, stderr=subprocess.STDOUT)
+            node_binary = Path(self.args.node_bin or self.args.server_bin).resolve()
+            node_caddy = Path(self.args.node_caddy_bin or self.args.caddy_bin).resolve()
+            environment = dict(os.environ, NEXO_CADDY_BINARY=str(node_caddy))
+            node = subprocess.Popen([str(node_binary), "--data-dir", str(node_dir), "node"], env=environment, stdout=log, stderr=subprocess.STDOUT)
             self.node_process = node
             self.processes.append(node)
             smoke.wait_for(lambda: self.request_node("web.nexo-smoke.localhost")[0] == 200, "HTTP 节点转发", timeout=75)
@@ -135,9 +153,38 @@ class NodeHarness(smoke.Harness):
             self.check(f"HTTP 跳转保留 HTTPS {self.args.https_port} 及原始路径和参数")
             def healthy():
                 with sqlite3.connect(self.root / "server/nexo.db") as db:
-                    return db.execute("SELECT COUNT(*) FROM relay_public_health WHERE node_id=? AND healthy=1", (node_id,)).fetchone()[0] == 2
+                    return db.execute(
+                        "SELECT COUNT(*) FROM relay_public_health WHERE node_id=? AND service_id IN (?, ?) AND healthy=1",
+                        (node_id, services[0]["id"], services[1]["id"]),
+                    ).fetchone()[0] == 2
             smoke.wait_for(healthy, "管理 Server 在自定义端口完成连续三次公网入口探测", timeout=90)
             self.check("管理 Server 在实际 HTTP/HTTPS 端口完成健康探测")
+            def node_health():
+                with self.opener.open("http://127.0.0.1:8282/health", timeout=3) as response:
+                    return json.load(response)
+            health = smoke.wait_for(node_health, "节点回环健康接口")
+            version = subprocess.check_output([node_binary, "--version"], text=True).split()[-1]
+            assert health["version"] == version and health["instance"]
+            self.check("节点回环健康接口返回当前进程实例与版本")
+
+            locked_host = "locked.nexo-smoke.localhost"
+            status, _, _ = self.request_node(locked_host)
+            assert status == 401, status
+            status, headers, _ = self.request_node(locked_host, headers={"Accept": "text/html"})
+            assert status == 303 and headers["Location"].startswith("/.nexo-access/"), status
+            origin_header = {"Origin": f"http://{locked_host}:{self.args.http_port}"}
+            status, _, _ = self.request_node(locked_host, path="/.nexo-access/login",
+                payload={"password": access_password + "x"}, headers=origin_header)
+            assert status == 401, status
+            status, headers, _ = self.request_node(locked_host, path="/.nexo-access/login",
+                payload={"password": access_password, "return_to": "/"}, headers=origin_header)
+            assert status == 200, status
+            cookie = headers["Set-Cookie"].split(";", 1)[0]
+            assert self.request_node(locked_host, headers={"Cookie": cookie})[2] == b"nexo-real-origin\n"
+            self.check("节点通过管理端验证访问密码并带有效会话转发请求")
+
+            quota = f"nodes/{node_id}/traffic/quota"
+            self.api(quota, "PUT", {"monthly_limit_bytes": 64 * 1024 * 1024})
             def tcp_response():
                 with socket.create_connection((self.args.node_ip, tcp["public_port"]), timeout=3) as client:
                     client.sendall(b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
@@ -172,6 +219,8 @@ class NodeHarness(smoke.Harness):
                 assert self.api(f"traffic/analytics/summary?range=1h&tunnel_id={service['id']}")["totals"]["requests"] >= before + 1
                 assert all(not e["path"].startswith("/.nexo-") and "node-private" not in json.dumps(e) for e in observed())
             self.check("独立节点 HTTP/HTTPS 完成日志经 mTLS 回传，8 MiB 字节、节点归属、探测排除和查询脱敏正确")
+            smoke.wait_for(lambda: self.api(quota)["used_bytes"] >= 16 * 1024 * 1024, "节点额度结算写入 Server 账本")
+            self.check("节点预算及真实转发用量写入管理端账本")
             ca = self.root / "server/caddy-storage/pki/authorities/local/root.crt"
             print("READY_PUBLIC " + json.dumps({"ip":self.args.node_ip, "http_port":self.args.http_port, "https_port":self.args.https_port, "ca_file":str(ca)}), flush=True)
             time.sleep(self.args.hold_seconds)
@@ -184,6 +233,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     for name in ("server-bin", "agent-bin", "caddy-bin"):
         parser.add_argument("--"+name, required=True)
+    parser.add_argument("--node-bin", help="从独立节点包解出的 nexo-server，省略时使用 Server 的 node 子命令")
+    parser.add_argument("--node-caddy-bin", help="从独立节点包解出的标准 Caddy，省略时使用 --caddy-bin")
     parser.add_argument("--server-test-bin", help="隔离 DNS 夹具所需的 Server 测试程序")
     parser.add_argument("--node-ip", default="127.0.0.1")
     parser.add_argument("--http-port", type=int, default=8080)

@@ -1,10 +1,22 @@
 //! 原生 VPS 数据面。仅内存持有控制器授权快照；冷启动及失联均不会从旧磁盘配置开放业务。
-use super::*;
+use anyhow::{Context, Result};
+use axum::{extract::State, http::StatusCode, response::IntoResponse, routing::get, Router};
+use nexo_core::unix_now;
+use serde::Deserialize;
+use serde_json::{json, Value};
+use uuid::Uuid;
+
+use crate::{
+    caddy::{CaddyRuntimeConfig, CaddySupervisor, Settings},
+    routes,
+};
 use futures_util::StreamExt;
 use nexo_protocol::nodes::{self as wire, Snapshot};
 use nexo_tunnel::{identity, LogicalStreamHeader};
 use std::{
     collections::HashMap,
+    fs,
+    net::Ipv4Addr,
     path::PathBuf,
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -57,7 +69,7 @@ struct Runtime {
     usage: AsyncMutex<Option<mpsc::UnboundedSender<wire::Request>>>,
     configured: AtomicBool,
     stop: CancellationToken,
-    caddy: AsyncMutex<Option<Arc<crate::caddy::CaddySupervisor>>>,
+    caddy: AsyncMutex<Option<Arc<CaddySupervisor>>>,
 }
 struct Access {
     request: wire::Request,
@@ -433,15 +445,15 @@ async fn listeners(runtime: Arc<Runtime>, directory: PathBuf, node_id: String) -
         .with_state(runtime.clone());
     let mut local_tasks = JoinSet::new();
     local_tasks.spawn(async move { axum::serve(access_listener, app).await });
-    let settings = crate::config::Caddy {
+    let settings = Settings {
         binary: std::env::var("NEXO_CADDY_BINARY")
             .unwrap_or_else(|_| "caddy".into())
             .into(),
         ..Default::default()
     };
-    let caddy = Arc::new(crate::caddy::CaddySupervisor::new(
-        crate::caddy::CaddyRuntimeConfig::new(&directory, &settings),
-    ));
+    let caddy = Arc::new(CaddySupervisor::new(CaddyRuntimeConfig::new(
+        &directory, &settings,
+    )));
     let empty = json!({"admin":{"listen":"127.0.0.1:8290"},"apps":{"http":{"servers":{}}}});
     caddy.set_analytics(runtime.analytics.clone());
     caddy.write_startup_config(&empty)?;
@@ -607,9 +619,9 @@ async fn listeners(runtime: Arc<Runtime>, directory: PathBuf, node_id: String) -
                             certificates.push(json!({"certificate":root.join("chain.pem"),"key":root.join("key.pem")}));
                         }
                         let (endpoint, check) =
-                            crate::service_access::handlers(&access_address, &service.id);
+                            routes::access_handlers(&access_address, &service.id);
                         let routes = server["routes"].as_array_mut().unwrap();
-                        routes.push(super::health::route(
+                        routes.push(routes::probe_route(
                             &host,
                             &node_id,
                             &service.id,
@@ -623,12 +635,7 @@ async fn listeners(runtime: Arc<Runtime>, directory: PathBuf, node_id: String) -
                                 .get(&service.device)
                                 .and_then(|s| s.public_ipv4)
                             {
-                                routes.push(crate::lan_redirect::route(
-                                    &service.id,
-                                    &host,
-                                    ip,
-                                    origin,
-                                ));
+                                routes.push(routes::lan_redirect(&service.id, &host, ip, origin));
                             }
                         }
                         routes.push(json!({"match":[{"host":[host],"path":["/.nexo-access/*"]}],"handle":[endpoint],"terminal":true}));
@@ -639,7 +646,7 @@ async fn listeners(runtime: Arc<Runtime>, directory: PathBuf, node_id: String) -
                         {
                             handlers.push(check);
                         }
-                        let mut proxy = crate::domain_runtime::proxy_handler(&upstream)?;
+                        let mut proxy = routes::proxy_handler(&upstream)?;
                         if service.reverse_proxy_target.is_some() && next.traffic_quota.is_some() {
                             proxy["upstreams"][0]["dial"] = json!(format!(
                                 "127.0.0.1:{}",
@@ -657,9 +664,10 @@ async fn listeners(runtime: Arc<Runtime>, directory: PathBuf, node_id: String) -
                     }
                     if service.protocol == "https" && service.http_redirect {
                         let http=servers.entry(format!("port_{}", service.http_port)).or_insert_with(||json!({"listen":[format!(":{}", service.http_port)],"automatic_https":{"disable":true},"routes":[]}));
-                        http["routes"].as_array_mut().unwrap().push(
-                            crate::domain_runtime::https_redirect(&host, service.https_port),
-                        );
+                        http["routes"]
+                            .as_array_mut()
+                            .unwrap()
+                            .push(routes::https_redirect(&host, service.https_port));
                     }
                 }
             }
@@ -788,7 +796,7 @@ async fn access_request(
 fn submit_update(command: wire::UpdateCommand) -> Result<()> {
     anyhow::ensure!(
         matches!(command.action.as_str(), "prepare" | "install" | "restart")
-            && super::updates::version(&command.version).is_some()
+            && crate::parse_version(&command.version).is_some()
             && command.task_id.len() <= 100
             && command
                 .task_id
@@ -813,7 +821,7 @@ fn update_report() -> wire::UpdateReport {
         .and_then(|v| serde_json::from_slice(&v).ok())
         .unwrap_or_default()
 }
-pub(super) fn operating_system() -> String {
+pub fn operating_system() -> String {
     fs::read_to_string("/etc/os-release")
         .ok()
         .and_then(|text| {

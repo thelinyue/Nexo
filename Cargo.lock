@@ -1500,6 +1500,34 @@ dependencies = [
 ]
 
 [[package]]
+name = "nexo-node"
+version = "0.2.26"
+dependencies = [
+ "anyhow",
+ "axum",
+ "clap",
+ "futures-util",
+ "hex",
+ "nexo-core",
+ "nexo-protocol",
+ "nexo-tunnel",
+ "rcgen",
+ "reqwest",
+ "rustls",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "tokio",
+ "tokio-rustls",
+ "tokio-util",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+ "yamux",
+]
+
+[[package]]
 name = "nexo-protocol"
 version = "0.2.26"
 dependencies = [
@@ -1528,6 +1556,7 @@ dependencies = [
  "image",
  "instant-acme",
  "nexo-core",
+ "nexo-node",
  "nexo-protocol",
  "nexo-tunnel",
  "quinn",

@@ -198,7 +198,7 @@ test("地址修改受未保存保护，保存中禁用控件且请求失败保�
   await expect(dialog.getByLabel("内网地址")).toHaveValue("10.0.0.4");
 });
 
-test("仅显示重定向开关，长 IPv6 本地目标在当前视口内可操作", async ({ page }, testInfo) => {
+test("仅显示重定向开关，长 IPv6 本地目标在当前视口内可操作", { tag: ["@mobile", "@landscape"] }, async ({ page }, testInfo) => {
   const state = await installApiMocks(page);
   const localAddress = "fd12:3456:789a:bcde:1234:5678:90ab:cdef";
   Object.assign(state.tunnels[0], { lan_redirect_enabled: true, local_address: localAddress, local_port: 65535 });

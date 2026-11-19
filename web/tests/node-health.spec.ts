@@ -1,7 +1,7 @@
 import { expect, test } from "@playwright/test";
 import { installApiMocks } from "./api-mocks";
 
-test("服务逐节点检查区分健康、失败、兼容、过期和待检查，长错误不溢出", async ({ page }, info) => {
+test("服务逐节点检查区分健康、失败、兼容、过期和待检查，长错误不溢出", { tag: "@mobile" }, async ({ page }, info) => {
   const state = await installApiMocks(page);
   const now = Math.floor(Date.now() / 1000);
   const message = "入口检查失败，请核对端口和证书";

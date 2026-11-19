@@ -2,7 +2,7 @@ import { expect, test } from "@playwright/test";
 import { installApiMocks } from "./api-mocks";
 import { openServiceEditor, selectServiceOption } from "./service-actions";
 
-test("UDP 与组合服务不依赖域名，表单和详情在小屏可用", async ({ page }, info) => {
+test("UDP 与组合服务不依赖域名，表单和详情在小屏可用", { tag: "@mobile" }, async ({ page }, info) => {
   const state = await installApiMocks(page);
   state.domains = [];
   await page.goto("/#/services");

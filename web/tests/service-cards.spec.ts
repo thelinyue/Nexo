@@ -38,7 +38,7 @@ test("卡片空白打开网页一次，详情与不可访问服务不触发新�
   expect(context.pages()).toHaveLength(1);
 });
 
-test("长按卡片空白只进入多选，抬手及再次点击不打开网页", async ({ page, context }, info) => {
+test("长按卡片空白只进入多选，抬手及再次点击不打开网页", { tag: "@mobile" }, async ({ page, context }, info) => {
   test.skip(info.project.name === "desktop-dark", "手机长按交互");
   await installApiMocks(page);
   await page.goto("/#/services");
@@ -157,7 +157,7 @@ test("图标失败、服务关闭与端口服务仍有明确入口，选择模�
   await expect(page).toHaveURL(/#\/services$/);
 });
 
-test("图标长按只多选，网页、端口和关闭服务均不执行主操作", async ({ page, context }, info) => {
+test("图标长按只多选，网页、端口和关闭服务均不执行主操作", { tag: "@mobile" }, async ({ page, context }, info) => {
   test.skip(info.project.name === "desktop-dark", "手机长按交互");
   const state = await installApiMocks(page);
   state.tunnels.push({ ...state.tunnels[0], id: "tcp", name: "SSH", protocol: "tcp" }, { ...state.tunnels[0], id: "closed", name: "已关闭", enabled: false });
@@ -184,7 +184,7 @@ test("图标长按只多选，网页、端口和关闭服务均不执行主操�
   }
 });
 
-test("端口图标复制失败展开整行，支持手动复制和重试反馈", async ({ page }) => {
+test("端口图标复制失败展开整行，支持手动复制和重试反馈", { tag: "@mobile" }, async ({ page }) => {
   const state = await installApiMocks(page);
   state.tunnels.push({ ...state.tunnels[0], id: "tcp", name: "SSH", protocol: "tcp", public_address: "example.com:22000" });
   await page.goto("/#/services");

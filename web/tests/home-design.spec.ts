@@ -1,7 +1,7 @@
 import { expect, test } from "@playwright/test";
 import { installApiMocks } from "./api-mocks";
 
-test("首页默认概览、图内选点与键盘读数跨主题可用", async ({ page }, info) => {
+test("首页默认概览、图内选点与键盘读数跨主题可用", { tag: "@mobile" }, async ({ page }, info) => {
   await installApiMocks(page);
   await page.goto("/");
   const plot = page.locator(".chart-plot");
@@ -116,7 +116,7 @@ test("折叠筛选保留对象，用量和实时速率不跟随图内选点", as
   await expect(page.getByLabel("统计隧道", { exact: true })).toHaveValue("t-1");
 });
 
-test("首页窄屏、放大文字及辅助功能偏好不溢出", async ({ page }, info) => {
+test("首页窄屏、放大文字及辅助功能偏好不溢出", { tag: "@mobile" }, async ({ page }, info) => {
   test.skip(info.project.name !== "mobile-light", "尺寸矩阵运行一次，其余项目覆盖原生交互");
   await installApiMocks(page);
   await page.goto("/");

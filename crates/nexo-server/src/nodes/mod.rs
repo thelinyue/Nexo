@@ -12,7 +12,6 @@ pub mod groups;
 pub mod health;
 pub mod quota;
 pub mod releases;
-pub mod runtime;
 pub mod selection;
 pub mod services;
 #[cfg(test)]
@@ -227,7 +226,7 @@ fn view(
     let mut query=db.prepare("SELECT t.id,t.name,t.tenant_id,t.enabled FROM tunnels t JOIN service_nodes s ON s.service_id=t.id WHERE s.node_id=?1 AND t.deleted_at IS NULL AND (?3 OR t.tenant_id=?2)").map_err(db_error)?;
     result["services"]=json!(query.query_map(params![id,tenant,admin],|r|Ok(json!({"id":r.get::<_,String>(0)?,"name":r.get::<_,String>(1)?,"tenant_id":r.get::<_,String>(2)?,"enabled":r.get::<_,bool>(3)?}))).map_err(db_error)?.collect::<rusqlite::Result<Vec<_>>>().map_err(db_error)?);
     if id == "local" {
-        result["os"] = json!(runtime::operating_system());
+        result["os"] = json!(nexo_node::operating_system());
         result["architecture"] = json!(std::env::consts::ARCH);
         result["connections"] = json!(state.tunnel_runtime.connection_count());
         result["public_ipv4"] = json!(crate::server_settings::relay_ipv4(state)?

@@ -1,7 +1,13 @@
 import { defineConfig, devices } from "@playwright/test";
 
+const hostChecks = "**/agent-deployment.spec.ts";
+const clipboardChecks = "**/clipboard.spec.ts";
+// 专用于手机的文件和带标签的交互场景在手机项目运行。
+const mobileChecks = /@mobile\b|(?:clipboard|domain-mobile|mobile-create|pwa-navigation)\.spec\.ts/;
+
 export default defineConfig({
   testDir: "./tests",
+  testIgnore: hostChecks,
   fullyParallel: true,
   workers: 3,
   forbidOnly: Boolean(process.env.CI),
@@ -29,6 +35,7 @@ export default defineConfig({
     },
     {
       name: "mobile-light",
+      grep: mobileChecks,
       use: {
         ...devices["iPhone 13"],
         browserName: "chromium",
@@ -38,6 +45,7 @@ export default defineConfig({
     },
     {
       name: "mobile-landscape",
+      grep: /@landscape\b/,
       use: {
         ...devices["iPhone 13"],
         browserName: "chromium",
@@ -47,6 +55,9 @@ export default defineConfig({
     },
     {
       name: "mobile-webkit",
+      // 真实剪贴板权限由 Chromium 验证，WebKit 用例覆盖复制失败反馈。
+      testIgnore: [hostChecks, clipboardChecks],
+      grep: [mobileChecks, /@webkit\b/],
       use: {
         ...devices["iPhone 13"],
         browserName: "webkit",

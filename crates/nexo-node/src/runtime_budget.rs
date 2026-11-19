@@ -227,7 +227,7 @@ mod tests {
             stop: CancellationToken::new(),
             caddy: Default::default(),
         });
-        let (state, controller) = super::super::tests::attach_meter(&runtime, &service).await;
+        let (meter, controller) = super::super::tests::attach_meter(&runtime, &service).await;
         let q = runtime.snapshot.borrow().traffic_quota.clone().unwrap();
         let (a, b) = tokio::join!(
             pump(
@@ -250,13 +250,11 @@ mod tests {
         assert!(a.is_err() && b.is_err());
         tokio::time::timeout(Duration::from_secs(3), async {
             loop {
-                let view = super::super::super::quota::view(
-                    &state.db.lock().unwrap(),
-                    "metered",
-                    unix_now(),
-                )
-                .unwrap();
-                if view.reserved_bytes == 0 && view.used_bytes == 4 {
+                let settled = {
+                    let meter = meter.lock().unwrap();
+                    meter.reserved_bytes() == 0 && meter.used_bytes == 4
+                };
+                if settled {
                     break;
                 }
                 tokio::time::sleep(Duration::from_millis(20)).await;

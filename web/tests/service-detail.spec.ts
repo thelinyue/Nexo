@@ -1,7 +1,7 @@
 import { expect, test } from "@playwright/test";
 import { installApiMocks } from "./api-mocks";
 
-test("名称打开详情浮层，背景与网址不变，关闭恢复焦点", async ({ page }) => {
+test("名称打开详情浮层，背景与网址不变，关闭恢复焦点", { tag: ["@mobile", "@landscape"] }, async ({ page }) => {
   const state = await installApiMocks(page);
   state.tunnels = Array.from({ length: 24 }, (_, i) => ({ ...state.tunnels[0], id: `t-${i}`, name: `媒体 ${i}` }));
   await page.goto("/#/services");
@@ -12,6 +12,7 @@ test("名称打开详情浮层，背景与网址不变，关闭恢复焦点", as
   await trigger.click();
   const modal = page.getByRole("dialog", { name: "媒体 16", exact: true });
   await expect(modal).toHaveCSS("opacity", "1");
+  await expect(modal.locator(".detail-field code").first()).toHaveText(state.tunnels[0].public_address);
   await expect(page).toHaveURL(/#\/services$/);
   const box = (await modal.boundingBox())!;
   expect(box.x).toBeGreaterThanOrEqual(16);
@@ -29,8 +30,8 @@ test("名称打开详情浮层，背景与网址不变，关闭恢复焦点", as
   expect(await page.evaluate(() => scrollY)).toBeCloseTo(scroll, 0);
 });
 
-test("编辑保存与放弃草稿回到详情原滚动位置", async ({ page }) => {
-  await installApiMocks(page);
+test("编辑保存与放弃草稿回到详情原滚动位置，保留原域名", { tag: "@mobile" }, async ({ page }) => {
+  const state = await installApiMocks(page);
   await page.goto("/#/services");
   await page.getByRole("link", { name: "媒体中心", exact: true }).click();
   const detail = page.locator(".application-modal");
@@ -45,9 +46,12 @@ test("编辑保存与放弃草稿回到详情原滚动位置", async ({ page }) 
   await expect(detail.getByRole("heading", { name: "媒体中心", exact: true })).toBeVisible();
   await expect.poll(() => detail.locator(".modal-body").evaluate(el => el.scrollTop)).toBeCloseTo(scroll, 0);
   await detail.getByRole("button", { name: "编辑服务" }).click();
+  await expect(editor.getByRole("combobox", { name: "根域名", exact: true })).toHaveAttribute("value", "d-1");
+  await expect(editor.getByRole("combobox", { name: "根域名", exact: true })).toBeEnabled();
   await editor.getByLabel("服务名称", { exact: true }).fill("新的名称");
   await editor.getByRole("button", { name: "保存服务" }).click();
   await expect(detail.getByRole("heading", { name: "新的名称", exact: true })).toBeVisible();
+  expect(state.calls.find(call => call.method === "PUT" && call.path === "/api/v1/tunnels/t-1")?.body.public_domain_id).toBe("d-1");
   await expect(detail.getByRole("status")).toHaveText("配置已保存");
 });
 
@@ -103,7 +107,7 @@ test("旧详情地址关闭回列表，关联设备导航只执行一次", async
   await expect(page.getByRole("dialog")).toHaveCount(0);
 });
 
-test("快速关闭、遮罩关闭、减少动画和应用内返回均释放浮层", async ({ page }) => {
+test("快速关闭、遮罩关闭、减少动画和应用内返回均释放浮层", { tag: "@mobile" }, async ({ page }) => {
   await installApiMocks(page);
   await page.goto("/#/home");
   await page.goto("/#/services");

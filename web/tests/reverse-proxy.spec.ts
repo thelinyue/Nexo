@@ -39,7 +39,7 @@ test("独立反代入口无需设备，创建服务入口保持内网穿透", as
 
 });
 
-test("手机添加入口紧邻底栏，选择类型后进入独立表单", async ({ page }, info) => {
+test("手机添加入口紧邻底栏，选择类型后进入独立表单", { tag: ["@mobile", "@landscape"] }, async ({ page }, info) => {
   test.skip(info.project.name === "desktop-dark", "手机操作面板");
   await installApiMocks(page);
   await page.goto("/#/services");

@@ -73,7 +73,7 @@ test("切换 TCP 清除认证草稿，反向代理支持认证", async ({ page }
   await expect(form.getByRole("switch", { name: "内网重定向" })).toHaveCount(0);
 });
 
-test("访客密码页支持错误反馈、键盘提交和原地址回跳", async ({ page }, info) => {
+test("访客密码页支持错误反馈、键盘提交和原地址回跳", { tag: "@webkit" }, async ({ page }, info) => {
   const html = readFileSync(new URL("../../crates/nexo-server/src/service_access.html", import.meta.url), "utf8").replaceAll("{{SERVICE_NAME}}", "家庭 NAS");
   let attempts = 0;
   await page.route("**/.nexo-access/**", async route => {

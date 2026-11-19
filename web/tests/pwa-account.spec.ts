@@ -8,7 +8,7 @@ async function installedPwa(page: Page) {
   await page.addInitScript(() => Object.defineProperty(navigator, "standalone", { configurable: true, value: true }));
 }
 
-test("PWA 悬浮头像代表本人，键盘进入账号和会话，代管空间不改变身份", async ({ page }) => {
+test("PWA 悬浮头像代表本人，键盘进入账号和会话，代管空间不改变身份", { tag: "@mobile" }, async ({ page }) => {
   await installedPwa(page);
   await installApiMocks(page);
   await page.goto("/#/agents");
@@ -51,7 +51,7 @@ test("PWA 悬浮头像代表本人，键盘进入账号和会话，代管空间�
   }
 });
 
-test("PWA 邀请失败可重试，重复点击只请求一次，跨屏后关闭弹窗恢复当前入口焦点", async ({ page }) => {
+test("PWA 邀请失败可重试，重复点击只请求一次，跨屏后关闭弹窗恢复当前入口焦点", { tag: "@mobile" }, async ({ page }) => {
   await installedPwa(page);
   await installApiMocks(page);
   let attempts = 0; let finish!: () => void;
@@ -100,7 +100,7 @@ test("PWA 邀请失败可重试，重复点击只请求一次，跨屏后关闭�
   await expect(page.locator(".mobile-create-slot button")).toHaveCount(desktop ? 1 : 0);
 });
 
-test("普通 PWA 用户只拥有本人头像入口，普通浏览器保留原导航和邀请布局", async ({ page }) => {
+test("普通 PWA 用户只拥有本人头像入口，普通浏览器保留原导航和邀请布局", { tag: "@mobile" }, async ({ page }) => {
   const state = await installApiMocks(page); state.authRole = "tenant";
   await installedPwa(page);
   await page.goto("/#/manage");
@@ -120,7 +120,7 @@ test("普通 PWA 用户只拥有本人头像入口，普通浏览器保留原导
   await browserPage.close();
 });
 
-test("悬浮头像遵守服务器草稿与保存保护，保存后可立即进入账号设置", async ({ page }) => {
+test("悬浮头像遵守服务器草稿与保存保护，保存后可立即进入账号设置", { tag: "@mobile" }, async ({ page }) => {
   await installedPwa(page);
   const state = await installApiMocks(page);
   let finish!: () => void; const pending = new Promise<void>(resolve => { finish = resolve; });

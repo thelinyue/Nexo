@@ -125,7 +125,7 @@ for (const protocol of ["tcp", "udp", "tcp_udp"]) {
   });
 }
 
-test("窄屏两个地址组保持同行，长地址仍可编辑且保存按钮可见", async ({ page }, info) => {
+test("窄屏两个地址组保持同行，长地址仍可编辑且保存按钮可见", { tag: ["@mobile", "@landscape"] }, async ({ page }, info) => {
   await installApiMocks(page);
   await page.goto("/#/services");
   await openServiceEditor(page);
@@ -224,7 +224,7 @@ test("错误定位到具体字段，折叠的无效端口自动展开，未通�
   expect(state.calls.find(item => item.method === "POST")?.body.public_port).toBe(21000);
 });
 
-test("键盘下一项不误提交，可视区域缩小后字段和保存按钮仍可见", async ({ page }, testInfo) => {
+test("键盘下一项不误提交，可视区域缩小后字段和保存按钮仍可见", { tag: ["@mobile", "@landscape"] }, async ({ page }, testInfo) => {
   const state = await installApiMocks(page);
   await page.setViewportSize({ width: 390, height: 844 });
   await page.goto("/#/services");
@@ -278,7 +278,7 @@ test("协议切换保留输入，但不提交其他协议的端口；多域名�
   expect(body.public_domain_id).toBe("d-2");
 });
 
-test("设备浮层显示当前选择，离线设备可选择并提交", async ({ page }, testInfo) => {
+test("设备浮层显示当前选择，离线设备可选择并提交", { tag: "@mobile" }, async ({ page }, testInfo) => {
   const state = await installApiMocks(page);
   await page.goto("/#/services");
   await openServiceEditor(page);
@@ -304,7 +304,7 @@ test("设备浮层显示当前选择，离线设备可选择并提交", async ({
   expect(state.calls.find(call => call.method === "POST" && call.path === "/api/v1/tunnels")?.body.device_id).toBe("a-2");
 });
 
-test("两个选择框互斥，键盘确认和取消不误提交或关闭表单", async ({ page }, testInfo) => {
+test("两个选择框互斥，键盘确认和取消不误提交或关闭表单", { tag: "@mobile" }, async ({ page }, testInfo) => {
   const state = await installApiMocks(page);
   state.domains.push({ ...state.domains[0], id: "d-2", domain: "second.example.com" });
   await page.goto("/#/services");
@@ -361,7 +361,7 @@ test("两个选择框互斥，键盘确认和取消不误提交或关闭表单",
   expect(state.calls.filter(call => call.method === "POST")).toHaveLength(0);
 });
 
-test("长名称和长域名浮层在窄屏、横屏及低高度视口内可滚动选择", async ({ page }, testInfo) => {
+test("长名称和长域名浮层在窄屏、横屏及低高度视口内可滚动选择", { tag: ["@mobile", "@landscape"] }, async ({ page }, testInfo) => {
   const state = await installApiMocks(page);
   state.devices = Array.from({ length: 14 }, (_, index) => ({ ...state.devices[0], id: `long-agent-${index}`, name: `家庭存储服务器长名称用于检查窄屏展示${index}` }));
   state.domains = Array.from({ length: 14 }, (_, index) => ({ ...state.domains[0], id: `long-domain-${index}`, domain: `very-long-home-network-domain-for-small-screens-${index}.example.com` }));
@@ -398,14 +398,16 @@ test("无设备或域名时指引先取消表单，选择框和保存禁用", as
   await openServiceEditor(page);
   const dialog = page.getByRole("dialog", { name: "创建服务" });
   await expect(dialog.getByRole("combobox", { name: "设备", exact: true })).toBeDisabled();
+  await dialog.getByLabel("服务名称").fill("等待设备的服务");
   await expect(dialog.getByText("请关闭表单，到设备页添加设备。", { exact: true })).toBeVisible();
+  await expect(dialog.getByRole("button", { name: "保存服务" })).toBeDisabled();
   await selectServiceOption(dialog.getByRole("combobox", { name: "内网协议", exact: true }), "HTTP");
   await expect(dialog.getByRole("combobox", { name: "根域名", exact: true })).toBeDisabled();
   await expect(dialog.getByText("网页服务需要域名，请关闭表单后到域名页添加。", { exact: true })).toBeVisible();
   await expect(dialog.getByRole("button", { name: "保存服务" })).toBeDisabled();
 });
 
-test("展开中的浮层跟随表单滚动和视口变化", async ({ page }) => {
+test("展开中的浮层跟随表单滚动和视口变化", { tag: ["@mobile", "@landscape"] }, async ({ page }) => {
   const state = await installApiMocks(page);
   state.devices = Array.from({ length: 10 }, (_, index) => ({ ...state.devices[0], id: `agent-${index}`, name: `设备 ${index}` }));
   await page.setViewportSize({ width: 375, height: 568 });

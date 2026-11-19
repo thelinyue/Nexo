@@ -1,7 +1,7 @@
 import { expect, test } from "@playwright/test";
 import { installApiMocks } from "./api-mocks";
 
-test("手机长按进入多选，抬手不跳转，全选限定当前筛选结果", async ({ page }, info) => {
+test("手机长按进入多选，抬手不跳转，全选限定当前筛选结果", { tag: "@mobile" }, async ({ page }, info) => {
   test.skip(info.project.name === "desktop-dark", "手机长按交互");
   const state = await installApiMocks(page);
   state.tunnels.push({ ...state.tunnels[0], id: "t-2", name: "备用服务" }, { ...state.tunnels[0], id: "t-3", name: "TCP 服务", protocol: "tcp" });
@@ -35,7 +35,7 @@ test("手机长按进入多选，抬手不跳转，全选限定当前筛选结�
   await expect(page.getByRole("dialog", { name: "TCP 服务", exact: true })).toBeVisible();
 });
 
-test("滑动、取消触摸、多指和离开列表取消长按，短按不触发选择", async ({ page }, info) => {
+test("滑动、取消触摸、多指和离开列表取消长按，短按不触发选择", { tag: "@mobile" }, async ({ page }, info) => {
   test.skip(info.project.name === "desktop-dark", "手机手势取消");
   await installApiMocks(page);
   await page.goto("/#/services");

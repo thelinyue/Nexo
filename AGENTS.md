@@ -8,7 +8,7 @@
 2. Web、数据库迁移和 Headscale Adapter 属于 Server 组件。共享运行时代码影响哪一端，就把哪一端视为有代码变化。
 3. 未发生代码变化的组件禁止为当前版本生成镜像、部署包或升级指引。本次版本清单明确声明实际发布组件。
 4. Server 与 Agent 的镜像标签可以不同。部署时只拉取并重建发生代码变化的服务，保留另一端的原版本和节点身份。
-5. 独立节点复用 Server 二进制，但不随 Web 或管理端更新发布。`release-manifest.json` 的 `node_version` 保留最近一次实际节点版本；节点运行逻辑、其使用的共享代码、Caddy 或安装/更新助手有实际变化时，才增加 `node` 发布项并更新 `node_version`。内置节点随 Server 进程显示版本。
+5. 独立节点使用专用程序。`release-manifest.json` 的 `node_version` 保留最近一次实际节点版本；节点运行逻辑、其使用的共享代码、Caddy 或安装/更新助手有实际变化时，才增加 `node` 发布项并更新 `node_version`。内置节点随 Server 进程显示版本。
 
 ## 注释和日志
 

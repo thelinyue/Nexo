@@ -1,6 +1,8 @@
 //! Server 启动配置与页面设置分开：在此读取 TOML 和管理员初始化环境变量，运行模块只使用解析结果。
 use anyhow::{Context, Result};
 use serde::Deserialize;
+
+pub use nexo_node::caddy::Settings as Caddy;
 use std::{
     net::{IpAddr, SocketAddr},
     path::{Path, PathBuf},
@@ -50,36 +52,6 @@ impl Default for Admin {
         Self {
             username: "admin".into(),
             password: String::new(),
-        }
-    }
-}
-#[derive(Clone, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct Caddy {
-    pub enabled: bool,
-    pub binary: PathBuf,
-    pub admin_url: String,
-    pub http_listen: String,
-    pub https_listen: String,
-}
-impl Caddy {
-    /// HTTP 服务共用管理端配置的公网端口；所有 DNS 候选节点保持同端口。
-    pub fn http_port(&self) -> u16 {
-        self.http_listen
-            .rsplit(':')
-            .next()
-            .and_then(|p| p.parse().ok())
-            .unwrap_or(80)
-    }
-}
-impl Default for Caddy {
-    fn default() -> Self {
-        Self {
-            enabled: true,
-            binary: "caddy".into(),
-            admin_url: "http://127.0.0.1:8290".into(),
-            http_listen: ":80".into(),
-            https_listen: ":443".into(),
         }
     }
 }

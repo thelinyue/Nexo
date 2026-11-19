@@ -17,9 +17,9 @@ class PublishLatestTests(unittest.TestCase):
         registry.alias.side_effect = lambda value: manifests.update(latest=value)
         return registry, source
 
-    def test_initial_alias_copies_complete_manifest_and_verifies(self):
-        registry, source = self.registry(["0.2.0"])
-        self.assertIn("已指向", promote(registry, "0.2.0", True))
+    def test_latest_uses_newest_stable_and_verifies_complete_manifest(self):
+        registry, source = self.registry(["0.2.9", "0.2.10", "0.3.0-rc.1"])
+        self.assertIn("已指向", promote(registry, "0.2.10", True))
         registry.alias.assert_called_once_with(source)
         self.assertEqual(registry.manifest.call_args.args, ("latest",))
 
@@ -33,11 +33,6 @@ class PublishLatestTests(unittest.TestCase):
         self.assertIn("历史", promote(registry, "0.2.9", True))
         registry.alias.assert_not_called()
         registry.manifest.assert_not_called()
-
-    def test_newest_stable_ignores_newer_pre_release(self):
-        registry, source = self.registry(["0.2.9", "0.2.10", "0.3.0-rc.1"])
-        promote(registry, "0.2.10", True)
-        registry.alias.assert_called_once_with(source)
 
     def test_dry_run_and_existing_alias_do_not_write(self):
         registry, source = self.registry(["0.2.0"])

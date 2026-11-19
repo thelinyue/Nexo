@@ -1271,7 +1271,8 @@ mod tests {
         let config = test_client_config(&state, "mine");
         let (mut client, task) = test_control_connection(&state, config, "8.8.8.8").await;
         test_hello(&mut client, "mine").await;
-        // 保持 TLS 连接但不发送心跳，走生产环境的 45 秒超时和清理路径。
+        // 真实 TLS 握手完成后暂停测试时钟，保留生产环境的 45 秒超时和清理路径。
+        tokio::time::pause();
         let error = tokio::time::timeout(Duration::from_secs(50), task)
             .await
             .unwrap()

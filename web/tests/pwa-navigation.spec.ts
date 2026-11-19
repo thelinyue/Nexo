@@ -32,7 +32,7 @@ test.describe("PWA 手机导航", () => {
     await installedPwa(page);
   });
 
-  test("登录、业务页面和设置共用手机视口与输入字号", async ({ page }, info) => {
+  test("登录、业务页面和设置共用手机视口与输入字号", { tag: "@landscape" }, async ({ page }, info) => {
     await installApiMocks(page, { anonymous: true });
     if (info.project.name === "mobile-light") await page.setViewportSize({ width: 320, height: 568 });
     await page.goto("/");
@@ -56,7 +56,7 @@ test.describe("PWA 手机导航", () => {
     }
   });
 
-  test("搜索时软键盘收起底栏，恢复可见高度后保留输入和导航", async ({ page }) => {
+  test("搜索时软键盘收起底栏，恢复可见高度后保留输入和导航", { tag: "@landscape" }, async ({ page }) => {
     await installApiMocks(page);
     await page.goto("/#/nodes");
     const search = page.getByRole("searchbox", { name: "搜索节点名称或 IP" });
@@ -77,7 +77,7 @@ test.describe("PWA 手机导航", () => {
     await expect(search).toHaveValue("香港");
   });
 
-  test("横屏刘海和主屏指示条避开导航与弹窗操作", async ({ page }, info) => {
+  test("横屏刘海和主屏指示条避开导航与弹窗操作", { tag: "@landscape" }, async ({ page }, info) => {
     test.skip(info.project.name !== "mobile-landscape", "使用 Chromium 模拟非对称安全区");
     await installApiMocks(page);
     const session = await page.context().newCDPSession(page);

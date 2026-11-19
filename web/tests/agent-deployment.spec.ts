@@ -12,22 +12,7 @@ test("Server 地址规范化保留 IPv6、端口及路径，拒绝危险或歧�
   }
 });
 
-test("Compose 是原生配置，docker run 是单条启动命令，均直接携带连接参数", () => {
-  const compose = agentDeploymentContent(template, "https://nexo.example.com", "nexo_join_secret", "compose");
-  expect(compose).toMatch(/^name: nexo-agent\n/);
-  expect(compose).toContain('NEXO_SERVER_URL: "https://nexo.example.com"');
-  expect(compose).toContain('NEXO_ENROLLMENT_TOKEN: "nexo_join_secret"');
-  expect(compose).toContain('NEXO_DEVICE_NAME: "Nexo 设备"');
-  expect(compose).not.toMatch(/docker compose|cat >|<<|set -eu/);
-  const command = agentDeploymentContent(template, "https://nexo.example.com", "nexo_join_secret", "docker");
-  expect(command).toMatch(/^docker run -d /);
-  expect(command).toContain("--env 'NEXO_SERVER_URL=https://nexo.example.com'");
-  expect(command).toContain("--env 'NEXO_ENROLLMENT_TOKEN=nexo_join_secret'");
-  expect(command).not.toMatch(/[\r\n]|cat >|<<|set -eu/);
-});
-
-test("真实 Compose 与 Shell 保留连接参数，不执行特殊字符或写配置脚本", ({}, info) => {
-  test.skip(info.project.name !== "desktop-dark", "部署格式验证与浏览器无关");
+test("真实 Compose 与 Shell 保留连接参数，不执行特殊字符或写配置脚本", () => {
   const token = "nexo_join_quote'\"\\ $HOME ${USER} $(touch injected) \u0060touch injected\u0060";
   const name = "家庭 NAS '\"\n$(touch injected)\\设备";
   const url = "https://example.com/path/$HOME";

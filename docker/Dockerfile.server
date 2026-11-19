@@ -19,14 +19,24 @@ COPY web/src/data/hd-icons.json ./web/src/data/hd-icons.json
 COPY --from=web-build /src/web/dist ./web/dist
 RUN cargo build --release -p nexo-server
 
-FROM golang:1.27.1-bookworm@sha256:69a7b9788769bec032d238959b61854e9ae87f57be9029ec04e9885fabf99195 AS caddy-build
+FROM golang:1.27.1-bookworm@sha256:69a7b9788769bec032d238959b61854e9ae87f57be9029ec04e9885fabf99195 AS caddy-base
 ARG CADDY_VERSION=2.11.9
 ARG XCADDY_VERSION=0.4.7
-ARG CLOUDFLARE_MODULE_VERSION=0.2.4
-# 原生节点包复用此构建阶段，静态 Caddy 可在支持的旧版 Linux 上启动。
 ENV CGO_ENABLED=0
-RUN go install "github.com/caddyserver/xcaddy/cmd/xcaddy@v${XCADDY_VERSION}" \
-    && /go/bin/xcaddy build "v${CADDY_VERSION}" \
+RUN go install "github.com/caddyserver/xcaddy/cmd/xcaddy@v${XCADDY_VERSION}"
+
+FROM caddy-base AS caddy-node-build
+# 节点加载 Server 下发的证书，标准模块足以提供节点的 HTTP/HTTPS 入口。
+RUN /go/bin/xcaddy build "v${CADDY_VERSION}" --output /usr/local/bin/caddy \
+    && /usr/local/bin/caddy version | grep -Fq "v${CADDY_VERSION}"
+
+# 本地导出只复制 Caddy，省去构建和提取包含 Go 工具链的镜像。
+FROM scratch AS caddy-node
+COPY --from=caddy-node-build /usr/local/bin/caddy /caddy
+
+FROM caddy-base AS caddy-build
+ARG CLOUDFLARE_MODULE_VERSION=0.2.4
+RUN /go/bin/xcaddy build "v${CADDY_VERSION}" \
       --with "github.com/caddy-dns/cloudflare@v${CLOUDFLARE_MODULE_VERSION}" \
       --with "github.com/caddy-dns/alidns@v1.0.29" \
       --with "github.com/caddy-dns/tencentcloud@v0.4.3" \

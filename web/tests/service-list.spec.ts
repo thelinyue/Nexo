@@ -160,7 +160,7 @@ test("列表端口复制失败提供整行手动输入，重试与多选保留�
   expect(context.pages()).toHaveLength(1);
 });
 
-test("桌面列对齐、手机紧凑行与长节点名称在各尺寸无溢出", async ({ page }, info) => {
+test("桌面列对齐、手机紧凑行与长节点名称在各尺寸无溢出", { tag: "@mobile" }, async ({ page }, info) => {
   const state = await setup(page);
   state.tunnels.push({ ...state.tunnels[0], id: "dns", name: "多个节点", distribution_mode: "dns", node_entry: entry(["hk", "jp"]) });
   state.tunnels.push({ ...state.tunnels[0], id: "long", name: "长名称的家庭媒体中心用来检查标题", distribution_mode: "manual", ipv6_direct_enabled: true, node_entry: { ...entry(["hk"]), entries: [{ node_id: "hk", node_name: "香港 VPS 这是一个很长的节点名称以及very-long-node-name-for-layout-testing", ipv4: "203.0.113.10" }] } });

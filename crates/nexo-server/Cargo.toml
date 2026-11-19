@@ -23,6 +23,7 @@ hickory-resolver = "0.24"
 reqwest.workspace = true
 x509-parser = "0.18"
 nexo-core = { path = "../nexo-core" }
+nexo-node = { path = "../nexo-node" }
 nexo-protocol = { path = "../nexo-protocol" }
 nexo-tunnel = { path = "../nexo-tunnel" }
 rusqlite.workspace = true
@@ -47,3 +48,4 @@ rcgen.workspace = true
 [dev-dependencies]
 tempfile.workspace = true
 hyper-util = { version = "0.1", features = ["client-legacy", "http1", "tokio"] }
+tokio = { workspace = true, features = ["test-util"] }

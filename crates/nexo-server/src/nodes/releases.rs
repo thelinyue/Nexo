@@ -95,20 +95,6 @@ mod tests {
     }
 
     #[test]
-    fn server_only_release_does_not_offer_new_node_version() {
-        // 即使历史发布误附了节点包，也不能因管理端版本提高而提示节点更新。
-        let releases = parse(
-            vec![
-                release("0.2.19", &["x86_64", "aarch64"]),
-                release("0.2.18", &["x86_64", "aarch64"]),
-            ],
-            "0.2.18",
-        );
-        assert_eq!(releases.len(), 1);
-        assert_eq!(releases[0].version, "0.2.18");
-    }
-
-    #[test]
     fn node_code_release_offers_supported_architectures_in_version_order() {
         let mut draft = release("0.2.20", &["x86_64"]);
         draft["draft"] = json!(true);
@@ -120,6 +106,7 @@ mod tests {
             vec![
                 release("0.2.18", &["x86_64", "aarch64"]),
                 release("0.2.20", &["x86_64"]),
+                // 已有安装包也不能越过控制器清单允许的节点版本。
                 release("0.2.21", &["x86_64", "aarch64"]),
                 release("0.2.20-rc.1", &["x86_64"]),
                 draft,

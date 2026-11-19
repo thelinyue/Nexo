@@ -56,7 +56,7 @@ test("一次复制即可配置并启动设备，两种部署方式均不写入�
   expect(await page.evaluate(() => (window as any).copiedCommand)).toContain("nexo_join_shared-test-key");
 });
 
-test("失败可重试，无效地址阻止复制，剪贴板失败展开完整命令", async ({ page }) => {
+test("失败可重试，无效地址阻止复制，剪贴板失败展开完整命令", { tag: "@webkit" }, async ({ page }) => {
   const state = await installApiMocks(page); await mockClipboard(page, true);
   state.failures.set("POST /api/v1/agent-access-key", "生成失败，请重试");
   const dialog = await openEnrollment(page);
@@ -92,7 +92,7 @@ test("共享密钥不过期，重置后配置更新且设备保留", async ({ pa
   await expect(dialog).toHaveCount(0);
 });
 
-test("移动端触控、长命令、横屏与键盘压缩视口", async ({ page }, info) => {
+test("移动端触控、长命令、横屏与键盘压缩视口", { tag: ["@mobile", "@landscape"] }, async ({ page }, info) => {
   await installApiMocks(page);
   const dialog = await openEnrollment(page);
   const copy = dialog.getByRole("button", { name: "复制 Compose 配置", exact: true });

@@ -31,7 +31,7 @@ test("完整网址可明确提取域名，清空后继续输入且操作不误�
   await expect(page.getByRole("dialog")).toHaveCount(0);
 });
 
-test("域名输入与错误在紧凑视口可见，固定提交按钮可操作", async ({ page }, testInfo) => {
+test("域名输入与错误在紧凑视口可见，固定提交按钮可操作", { tag: "@landscape" }, async ({ page }, testInfo) => {
   const state = await installApiMocks(page);
   await page.setViewportSize({ width: 390, height: 844 });
   await page.goto("/#/domains");

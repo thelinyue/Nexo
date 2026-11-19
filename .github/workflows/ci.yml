@@ -12,7 +12,6 @@ permissions:
 jobs:
   quality:
     runs-on: ubuntu-24.04
-    # 完整浏览器矩阵约需 24 分钟，为 Rust 构建和节点安装验收保留时间。
     timeout-minutes: 45
     steps:
       - name: 检出源码
@@ -23,43 +22,72 @@ jobs:
           rustup toolchain install 1.89.0 --profile minimal --component rustfmt,clippy
           rustup default 1.89.0
 
-      - name: 安装 Node.js
-        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
-        with:
-          node-version: 22.16.0
-          cache: npm
-          cache-dependency-path: web/package-lock.json
-
       - name: Rust 格式检查
         run: cargo fmt --all -- --check
       - name: Rust 测试
         run: cargo test --workspace --locked
       - name: Rust 静态检查
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
-      - name: 安装 Web 依赖
-        working-directory: web
-        run: npm ci --ignore-scripts
-      - name: 构建 Web
-        working-directory: web
-        run: npm run build
-      - name: 安装 Chromium
-        working-directory: web
-        run: npx playwright install --with-deps chromium webkit
-      - name: 浏览器发布验收
-        working-directory: web
-        run: |
-          npx playwright test --grep-invert "真实复制地址"
-          npx playwright test tests/clipboard.spec.ts --workers=1
       - name: 验收脚本语法检查
         run: |
-          python -c "import ast, pathlib; [ast.parse(pathlib.Path(path).read_text(encoding='utf-8'), filename=path) for path in ['docker/integration-terminal.py', 'docker/config-smoke.py', 'docker/image-config-smoke.py', 'docker/admin-init-smoke.py', 'docker/shared-access-smoke.py', 'docker/identity-renewal-smoke.py', 'docker/multiuser-smoke.py', 'docker/tunnel-smoke.py', 'docker/udp-smoke.py']]"
+          python -c "import ast, pathlib; [ast.parse(pathlib.Path(path).read_text(encoding='utf-8'), filename=path) for path in ['docker/integration-terminal.py', 'docker/config-smoke.py', 'docker/image-config-smoke.py', 'docker/admin-init-smoke.py', 'docker/shared-access-smoke.py', 'docker/identity-renewal-smoke.py', 'docker/multiuser-smoke.py', 'docker/tunnel-smoke.py', 'docker/udp-smoke.py', 'docker/node-port-smoke.py', 'docker/check-node-package.py']]"
           node --check docker/recovery-smoke.mjs
       - name: 原生节点安装和更新助手检查
         run: |
           bash -n docker/install-node.sh docker/build-node.sh
           python3 -m unittest docker/test_node_updater.py
           docker run --rm --network none -e NEXO_INSTALLER_TEST=1 -v "$PWD:/src:ro" python:3.12-bookworm python3 /src/docker/test_node_installer.py
-      - name: latest 发布规则测试
+      - name: 发布规则测试
         run: python3 -m unittest discover -s .github/scripts -p 'test_*.py'
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22.16.0
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - name: 使用宿主机验证部署命令
+        working-directory: web
+        run: |
+          npm ci --ignore-scripts
+          npm run test:host
       - name: 工作区差异检查
         run: git diff --check
+
+  browser-version:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      version: ${{ steps.lock.outputs.version }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: 从锁文件取得 Playwright 版本
+        id: lock
+        run: echo "version=$(node -p "require('./web/package-lock.json').packages['node_modules/@playwright/test'].version")" >> "$GITHUB_OUTPUT"
+
+  browser:
+    needs: browser-version
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3]
+    container:
+      image: mcr.microsoft.com/playwright:v${{ needs.browser-version.outputs.version }}-noble
+      options: --ipc=host
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22.16.0
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - name: 安装 Web 依赖
+        run: npm ci --ignore-scripts
+      - name: 浏览器验收
+        run: npx playwright test --grep-invert "真实复制地址" --shard=${{ matrix.shard }}/3
+      - name: 真实剪贴板验收
+        if: matrix.shard == 1
+        run: npx playwright test tests/clipboard.spec.ts --workers=1

@@ -1,7 +1,7 @@
 import { expect, test } from "@playwright/test";
 import { installApiMocks } from "./api-mocks";
 
-test("管理首页直达密码与会话，密码键盘不误提交且可切换可见性", async ({ page }, testInfo) => {
+test("管理首页直达密码与会话，密码键盘不误提交且可切换可见性", { tag: "@mobile" }, async ({ page }, testInfo) => {
   const state = await installApiMocks(page);
   await page.goto("/#/manage");
   await page.screenshot({ path: testInfo.outputPath("manage-home.png") });
@@ -47,7 +47,7 @@ test("账号页兼容旧链接，设备作为独立导航入口", async ({ page 
   await expect(page.locator(".page-slot:not([hidden]) .agent-row")).toHaveCount(2);
 });
 
-test("服务直达设备可返回原列表，正常证书折叠且关联服务优先", async ({ page }, info) => {
+test("服务直达设备可返回原列表，正常证书折叠且关联服务优先", { tag: "@mobile" }, async ({ page }, info) => {
   const state = await installApiMocks(page);
   state.devices[0].certificate = { status: "valid", expires_at: 1893456000, renew_after: 1890864000, error: null, next_retry_at: null };
   await page.goto("/#/services");

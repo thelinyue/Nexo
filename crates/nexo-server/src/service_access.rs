@@ -446,22 +446,6 @@ async fn login_inner(
     Ok(response)
 }
 
-/// 复用 Caddy forward_auth 的响应接管方式：2xx 继续原请求，其他状态直接返回访客。
-/// 元数据全部覆盖；校验使用 GET，不消耗原 POST 请求体。认证 Cookie 不转发到目标应用。
-pub fn handlers(address: &str, id: &str) -> (Value, Value) {
-    let headers = json!({"request":{"set":{
-        "X-Nexo-Access-Service":[id], "X-Nexo-Access-Host":["{http.request.host}"],
-        "X-Nexo-Access-Authority":["{http.request.hostport}"], "X-Nexo-Access-Proto":["{http.request.scheme}"],
-        "X-Nexo-Access-Ip":["{http.request.remote.host}"], "X-Nexo-Access-Method":["{http.request.method}"],
-        "X-Nexo-Access-Uri":["{http.request.uri}"]}}});
-    let endpoint =
-        json!({"handler":"reverse_proxy","upstreams":[{"dial":address}],"headers":headers});
-    let mut check = endpoint.clone();
-    check["rewrite"] = json!({"method":"GET","uri":"/check"});
-    check["handle_response"] = json!([{"match":{"status_code":[2]},"routes":[{"handle":[{"handler":"headers","request":{"set":{"Cookie":["{http.reverse_proxy.header.X-Nexo-Upstream-Cookie}"]},"delete":["X-Nexo-Access-*","X-Nexo-Upstream-Cookie"]}}]}]}]);
-    (endpoint, check)
-}
-
 /// 仅供管理端生成的兼容路由使用；内部元数据不会经过公网或节点协议传递。
 pub(crate) fn relay_handlers(
     endpoint: &mut Value,

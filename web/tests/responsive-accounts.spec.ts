@@ -103,7 +103,7 @@ test("桌面主页面填满可用宽度，服务详情不再受固定上限限�
   }
 });
 
-test("更多菜单支持键盘、外部关闭和弹窗返回，列表行高保持不变", async ({ page }) => {
+test("更多菜单支持键盘、外部关闭和弹窗返回，列表行高保持不变", { tag: "@mobile" }, async ({ page }) => {
   await installApiMocks(page);
   await page.goto("/#/users");
   const row = page.locator(".user-card").last();
@@ -153,7 +153,7 @@ test("登录与注册使用同宽紧凑卡片，短屏可滚动到提交按钮",
   }
 });
 
-test("登录失败保留输入，同一轮重复提交只发送一次，Enter 可登录", async ({ page }) => {
+test("登录失败保留输入，同一轮重复提交只发送一次，Enter 可登录", { tag: "@mobile" }, async ({ page }) => {
   const state = await installApiMocks(page, { anonymous: true });
   let finish!: () => void;
   const pending = new Promise<void>(resolve => { finish = resolve; });

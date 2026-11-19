@@ -18,7 +18,7 @@ async function updateProbe(page: Page) {
 const notice = (page: Page) => page.getByRole("complementary", { name: "网页更新" });
 const check = (page: Page) => page.evaluate(() => window.dispatchEvent(new Event("online")));
 
-test("新版仅提示，支持键盘刷新并保持路由和登录", async ({ page }, info) => {
+test("新版仅提示，支持键盘刷新并保持路由和登录", { tag: "@webkit" }, async ({ page }, info) => {
   await installApiMocks(page); const probe = await updateProbe(page);
   await page.goto("/#/settings/server");
   await expect.poll(() => probe.state.calls).toBeGreaterThan(0);
@@ -97,7 +97,7 @@ test("服务器设置草稿须确认放弃，弹窗和写入期间暂停刷新�
   await expect(page.locator(".web-update-notice .secondary-button")).toBeDisabled();
 });
 
-test("断网点击不刷新，恢复连接后可重新操作", async ({ page, context }) => {
+test("断网点击不刷新，恢复连接后可重新操作", { tag: "@webkit" }, async ({ page, context }) => {
   await installApiMocks(page); const probe = await updateProbe(page);
   await page.goto("/#/settings/server"); probe.deploy(); await check(page);
   await expect(notice(page)).toBeVisible();

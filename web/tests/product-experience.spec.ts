@@ -87,7 +87,7 @@ test("部署命令可直接复制，弹窗显示多台独立设备", async ({ pa
   await page.screenshot({ path: info.outputPath("shared-agent-devices.png") });
 });
 
-test("服务进入关联域名后返回原服务，手机子页隐藏底栏", async ({ page }, info) => {
+test("服务进入关联域名后返回原服务，手机子页隐藏底栏", { tag: "@mobile" }, async ({ page }, info) => {
   const state = await installApiMocks(page);
   state.tunnels[0].apply_status = "failed";
   state.tunnels[0].apply_error = "证书尚未签发";

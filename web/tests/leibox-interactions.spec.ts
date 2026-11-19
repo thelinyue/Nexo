@@ -15,7 +15,7 @@ async function switchView(page: Page, label: "列表视图" | "图标视图") {
   await frames(page);
 }
 
-test("手机选中块跟随真实路由，更多连续开关不移动底座和添加按钮", async ({ page }, info) => {
+test("手机选中块跟随真实路由，更多连续开关不移动底座和添加按钮", { tag: ["@mobile", "@landscape"] }, async ({ page }, info) => {
   test.skip(info.project.name === "desktop-dark", "手机底栏动效");
   await installApiMocks(page);
   await page.goto("/#/services");
@@ -58,7 +58,7 @@ test("手机选中块跟随真实路由，更多连续开关不移动底座和�
   await page.screenshot({ path: info.outputPath("leibox-navigation-more.png"), scale: "css" });
 });
 
-test("真实服务元素连续切换，复用 DOM、选择和显示偏好且不写配置", async ({ page }, info) => {
+test("真实服务元素连续切换，复用 DOM、选择和显示偏好且不写配置", { tag: "@mobile" }, async ({ page }, info) => {
   const state = await installApiMocks(page);
   state.tunnels = Array.from({ length: 8 }, (_, index) => ({ ...state.tunnels[0], id: `morph-${index}`, name: `家庭应用 ${index + 1}` }));
   await page.goto("/#/services");
@@ -99,16 +99,22 @@ test("真实服务元素连续切换，复用 DOM、选择和显示偏好且不�
   await page.screenshot({ path: info.outputPath("leibox-service-list.png"), scale: "css" });
 });
 
-test("减少动画和断点变化立即释放 JS 动画，后台页面不继续变换", async ({ page }, info) => {
+test("减少动画和断点变化立即释放 JS 动画，后台页面不继续变换", { tag: "@mobile" }, async ({ page }, info) => {
+  await page.clock.install();
   const state = await installApiMocks(page);
   state.tunnels = Array.from({ length: 6 }, (_, index) => ({ ...state.tunnels[0], id: `reduce-${index}`, name: `媒体 ${index}` }));
   await page.goto("/#/services");
   const list = page.locator(".service-list");
   await expect(list.locator(".service-row")).toHaveCount(6);
-  await switchView(page, "图标视图");
+  // WebKit 分片负载高时，跨进程断言可能错过短动画。暂停时钟确保在动画进行中切换偏好。
+  await page.clock.pauseAt(await page.evaluate(() => Date.now() + 2000));
+  await page.getByRole("button", { name: "图标视图", exact: true }).evaluate((button: HTMLButtonElement) => button.click());
+  await page.clock.runFor(48);
   await expect(list).toHaveAttribute("data-moving", "true");
   await page.emulateMedia({ reducedMotion: "reduce", contrast: "more" });
+  await page.clock.runFor(32);
   await expect(list).toHaveAttribute("data-moving", "false");
+  await page.clock.resume();
   await switchView(page, "列表视图");
   await expect(list).toHaveAttribute("data-moving", "false");
   expect(await list.locator(".application-launch,.service-identity").evaluateAll(elements => elements.every(element => !(element as HTMLElement).style.transform))).toBe(true);
@@ -131,7 +137,7 @@ test("减少动画和断点变化立即释放 JS 动画，后台页面不继续�
   expect(await list.locator(".application-launch,.service-identity").evaluateAll(elements => elements.every(element => !(element as HTMLElement).style.transform))).toBe(true);
 });
 
-test("动画中打开详情及刷新大量服务不留下变换或重复条目", async ({ page }) => {
+test("动画中打开详情及刷新大量服务不留下变换或重复条目", { tag: "@webkit" }, async ({ page }) => {
   const state = await installApiMocks(page);
   state.tunnels = Array.from({ length: 120 }, (_, index) => ({ ...state.tunnels[0], id: `many-${index}`, name: `服务 ${index}` }));
   await page.goto("/#/services");
@@ -158,7 +164,7 @@ test("动画中打开详情及刷新大量服务不留下变换或重复条目",
   await expect(list).toHaveAttribute("data-moving", "false");
 });
 
-test("320px 明暗主题、减少透明度与双倍字号仍保留完整操作", async ({ page }, info) => {
+test("320px 明暗主题、减少透明度与双倍字号仍保留完整操作", { tag: "@mobile" }, async ({ page }, info) => {
   test.skip(info.project.name !== "mobile-light", "窄屏和辅助功能矩阵集中验收");
   await page.setViewportSize({ width: 320, height: 568 });
   const state = await installApiMocks(page);

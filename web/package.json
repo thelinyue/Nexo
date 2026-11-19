@@ -7,7 +7,8 @@
     "build": "vite build",
     "dev": "vite",
     "preview": "vite preview",
-    "test:e2e": "playwright test"
+    "test:e2e": "playwright test",
+    "test:host": "playwright test --config=playwright.host.config.ts"
   },
   "dependencies": {
     "@iconify-icons/tabler": "^2.0.3",

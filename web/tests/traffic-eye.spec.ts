@@ -133,7 +133,7 @@ test("没有请求的延迟采样点不显示为零毫秒", async ({ page }) => 
   await expect(slider).toHaveAttribute("aria-valuetext", /p50 上界 —.*p95 上界 —/);
 });
 
-test("天眼在小屏与放大文字下保留触控热区且不溢出", async ({ page }) => {
+test("天眼在小屏与放大文字下保留触控热区且不溢出", { tag: "@mobile" }, async ({ page }) => {
   await installApiMocks(page);
   await page.setViewportSize({ width: 320, height: 568 });
   await page.goto("/");

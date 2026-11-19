@@ -64,7 +64,7 @@ for (const mode of ["tunnel", "reverse_proxy"] as const) {
   });
 }
 
-test("粘贴主机名和 IPv6 网址填入显式或默认端口，公网 HTTP 保持独立", async ({ page }) => {
+test("粘贴主机名和 IPv6 网址填入显式或默认端口，公网 HTTP 保持独立", { tag: "@mobile" }, async ({ page }) => {
   await installApiMocks(page);
   await page.goto("/#/services");
   await openServiceEditor(page);
@@ -116,7 +116,7 @@ test("路径、参数和片段提示随再次粘贴或手动修改连接字段�
   await expect(message).toHaveCount(0);
 });
 
-test("普通地址、无效网址和带账号密码的网址保留原生粘贴，手动输入不触发拆分", async ({ page }) => {
+test("普通地址、无效网址和带账号密码的网址保留原生粘贴，手动输入不触发拆分", { tag: "@mobile" }, async ({ page }) => {
   const state = await installApiMocks(page);
   await page.goto("/#/services");
   await openServiceEditor(page);

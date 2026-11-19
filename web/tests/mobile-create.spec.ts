@@ -6,7 +6,7 @@ const current = (page: Page) => page.locator(".page-slot:not([hidden])");
 const createSlot = (page: Page) => page.locator(".mobile-create-slot");
 
 for (const installed of [false, true]) {
-  test(`${installed ? "PWA" : "手机浏览器"} 四类添加入口紧邻底栏，切页不残留缓存按钮`, async ({ page }, info) => {
+  test(`${installed ? "PWA" : "手机浏览器"} 四类添加入口紧邻底栏，切页不残留缓存按钮`, { tag: "@landscape" }, async ({ page }, info) => {
     test.skip(info.project.name === "desktop-dark", "移动端入口矩阵");
     if (installed) await page.addInitScript(() => Object.defineProperty(navigator, "standalone", { configurable: true, value: true }));
     await installApiMocks(page);

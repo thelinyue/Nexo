@@ -3,7 +3,7 @@ import { installApiMocks } from "./api-mocks";
 
 const activePage = (page: import("@playwright/test").Page) => page.locator(".page-slot:not([hidden])");
 
-test("手机视图切换并入搜索首行，筛选不挤压且键盘选择入口可达", async ({ page }, info) => {
+test("手机视图切换并入搜索首行，筛选不挤压且键盘选择入口可达", { tag: ["@mobile", "@landscape"] }, async ({ page }, info) => {
   test.skip(info.project.name === "desktop-dark", "手机紧凑工具栏");
   const state = await installApiMocks(page);
   state.tunnels = ["媒体中心", "文件管理", "下载助手", "家庭相册", "音乐库", "笔记", "设备面板", "备用服务"].map((name, index) => ({ ...state.tunnels[0], id: `layout-${index}`, name }));

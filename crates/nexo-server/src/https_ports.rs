@@ -1,13 +1,7 @@
 //! HTTPS 公网端口属于服务；默认端口保留既有监听配置，自定义端口共享 Caddy 按域名分流。
 use crate::*;
 
-pub fn url(protocol: &str, host: &str, port: u16) -> String {
-    if protocol == "https" && port != 443 {
-        format!("https://{host}:{port}")
-    } else {
-        format!("{protocol}://{host}")
-    }
-}
+pub use nexo_node::routes::public_url as url;
 
 pub fn migrate(db: &Connection) -> Result<()> {
     let tx = db.unchecked_transaction()?;

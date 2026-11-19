@@ -6,20 +6,7 @@ use std::{
     time::Duration,
 };
 
-pub const PROBE_PATH: &str = "/.nexo-relay/probe";
-
-/// 回显配置标识用于识别错端口、错路由和迟到的 Caddy 配置，不包含身份凭据。
-#[derive(Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
-pub struct ProbeIdentity {
-    pub node_id: String,
-    pub service_id: String,
-    pub revision: i64,
-}
-
-pub fn route(host: &str, node: &str, service: &str, revision: i64) -> Value {
-    let body = json!({"node_id":node,"service_id":service,"revision":revision}).to_string();
-    json!({"match":[{"host":[host],"path":[PROBE_PATH],"method":["GET"]}],"handle":[{"handler":"static_response","status_code":200,"body":body,"headers":{"Content-Type":["application/json"],"Cache-Control":["no-store"]}}],"terminal":true})
-}
+pub use nexo_node::routes::{ProbeIdentity, PROBE_PATH};
 
 /// 一个探测目标绑定节点地址及服务版本；网络等待后的结果必须再次核对这些字段。
 #[derive(Clone, Debug, PartialEq, Eq)]

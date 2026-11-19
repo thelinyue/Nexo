@@ -1,4 +1,8 @@
 use super::*;
+use std::sync::Mutex;
+
+#[path = "../../test-support/echo_origin.rs"]
+mod origin;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 fn csr(key: &rcgen::KeyPair) -> String {
@@ -7,58 +11,109 @@ fn csr(key: &rcgen::KeyPair) -> String {
     params.serialize_request(key).unwrap().pem().unwrap()
 }
 
-/// 测试使用真实中央账本处理节点请求，不以节点自报的总量替代预算授权。
+pub(super) struct Meter {
+    policy: wire::NodeQuota,
+    pub(super) used_bytes: u64,
+    grants: HashMap<String, u64>,
+}
+
+impl Meter {
+    fn set_limit(&mut self, limit: Option<u64>) {
+        self.policy.revision += 1;
+        self.policy.monthly_limit_bytes = limit;
+        self.refresh();
+    }
+
+    fn refresh(&mut self) {
+        self.policy.exhausted = self
+            .policy
+            .monthly_limit_bytes
+            .is_some_and(|limit| self.used_bytes >= limit);
+    }
+
+    pub(super) fn reserved_bytes(&self) -> u64 {
+        self.grants.values().sum()
+    }
+}
+
+/// 通过与控制器相同的请求和响应测试节点的预算泵；持久账本由 Server 单测及真实进程烟测覆盖。
 pub(super) async fn attach_meter(
     runtime: &Arc<Runtime>,
     service: &wire::Service,
-) -> (AppState, tokio::task::JoinHandle<()>) {
-    let (state, _) = crate::tests::domain_fixture();
-    {
-        let db = state.db.lock().unwrap();
-        db.execute("INSERT INTO relay_nodes(id,name,approved,traffic_quota_supported,created_at) VALUES('metered','计量节点',1,1,0)",[]).unwrap();
-        db.execute(
-            "INSERT INTO relay_node_grants VALUES('metered','default')",
-            [],
-        )
-        .unwrap();
-        db.execute("INSERT INTO tunnels(id,tenant_id,name,protocol,local_address,local_port,service_mode,created_at,updated_at) VALUES(?1,'default','服务','http','127.0.0.1',80,?2,0,0)",params![service.id,if service.reverse_proxy_target.is_some(){"reverse_proxy"}else{"tunnel"}]).unwrap();
-        db.execute(
-            "INSERT INTO service_nodes VALUES(?1,'metered')",
-            [&service.id],
-        )
-        .unwrap();
-        db.execute("INSERT INTO node_traffic_limits(node_id,monthly_limit_bytes,revision) VALUES('metered',10485760,1)",[]).unwrap();
-        let mut next = runtime.snapshot.borrow().clone();
-        next.traffic_quota = super::super::quota::policy(&db, "metered").unwrap();
-        runtime.snapshot.send_replace(next);
-    }
+) -> (Arc<Mutex<Meter>>, tokio::task::JoinHandle<()>) {
+    let now = unix_now();
+    let policy = wire::NodeQuota {
+        revision: 1,
+        period_start: now,
+        period_end: now + 3600,
+        monthly_limit_bytes: Some(10 * 1024 * 1024),
+        exhausted: false,
+    };
+    runtime
+        .snapshot
+        .send_modify(|snapshot| snapshot.traffic_quota = Some(policy.clone()));
+    let meter = Arc::new(Mutex::new(Meter {
+        policy,
+        used_bytes: 0,
+        grants: HashMap::new(),
+    }));
     let (sender, mut requests) = mpsc::channel::<Access>(32);
     let (reports, mut usage) = mpsc::unbounded_channel();
     *runtime.access.lock().await = Some(sender);
     *runtime.usage.lock().await = Some(reports);
-    let controller = state.clone();
-    let rt = runtime.clone();
+    let controller = meter.clone();
+    let service = service.clone();
+    let snapshot = runtime.snapshot.clone();
     let task = tokio::spawn(async move {
         let mut tick = tokio::time::interval(Duration::from_millis(20));
         loop {
             tokio::select! {
-                Some(call)=requests.recv()=>{
-                    if let wire::Request::Budget{request_id,service_id,service_revision,quota_revision,month,bytes}=call.request {
-                        let (grant_id,bytes)=super::super::quota::reserve(&controller.db.lock().unwrap(),"metered",&service_id,service_revision,quota_revision,month,bytes).unwrap();
-                        let _=call.reply.send(wire::Response::Budget{request_id,grant_id,bytes});
-                    } else {let _=call.reply.send(wire::Response::Access{request_id:0,status:403,headers:vec![],body:"测试拒绝访问".into()});}
-                },
-                Some(wire::Request::Usage{grant_id,to_origin,to_public,finished})=usage.recv()=>{
-                    super::super::quota::settle(&controller.db.lock().unwrap(),"metered",&grant_id,to_origin,to_public,finished).unwrap();
-                },
-                _=tick.tick()=>{
-                    let policy=super::super::quota::policy(&controller.db.lock().unwrap(),"metered").unwrap();
-                    rt.snapshot.send_if_modified(|s|if s.traffic_quota!=policy {s.traffic_quota=policy.clone();true}else{false});
+                Some(call) = requests.recv() => {
+                    let reply = match call.request {
+                        wire::Request::Budget { request_id, service_id, service_revision, quota_revision, month, bytes } => {
+                            let mut meter = controller.lock().unwrap();
+                            assert_eq!(service_id, service.id);
+                            assert_eq!(service_revision, service.revision);
+                            assert_eq!(month, meter.policy.period_start);
+                            let limit = meter.policy.monthly_limit_bytes.unwrap_or(u64::MAX);
+                            let available = limit.saturating_sub(meter.used_bytes + meter.reserved_bytes());
+                            let mut grant_id = String::new();
+                            let bytes = if meter.policy.revision == quota_revision {
+                                available.min(u64::from(bytes))
+                            } else {
+                                0
+                            };
+                            if bytes != 0 {
+                                grant_id = Uuid::new_v4().to_string();
+                                meter.grants.insert(grant_id.clone(), bytes);
+                            }
+                            wire::Response::Budget { request_id, grant_id, bytes }
+                        }
+                        _ => wire::Response::Access { request_id: 0, status: 403, headers: vec![], body: "测试拒绝访问".into() },
+                    };
+                    let _ = call.reply.send(reply);
+                }
+                Some(wire::Request::Usage { grant_id, to_origin, to_public, finished }) = usage.recv() => {
+                    let mut meter = controller.lock().unwrap();
+                    assert!(finished);
+                    let reserved = meter.grants.remove(&grant_id).unwrap();
+                    let used = to_origin + to_public;
+                    assert!(used <= reserved);
+                    meter.used_bytes += used;
+                    meter.refresh();
+                }
+                _ = tick.tick() => {
+                    let policy = Some(controller.lock().unwrap().policy.clone());
+                    snapshot.send_if_modified(|state| {
+                        if state.traffic_quota == policy { return false; }
+                        state.traffic_quota = policy;
+                        true
+                    });
                 }
             }
         }
     });
-    (state, task)
+    (meter, task)
 }
 
 /// 两个真实 mTLS/Yamux 入口共用 Agent 身份；撤销其中一个不得取消另一个的存量流。
@@ -206,29 +261,19 @@ async fn mtls_scenario(metered: bool) {
     assert_eq!(runtimes[1].connections.load(Ordering::Relaxed), 1);
     if metered {
         tokio::time::sleep(Duration::from_millis(350)).await;
-        assert_eq!(
-            super::super::quota::view(&meters[1].db.lock().unwrap(), "metered", unix_now())
-                .unwrap()
-                .used_bytes,
-            16
-        );
-        assert_eq!(
-            super::super::quota::view(&meters[0].db.lock().unwrap(), "metered", unix_now())
-                .unwrap()
-                .used_bytes,
-            8
-        );
+        assert_eq!(meters[1].lock().unwrap().used_bytes, 16);
+        assert_eq!(meters[0].lock().unwrap().used_bytes, 8);
     }
 }
 
 /// 独立节点的真实 Caddy 在没有任何 Agent 会话时直接回源，并验证入口撤销和 TLS。
 #[tokio::test]
-#[ignore = "需要 NEXO_TEST_CADDY_BIN 与 NEXO_CADDY_BINARY；只访问本机"]
+#[ignore = "需要 NEXO_CADDY_BINARY；只访问本机"]
 async fn real_caddy_node_reverse_proxy_without_agent_tls_websocket_and_revocation() {
     proxy_scenario(false).await;
 }
 #[tokio::test]
-#[ignore = "需要 NEXO_TEST_CADDY_BIN 与 NEXO_CADDY_BINARY；只访问本机"]
+#[ignore = "需要 NEXO_CADDY_BINARY；只访问本机"]
 async fn real_caddy_metered_proxy_tls_websocket_exhaustion_and_recovery() {
     proxy_scenario(true).await;
 }
@@ -249,9 +294,7 @@ async fn proxy_scenario(metered: bool) {
         loop {
             let (stream, _) = origin.accept().await.unwrap();
             tokio::spawn(async move {
-                let _ =
-                    crate::domain_runtime::reverse_proxy_tests::echo_origin(stream, "node-origin")
-                        .await;
+                let _ = origin::echo_origin(stream, "node-origin").await;
             });
         }
     });
@@ -290,9 +333,13 @@ async fn proxy_scenario(metered: bool) {
     } else {
         None
     };
-    let directory = std::env::temp_dir().join(format!("nexo-node-proxy-{}", Uuid::new_v4()));
+    let directory = tempfile::tempdir().unwrap();
     let node = runtime.clone();
-    tasks.spawn(listeners(node, directory, "test-node".into()));
+    tasks.spawn(listeners(
+        node,
+        directory.path().to_owned(),
+        "test-node".into(),
+    ));
     let client = reqwest::Client::builder()
         .no_proxy()
         .redirect(reqwest::redirect::Policy::none())
@@ -335,21 +382,22 @@ async fn proxy_scenario(metered: bool) {
         drop(socket);
         if let Some(meter)=&meter {
             tokio::time::sleep(Duration::from_millis(350)).await;
-            let used=super::super::quota::view(&meter.db.lock().unwrap(),"metered",unix_now())?.used_bytes;
+            let used=meter.lock().unwrap().used_bytes;
             anyhow::ensure!(used>0,"反向代理未计量");
             let limit=used+1_500_000;
-            meter.db.lock().unwrap().execute("UPDATE node_traffic_limits SET monthly_limit_bytes=?1,revision=revision+1 WHERE node_id='metered'",[limit])?;
+            meter.lock().unwrap().set_limit(Some(limit));
             tokio::time::timeout(Duration::from_secs(3),async {loop {if runtime.snapshot.borrow().traffic_quota.as_ref().is_some_and(|q|q.revision==2){break;}tokio::time::sleep(Duration::from_millis(20)).await;}}).await?;
             let response=client.post(format!("http://127.0.0.1:{http_port}/large")).header("Host","app.localhost").body("x".repeat(1_048_576)).send().await;
             anyhow::ensure!(response.is_err() || response.unwrap().bytes().await.is_err(),"超额长下载没有中断");
-            tokio::time::timeout(Duration::from_secs(5),async {loop {if super::super::quota::view(&meter.db.lock().unwrap(),"metered",unix_now()).unwrap().exhausted{break;}tokio::time::sleep(Duration::from_millis(20)).await;}}).await.with_context(||format!("等待用尽失败：{:?}",super::super::quota::view(&meter.db.lock().unwrap(),"metered",unix_now())))?;
-            let q=super::super::quota::view(&meter.db.lock().unwrap(),"metered",unix_now())?;
-            anyhow::ensure!(q.used_bytes==limit && q.reserved_bytes==0,"节点额度超支或结算不完整");
+            tokio::time::timeout(Duration::from_secs(5),async {loop {if meter.lock().unwrap().policy.exhausted{break;}tokio::time::sleep(Duration::from_millis(20)).await;}}).await.context("等待节点额度用尽超时")?;
+            {
+                let meter = meter.lock().unwrap();
+                anyhow::ensure!(meter.used_bytes == limit && meter.reserved_bytes() == 0, "节点额度超支或结算不完整");
+            }
             anyhow::ensure!(client.get(format!("http://127.0.0.1:{http_port}/")).header("Host","app.localhost").send().await?.status().is_server_error(),"用尽后仍允许新请求");
-            meter.db.lock().unwrap().execute("UPDATE node_traffic_limits SET monthly_limit_bytes=NULL,revision=revision+1 WHERE node_id='metered'",[])?;
+            meter.lock().unwrap().set_limit(None);
             tokio::time::timeout(Duration::from_secs(3),async {loop {if runtime.snapshot.borrow().traffic_quota.as_ref().is_some_and(|q|q.revision==3){break;}tokio::time::sleep(Duration::from_millis(20)).await;}}).await?;
             anyhow::ensure!(client.get(format!("http://127.0.0.1:{http_port}/")).header("Host","app.localhost").send().await?.status()==200,"解除额度没有恢复入口");
-            anyhow::ensure!(meter.db.lock().unwrap().query_row("SELECT COUNT(*) FROM traffic_quota_months",[],|r|r.get::<_,i64>(0))?==0,"节点反代不应消耗用户穿透额度");
         }
         // 自签名 HTTPS 回源必须拒绝，不能为了节点直连关闭证书校验。
         let mut tls_origin=service.clone();tls_origin.id="tls-origin".into();tls_origin.http_redirect=false;

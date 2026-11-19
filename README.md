@@ -208,6 +208,14 @@ npm ci --ignore-scripts
 npm run build
 ```
 
+在 `web` 目录运行以下测试。桌面 Chromium 执行完整业务回归，手机项目重点验收触控、键盘、PWA 和布局。通用测试可用 `@mobile` 加入两个竖屏项目，用 `@landscape` 验收横屏，用 `@webkit` 补充引擎兼容性。部署命令验收依赖 Linux 或 WSL 中的 Python、Docker Compose 和 Shell。
+
+```bash
+npm run test:e2e -- --grep-invert "真实复制地址"
+npm run test:e2e -- tests/clipboard.spec.ts --workers=1
+npm run test:host
+```
+
 漏洞请按 [安全策略](https://github.com/thelinyue/Nexo/blob/master/SECURITY.md) 私密报告，不要在公开 Issue 中提交 Token、私钥或包含凭据的日志。
 
 ## 许可证

@@ -176,7 +176,7 @@ test("切换用户丢弃迟到统计，切走首页停止统计请求", async ({
   await expect.poll(() => state.calls.filter(call => call.path.includes("/traffic/")).length).toBeGreaterThan(0);
 });
 
-test("首页空状态、零流量与缺口、窄屏主题与辅助功能", async ({ page }, info) => {
+test("首页空状态、零流量与缺口、窄屏主题与辅助功能", { tag: "@mobile" }, async ({ page }, info) => {
   test.skip(info.project.name !== "mobile-light", "视觉尺寸矩阵只运行一次");
   const state = await installApiMocks(page, { empty: true }); state.devices = [];
   await page.route("**/api/v1/admin/traffic/history?**", route => route.fulfill({ json: { start: 100, end: 280, step: 60, sampled_at: 280, total: { to_origin: 0, to_public: 0 }, points: [{ at: 100, seconds: 60, covered_seconds: 60, bytes: { to_origin: 0, to_public: 0 }, rates: { to_origin: 0, to_public: 0 } }, { at: 160, seconds: 60, covered_seconds: 0, bytes: { to_origin: 0, to_public: 0 }, rates: null }, { at: 220, seconds: 60, covered_seconds: 60, bytes: { to_origin: 0, to_public: 0 }, rates: { to_origin: 0, to_public: 0 } }] } }));

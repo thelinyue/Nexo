@@ -6,33 +6,43 @@ on:
       - "v*"
 
 permissions:
-  contents: write
-  packages: write
+  contents: read
 
 concurrency:
-  # 不同版本共用发布锁，避免检查最新版本后被另一场发布交叉覆盖。
+  # 不同版本共用发布锁，避免两场发布交叉更新 latest。
   group: nexo-release
   cancel-in-progress: false
 
 jobs:
+  scope:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      components: ${{ steps.version.outputs.components }}
+      node: ${{ steps.version.outputs.node }}
+      images: ${{ steps.version.outputs.images }}
+      published: ${{ steps.version.outputs.published }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: 校验发布标签和组件
+        id: version
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: python3 .github/scripts/release.py scope
+
   node-packages:
+    needs: scope
+    if: needs.scope.outputs.node == 'true' && needs.scope.outputs.published == 'false'
     strategy:
+      fail-fast: false
       matrix:
         runner: [ubuntu-24.04, ubuntu-24.04-arm]
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
-        with:
-          node-version: 22.16.0
-          cache: npm
-          cache-dependency-path: web/package-lock.json
-      - name: 判断独立节点发布范围
-        id: scope
-        run: echo "node=$(node -p "require('./release-manifest.json').components.includes('node')")" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: 构建原生节点与配套 Caddy
-        if: steps.scope.outputs.node == 'true'
         run: |
           sudo apt-get update
           sudo apt-get install -y musl-tools
@@ -40,161 +50,167 @@ jobs:
           rustup default 1.89.0
           bash docker/build-node.sh
       - uses: actions/upload-artifact@v4
-        if: steps.scope.outputs.node == 'true'
         with:
           name: nexo-node-${{ matrix.runner }}
           path: dist/nexo-node-*.tar.gz
           if-no-files-found: error
-  publish:
-    needs: node-packages
+          overwrite: true
+
+  images:
+    needs: scope
+    if: needs.scope.outputs.images != '[]'
+    strategy:
+      fail-fast: false
+      matrix:
+        component: ${{ fromJSON(needs.scope.outputs.images) }}
     runs-on: ubuntu-24.04
-    timeout-minutes: 90
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      packages: write
+    env:
+      COMPONENT: ${{ matrix.component }}
+      VERSION: ${{ needs.scope.outputs.version }}
+      REVISION: ${{ github.sha }}
+      PUBLISHED: ${{ needs.scope.outputs.published }}
     steps:
-      - name: 检出发布标签
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-
-      - name: 校验标签与项目版本
-        id: version
-        shell: bash
-        run: |
-          set -euo pipefail
-          tag_version="${GITHUB_REF_NAME#v}"
-          cargo_version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n 1)"
-          web_version="$(node -p "require('./web/package.json').version")"
-          manifest_version="$(node -p "require('./release-manifest.json').version")"
-          publish_server="$(node -p "require('./release-manifest.json').components.includes('server')")"
-          publish_agent="$(node -p "require('./release-manifest.json').components.includes('agent')")"
-          publish_node="$(node -p "require('./release-manifest.json').components.includes('node')")"
-          if [[ "$GITHUB_REF_NAME" != "v${tag_version}" || -z "$tag_version" ]]; then
-            echo "发布标签必须使用 v<版本号> 格式" >&2
-            exit 1
-          fi
-          if [[ "$cargo_version" != "$tag_version" || "$web_version" != "$tag_version" || "$manifest_version" != "$tag_version" ]]; then
-            echo "标签、Cargo、Web 和发布清单版本不一致：tag=$tag_version cargo=$cargo_version web=$web_version manifest=$manifest_version" >&2
-            exit 1
-          fi
-          if [[ "$publish_server" != "true" && "$publish_agent" != "true" && "$publish_node" != "true" ]]; then
-            echo "发布清单至少要声明一个实际变化的组件" >&2
-            exit 1
-          fi
-          echo "version=$tag_version" >> "$GITHUB_OUTPUT"
-          echo "publish_server=$publish_server" >> "$GITHUB_OUTPUT"
-          echo "publish_agent=$publish_agent" >> "$GITHUB_OUTPUT"
-          echo "publish_node=$publish_node" >> "$GITHUB_OUTPUT"
-
-      - name: 准备 Docker Buildx
-        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
-
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: 登录 GHCR
         uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: 构建并发布 Server
-        if: steps.version.outputs.publish_server == 'true'
-        id: server
-        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
-        with:
-          context: .
-          file: docker/Dockerfile.server
-          platforms: linux/amd64
-          push: true
-          tags: ghcr.io/thelinyue/nexo-server:${{ steps.version.outputs.version }}
-          build-args: |
-            NEXO_VERSION=${{ steps.version.outputs.version }}
-            NEXO_REVISION=${{ github.sha }}
-          cache-from: type=gha,scope=nexo-server
-          cache-to: type=gha,mode=max,scope=nexo-server
-
-      - name: 构建并发布 Agent
-        if: steps.version.outputs.publish_agent == 'true'
-        id: agent
-        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
-        with:
-          context: .
-          file: docker/Dockerfile.agent
-          platforms: linux/amd64
-          push: true
-          tags: ghcr.io/thelinyue/nexo-agent:${{ steps.version.outputs.version }}
-          build-args: |
-            NEXO_VERSION=${{ steps.version.outputs.version }}
-            NEXO_REVISION=${{ github.sha }}
-          cache-from: type=gha,scope=nexo-agent
-          cache-to: type=gha,mode=max,scope=nexo-agent
-
-      - name: 更新实际发布组件的 latest
-        if: steps.version.outputs.publish_server == 'true' || steps.version.outputs.publish_agent == 'true'
+      - name: 检查同版本镜像
+        id: existing
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          VERSION: ${{ steps.version.outputs.version }}
-          PUBLISH_SERVER: ${{ steps.version.outputs.publish_server }}
-          PUBLISH_AGENT: ${{ steps.version.outputs.publish_agent }}
+          PYTHONPATH: .github/scripts
         run: |
           set -euo pipefail
-          components=()
-          if [[ "$PUBLISH_SERVER" == "true" ]]; then components+=(server); fi
-          if [[ "$PUBLISH_AGENT" == "true" ]]; then components+=(agent); fi
-          python3 .github/scripts/publish_latest.py --version "$VERSION" --components "${components[@]}" --apply
+          repository="thelinyue/nexo-$COMPONENT"
+          digest=$(python3 - <<'PY'
+          import os
+          from publish_latest import Registry
 
+          repository = "thelinyue/nexo-" + os.environ["COMPONENT"]
+          registry = Registry(repository, os.environ["GITHUB_ACTOR"], os.environ["GH_TOKEN"], apply=False)
+          manifest = registry.manifest(os.environ["VERSION"])
+          print(manifest[2] if manifest else "")
+          PY
+          )
+          if [[ -n "$digest" ]]; then
+            image="ghcr.io/$repository@$digest"
+            docker pull --platform linux/amd64 "$image"
+            revision=$(docker image inspect --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}' "$image")
+            version=$(docker image inspect --format '{{ index .Config.Labels "org.opencontainers.image.version" }}' "$image")
+            if [[ "$revision" != "$REVISION" || "$version" != "$VERSION" ]]; then
+              echo "同版本镜像的提交或版本不匹配，停止发布" >&2
+              exit 1
+            fi
+          elif [[ "$PUBLISHED" == 'true' ]]; then
+            echo "正式版本镜像缺失，无法验证已有发布" >&2
+            exit 1
+          fi
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+      - name: 准备 Docker Buildx
+        if: steps.existing.outputs.digest == ''
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - name: 构建并上传数字版本镜像
+        if: steps.existing.outputs.digest == ''
+        id: build
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: .
+          file: docker/Dockerfile.${{ matrix.component }}
+          platforms: linux/amd64
+          push: true
+          tags: ghcr.io/thelinyue/nexo-${{ matrix.component }}:${{ needs.scope.outputs.version }}
+          build-args: |
+            NEXO_VERSION=${{ needs.scope.outputs.version }}
+            NEXO_REVISION=${{ github.sha }}
+          cache-from: type=gha,scope=nexo-${{ matrix.component }}
+          cache-to: type=gha,mode=max,scope=nexo-${{ matrix.component }}
+      - name: 记录发布镜像摘要
+        env:
+          DIGEST: ${{ steps.existing.outputs.digest || steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          [[ "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
+          mkdir -p dist
+          printf '%s\n' "$DIGEST" > "dist/$COMPONENT.digest"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: image-metadata-${{ matrix.component }}
+          path: dist/${{ matrix.component }}.digest
+          if-no-files-found: error
+          overwrite: true
+
+  publish:
+    needs: [scope, node-packages, images]
+    # 所选构建必须成功，跳过的组件不阻塞发布。
+    if: >-
+      ${{
+        !cancelled() && needs.scope.result == 'success' &&
+        (needs.scope.outputs.images == '[]' || needs.images.result == 'success') &&
+        (needs.scope.outputs.node == 'false' || needs.scope.outputs.published == 'true' || needs.node-packages.result == 'success')
+      }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+      packages: write
+    env:
+      VERSION: ${{ needs.scope.outputs.version }}
+      COMPONENTS: ${{ needs.scope.outputs.components }}
+      IMAGES: ${{ needs.scope.outputs.images }}
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: 取得原生节点包
-        if: steps.version.outputs.publish_node == 'true'
+        if: needs.node-packages.result == 'success'
         uses: actions/download-artifact@v4
         with:
           pattern: nexo-node-*
           path: dist
           merge-multiple: true
-
+      - name: 取得容器镜像摘要
+        if: needs.scope.outputs.images != '[]' && needs.scope.outputs.published == 'false'
+        uses: actions/download-artifact@v4
+        with:
+          pattern: image-metadata-*
+          path: dist
+          merge-multiple: true
       - name: 生成部署包与发布说明
-        env:
-          VERSION: ${{ steps.version.outputs.version }}
-          SERVER_DIGEST: ${{ steps.server.outputs.digest }}
-          AGENT_DIGEST: ${{ steps.agent.outputs.digest }}
-          PUBLISH_SERVER: ${{ steps.version.outputs.publish_server }}
-          PUBLISH_AGENT: ${{ steps.version.outputs.publish_agent }}
+        if: needs.scope.outputs.published == 'false'
         run: |
           set -euo pipefail
-          bundle="nexo-v${VERSION}-docker"
-          mkdir -p "dist/${bundle}/config"
-          cp LICENSE THIRD_PARTY_NOTICES.md release-manifest.json "dist/${bundle}/"
-          cp "docs/releases/v${VERSION}.md" "dist/${bundle}/README.md"
-          # 仅打包本次实际发布组件，避免无代码变化的组件被误升级。
-          if [[ "$PUBLISH_SERVER" == "true" ]]; then
-            cp compose.yml "dist/${bundle}/"
-            cp config/server.toml "dist/${bundle}/config/"
-            sed -i "s|nexo-server:latest|nexo-server:${VERSION}|" "dist/${bundle}/compose.yml"
-          fi
-          if [[ "$PUBLISH_AGENT" == "true" ]]; then
-            cp compose.agent.yml "dist/${bundle}/"
-            cp config/agent.toml "dist/${bundle}/config/"
-            sed -i "s|nexo-agent:latest|nexo-agent:${VERSION}|" "dist/${bundle}/compose.agent.yml"
-          fi
-          cp -R licenses "dist/${bundle}/licenses"
-          tar -C dist -czf "dist/${bundle}.tar.gz" "${bundle}"
-          (cd dist && sha256sum nexo*.tar.gz > SHA256SUMS)
+          mkdir -p dist
           cp "docs/releases/v${VERSION}.md" dist/release-notes.md
-          {
-            echo
-            echo "### 不可变镜像摘要"
-            if [[ "$PUBLISH_SERVER" == "true" ]]; then
-              echo "- \`ghcr.io/thelinyue/nexo-server:${VERSION}@${SERVER_DIGEST}\`"
-            fi
-            if [[ "$PUBLISH_AGENT" == "true" ]]; then
-              echo "- \`ghcr.io/thelinyue/nexo-agent:${VERSION}@${AGENT_DIGEST}\`"
-            fi
-          } >> dist/release-notes.md
+          if [[ "$IMAGES" == '[]' ]]; then exit 0; fi
 
-      - name: 创建 GitHub Release
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          VERSION: ${{ steps.version.outputs.version }}
+          bundle="nexo-v${VERSION}-docker"
+          mkdir -p "dist/$bundle/config"
+          cp LICENSE THIRD_PARTY_NOTICES.md release-manifest.json "dist/$bundle/"
+          cp "docs/releases/v${VERSION}.md" "dist/$bundle/README.md"
+          cp -R licenses "dist/$bundle/licenses"
+          mapfile -t images < <(jq -r '.[]' <<< "$IMAGES")
+          printf '\n### 不可变镜像摘要\n' >> dist/release-notes.md
+          for component in "${images[@]}"; do
+            compose=compose.yml
+            if [[ "$component" == "agent" ]]; then compose=compose.agent.yml; fi
+            cp "$compose" "dist/$bundle/"
+            cp "config/$component.toml" "dist/$bundle/config/"
+            sed -i "s|nexo-$component:latest|nexo-$component:${VERSION}|" "dist/$bundle/$compose"
+            digest=$(cat "dist/$component.digest")
+            printf -- '- `ghcr.io/thelinyue/nexo-%s:%s@%s`\n' "$component" "$VERSION" "$digest" >> dist/release-notes.md
+          done
+          tar -C dist -czf "dist/$bundle.tar.gz" "$bundle"
+      - name: 发布或校验 GitHub Release
+        run: mkdir -p dist && python3 .github/scripts/release.py publish
+      - name: 更新实际发布镜像的 latest
+        if: needs.scope.outputs.images != '[]'
         run: |
           set -euo pipefail
-          if gh release view "v${VERSION}" >/dev/null 2>&1; then
-            gh release edit "v${VERSION}" --title "Nexo v${VERSION}" --notes-file dist/release-notes.md
-            gh release upload "v${VERSION}" dist/nexo*.tar.gz dist/SHA256SUMS --clobber
-          else
-            gh release create "v${VERSION}" dist/nexo*.tar.gz dist/SHA256SUMS \
-              --verify-tag --title "Nexo v${VERSION}" --notes-file dist/release-notes.md
-          fi
+          mapfile -t images < <(jq -r '.[]' <<< "$IMAGES")
+          python3 .github/scripts/publish_latest.py --version "$VERSION" --components "${images[@]}" --apply

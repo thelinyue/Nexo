@@ -98,7 +98,7 @@ test("忽略旧页签记录，无路径进入首页且不恢复其他用户资�
   expect(await page.evaluate(() => JSON.parse(sessionStorage.getItem("nexo:tabs:admin:default")!).route)).toBe("#/domains");
 });
 
-test("PWA 玻璃底栏在复杂背景和辅助功能偏好下仍可用", async ({ page }, info) => {
+test("PWA 玻璃底栏在复杂背景和辅助功能偏好下仍可用", { tag: "@mobile" }, async ({ page }, info) => {
   test.skip(info.project.name !== "mobile-light", "材质及断点矩阵只运行一次");
   const state = await installApiMocks(page);
   state.tunnels = Array.from({ length: 12 }, (_, index) => ({ ...state.tunnels[0], id: `t-${index}`, name: `家庭隧道 ${index}` }));
@@ -126,7 +126,7 @@ test("PWA 玻璃底栏在复杂背景和辅助功能偏好下仍可用", async (
   await expect(page.locator(".sidebar-settings")).toBeVisible();
 });
 
-test("手机常用入口与更多列表、详情返回与账号设置", async ({ page }, info) => {
+test("手机常用入口与更多列表、详情返回与账号设置", { tag: ["@mobile", "@landscape"] }, async ({ page }, info) => {
   test.skip(info.project.name === "desktop-dark", "手机 App 导航");
   await installApiMocks(page);
   await page.goto("/#/services");
@@ -159,7 +159,7 @@ test("手机常用入口与更多列表、详情返回与账号设置", async ({
   await page.screenshot({ animations: "disabled", scale: "css", path: info.outputPath("mobile-account.png") });
 });
 
-test("空白与已修改表单锁住历史导航，跨断点保持实例", async ({ page }, info) => {
+test("空白与已修改表单锁住历史导航，跨断点保持实例", { tag: "@mobile" }, async ({ page }, info) => {
   await installApiMocks(page);
   await page.goto("/#/agents");
   await page.evaluate(() => { window.location.hash = "#/services"; });

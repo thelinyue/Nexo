@@ -167,7 +167,7 @@ test("管理员从离线节点卡片确认移除并刷新列表", async ({ page 
   expect(state.writes).toEqual([{ method: "DELETE", path: "/api/v1/nodes/jp", body: null }]);
 });
 
-test("本地节点支持反代授权配置，窄屏和主题变化不遮挡信息与操作", async ({ page }, info) => {
+test("本地节点支持反代授权配置，窄屏和主题变化不遮挡信息与操作", { tag: "@mobile" }, async ({ page }, info) => {
   const { state } = await setup(page);
   state.nodes.push({ ...state.nodes[0], id: "local", name: "本地入口", public_ipv4: "" });
   await page.goto("/#/nodes");

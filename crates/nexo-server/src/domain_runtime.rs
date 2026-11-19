@@ -6,6 +6,9 @@ use crate::{
     unix_now, AppState,
 };
 use anyhow::{Context, Result};
+use nexo_node::routes::{
+    access_handlers, https_redirect, lan_redirect, probe_route, proxy_handler,
+};
 use rusqlite::params;
 use serde::Serialize;
 use serde_json::{json, Value};
@@ -342,32 +345,6 @@ fn admin_listen(settings: &CaddyRuntimeConfig) -> Result<String> {
     Ok(SocketAddr::new(ip, url.port_or_known_default().unwrap_or(8290)).to_string())
 }
 
-/// URL 只用于 Server 直连；隧道入口仍是已认证的本地 socket，保持原有回源方式。
-pub(crate) fn proxy_handler(upstream: &str) -> Result<Value> {
-    let mut handler = json!({"handler":"reverse_proxy","upstreams":[{"dial":upstream}],"stream_close_delay":300000000000_u64});
-    if upstream.starts_with("http://") || upstream.starts_with("https://") {
-        let url = reqwest::Url::parse(upstream)?;
-        let host = url.host_str().context("反代目标缺少主机名")?;
-        handler["upstreams"][0]["dial"] = json!(format!(
-            "{host}:{}",
-            url.port_or_known_default().context("反代目标缺少端口")?
-        ));
-        // Caddy 新版本 HTTPS 回源可能重写 Host；显式保留用户访问的公网主机名。
-        handler["headers"] = json!({"request":{"set":{"Host":["{http.request.hostport}"]}}});
-        if url.scheme() == "https" {
-            handler["transport"] =
-                json!({"protocol":"http","tls":{"server_name":host.trim_matches(['[', ']'])}});
-        }
-    }
-    Ok(handler)
-}
-
-/// 只跳到配置中的域名，保留原方法与 URI；禁止缓存以便关闭和换域名后立即恢复。
-pub(crate) fn https_redirect(hostname: &str, port: u16) -> Value {
-    let origin = crate::https_ports::url("https", hostname, port);
-    json!({"match":[{"host":[hostname]}],"handle":[{"handler":"static_response","status_code":307,"headers":{"Location":[format!("{origin}{{http.request.uri}}")],"Cache-Control":["no-store"]}}],"terminal":true})
-}
-
 /// 只发布显式域名；未知主机返回 404。没有可信 Tunnel socket 时明确返回 503，不连接 Agent 的私网地址。
 fn build_config(settings: &CaddyRuntimeConfig, domains: &[DomainSpec]) -> Result<Value> {
     let mut http = Vec::new();
@@ -414,7 +391,7 @@ fn build_config(settings: &CaddyRuntimeConfig, domains: &[DomainSpec]) -> Result
                 continue;
             }
             let (mut access_endpoint, mut access_check) =
-                crate::service_access::handlers(&settings.access_address, &service.id);
+                access_handlers(&settings.access_address, &service.id);
             crate::service_access::relay_handlers(
                 &mut access_endpoint,
                 &mut access_check,
@@ -440,7 +417,7 @@ fn build_config(settings: &CaddyRuntimeConfig, domains: &[DomainSpec]) -> Result
                 &mut http
             };
             if let Some(revision) = service.relay_probe_revision {
-                routes.push(crate::nodes::health::route(
+                routes.push(probe_route(
                     &service.hostname,
                     "local",
                     &service.id,
@@ -448,7 +425,7 @@ fn build_config(settings: &CaddyRuntimeConfig, domains: &[DomainSpec]) -> Result
                 ));
             }
             if let Some(redirect) = &service.lan_redirect {
-                routes.push(crate::lan_redirect::route(
+                routes.push(lan_redirect(
                     &service.id,
                     &service.hostname,
                     redirect.public_ipv4,

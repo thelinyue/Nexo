@@ -34,7 +34,7 @@ test("应用图标自适应列数，图标访问与名称详情分开", async ({
   }
 });
 
-test("所有页面在移动尺寸和明暗主题中无溢出，输出实际截图", async ({ page }, testInfo) => {
+test("所有页面在移动尺寸和明暗主题中无溢出", async ({ page }, testInfo) => {
   test.skip(testInfo.project.name !== "desktop-dark", "尺寸矩阵由单个项目执行");
   test.setTimeout(120000);
   const state = await installApiMocks(page);
@@ -74,7 +74,8 @@ test("所有页面在移动尺寸和明暗主题中无溢出，输出实际截�
           }
           if (route === "agents") await expect(page.locator(".page-slot:not([hidden])").getByText("离线", { exact: true })).toBeVisible();
         }
-        await page.screenshot({ path: testInfo.outputPath(`${name}-${theme}-${route.replaceAll("/", "-")}.png`) });
+        // CI 失败时由 Playwright 自动截图，本地验收仍可查看完整尺寸矩阵。
+        if (!process.env.CI) await page.screenshot({ path: testInfo.outputPath(`${name}-${theme}-${route.replaceAll("/", "-")}.png`) });
         if (route.startsWith("services/")) { await page.keyboard.press("Escape"); await expect(page.locator(".application-modal")).toHaveCount(0); await expect(page).toHaveURL(/#\/services$/); }
       }
       await page.goto("/#/services");
@@ -83,12 +84,12 @@ test("所有页面在移动尺寸和明暗主题中无溢出，输出实际截�
       await expect(dialog).toBeVisible();
       await expect(dialog.getByRole("button", { name: "保存服务" })).toBeInViewport();
       expect(await dialog.evaluate(el => el.scrollWidth <= el.clientWidth)).toBeTruthy();
-      await page.screenshot({ path: testInfo.outputPath(`${name}-${theme}-create.png`) });
+      if (!process.env.CI) await page.screenshot({ path: testInfo.outputPath(`${name}-${theme}-create.png`) });
       await page.keyboard.press("Escape");
       await page.goto("/#/agents");
       await page.getByRole("button", { name: "批准", exact: true }).click();
       await expect(page.getByRole("dialog").getByRole("button", { name: "批准恢复" })).toBeInViewport();
-      await page.screenshot({ path: testInfo.outputPath(`${name}-${theme}-approve.png`) });
+      if (!process.env.CI) await page.screenshot({ path: testInfo.outputPath(`${name}-${theme}-approve.png`) });
       await page.keyboard.press("Escape");
     }
   }
@@ -109,7 +110,7 @@ test("登录与恢复在各尺寸可用", async ({ page }, testInfo) => {
   }
 });
 
-test("小屏放大文字和关键触控热区", async ({ page }, testInfo) => {
+test("小屏放大文字和关键触控热区", { tag: "@mobile" }, async ({ page }, testInfo) => {
   test.skip(testInfo.project.name !== "mobile-light", "只在触控项目中检查");
   await installApiMocks(page);
   await page.setViewportSize({ width: 320, height: 568 });

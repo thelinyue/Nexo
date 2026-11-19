@@ -18,6 +18,7 @@ use std::{
 
 use anyhow::{Context, Result};
 use reqwest::Client;
+use serde::Deserialize;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use tokio::{
@@ -30,8 +31,38 @@ pub const CADDY_VERSION: &str = "2.11.9";
 pub const XCADDY_VERSION: &str = "0.4.7";
 pub const CLOUDFLARE_MODULE_VERSION: &str = "0.2.4";
 /// 内网重定向依赖本次进程内的已认证会话，不能把旧出口当作跨重启的可信配置。
-pub(crate) const LAN_REDIRECT_ROUTE_PREFIX: &str = "nexo-lan-redirect-";
+pub const LAN_REDIRECT_ROUTE_PREFIX: &str = "nexo-lan-redirect-";
 
+#[derive(Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Settings {
+    pub enabled: bool,
+    pub binary: PathBuf,
+    pub admin_url: String,
+    pub http_listen: String,
+    pub https_listen: String,
+}
+impl Settings {
+    /// HTTP 服务共用管理端配置的公网端口；所有 DNS 候选节点保持同端口。
+    pub fn http_port(&self) -> u16 {
+        self.http_listen
+            .rsplit(':')
+            .next()
+            .and_then(|p| p.parse().ok())
+            .unwrap_or(80)
+    }
+}
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            binary: "caddy".into(),
+            admin_url: "http://127.0.0.1:8290".into(),
+            http_listen: ":80".into(),
+            https_listen: ":443".into(),
+        }
+    }
+}
 #[derive(Debug, Clone)]
 pub struct CaddyRuntimeConfig {
     /// 由本进程绑定的认证监听地址；未初始化时使用不可连接的端口，禁止绕过认证。
@@ -311,7 +342,7 @@ fn parse_retry_after(message: &str) -> Option<u64> {
 }
 
 impl CaddyRuntimeConfig {
-    pub fn new(data_dir: impl Into<PathBuf>, settings: &crate::config::Caddy) -> Self {
+    pub fn new(data_dir: impl Into<PathBuf>, settings: &Settings) -> Self {
         let data_dir = data_dir.into();
         Self {
             access_address: "127.0.0.1:0".into(),
@@ -1001,10 +1032,7 @@ mod tests {
     #[test]
     fn startup_drops_legacy_http_and_default_issuance_but_keeps_dns_credentials() {
         let root = std::env::temp_dir().join(format!("nexo-dns-startup-{}", uuid::Uuid::new_v4()));
-        let supervisor = CaddySupervisor::new(CaddyRuntimeConfig::new(
-            &root,
-            &crate::config::Caddy::default(),
-        ));
+        let supervisor = CaddySupervisor::new(CaddyRuntimeConfig::new(&root, &Settings::default()));
         let mut applied = serde_json::json!({"apps":{"tls":{
             "certificates":{"automate":["http.test","dns.test","default.test"]},
             "automation":{"policies":[
@@ -1078,7 +1106,7 @@ mod tests {
             }),
         );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let settings = crate::config::Caddy {
+        let settings = Settings {
             admin_url: format!("http://{}", listener.local_addr().unwrap()),
             ..Default::default()
         };

@@ -13,7 +13,7 @@ async function emulateInstalledPwa(page: Page) {
   });
 }
 
-test("PWA 慢启动显示连接提示并在认证明确后立即进入", async ({ page }, info) => {
+test("PWA 慢启动显示连接提示并在认证明确后立即进入", { tag: "@mobile" }, async ({ page }, info) => {
   await emulateInstalledPwa(page);
   const state = await installApiMocks(page);
   state.delay = 1300;

@@ -1,23 +1,8 @@
 //! 更新队列使用 SQLite 事务串行创建；持久阶段必须与节点实际版本核对，不能把断线视为成功。
 use super::*;
 
-pub fn version(value: &str) -> Option<(u64, u64, u64)> {
-    let parts = value.split('.').collect::<Vec<_>>();
-    if parts.len() != 3
-        || parts.iter().any(|p| {
-            p.is_empty()
-                || p.len() > 1 && p.starts_with('0')
-                || !p.bytes().all(|b| b.is_ascii_digit())
-        })
-    {
-        return None;
-    }
-    Some((
-        parts[0].parse().ok()?,
-        parts[1].parse().ok()?,
-        parts[2].parse().ok()?,
-    ))
-}
+pub use nexo_node::parse_version as version;
+
 pub fn busy(db: &Connection, node: &str) -> rusqlite::Result<bool> {
     db.query_row("SELECT EXISTS(SELECT 1 FROM node_update_items i JOIN node_update_jobs j ON j.id=i.job_id WHERE i.node_id=?1 AND j.status IN ('queued','running','paused') AND i.stage NOT IN ('complete','skipped','cancelled'))",[node],|r|r.get(0))
 }

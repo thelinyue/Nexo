@@ -189,7 +189,7 @@ test("管理员从节点组列表删除当前筛选的组，取消或失败时�
   expect(attempts).toBe(2);
 });
 
-test("手机更多选择列表可关闭、导航和区分用户权限", async ({ page }, info) => {
+test("手机更多选择列表可关闭、导航和区分用户权限", { tag: ["@mobile", "@landscape"] }, async ({ page }, info) => {
   test.skip(info.project.name === "desktop-dark", "手机导航");
   await setup(page, false);
   await page.goto("/#/nodes");
@@ -254,7 +254,7 @@ test("更新提示业务中断，无备用和有连接时也可直接开始", as
   expect(submitted).toEqual({ node_ids: ["hk"], target_version: "0.2.12" });
 });
 
-test("普通用户添加节点使用公网管理地址和自定义端口，并自动跟进接入状态", async ({ page }, info) => {
+test("普通用户添加节点使用公网管理地址和自定义端口，并自动跟进接入状态", { tag: "@mobile" }, async ({ page }, info) => {
   await setup(page, false);
   const node = { id: "new", name: "新 VPS", public_ipv4: "8.8.8.8", control_port: 9892, status: "unregistered", approved: false, enabled: true, registered: false, can_enroll: true, assigned: false, latencies: [], services: [], connections: 0 };
   const enrollment = { id: node.id, token: "only-visible-in-copy", expires_at: Math.floor(Date.now() / 1000) + 1800, version: "0.2.18", server_url: "https://manage.example:8443", http_port: 8080, data_port: 9892 };
@@ -387,7 +387,7 @@ for (const [mode, label] of [["single", "单节点"], ["dns", "DNS 分流"], ["l
   });
 }
 
-test("节点菜单长名称在窄屏和低高度视口内可滚动选择", async ({ page }, info) => {
+test("节点菜单长名称在窄屏和低高度视口内可滚动选择", { tag: ["@mobile", "@landscape"] }, async ({ page }, info) => {
   await setup(page);
   const groups = Array.from({ length: 12 }, (_, i) => ({ id: `group-${i}`, name: `家庭与办公室的亚洲公网入口长名称节点组 ${i}`, node_ids: ["hk", "us"], selectable: true }));
   await page.route("**/api/v1/node-groups", route => route.fulfill({ json: groups }));

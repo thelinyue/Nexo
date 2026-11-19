@@ -24,7 +24,7 @@ test("账号恢复校验确认密码，失败保留输入，成功返回登录",
   await expect(page.getByRole("status")).toContainText("密码已重设");
 });
 
-test("保存遇到会话过期后重新登录，保留原服务草稿", async ({ page }, testInfo) => {
+test("保存遇到会话过期后重新登录，保留原服务草稿", { tag: "@mobile" }, async ({ page }, testInfo) => {
   const state = await installApiMocks(page);
   await page.goto("/#/services");
   await openServiceEditor(page);

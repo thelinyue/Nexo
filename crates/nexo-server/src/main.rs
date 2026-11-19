@@ -7,7 +7,6 @@ use std::{
     net::SocketAddr,
     path::PathBuf,
     sync::{Arc, Mutex},
-    time::{SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, Result};
@@ -20,7 +19,8 @@ use axum::{
     Json, Router,
 };
 use clap::{Parser, Subcommand};
-use nexo_core::{EnrollmentStatus, EnrollmentToken};
+use nexo_core::{unix_now, EnrollmentStatus, EnrollmentToken};
+use nexo_node::{caddy, shutdown_signal};
 use nexo_protocol::{
     AgentEnrollmentPollRequest, AgentEnrollmentPollResponse, AgentEnrollmentRequest,
     AgentEnrollmentResponse, TunnelDataEndpoint, TunnelDesiredState,
@@ -34,7 +34,6 @@ mod access_keys;
 mod accounts;
 mod agent_release;
 mod auth;
-mod caddy;
 mod config;
 mod direct;
 mod dns_provider;
@@ -281,13 +280,6 @@ struct DomainInput {
     https_enabled: Option<bool>,
 }
 
-pub(crate) fn unix_now() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or_default()
-}
-
 #[tokio::main]
 async fn main() -> Result<()> {
     // 按进程所在时区输出毫秒及 UTC 偏移；容器使用 TZ，避免排障时误把 UTC 当成本地时间。
@@ -309,7 +301,7 @@ async fn run(cli: Cli) -> Result<()> {
         enroll_only,
     }) = &cli.command
     {
-        return nodes::runtime::run(
+        return nexo_node::run(
             data_dir,
             server_url.clone(),
             *enroll || *enroll_only,
@@ -445,22 +437,6 @@ async fn run(cli: Cli) -> Result<()> {
     runtime.supervisor.shutdown().await?;
     serving?;
     Ok(())
-}
-
-/// Docker 使用 SIGTERM 停止容器；与 Ctrl+C 共用清理流程，回收 Caddy 与 Tunnel 入口。
-async fn shutdown_signal() {
-    #[cfg(unix)]
-    {
-        let mut terminate =
-            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-                .expect("无法监听 SIGTERM");
-        tokio::select! {
-            _ = tokio::signal::ctrl_c() => {},
-            _ = terminate.recv() => {},
-        }
-    }
-    #[cfg(not(unix))]
-    let _ = tokio::signal::ctrl_c().await;
 }
 
 fn router(state: AppState) -> Router {

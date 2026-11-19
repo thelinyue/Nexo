@@ -5,7 +5,7 @@ const account = (page: Page) => page.getByRole("button", { name: "账号菜单",
 const menu = (page: Page) => page.getByRole("menu", { name: "本人账号", exact: true });
 async function pwa(page: Page) { await page.addInitScript(() => Object.defineProperty(navigator, "standalone", { configurable: true, value: true })); }
 
-test("账号菜单随内容调整宽度，长用户名与放大字体仍在可见视口内", async ({ page }, info) => {
+test("账号菜单随内容调整宽度，长用户名与放大字体仍在可见视口内", { tag: "@mobile" }, async ({ page }, info) => {
   await pwa(page); await installApiMocks(page);
   let username = "admin"; let warning = false;
   await page.route("**/api/v1/auth/status", route => route.fulfill({ json: { initialized: true, authenticated: true, user_id: "admin", username, role: "system_admin", workspace_id: "default", csrf_token: "test-csrf", local_http_warning: warning } }));
@@ -39,7 +39,7 @@ test("账号菜单随内容调整宽度，长用户名与放大字体仍在可�
   }
 });
 
-test("头像菜单共用首行，无账号页，支持键盘和会话返回来源", async ({ page }) => {
+test("头像菜单共用首行，无账号页，支持键盘和会话返回来源", { tag: "@mobile" }, async ({ page }) => {
   await pwa(page); await installApiMocks(page);
   await page.goto("/#/users");
   await expect(account(page)).toBeVisible();
@@ -73,7 +73,7 @@ test("头像菜单共用首行，无账号页，支持键盘和会话返回来�
   await expect(page.locator(".account-card,.manage-page")).toHaveCount(0);
 });
 
-test("菜单关闭、个人密码弹窗与跨屏焦点恢复不改变代管身份", async ({ page }) => {
+test("菜单关闭、个人密码弹窗与跨屏焦点恢复不改变代管身份", { tag: "@mobile" }, async ({ page }) => {
   await installApiMocks(page);
   await page.goto("/#/users");
   await page.getByRole("button", { name: "管理 alice 的空间", exact: true }).click();
@@ -160,7 +160,7 @@ test("外部点击保留目标焦点，HTTP 提醒可见，其他弹窗隔离头
   await page.keyboard.press("Escape"); await expect(account(page)).toBeFocused();
 });
 
-test("字体放大时正文跟随首行高度，跨断点保留搜索和筛选", async ({ page }) => {
+test("字体放大时正文跟随首行高度，跨断点保留搜索和筛选", { tag: "@mobile" }, async ({ page }) => {
   await pwa(page); await installApiMocks(page); await page.goto("/#/users");
   await page.getByLabel("搜索用户", { exact: true }).fill("alice"); await page.getByLabel("用户状态筛选", { exact: true }).selectOption("enabled");
   for (const width of [320, 900, 901, 1440]) {
