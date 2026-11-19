@@ -1501,7 +1501,7 @@ checksum = "27b02d87554356db9e9a873add8782d4ea6e3e58ea071a9adb9a2e8ddb884a8b"
 
 [[package]]
 name = "nexo-agent"
-version = "0.2.26"
+version = "0.2.27"
 dependencies = [
  "anyhow",
  "axum",
@@ -1528,7 +1528,7 @@ dependencies = [
 
 [[package]]
 name = "nexo-core"
-version = "0.2.26"
+version = "0.2.27"
 dependencies = [
  "anyhow",
  "base64 0.23.1",
@@ -1556,7 +1556,7 @@ dependencies = [
 
 [[package]]
 name = "nexo-node"
-version = "0.2.26"
+version = "0.2.27"
 dependencies = [
  "anyhow",
  "axum",
@@ -1584,7 +1584,7 @@ dependencies = [
 
 [[package]]
 name = "nexo-protocol"
-version = "0.2.26"
+version = "0.2.27"
 dependencies = [
  "bytes",
  "nexo-core",
@@ -1594,7 +1594,7 @@ dependencies = [
 
 [[package]]
 name = "nexo-server"
-version = "0.2.26"
+version = "0.2.27"
 dependencies = [
  "anyhow",
  "argon2",
@@ -1639,7 +1639,7 @@ dependencies = [
 
 [[package]]
 name = "nexo-tunnel"
-version = "0.2.26"
+version = "0.2.27"
 dependencies = [
  "anyhow",
  "bytes",
