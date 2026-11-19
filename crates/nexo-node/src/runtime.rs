@@ -678,6 +678,9 @@ async fn listeners(runtime: Arc<Runtime>, directory: PathBuf, node_id: String) -
                         proxy.as_object_mut().unwrap().remove("stream_close_delay");
                         proxy["headers"]["request"]["delete"] =
                             json!(["X-Nexo-Access-*", "X-Nexo-Upstream-Cookie"]);
+                        if service.reverse_proxy_target.is_none() {
+                            proxy = routes::tunnel_web_handler(proxy);
+                        }
                         handlers.push(proxy);
                         routes.push(
                             json!({"match":[{"host":[host]}],"handle":handlers,"terminal":true}),

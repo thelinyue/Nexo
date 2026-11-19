@@ -31,6 +31,35 @@ pub fn proxy_handler(upstream: &str) -> Result<Value> {
     Ok(handler)
 }
 
+/// 公网慢链路上并行写入大脚本可能触及 HTTP/3 单流写超时。仅协商压缩源站明确
+/// 允许公开缓存的脚本和样式，保留 Caddy 的写超时、已有内容编码及 no-transform 语义。
+pub fn tunnel_web_handler(proxy: Value) -> Value {
+    let encoding = json!({
+        "handler": "encode",
+        "encodings": {"zstd": {}, "gzip": {}},
+        "prefer": ["zstd", "gzip"],
+        "match": {"status_code": [200], "headers": {
+            "Content-Type": ["text/javascript*", "application/javascript*", "text/css*"],
+            "Cache-Control": ["public", "public,*", "*, public", "*, public,*"]
+        }}
+    });
+    // 让同一服务的静态资源在 HTTP 连接池内等候，给其他请求及长连接留出转发名额。
+    let mut assets = proxy.clone();
+    assets["transport"] = json!({
+        "protocol": "http", "max_conns_per_host": nexo_tunnel::FORWARDING_SLOTS / 2,
+        "keep_alive": {"max_idle_conns_per_host": 4}
+    });
+    // 回源连接可能在返回响应头前关闭。只在静态文件的只读分支重试传输错误。
+    assets["load_balancing"] = json!({
+        "retries": 2, "try_interval": "250ms", "retry_match": [{"method": ["GET", "HEAD"]}]
+    });
+    json!({"handler":"subroute","routes":[
+        {"match":[{"method":["GET","HEAD"],"path":["*.js","*.mjs","*.css"]}],
+         "handle":[encoding,assets],"terminal":true},
+        {"handle":[proxy]}
+    ]})
+}
+
 /// 只跳到配置中的域名，保留原方法与 URI；禁止缓存以便关闭和换域名后立即恢复。
 pub fn https_redirect(hostname: &str, port: u16) -> Value {
     let origin = public_url("https", hostname, port);

@@ -409,6 +409,13 @@ fn build_config(settings: &CaddyRuntimeConfig, domains: &[DomainSpec]) -> Result
                 handler["headers"]["request"]["delete"] =
                     json!(["X-Nexo-Access-*", "X-Nexo-Upstream-Cookie"]);
             }
+            // 穿透入口使用本地 socket，直接回源和兼容转发使用带协议的 URL。
+            if service.upstream.as_deref().is_some_and(|upstream| {
+                upstream.starts_with("unix/") || upstream.starts_with("127.0.0.1:")
+            }) && service.relay.is_none()
+            {
+                handler = nexo_node::routes::tunnel_web_handler(handler);
+            }
             let route =
                 json!({"match":[{"host":[service.hostname]}],"handle":[access_check,handler]});
             let routes = if service.protocol == "https" {
@@ -2169,11 +2176,20 @@ mod tests {
             build_config(&settings(Path::new("test")), &[missing]).unwrap()["apps"]["tls"]
                 .is_null()
         );
+        let handlers = &config["apps"]["http"]["servers"]["https"]["routes"][2]["handle"];
+        let routes = &handlers[1]["routes"];
+        assert_eq!(routes[0]["handle"][0]["handler"], "encode");
         assert_eq!(
-            config["apps"]["http"]["servers"]["https"]["routes"][2]["handle"][1]
-                ["stream_close_delay"],
+            routes[0]["handle"][1]["transport"]["max_conns_per_host"],
+            32
+        );
+        assert_eq!(
+            routes[1]["handle"][0]["stream_close_delay"],
             300_000_000_000_u64
         );
+        assert!(routes[1]["handle"][0]["transport"].is_null());
+        assert_eq!(routes[0]["handle"][1]["load_balancing"]["retries"], 2);
+        assert!(routes[1]["handle"][0]["load_balancing"].is_null());
         assert!(config["apps"]["http"]["servers"]["https"]["protocols"].is_null());
     }
 
