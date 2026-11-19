@@ -348,7 +348,7 @@ class Harness:
             # 归属验证由独立测试覆盖；本地固定夹具不查询公网 DNS、不触发公网 ACME。
             self.configure_local_domain(domain)
             def create(protocol, name, local_port, public_port=None):
-                return self.api("tunnels", "POST", {"name": name, "protocol": protocol, "device_id": device, "local_address": "127.0.0.1", "local_port": local_port, "enabled": True, "public_port": public_port, "https_port": self.ports["https"], "hostname": name if protocol != "tcp" else None, "public_domain_id": domain["id"] if protocol != "tcp" else None})
+                return self.api("tunnels", "POST", {"name": name, "protocol": protocol, "device_id": device, "local_address": "127.0.0.1", "local_port": local_port, "enabled": True, "compression_enabled": protocol in ("https", "tcp"), "public_port": public_port, "https_port": self.ports["https"], "hostname": name if protocol != "tcp" else None, "public_domain_id": domain["id"] if protocol != "tcp" else None})
             tcp = create("tcp", "echo", echo.server_address[1], self.ports["public"])
             web = create("http", "web", origin.server_address[1])
             secure = create("https", "secure", origin.server_address[1])
@@ -394,6 +394,9 @@ class Harness:
             wait_for(lambda: analytics(tcp)["totals"]["sessions"] >= 9, "天眼 TCP 会话采集")
             assert analytics(tcp)["totals"]["to_origin"] == 9 * 1024 * 1024
             assert analytics(tcp)["totals"]["to_public"] == 9 * 1024 * 1024 + len(TAIL) * 9
+            sessions = self.api(f"traffic/analytics/sessions?tunnel_id={tcp['id']}")["items"]
+            assert sessions and all(e["source"] == "127.0.0.0/24" and e["country"] == "未知" for e in sessions)
+            assert analytics(tcp)["breakdowns"]["session_country"] == [{"label": "未知", "count": len(sessions)}]
             assert self.web("web.nexo-smoke.localhost", False, "/?private_token=nexo-private-acceptance")[0] == 200
             wait_for(lambda: analytics(web)["totals"]["requests"] >= 2, "带查询参数的请求完成采集")
             entries = self.api(f"traffic/analytics/requests?tunnel_id={web['id']}")["items"]

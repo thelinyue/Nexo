@@ -71,6 +71,7 @@ async fn pump<R, W>(
     node: &str,
     tunnel: &TunnelDesiredState,
     to_origin: bool,
+    flush: bool,
 ) -> Result<()>
 where
     R: tokio::io::AsyncRead + Unpin,
@@ -105,6 +106,9 @@ where
             }
             offset += written;
         }
+        if flush {
+            write.flush().await?;
+        }
     }
 }
 pub async fn copy<A, B>(
@@ -113,6 +117,7 @@ pub async fn copy<A, B>(
     client: Client,
     node: &str,
     tunnel: &TunnelDesiredState,
+    compressed: bool,
 ) -> Result<()>
 where
     A: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + ?Sized,
@@ -121,8 +126,16 @@ where
     let (local_read, local_write) = tokio::io::split(local);
     let (remote_read, remote_write) = tokio::io::split(stream);
     tokio::try_join!(
-        pump(remote_read, local_write, &client, node, tunnel, true),
-        pump(local_read, remote_write, &client, node, tunnel, false)
+        pump(remote_read, local_write, &client, node, tunnel, true, false),
+        pump(
+            local_read,
+            remote_write,
+            &client,
+            node,
+            tunnel,
+            false,
+            compressed
+        )
     )?;
     Ok(())
 }

@@ -210,7 +210,7 @@ pub fn snapshot(state: &AppState, node: &str) -> Result<Snapshot> {
             ..Default::default()
         });
     }
-    let mut q=db.prepare("SELECT t.id,t.tenant_id,t.device_id,t.apply_revision,t.protocol,COALESCE(t.public_port,0),t.hostname||'.'||p.domain,t.https_port,t.access_mode,t.http_redirect_enabled,CASE WHEN t.service_mode='reverse_proxy' THEN t.origin_protocol||'://' ELSE NULL END,t.local_address,t.local_port FROM authorized_service_nodes s JOIN tunnels t ON t.id=s.service_id LEFT JOIN devices d ON d.id=t.device_id JOIN tenants w ON w.id=t.tenant_id LEFT JOIN public_domains p ON p.id=t.public_domain_id WHERE s.node_id=?1 AND t.enabled=1 AND t.deleted_at IS NULL AND w.enabled=1 AND ((t.service_mode='tunnel' AND d.status='online' AND d.node_capable=1) OR (t.service_mode='reverse_proxy' AND EXISTS(SELECT 1 FROM relay_nodes n WHERE n.id=s.node_id AND n.reverse_proxy_supported=1))) AND t.protocol IN ('http','https','tcp')")?;
+    let mut q=db.prepare("SELECT t.id,t.tenant_id,t.device_id,t.apply_revision,t.protocol,COALESCE(t.public_port,0),t.hostname||'.'||p.domain,t.https_port,t.access_mode,t.http_redirect_enabled,CASE WHEN t.service_mode='reverse_proxy' THEN t.origin_protocol||'://' ELSE NULL END,t.local_address,t.local_port,t.compression_enabled FROM authorized_service_nodes s JOIN tunnels t ON t.id=s.service_id LEFT JOIN devices d ON d.id=t.device_id JOIN tenants w ON w.id=t.tenant_id LEFT JOIN public_domains p ON p.id=t.public_domain_id WHERE s.node_id=?1 AND t.enabled=1 AND t.deleted_at IS NULL AND w.enabled=1 AND ((t.service_mode='tunnel' AND d.status='online' AND d.node_capable=1) OR (t.service_mode='reverse_proxy' AND EXISTS(SELECT 1 FROM relay_nodes n WHERE n.id=s.node_id AND n.reverse_proxy_supported=1))) AND t.protocol IN ('http','https','tcp')")?;
     let mut services = q
         .query_map([node], |r| {
             Ok(wire::Service {
@@ -228,6 +228,7 @@ pub fn snapshot(state: &AppState, node: &str) -> Result<Snapshot> {
                 device: r.get::<_, Option<String>>(2)?.unwrap_or_default(),
                 revision: r.get(3)?,
                 protocol: r.get(4)?,
+                compression_enabled: r.get(13)?,
                 port: r.get(5)?,
                 hostname: r.get(6)?,
                 http_port: state.config.caddy.http_port(),

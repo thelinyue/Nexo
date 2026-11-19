@@ -338,6 +338,7 @@ struct Process {
     last: Value,
     reload: bool,
     analytics: Arc<nexo_core::telemetry::Hub>,
+    _geoip_refresh: Option<tokio_util::task::AbortOnDropHandle<()>>,
     log_task: tokio::task::JoinHandle<()>,
 }
 impl Drop for Process {
@@ -388,6 +389,7 @@ impl Process {
         });
         let mut process = Self {
             analytics,
+            _geoip_refresh: None,
             log_task,
             child,
             admin: format!("http://{address}"),
@@ -410,6 +412,7 @@ impl Process {
                 .await
                 .is_ok_and(|r| r.status().is_success())
             {
+                process._geoip_refresh = process.analytics.start_geoip_refresh();
                 return Ok(process);
             }
             tokio::time::sleep(Duration::from_millis(100)).await;

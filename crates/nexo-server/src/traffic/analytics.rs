@@ -71,38 +71,34 @@ pub fn ingest(state: &AppState, batch: &Batch, source: &str, device: Option<&str
         if e.kind == "flow" {
             tx.execute("INSERT INTO analytics_sources VALUES(?1,?2,?3,?4,?5,?6) ON CONFLICT(tenant_id,service_id,node_id,protocol) DO UPDATE SET at=MAX(at,excluded.at),active=CASE WHEN excluded.at>=at THEN excluded.active ELSE active END",params![tenant,e.service,node,e.protocol,e.at,e.active])?;
         }
-        if http {
-            for (dimension, value) in event_dimensions(&e) {
-                // 防止攻击者用随机路径/IP 令聚合无限膨胀；同小时超额值归入其他。
-                let key = if matches!(dimension, "path" | "source") {
-                    let count:i64=tx.query_row("SELECT COUNT(*) FROM analytics_dimensions WHERE tenant_id=?1 AND service_id=?2 AND hour=?3 AND dimension=?4 AND protocol=?6 AND status_class=?7 AND ?5=''",params![tenant,e.service,hour,dimension,"",e.protocol,status_class],|r|r.get(0))?;
-                    let exists:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM analytics_dimensions WHERE tenant_id=?1 AND service_id=?2 AND hour=?3 AND dimension=?4 AND protocol=?6 AND status_class=?7 AND value=?5)",params![tenant,e.service,hour,dimension,value,e.protocol,status_class],|r|r.get(0))?;
-                    if count >= 256 && !exists {
-                        "其他".into()
-                    } else {
-                        value
-                    }
+        for (dimension, value) in event_dimensions(&e) {
+            // 请求路径与网段的取值有上限，同小时超额值归入其他。
+            let key = if matches!(dimension, "path" | "source") {
+                let count:i64=tx.query_row("SELECT COUNT(*) FROM analytics_dimensions WHERE tenant_id=?1 AND service_id=?2 AND hour=?3 AND dimension=?4 AND protocol=?6 AND status_class=?7 AND ?5=''",params![tenant,e.service,hour,dimension,"",e.protocol,status_class],|r|r.get(0))?;
+                let exists:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM analytics_dimensions WHERE tenant_id=?1 AND service_id=?2 AND hour=?3 AND dimension=?4 AND protocol=?6 AND status_class=?7 AND value=?5)",params![tenant,e.service,hour,dimension,value,e.protocol,status_class],|r|r.get(0))?;
+                if count >= 256 && !exists {
+                    "其他".into()
                 } else {
                     value
-                };
-                tx.execute("INSERT INTO analytics_dimensions VALUES(?1,?2,?3,?6,?7,?4,?5,1) ON CONFLICT(tenant_id,service_id,hour,protocol,status_class,dimension,value) DO UPDATE SET count=count+1",params![tenant,e.service,hour,dimension,key,e.protocol,status_class])?;
-            }
-            if !e.visitor.is_empty() {
-                tx.execute(
-                    "INSERT OR IGNORE INTO analytics_visitors VALUES(?1,?2,?3,?4,?5,?7,?6)",
-                    params![
-                        tenant,
-                        e.service,
-                        telemetry::day(e.at),
-                        hour,
-                        e.protocol,
-                        e.visitor,
-                        status_class
-                    ],
-                )?;
-            }
-        } else if session {
-            tx.execute("INSERT INTO analytics_dimensions VALUES(?1,?2,?3,?5,0,'reason',?4,1) ON CONFLICT(tenant_id,service_id,hour,protocol,status_class,dimension,value) DO UPDATE SET count=count+1",params![tenant,e.service,hour,e.reason,e.protocol])?;
+                }
+            } else {
+                value
+            };
+            tx.execute("INSERT INTO analytics_dimensions VALUES(?1,?2,?3,?6,?7,?4,?5,1) ON CONFLICT(tenant_id,service_id,hour,protocol,status_class,dimension,value) DO UPDATE SET count=count+1",params![tenant,e.service,hour,dimension,key,e.protocol,status_class])?;
+        }
+        if http && !e.visitor.is_empty() {
+            tx.execute(
+                "INSERT OR IGNORE INTO analytics_visitors VALUES(?1,?2,?3,?4,?5,?7,?6)",
+                params![
+                    tenant,
+                    e.service,
+                    telemetry::day(e.at),
+                    hour,
+                    e.protocol,
+                    e.visitor,
+                    status_class
+                ],
+            )?;
         }
     }
     let source = if let Some(device) = device {
@@ -497,6 +493,14 @@ fn summary(state: &AppState, s: &Scope) -> Result<Value, ApiError> {
             }
         }
     }
+    // 旧小时记录只有会话总数。用差额标记未知，避免给历史网段重新推断位置。
+    if total.sessions > 0 {
+        let countries = dims.entry("session_country".into()).or_default();
+        let missing = total.sessions.saturating_sub(countries.values().sum());
+        if missing > 0 {
+            *countries.entry("未知".into()).or_default() += missing;
+        }
+    }
     let mut breakdown = BTreeMap::<String, Vec<Value>>::new();
     for (dimension, entries) in dims {
         let mut entries: Vec<_> = entries.into_iter().collect();
@@ -630,7 +634,15 @@ fn event_dimensions(e: &Event) -> Vec<(&'static str, String)> {
             ("domain", e.host.clone()),
         ]
     } else if e.kind == "session" {
-        vec![("reason", e.reason.clone())]
+        let country = if e.country.is_empty() {
+            "未知"
+        } else {
+            &e.country
+        };
+        vec![
+            ("reason", e.reason.clone()),
+            ("session_country", country.into()),
+        ]
     } else {
         vec![]
     }
@@ -739,6 +751,9 @@ fn details(state: &AppState, s: &Scope, f: &Filter, kind: &str) -> Result<Value,
                 let mut v: Value = serde_json::from_str(&payload).unwrap_or(Value::Null);
                 v["name"] = json!(r.get::<_, String>(3)?);
                 v["node"] = json!(r.get::<_, String>(4)?);
+                if v["country"].as_str().unwrap_or_default().is_empty() {
+                    v["country"] = json!("未知");
+                }
                 v.as_object_mut().map(|v| v.remove("visitor"));
                 Ok(v)
             },

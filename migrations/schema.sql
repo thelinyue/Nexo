@@ -94,7 +94,7 @@ CREATE TABLE "tunnels" (
     origin_protocol TEXT, origin_tls_server_name TEXT, origin_tls_verification TEXT NOT NULL DEFAULT 'system', origin_ca_pem TEXT,
     public_domain_id TEXT REFERENCES public_domains(id) ON DELETE SET NULL,
     deleted_at INTEGER, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
-, http_redirect_enabled INTEGER NOT NULL DEFAULT 0, service_mode TEXT NOT NULL DEFAULT 'tunnel' CHECK(service_mode IN ('tunnel','reverse_proxy')), lan_redirect_enabled INTEGER NOT NULL DEFAULT 0, access_mode TEXT NOT NULL DEFAULT 'public' CHECK(access_mode IN ('public','password')), access_password_hash TEXT, protocol_statuses TEXT NOT NULL DEFAULT '{}');
+, http_redirect_enabled INTEGER NOT NULL DEFAULT 0, service_mode TEXT NOT NULL DEFAULT 'tunnel' CHECK(service_mode IN ('tunnel','reverse_proxy')), lan_redirect_enabled INTEGER NOT NULL DEFAULT 0, access_mode TEXT NOT NULL DEFAULT 'public' CHECK(access_mode IN ('public','password')), access_password_hash TEXT, protocol_statuses TEXT NOT NULL DEFAULT '{}', compression_enabled INTEGER NOT NULL DEFAULT 0);
 
 CREATE TABLE service_icons (id TEXT PRIMARY KEY, name TEXT NOT NULL, created_at INTEGER NOT NULL);
 

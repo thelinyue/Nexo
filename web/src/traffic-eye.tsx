@@ -7,7 +7,7 @@ type Totals = { requests: number; errors: number; sessions: number; duration_ms:
 type Rank = { label: string; count: number };
 type Summary = {
   sampled_at: number | null; started_at: number; uptime: number; status: "ready" | "collecting" | "stale";
-  start: number; end: number; step: number; partial: boolean; dropped: number; lag_seconds?: number; coverage_percent?: number; geo_available: boolean;
+  start: number; end: number; step: number; partial: boolean; dropped: number; lag_seconds?: number; coverage_percent?: number;
   totals: Totals; qps: number; active: number; uv_daily_sum: number; p50_ms: number | null; p95_ms: number | null;
   series: { at: number; covered: boolean; partial: boolean; totals: Totals; p50_ms?: number | null; p95_ms?: number | null }[];
   services: { id: string; name: string; mode: string; requests: number; bytes: number; errors: number }[];
@@ -33,8 +33,24 @@ function useOnscreen(active: boolean) {
 
 /** 排行始终显示真实计数；长标签可换行，颜色仅作辅助，读屏有完整标签。 */
 function Ranking({ title, rows = [], help }: { title: string; rows?: Rank[]; help?: string }) {
+  return <section className="eye-card eye-ranking" aria-label={title}><header><h3>{title}</h3></header><RankRows rows={rows} />{help && <p className="eye-caption">{help}</p>}</section>;
+}
+
+function RankRows({ rows = [] }: { rows?: Rank[] }) {
   const max = Math.max(1, ...rows.map(row => row.count));
-  return <section className="eye-card eye-ranking" aria-label={title}><header><h3>{title}</h3></header>{rows.length ? <ol>{rows.slice(0, 10).map((row, i) => <li key={row.label}><span className="eye-rank-index">{i + 1}</span><div><span title={row.label}>{row.label || "未知"}</span><span className="eye-bar" aria-hidden="true" style={{ width: `${Math.max(1, row.count / max * 100)}%` }} /></div><strong>{number(row.count)}</strong></li>)}</ol> : <p className="eye-empty">暂无采集记录</p>}{help && <p className="eye-caption">{help}</p>}</section>;
+  return rows.length ? <ol>{rows.slice(0, 10).map((row, i) => <li key={row.label}><span className="eye-rank-index">{i + 1}</span><div><span title={row.label}>{row.label || "未知"}</span><span className="eye-bar" aria-hidden="true" style={{ width: `${Math.max(1, row.count / max * 100)}%` }} /></div><strong>{number(row.count)}</strong></li>)}</ol> : <p className="eye-empty">暂无采集记录</p>;
+}
+
+function CountryRanking({ data, query }: { data: Summary | null; query: string }) {
+  const filters = new URLSearchParams(query);
+  const protocol = filters.get("protocol");
+  const transport = protocol === "tcp" || protocol === "udp";
+  return <section className="eye-card eye-ranking eye-country" aria-label="来源国家 / 地区">
+    <header><h3>来源国家 / 地区</h3></header>
+    {!transport && <div><h4>HTTP 请求数</h4><RankRows rows={data?.breakdowns.country} /></div>}
+    {(transport || (!protocol && !filters.has("status_class"))) && <div><h4>{transport ? protocol.toUpperCase() : "TCP / UDP"} 会话数</h4><RankRows rows={data?.breakdowns.session_country} /></div>}
+    <footer><a href="https://db-ip.com/" target="_blank" rel="noopener noreferrer">默认地理数据库由 DB-IP 提供</a></footer>
+  </section>;
 }
 
 /** SVG 只负责视觉。原生滑块和读数共用选点，触屏与键盘均可查看，无采样点不补成零。 */
@@ -164,7 +180,7 @@ function EyeData({ active, base, query, range, compact = false, onService }: { a
     <div className="eye-health"><span className={`eye-live eye-live-${data?.status ?? "collecting"}`}>{data?.status === "ready" ? "采集运行中" : data?.status === "stale" ? "采集暂未更新" : "正在建立采集"}</span><span>{data?.sampled_at ? `更新于 ${dateText(data.sampled_at)}` : "等待首批记录"}</span><span>北京时间</span>{data?.coverage_percent != null && <span>采集覆盖 {number(data.coverage_percent)}%</span>}{Boolean(data?.lag_seconds && data.lag_seconds > 15) && <span>采集延迟 {number(data?.lag_seconds)} 秒</span>}</div>
     <div className="eye-kpis">{cards.map(([label, value, help]) => <section key={label} className="eye-card eye-kpi"><span>{label}</span><strong>{value}</strong>{help && <small>{help}</small>}</section>)}</div>
     {!data && summary.busy && <Loading />}
-    <div className="eye-main-grid"><section className="eye-card eye-throughput"><header><h3>实时吞吐</h3><small>最近 60 秒</small></header>{range !== "live" && <Notice error={live.error} updatedAt={live.updatedAt} onRetry={() => void live.reload()} />}{(range === "live" ? data : live.data) ? <Trend data={(range === "live" ? data : live.data)!} rate /> : <p className="eye-empty">等待采集数据</p>}</section><Distribution data={data} /><section className="eye-card eye-profile"><header><h3>访客画像</h3><small>HTTP 请求</small></header><div className="eye-profile-grid">{[["device", "设备"], ["os", "系统"], ["browser", "浏览器"], ["operator", "运营商 / ASN"]].map(([key, title]) => <div key={key}><h4>{title}</h4>{data?.breakdowns[key]?.slice(0, 3).map(row => <p key={row.label}><span>{row.label}</span><strong>{number(row.count)}</strong></p>) ?? <p>暂无采集记录</p>}</div>)}</div><footer><span>UV · 日去重之和 <b>{number(data?.uv_daily_sum)}</b></span></footer></section><Ranking title="来源国家 / 地区" rows={data?.breakdowns.country} help={data?.geo_available ? "本地 GeoIP 数据" : "未配置本地 GeoIP，地域显示未知"} /></div>
+    <div className="eye-main-grid"><section className="eye-card eye-throughput"><header><h3>实时吞吐</h3><small>最近 60 秒</small></header>{range !== "live" && <Notice error={live.error} updatedAt={live.updatedAt} onRetry={() => void live.reload()} />}{(range === "live" ? data : live.data) ? <Trend data={(range === "live" ? data : live.data)!} rate /> : <p className="eye-empty">等待采集数据</p>}</section><Distribution data={data} /><section className="eye-card eye-profile"><header><h3>访客画像</h3><small>HTTP 请求</small></header><div className="eye-profile-grid">{[["device", "设备"], ["os", "系统"], ["browser", "浏览器"], ["operator", "运营商 / ASN"]].map(([key, title]) => <div key={key}><h4>{title}</h4>{data?.breakdowns[key]?.slice(0, 3).map(row => <p key={row.label}><span>{row.label}</span><strong>{number(row.count)}</strong></p>) ?? <p>暂无采集记录</p>}</div>)}</div><footer><span>UV · 日去重之和 <b>{number(data?.uv_daily_sum)}</b></span></footer></section><CountryRanking data={data} query={query} /></div>
     <div className="eye-bottom-grid"><section className="eye-card eye-services"><header><h3>服务流量排行</h3></header>{data?.services.length ? <ol>{data.services.map((service, i) => <li key={service.id}><span>{i + 1}</span><button className="text-button" onClick={() => onService(service.id, service.name)}>{service.name}</button><strong>{bytes(service.bytes)}</strong><small>{number(service.requests)} 请求 · {number(service.errors)} 非成功响应</small></li>)}</ol> : <p className="eye-empty">暂无采集记录</p>}</section><RequestStream key={`requests:${query}`} active={active} base={base} query={query} onService={onService} /><Ranking title="来源网段" rows={data?.breakdowns.source} help="IPv4 /24 · IPv6 /48 脱敏" /><Ranking title="访问路径" rows={data?.breakdowns.path} help="查询参数不进入统计" /></div>
     <div className="eye-secondary-grid"><section className="eye-card"><header><h3>历史流量趋势</h3></header>{data && <Trend data={data} />}</section><Ranking title="访问域名" rows={data?.breakdowns.domain} /><section className="eye-card"><header><h3>延迟趋势</h3><small>HTTP 请求</small></header>{data && <Trend data={data} kind="latency" />}<dl className="eye-latencies"><div><dt>平均耗时</dt><dd>{milliseconds(avg)}</dd></div><div><dt>p50 上界</dt><dd>{milliseconds(data?.p50_ms)}</dd></div><div><dt>p95 上界</dt><dd>{milliseconds(data?.p95_ms)}</dd></div></dl></section><section className="eye-card"><header><h3>访问趋势</h3></header>{data && <Trend data={data} kind="requests" />}</section><section className="eye-card"><header><h3>协议分布</h3><small>请求 / 会话</small></header><Ranking title="协议" rows={Object.entries(data?.protocols ?? {}).map(([label, count]) => ({ label: label.toUpperCase(), count }))} /></section><section className="eye-card"><header><h3>TCP / UDP 会话趋势</h3></header>{data && <Trend data={data} kind="sessions" />}</section></div>
     <details className="eye-session-details"><summary>TCP / UDP 会话明细与结束原因</summary><div className="eye-session-grid"><RequestStream key={`sessions:${query}`} active={active} base={base} query={query} sessions onService={onService} /><Ranking title="结束原因" rows={data?.breakdowns.reason?.map(row => ({ ...row, label: reasons[row.label] ?? row.label }))} /></div></details>

@@ -221,6 +221,7 @@ struct Tunnel {
     enabled: bool,
     lan_redirect_enabled: bool,
     http_redirect_enabled: bool,
+    compression_enabled: bool,
     apply_status: String,
     apply_error: Option<String>,
     apply_revision: i64,
@@ -260,6 +261,7 @@ struct TunnelInput {
     public_domain_id: Option<String>,
     lan_redirect_enabled: Option<bool>,
     http_redirect_enabled: Option<bool>,
+    compression_enabled: Option<bool>,
 }
 #[derive(Debug, Serialize)]
 struct PublicDomain {
@@ -417,6 +419,7 @@ async fn run(cli: Cli) -> Result<()> {
     let app = router(state);
     tracing::info!("Nexo 内网穿透服务监听 http://{http_addr}");
     let listener = tokio::net::TcpListener::bind(http_addr).await?;
+    let _geoip_refresh = tunnel_runtime.analytics.start_geoip_refresh();
     let serving = axum::serve(
         listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),
@@ -693,6 +696,9 @@ fn initialize_database(connection: &Connection, is_new: bool) -> Result<()> {
     if !connection.query_row("SELECT EXISTS(SELECT 1 FROM pragma_table_info('tunnels') WHERE name='http_redirect_enabled')", [], |r| r.get::<_, bool>(0))? {
         connection.execute("ALTER TABLE tunnels ADD COLUMN http_redirect_enabled INTEGER NOT NULL DEFAULT 0", [])?;
     }
+    if !connection.query_row("SELECT EXISTS(SELECT 1 FROM pragma_table_info('tunnels') WHERE name='compression_enabled')", [], |r| r.get::<_, bool>(0))? {
+        connection.execute("ALTER TABLE tunnels ADD COLUMN compression_enabled INTEGER NOT NULL DEFAULT 0", [])?;
+    }
     Ok(())
 }
 
@@ -863,7 +869,7 @@ async fn create_tunnel(
             &mut input,
             access_hash.as_deref(),
         )?;
-        db.execute("INSERT INTO tunnels (id,tenant_id,device_id,name,protocol,local_address,local_port,public_port,hostname,enabled,apply_status,apply_revision,public_domain_id,created_at,updated_at,lan_redirect_enabled,origin_protocol,service_mode,http_redirect_enabled) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,'checking',1,?11,?12,?12,?13,?14,?15,?16)",params![id,session.tenant_id,input.device_id,input.name.trim(),input.protocol,input.local_address.trim(),input.local_port,input.public_port,input.hostname,input.enabled.unwrap_or(true),input.public_domain_id,unix_now(),input.lan_redirect_enabled.unwrap_or(false),input.origin_protocol,input.service_mode,input.http_redirect_enabled.unwrap_or(false)]).map_err(db_error)?;
+        db.execute("INSERT INTO tunnels (id,tenant_id,device_id,name,protocol,local_address,local_port,public_port,hostname,enabled,apply_status,apply_revision,public_domain_id,created_at,updated_at,lan_redirect_enabled,origin_protocol,service_mode,http_redirect_enabled,compression_enabled) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,'checking',1,?11,?12,?12,?13,?14,?15,?16,?17)",params![id,session.tenant_id,input.device_id,input.name.trim(),input.protocol,input.local_address.trim(),input.local_port,input.public_port,input.hostname,input.enabled.unwrap_or(true),input.public_domain_id,unix_now(),input.lan_redirect_enabled.unwrap_or(false),input.origin_protocol,input.service_mode,input.http_redirect_enabled.unwrap_or(false),input.compression_enabled.unwrap_or(false)]).map_err(db_error)?;
         origin_ca::save(&db, &session.tenant_id, &id, &input)?;
         nodes::services::save(&db, &id, &input)?;
         https_ports::save(&db, &id, &input)?;
@@ -941,16 +947,27 @@ async fn update_tunnel(
         let selection_changed = db.query_row("SELECT distribution_mode IS NOT ?2 OR preferred_node_id IS NOT ?3 OR node_group_id IS NOT NULLIF(?4,'') FROM tunnels WHERE id=?1",params![id,input.distribution_mode,input.preferred_node_id,input.node_group_id],|r|r.get::<_,bool>(0)).map_err(db_error)?;
         let nodes_changed =
             nodes::services::ids(&db, &id).map_err(db_error)? != *input.node_ids.as_ref().unwrap();
+        let compression_changed = match input.compression_enabled {
+            Some(enabled) => db
+                .query_row(
+                    "SELECT compression_enabled != ?2 FROM tunnels WHERE id=?1",
+                    params![id, enabled],
+                    |row| row.get::<_, bool>(0),
+                )
+                .map_err(db_error)?,
+            None => false,
+        };
         let revision_changed = !origin_unchanged
             || !entry_unchanged
             || !direct_unchanged
+            || compression_changed
             || (input.service_mode.as_deref() == Some(reverse_proxy::MODE) && nodes_changed);
         runtime_changed =
             revision_changed || !redirect_unchanged || selection_changed || nodes_changed;
         if revision_changed {
             direct::prepare(&db, &session.tenant_id, &id, &mut input)?;
         }
-        db.execute("UPDATE tunnels SET device_id=?1,name=?2,protocol=?3,local_address=?4,local_port=?5,public_port=?6,hostname=?7,enabled=?8,apply_revision=apply_revision+?17,apply_status=CASE WHEN ?17 THEN CASE WHEN ?8 THEN 'checking' ELSE 'disabled' END ELSE apply_status END,updated_at=?9,public_domain_id=?12,lan_redirect_enabled=?13,origin_protocol=?14,service_mode=?15,http_redirect_enabled=?16 WHERE id=?10 AND tenant_id=?11 AND deleted_at IS NULL",params![input.device_id,input.name.trim(),input.protocol,input.local_address.trim(),input.local_port,input.public_port,input.hostname,input.enabled.unwrap_or(true),unix_now(),id,session.tenant_id,input.public_domain_id,input.lan_redirect_enabled.unwrap_or(false),input.origin_protocol,input.service_mode,input.http_redirect_enabled.unwrap_or(false),revision_changed]).map_err(db_error)?;
+        db.execute("UPDATE tunnels SET device_id=?1,name=?2,protocol=?3,local_address=?4,local_port=?5,public_port=?6,hostname=?7,enabled=?8,apply_revision=apply_revision+?17,apply_status=CASE WHEN ?17 THEN CASE WHEN ?8 THEN 'checking' ELSE 'disabled' END ELSE apply_status END,updated_at=?9,public_domain_id=?12,lan_redirect_enabled=?13,origin_protocol=?14,service_mode=?15,http_redirect_enabled=?16,compression_enabled=COALESCE(?18,compression_enabled) WHERE id=?10 AND tenant_id=?11 AND deleted_at IS NULL",params![input.device_id,input.name.trim(),input.protocol,input.local_address.trim(),input.local_port,input.public_port,input.hostname,input.enabled.unwrap_or(true),unix_now(),id,session.tenant_id,input.public_domain_id,input.lan_redirect_enabled.unwrap_or(false),input.origin_protocol,input.service_mode,input.http_redirect_enabled.unwrap_or(false),revision_changed,input.compression_enabled]).map_err(db_error)?;
         origin_ca::save(&db, &session.tenant_id, &id, &input)?;
         nodes::services::save(&db, &id, &input)?;
         if revision_changed {
@@ -1410,7 +1427,7 @@ fn query_tunnels(
         .get(axum::http::header::HOST)
         .and_then(|value| value.to_str().ok())
         .and_then(|host| host.parse::<axum::http::uri::Authority>().ok());
-    let sql="SELECT t.id,t.tenant_id,t.device_id,d.name,t.name,t.protocol,t.local_address,t.local_port,t.public_port,t.hostname,t.enabled,t.apply_status,t.apply_error,t.apply_revision,t.public_domain_id,t.deleted_at,p.domain,t.lan_redirect_enabled,CASE WHEN t.protocol IN ('tcp','udp','tcp_udp') THEN NULL ELSE COALESCE(t.origin_protocol,'http') END,t.service_mode,t.access_mode,t.protocol_statuses,t.http_redirect_enabled,t.https_port,t.ipv6_direct_enabled,t.icon_id,t.origin_tls_verification,t.origin_ca_pem FROM tunnels t LEFT JOIN devices d ON d.id=t.device_id LEFT JOIN public_domains p ON p.id=t.public_domain_id WHERE t.tenant_id=?1 AND t.deleted_at IS NULL AND (?2 IS NULL OR t.id=?2) ORDER BY t.created_at DESC";
+    let sql="SELECT t.id,t.tenant_id,t.device_id,d.name,t.name,t.protocol,t.local_address,t.local_port,t.public_port,t.hostname,t.enabled,t.apply_status,t.apply_error,t.apply_revision,t.public_domain_id,t.deleted_at,p.domain,t.lan_redirect_enabled,CASE WHEN t.protocol IN ('tcp','udp','tcp_udp') THEN NULL ELSE COALESCE(t.origin_protocol,'http') END,t.service_mode,t.access_mode,t.protocol_statuses,t.http_redirect_enabled,t.https_port,t.ipv6_direct_enabled,t.icon_id,t.origin_tls_verification,t.origin_ca_pem,t.compression_enabled FROM tunnels t LEFT JOIN devices d ON d.id=t.device_id LEFT JOIN public_domains p ON p.id=t.public_domain_id WHERE t.tenant_id=?1 AND t.deleted_at IS NULL AND (?2 IS NULL OR t.id=?2) ORDER BY t.created_at DESC";
     let mut q = connection.prepare(sql)?;
     let rows = q
         .query_map(params![tenant, only], |row| {
@@ -1468,6 +1485,7 @@ fn query_tunnels(
                 enabled: row.get::<_, i64>(10)? != 0,
                 lan_redirect_enabled: row.get(17)?,
                 http_redirect_enabled: row.get(22)?,
+                compression_enabled: row.get(28)?,
                 apply_status: row.get(11)?,
                 apply_error: row.get(12)?,
                 apply_revision: row.get(13)?,
@@ -1487,6 +1505,20 @@ fn prepare_tunnel(
     input: &mut TunnelInput,
 ) -> Result<(), ApiError> {
     validate_tunnel(input)?;
+    let compression_supported = input.service_mode.as_deref() == Some("tunnel")
+        && matches!(
+            input.protocol.as_str(),
+            "tcp" | "tcp_udp" | "http" | "https"
+        );
+    if !compression_supported {
+        if input.compression_enabled == Some(true) {
+            return Err(ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "隧道压缩适用于 HTTP、HTTPS 和 TCP 穿透",
+            ));
+        }
+        input.compression_enabled = Some(false);
+    }
     // 先确定本次有效回源协议，随后重定向验证、持久化与 Agent 下发使用同一份值。
     // 局部更新省略回源字段时保留已有 HTTPS，避免意外降级。
     input.origin_protocol = if nexo_tunnel::udp::is_port(&input.protocol) {

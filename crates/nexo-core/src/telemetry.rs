@@ -1,5 +1,7 @@
 //! 各公网入口共用的脱敏观测。原始 IP、请求头和查询串只在解析栈内存在，
 //! 队列及跨进程上报只包含白名单字段；采集失败不改变业务转发结果。
+mod geoip;
+
 use hmac::{Hmac, Mac};
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
@@ -8,6 +10,7 @@ use sha2::Sha256;
 use std::{
     collections::{BTreeMap, VecDeque},
     net::IpAddr,
+    path::Path,
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc, Mutex,
@@ -84,16 +87,21 @@ struct Queue {
 pub struct Hub {
     queue: Mutex<Queue>,
     secret: [u8; 32],
-    geo: Option<maxminddb::Reader<Vec<u8>>>,
+    geo: Arc<geoip::CountryLookup>,
     asn: Option<maxminddb::Reader<Vec<u8>>>,
     started: Instant,
 }
 impl Default for Hub {
     fn default() -> Self {
+        Self::with_geo(None)
+    }
+}
+impl Hub {
+    fn with_geo(directory: Option<&Path>) -> Self {
         let mut secret = [0; 32];
         rand::thread_rng().fill_bytes(&mut secret);
-        let geo = std::env::var_os("NEXO_GEOIP_DATABASE")
-            .and_then(|p| maxminddb::Reader::open_readfile(p).ok());
+        let configured = std::env::var_os("NEXO_GEOIP_DATABASE").filter(|path| !path.is_empty());
+        let geo = Arc::new(geoip::CountryLookup::open(configured.as_deref(), directory));
         let asn = std::env::var_os("NEXO_GEOIP_ASN_DATABASE")
             .and_then(|p| maxminddb::Reader::open_readfile(p).ok());
         Self {
@@ -104,14 +112,12 @@ impl Default for Hub {
             started: Instant::now(),
         }
     }
-}
-impl Hub {
     /// 隐私密钥与节点身份同目录持久化，普通重启不会令当天 UV 重复。
-    pub fn persistent(directory: &std::path::Path) -> anyhow::Result<Self> {
+    pub fn persistent(directory: &Path) -> anyhow::Result<Self> {
         use std::io::Write;
         std::fs::create_dir_all(directory)?;
         let path = directory.join("analytics.key");
-        let mut hub = Self::default();
+        let mut hub = Self::with_geo(Some(directory));
         if path.exists() {
             hub.secret = std::fs::read(path)?
                 .try_into()
@@ -134,7 +140,18 @@ impl Hub {
         self.started.elapsed().as_secs()
     }
     pub fn geo_available(&self) -> bool {
-        self.geo.is_some()
+        self.geo.available()
+    }
+    /// 下载任务由入口进程持有，随入口停止。临时统计实例不会下载数据库。
+    pub fn start_geoip_refresh(&self) -> Option<tokio_util::task::AbortOnDropHandle<()>> {
+        self.geo.start()
+    }
+    fn source_country(&self, ip: Option<IpAddr>) -> (String, String) {
+        let source = ip.map(mask_ip).unwrap_or_else(|| "未知".into());
+        let country = ip
+            .and_then(|ip| self.geo.country(ip))
+            .unwrap_or_else(|| "未知".into());
+        (source, country)
     }
     pub fn push(&self, event: Event) {
         let mut q = self.queue.lock().unwrap_or_else(|e| e.into_inner());
@@ -188,7 +205,13 @@ impl Hub {
             }
         }
     }
-    pub fn session(self: &Arc<Self>, service: &str, protocol: &str) -> Session {
+    pub fn session(
+        self: &Arc<Self>,
+        service: &str,
+        protocol: &str,
+        peer: Option<IpAddr>,
+    ) -> Session {
+        let (source, country) = self.source_country(peer.map(normalized_ip));
         let mut q = self.queue.lock().unwrap_or_else(|e| e.into_inner());
         let counts = q
             .flows
@@ -202,6 +225,8 @@ impl Hub {
             hub: self.clone(),
             service: service.into(),
             protocol: protocol.into(),
+            source,
+            country,
             counts,
             origin: 0,
             public: 0,
@@ -230,11 +255,8 @@ impl Hub {
         }
         let at = v["ts"].as_f64().unwrap_or(now() as f64) as i64;
         let raw = request["remote_ip"].as_str().unwrap_or("");
-        let ip = raw.parse::<IpAddr>().ok().map(|ip| match ip {
-            IpAddr::V6(v) => v.to_ipv4_mapped().map(IpAddr::V4).unwrap_or(ip),
-            _ => ip,
-        });
-        let source = ip.map(mask_ip).unwrap_or_else(|| "未知".into());
+        let ip = raw.parse::<IpAddr>().ok().map(normalized_ip);
+        let (source, country) = self.source_country(ip);
         let ua = request["headers"]["User-Agent"][0]
             .as_str()
             .unwrap_or("")
@@ -279,15 +301,6 @@ impl Hub {
         } else {
             String::new()
         };
-        let country = ip
-            .and_then(|ip| self.geo.as_ref()?.lookup::<Value>(ip).ok())
-            .and_then(|v| {
-                v["country"]["names"]["zh-CN"]
-                    .as_str()
-                    .or_else(|| v["country"]["iso_code"].as_str())
-                    .map(str::to_owned)
-            })
-            .unwrap_or_else(|| "未知".into());
         let operator = ip
             .and_then(|ip| self.asn.as_ref()?.lookup::<Value>(ip).ok())
             .and_then(|v| {
@@ -335,6 +348,12 @@ pub fn limited(s: &str, n: usize) -> String {
 pub fn clean_path(s: &str) -> String {
     limited(s.split(['?', '#']).next().unwrap_or("/"), 256)
 }
+fn normalized_ip(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V6(v) => v.to_ipv4_mapped().map(IpAddr::V4).unwrap_or(ip),
+        _ => ip,
+    }
+}
 pub fn mask_ip(ip: IpAddr) -> String {
     match ip {
         IpAddr::V4(v) => {
@@ -359,6 +378,8 @@ pub struct Session {
     hub: Arc<Hub>,
     service: String,
     protocol: String,
+    source: String,
+    country: String,
     counts: Arc<Counters>,
     origin: u64,
     public: u64,
@@ -392,6 +413,8 @@ impl Drop for Session {
             at: now(),
             kind: "session".into(),
             protocol: self.protocol.clone(),
+            source: std::mem::take(&mut self.source),
+            country: std::mem::take(&mut self.country),
             duration_ms: self.started.elapsed().as_millis().min(u64::MAX as u128) as u64,
             to_origin: self.origin,
             to_public: self.public,
@@ -518,8 +541,8 @@ mod tests {
     #[test]
     fn session_bytes_and_cancelled_drop_are_sampled_once() {
         let hub = Arc::new(Hub::default());
-        let mut a = hub.session("tcp", "tcp");
-        let b = hub.session("tcp", "tcp");
+        let mut a = hub.session("tcp", "tcp", Some("::ffff:203.0.113.9".parse().unwrap()));
+        let b = hub.session("tcp", "tcp", None);
         a.record(true, 23);
         a.record(false, 17);
         let first = hub.batch();

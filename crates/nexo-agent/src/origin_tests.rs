@@ -406,3 +406,42 @@ async fn https_origin_accepts_explicitly_trusted_self_signed_certificate() {
     .await
     .expect("HTTPS 测试超时");
 }
+#[tokio::test]
+async fn stream_compression_negotiates_and_falls_back_to_the_old_data_listener() {
+    let dir = tempfile::tempdir().unwrap();
+    let authority = identity::Authority::load_or_create(&dir.path().join("identity.json")).unwrap();
+    let key = KeyPair::generate().unwrap();
+    let csr = CertificateParams::new(vec!["agent.nexo".into()])
+        .unwrap()
+        .serialize_request(&key)
+        .unwrap()
+        .pem()
+        .unwrap();
+    let cert = authority.issue_device(&csr, "agent").unwrap();
+    let connector = TlsConnector::from(
+        identity::client_config(&authority.ca_pem, &cert, &key.serialize_pem()).unwrap(),
+    );
+    for alpn in [nexo_tunnel::compression::ALPN, nexo_protocol::direct::ALPN] {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = TunnelDataEndpoint {
+            address: listener.local_addr().unwrap().to_string(),
+            server_name: SERVER_NAME.into(),
+        };
+        let mut config = authority.server_config().unwrap();
+        Arc::make_mut(&mut config).alpn_protocols = vec![alpn.to_vec()];
+        let acceptor = tokio_rustls::TlsAcceptor::from(config);
+        let expected = (alpn == nexo_tunnel::compression::ALPN).then_some(alpn);
+        let server = tokio::spawn(async move {
+            if expected.is_none() {
+                let (first, _) = listener.accept().await.unwrap();
+                assert!(acceptor.accept(first).await.is_err());
+            }
+            let (incoming, _) = listener.accept().await.unwrap();
+            let tls = acceptor.accept(incoming).await.unwrap();
+            assert_eq!(tls.get_ref().1.alpn_protocol(), expected);
+        });
+        let tls = connect_data_tls(&connector, &endpoint).await.unwrap();
+        assert_eq!(tls.get_ref().1.alpn_protocol(), expected);
+        server.await.unwrap();
+    }
+}

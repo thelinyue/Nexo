@@ -1479,18 +1479,24 @@ version = "0.2.26"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
+ "flate2",
  "hex",
  "hmac",
  "ipnet",
  "maxminddb",
  "rand 0.8.8",
+ "reqwest",
  "serde",
  "serde_json",
  "serde_path_to_error",
  "sha2",
  "tempfile",
  "thiserror 2.0.20",
+ "time",
+ "tokio",
+ "tokio-util",
  "toml",
+ "tracing",
 ]
 
 [[package]]
@@ -1554,6 +1560,7 @@ dependencies = [
  "anyhow",
  "bytes",
  "chrono",
+ "flate2",
  "futures-io",
  "futures-util",
  "nexo-core",

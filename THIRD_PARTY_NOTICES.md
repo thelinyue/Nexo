@@ -8,6 +8,10 @@ Nexo bundles or links the following third-party components:
 
 This file is a navigation index; authoritative license texts remain with each upstream project.
 
+## DB-IP Country Lite
+
+流量天眼在运行时下载 DB-IP 提供的 IP to Country Lite 数据库。数据库采用 CC BY 4.0 许可，页面显示来源署名。 [DB-IP Country Lite](https://db-ip.com/db/download/ip-to-country-lite) · [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/)
+
 ## Iconify 与 Tabler Icons
 
 界面操作图标使用 [Iconify React](https://iconify.design/docs/icon-components/react/) 的离线组件与 [Tabler Icons](https://github.com/tabler/tabler-icons) 线性图标，均使用 MIT 许可证。仅将实际使用的图标数据打包到前端，不在运行时请求 Iconify API。完整版权及许可声明位于 `web/public/licenses/Iconify.txt` 和 `web/public/licenses/Tabler.txt`，部署后可通过 `/licenses/Iconify.txt` 与 `/licenses/Tabler.txt` 查看。

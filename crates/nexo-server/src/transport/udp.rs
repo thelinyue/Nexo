@@ -164,7 +164,11 @@ async fn forward(
     peer: Arc<Peer>,
     mut packets: mpsc::Receiver<Packet>,
 ) -> Result<()> {
-    let mut observation = state.tunnel_runtime.analytics.session(&service.id, "udp");
+    let mut observation =
+        state
+            .tunnel_runtime
+            .analytics
+            .session(&service.id, "udp", Some(address.ip()));
     let quota = state.tunnel_runtime.quotas.get(&state, &service.tenant)?;
     let quota_cancel = quota.connection().context("UDP 流量额度不足")?;
     let meter = state

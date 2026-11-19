@@ -14,6 +14,7 @@ use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio_util::compat::{Compat, FuturesAsyncReadCompatExt, TokioAsyncReadCompatExt};
 
+pub mod compression;
 pub mod control_diagnostics;
 pub mod identity;
 pub mod observation;
@@ -70,6 +71,8 @@ pub struct LogicalStreamHeader {
     pub tunnel_id: String,
     pub connection_id: String,
     pub revision: i64,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub compressed: bool,
 }
 
 impl LogicalStreamHeader {
@@ -83,6 +86,7 @@ impl LogicalStreamHeader {
             tunnel_id: tunnel_id.into(),
             connection_id: connection_id.into(),
             revision,
+            compressed: false,
         };
         header.validate()?;
         Ok(header)

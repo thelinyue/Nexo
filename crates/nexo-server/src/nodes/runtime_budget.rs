@@ -112,12 +112,15 @@ async fn pump<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
             }
             offset += written;
         }
+        if to_origin && service.compression_enabled {
+            write.flush().await?;
+        }
     }
 }
 
 /// 服务、额度修订或月份变化立即取消旧流；预留占满只拒绝新的预算，不取消有效预算。
-pub(super) async fn copy<A: AsyncRead + AsyncWrite + Unpin, B: AsyncRead + AsyncWrite + Unpin>(
-    public: &mut A,
+pub(super) async fn copy<B: AsyncRead + AsyncWrite + Unpin>(
+    public: &mut TcpStream,
     origin: &mut B,
     runtime: Arc<Runtime>,
     service: &wire::Service,
@@ -141,9 +144,11 @@ pub(super) async fn copy<A: AsyncRead + AsyncWrite + Unpin, B: AsyncRead + Async
         }
     };
     let observation = (service.protocol == "tcp").then(|| {
-        Arc::new(std::sync::Mutex::new(
-            runtime.analytics.session(&service.id, "tcp"),
-        ))
+        Arc::new(std::sync::Mutex::new(runtime.analytics.session(
+            &service.id,
+            "tcp",
+            public.peer_addr().ok().map(|peer| peer.ip()),
+        )))
     });
     let transfer = async {
         let mut public =

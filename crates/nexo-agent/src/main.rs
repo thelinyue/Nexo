@@ -644,6 +644,36 @@ async fn run_control(
     })
 }
 
+async fn connect_data_tls(
+    connector: &TlsConnector,
+    endpoint: &TunnelDataEndpoint,
+) -> Result<tokio_rustls::client::TlsStream<TcpStream>> {
+    let mut config = (**connector.config()).clone();
+    config.alpn_protocols = vec![nexo_tunnel::compression::ALPN.to_vec()];
+    let result = connect_tls(&TlsConnector::from(Arc::new(config)), endpoint).await;
+    if let Err(error) = &result {
+        // 旧内置节点的数据监听只声明直连 ALPN。仅在协议未协商时重试，仍校验 mTLS。
+        let unsupported = error.chain().any(|cause| {
+            let tls_error = cause.downcast_ref::<rustls::Error>().or_else(|| {
+                cause
+                    .downcast_ref::<std::io::Error>()?
+                    .get_ref()?
+                    .downcast_ref::<rustls::Error>()
+            });
+            matches!(
+                tls_error,
+                Some(rustls::Error::AlertReceived(
+                    rustls::AlertDescription::NoApplicationProtocol
+                ))
+            )
+        });
+        if unsupported {
+            return connect_tls(connector, endpoint).await;
+        }
+    }
+    result
+}
+
 /// Yamux 重连独立于心跳；每个逻辑流依照当前完整快照核对 ID 和版本，不接受服务端任意目标地址。
 async fn run_data(
     connectors: watch::Receiver<TlsConnector>,
@@ -655,17 +685,21 @@ async fn run_data(
         let endpoint = desired.borrow_and_update().endpoint.clone();
         let connector = connectors.borrow().clone();
         // 每次数据重连都重新设置；失败进入现有重试流程，不影响控制连接。
-        let connected = connect_tls(&connector, &endpoint).await.and_then(|stream| {
-            stream
-                .get_ref()
-                .0
-                .set_nodelay(true)
-                .context("设置隧道数据连接 TCP_NODELAY 失败")?;
-            Ok(stream)
-        });
+        let connected = connect_data_tls(&connector, &endpoint)
+            .await
+            .and_then(|stream| {
+                stream
+                    .get_ref()
+                    .0
+                    .set_nodelay(true)
+                    .context("设置隧道数据连接 TCP_NODELAY 失败")?;
+                Ok(stream)
+            });
         match connected {
             Ok(stream) => {
                 delay = 1;
+                let compression_supported =
+                    stream.get_ref().1.alpn_protocol() == Some(nexo_tunnel::compression::ALPN);
                 tracing::info!("隧道数据通道已连接");
                 let mut connection = nexo_tunnel::yamux_connection(stream, yamux::Mode::Client);
                 let mut tasks = JoinSet::new();
@@ -691,7 +725,7 @@ async fn run_data(
                         Some(_) = tasks.join_next(), if !tasks.is_empty() => {},
                     change = desired.changed() => { if change.is_err() { return; } else if desired.borrow().endpoint != endpoint { break; } },
                         inbound=nexo_tunnel::next_inbound(&mut connection) => match inbound {
-                            Ok(Some(stream)) => { let snapshot=desired.clone(); let budget=budget.clone(); tasks.spawn(async move { if let Err(error)=forward_with_budget(stream,snapshot,budget).await { tracing::debug!("隧道逻辑流结束：{error:#}"); } }); },
+                            Ok(Some(stream)) => { let snapshot=desired.clone(); let budget=budget.clone(); tasks.spawn(async move { if let Err(error)=forward_with_budget(stream,snapshot,budget,compression_supported).await { tracing::debug!("隧道逻辑流结束：{error:#}"); } }); },
                             Ok(None) => break,
                             Err(error) => { tracing::warn!("隧道数据通道断开：{error}"); break; }
                         }
@@ -708,6 +742,7 @@ async fn forward_with_budget(
     stream: yamux::Stream,
     mut desired: watch::Receiver<Desired>,
     budget: Option<(node_budget::Client, String)>,
+    compression_supported: bool,
 ) -> Result<()> {
     let mut stream = nexo_tunnel::into_tokio_io(stream);
     let header = tokio::time::timeout(
@@ -715,6 +750,10 @@ async fn forward_with_budget(
         nexo_tunnel::read_logical_header(&mut stream),
     )
     .await??;
+    anyhow::ensure!(
+        !header.compressed || compression_supported,
+        "隧道压缩尚未协商"
+    );
     let tunnel = desired
         .borrow_and_update()
         .tunnels
@@ -723,9 +762,18 @@ async fn forward_with_budget(
         .cloned()
         .context("逻辑流不属于当前启用的配置")?;
     let transfer = async {
+        let mut stream = nexo_tunnel::compression::wrap(stream, header.compressed);
         let mut local = connect_origin(&tunnel).await?;
         if let Some((client, node)) = budget {
-            node_budget::copy(&mut *local, &mut stream, client, &node, &tunnel).await?;
+            node_budget::copy(
+                &mut *local,
+                &mut stream,
+                client,
+                &node,
+                &tunnel,
+                header.compressed,
+            )
+            .await?;
         } else {
             tokio::io::copy_bidirectional(&mut local, &mut stream).await?;
         }

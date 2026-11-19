@@ -215,6 +215,13 @@ class Harness(base.Harness):
                     pass
             self.api(f"tunnels/{tunnel['id']}", "PUT", body)
             base.wait_for(lambda: self.ready(tunnel["id"]), "重新启用")
+            def udp_sessions():
+                items = self.api(f"traffic/analytics/sessions?tunnel_id={tunnel['id']}&protocol=udp")["items"]
+                return [entry for entry in items if entry["to_public"] > 0]
+            observed = base.wait_for(udp_sessions, "UDP 来源地域会话")
+            assert all(entry["source"] == "127.0.0.0/24" and entry["country"] == "未知" for entry in observed)
+            summary = self.api(f"traffic/analytics/summary?tunnel_id={tunnel['id']}&protocol=udp")
+            assert any(row["label"] == "未知" for row in summary["breakdowns"]["session_country"])
             self.check("组合服务停用与恢复")
             self.stop_server()
             self.start_server()

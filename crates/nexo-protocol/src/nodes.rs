@@ -19,6 +19,8 @@ pub struct Service {
     pub device: String,
     pub revision: i64,
     pub protocol: String,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub compression_enabled: bool,
     pub port: u16,
     pub hostname: Option<String>,
     /// HTTP 入口及 HTTPS 跳转入口使用同一公网端口，旧快照默认 80。

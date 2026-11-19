@@ -155,6 +155,7 @@ pub async fn run(
         stop: CancellationToken::new(),
         caddy: Default::default(),
     });
+    let _geoip_refresh = runtime.analytics.start_geoip_refresh();
     let mut tasks = JoinSet::new();
     tasks.spawn(control(runtime.clone(), identity.clone()));
     tasks.spawn(data(runtime.clone(), identity.clone()));
@@ -312,11 +313,9 @@ async fn data(runtime: Arc<Runtime>, saved: Arc<NodeIdentity>) -> Result<()> {
     let mut listener = TcpListener::bind(("0.0.0.0", saved.data_port))
         .await
         .context("节点数据端口被占用")?;
-    let acceptor = TlsAcceptor::from(identity::node_server_config(
-        &saved.ca,
-        &saved.certificate,
-        &saved.key,
-    )?);
+    let mut config = identity::node_server_config(&saved.ca, &saved.certificate, &saved.key)?;
+    Arc::make_mut(&mut config).alpn_protocols = vec![nexo_tunnel::compression::ALPN.to_vec()];
+    let acceptor = TlsAcceptor::from(config);
     let mut tasks = JoinSet::new();
     let mut snapshot = runtime.snapshot.subscribe();
     loop {
@@ -356,6 +355,8 @@ async fn data_session(
     };
     nexo_tunnel::configure_tunnel_tcp_keepalive(&socket)?;
     let stream = tokio::time::timeout(Duration::from_secs(10), acceptor.accept(socket)).await??;
+    let compression_supported =
+        stream.get_ref().1.alpn_protocol() == Some(nexo_tunnel::compression::ALPN);
     let cert = stream
         .get_ref()
         .1
@@ -394,7 +395,10 @@ async fn data_session(
                 struct Count(Arc<AtomicU64>);impl Drop for Count{fn drop(&mut self){self.0.fetch_sub(1,Ordering::Relaxed);}}
                 let _count=Count(count);let mut stream=nexo_tunnel::into_tokio_io(stream);
                 let transfer=async{
-                    nexo_tunnel::write_logical_header(&mut stream,&LogicalStreamHeader::new(&request.service.id,Uuid::new_v4().to_string(),request.service.revision)?).await?;
+                    let mut header = LogicalStreamHeader::new(&request.service.id, Uuid::new_v4().to_string(), request.service.revision)?;
+                    header.compressed = compression_supported && request.service.compression_enabled;
+                    nexo_tunnel::write_logical_header(&mut stream, &header).await?;
+                    let mut stream = nexo_tunnel::compression::wrap(stream, header.compressed);
                     budget::copy(&mut request.socket,&mut stream,metered_runtime,&request.service).await?;anyhow::Ok(())
                 };
                 tokio::select!{_=request.cancel.cancelled()=>{},result=transfer=>if let Err(error)=result{tracing::debug!("节点转发结束：{error:#}");}}

@@ -15,18 +15,34 @@ test("首页呈现完整天眼布局并可打开单服务统计与会话明细",
   await expect(page.getByRole("heading", {name:"状态码分布",exact:true})).toBeVisible();
   await expect(page.getByRole("heading", {name:"访客画像",exact:true})).toBeVisible();
   await expect(page.getByRole("heading", {name:"来源国家 / 地区",exact:true})).toBeVisible();
+  const geography = page.getByRole("region", {name:"来源国家 / 地区",exact:true});
+  await expect(geography).toContainText("美国");
+  await expect(geography).toContainText("日本");
+  await expect(geography.getByRole("link", {name:/DB-IP/})).toHaveAttribute("href", "https://db-ip.com/");
   await expect(page.getByRole("heading", {name:"访问域名",exact:true})).toBeVisible();
   const requests = page.getByRole("region", {name:"实时请求流",exact:true});
   await requests.scrollIntoViewIfNeeded(); await expect(requests).toContainText("/media");
   await page.locator(".eye-services").getByRole("button",{name:"媒体中心",exact:true}).click();
   const dialog = page.getByRole("dialog",{name:"媒体中心 · 统计",exact:true}); await expect(dialog).toBeVisible();
+  await expect(dialog.getByRole("region",{name:"来源国家 / 地区",exact:true})).toContainText("日本");
   await expect(dialog.locator(".eye-kpis")).toContainText("PV"); await expect(dialog.locator(".eye-kpis")).toContainText("UV");
   await dialog.getByRole("button",{name:"关闭",exact:true}).click(); await expect(dialog).toHaveCount(0);
   await page.locator(".eye-session-details summary").click();
   await expect(page.getByRole("region",{name:"会话明细",exact:true})).toContainText("正常结束");
+  await expect(page.getByRole("region",{name:"会话明细",exact:true})).toContainText("日本");
   expect(errors).toEqual([]);
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBeTruthy();
   await page.screenshot({path:info.outputPath("traffic-eye.png"),fullPage:true});
+});
+
+test("按 TCP 筛选时地域卡显示会话计数", async ({ page }) => {
+  await installApiMocks(page);
+  await page.goto("/");
+  await page.getByLabel("统计协议", { exact: true }).selectOption("tcp");
+  const geography = page.getByRole("region", { name:"来源国家 / 地区", exact: true });
+  await expect(geography.getByRole("heading", { name:"TCP 会话数", exact: true })).toBeVisible();
+  await expect(geography).toContainText("日本");
+  await expect(geography.getByRole("heading", { name:"HTTP 请求数", exact: true })).toHaveCount(0);
 });
 
 test("协议、服务类型、时间范围可刷新恢复，筛选请求与明细同步", async ({ page }) => {

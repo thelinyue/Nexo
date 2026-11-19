@@ -452,3 +452,15 @@ test("保存期间关闭浮层并禁用所有选择框，失败后恢复选择�
   await expect(dialog.getByRole("combobox", { name: "根域名", exact: true })).toBeEnabled();
   await expect(dialog.getByLabel("服务名称")).toHaveValue("保存期间");
 });
+test("隧道压缩默认关闭且可按服务保存", async ({ page }) => {
+  const state = await installApiMocks(page);
+  await page.goto("/#/services/t-1");
+  await page.getByRole("button", { name: "编辑服务", exact: true }).click();
+  const editor = page.getByRole("dialog", { name: "编辑服务" });
+  const compression = editor.getByRole("switch", { name: "隧道压缩" });
+  await expect(compression).not.toBeChecked();
+  await compression.check();
+  await editor.getByRole("button", { name: "保存服务" }).click();
+  await expect(editor).toBeHidden();
+  expect(state.calls.find(call => call.method === "PUT")?.body).toMatchObject({ compression_enabled: true });
+});

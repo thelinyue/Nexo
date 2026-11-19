@@ -145,6 +145,73 @@ fn ingestion_is_idempotent_and_summary_protocols_and_details_remain_scoped() {
 }
 
 #[test]
+fn session_country_tracks_remote_sources_and_missing_history() {
+    let (state, headers) = fixture();
+    state
+        .db
+        .lock()
+        .unwrap()
+        .execute_batch(
+            "INSERT INTO relay_nodes(id,name,approved,created_at) VALUES('remote','远端',1,0);
+         INSERT INTO relay_node_grants VALUES('remote','default');
+         INSERT INTO service_nodes VALUES('tcp','remote');",
+        )
+        .unwrap();
+    let now = unix_now();
+    let mut session = event("tcp", now, 0);
+    session.kind = "session".into();
+    session.protocol = "tcp".into();
+    session.reason = "closed".into();
+    session.source = "8.8.8.8/32".into();
+    let mut old = session.clone();
+    old.id = Uuid::new_v4().simple().to_string();
+    old.country.clear();
+    session.country = "美国".into();
+    let batch = Batch {
+        events: vec![session, old],
+        dropped: 0,
+    };
+    ingest(&state, &batch, "remote", None).unwrap();
+    ingest(&state, &batch, "remote", None).unwrap();
+    // 模拟升级前已聚合的会话。当时只记录结束原因，地域计数缺失。
+    state
+        .db
+        .lock()
+        .unwrap()
+        .execute(
+            "DELETE FROM analytics_dimensions WHERE dimension='session_country' AND value='未知'",
+            [],
+        )
+        .unwrap();
+    for range in ["live", "24h"] {
+        let filter = Filter {
+            range: Some(range.into()),
+            protocol: Some("tcp".into()),
+            ..Default::default()
+        };
+        let scope = scope(&state, &headers, &filter, false).unwrap();
+        let summary = summary(&state, &scope).unwrap();
+        assert_eq!(summary["totals"]["sessions"], 2);
+        assert_eq!(summary["totals"]["to_public"], 0);
+        assert_eq!(
+            summary["breakdowns"]["session_country"],
+            json!([
+                {"label":"未知","count":1}, {"label":"美国","count":1},
+            ])
+        );
+        assert!(summary["breakdowns"]["country"].is_null());
+        let records = details(&state, &scope, &filter, "session").unwrap();
+        assert!(records["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| entry["country"] == "美国"
+                && entry["source"] == "8.8.8.0/24"
+                && entry["node"] == "remote"));
+    }
+}
+
+#[test]
 fn live_window_excludes_old_requests_from_totals_rankings_and_distributions() {
     let (state, headers) = fixture();
     let mut old = event("web", unix_now() - 120, 503);

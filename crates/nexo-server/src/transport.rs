@@ -39,6 +39,7 @@ struct Service {
     device: String,
     revision: i64,
     protocol: String,
+    compression_enabled: bool,
     port: Option<u16>,
 }
 struct Listener {
@@ -51,6 +52,7 @@ struct Listener {
 struct OpenStream {
     service: Service,
     socket: BoxIo,
+    peer: Option<IpAddr>,
     cancel: CancellationToken,
     _permit: OwnedSemaphorePermit,
 }
@@ -285,12 +287,13 @@ impl Runtime {
                 .db
                 .lock()
                 .map_err(|_| anyhow::anyhow!("数据库锁不可用"))?;
-            let mut query = db.prepare("SELECT t.id,t.device_id,t.apply_revision,t.protocol,t.public_port,t.tenant_id FROM tunnels t JOIN devices d ON d.id=t.device_id AND d.tenant_id=t.tenant_id JOIN tenants w ON w.id=t.tenant_id AND w.enabled=1 WHERE t.service_mode='tunnel' AND t.enabled=1 AND t.deleted_at IS NULL AND EXISTS(SELECT 1 FROM authorized_service_nodes sn WHERE sn.service_id=t.id AND sn.node_id='local')")?;
+            let mut query = db.prepare("SELECT t.id,t.device_id,t.apply_revision,t.protocol,t.public_port,t.tenant_id,t.compression_enabled FROM tunnels t JOIN devices d ON d.id=t.device_id AND d.tenant_id=t.tenant_id JOIN tenants w ON w.id=t.tenant_id AND w.enabled=1 WHERE t.service_mode='tunnel' AND t.enabled=1 AND t.deleted_at IS NULL AND EXISTS(SELECT 1 FROM authorized_service_nodes sn WHERE sn.service_id=t.id AND sn.node_id='local')")?;
             let services = query
                 .query_map([], |r| {
                     Ok(Service {
                         id: r.get(0)?,
                         tenant: r.get(5)?,
+                        compression_enabled: r.get(6)?,
                         device: r.get(1)?,
                         revision: r.get(2)?,
                         protocol: r.get(3)?,
@@ -422,7 +425,7 @@ impl Runtime {
                     tokio::select! {
                         _ = task_cancel.cancelled() => break,
                         accepted = listener.accept() => match accepted {
-                            Ok((socket, _)) => handoff(&task_state, &task_service, Box::new(socket), &task_cancel).await,
+                            Ok((socket, _)) => handoff(&task_state, &task_service, Box::new(socket), None, &task_cancel).await,
                             Err(error) => { tracing::warn!("Web 隧道监听停止：{error}"); break; }
                         }
                     }
@@ -481,14 +484,20 @@ fn tcp_listener(
             tokio::select! {
                 _ = cancel.cancelled() => break,
                 accepted = listener.accept() => match accepted {
-                    Ok((socket, _)) => handoff(&state, &service, Box::new(socket), &cancel).await,
+                    Ok((socket, peer)) => handoff(&state, &service, Box::new(socket), Some(peer.ip()), &cancel).await,
                     Err(error) => { tracing::warn!("TCP 隧道监听停止：{error}"); break; }
                 }
             }
         }
     })
 }
-async fn handoff(state: &AppState, service: &Service, socket: BoxIo, cancel: &CancellationToken) {
+async fn handoff(
+    state: &AppState,
+    service: &Service,
+    socket: BoxIo,
+    peer: Option<IpAddr>,
+    cancel: &CancellationToken,
+) {
     match state.tunnel_runtime.quotas.get(state, &service.tenant) {
         Ok(quota) if quota.connection().is_some() => {}
         Ok(_) => return,
@@ -507,6 +516,7 @@ async fn handoff(state: &AppState, service: &Service, socket: BoxIo, cancel: &Ca
     let _ = session.sender.try_send(OpenStream {
         service: service.clone(),
         socket,
+        peer,
         cancel: cancel.child_token(),
         _permit: permit,
     });
@@ -581,7 +591,9 @@ pub async fn serve(state: AppState, listener: TcpListener, data: bool) -> Result
             Some(_) = tasks.join_next(), if !tasks.is_empty() => {},
             incoming = listener.accept() => {
                 let (socket, peer) = incoming?; let mut tls_config = (*state.authority.server_config()).clone();
-                if data { tls_config.alpn_protocols = vec![nexo_protocol::direct::ALPN.to_vec()]; }
+                if data {
+                    tls_config.alpn_protocols = vec![nexo_protocol::direct::ALPN.to_vec(), nexo_tunnel::compression::ALPN.to_vec()];
+                }
                 let acceptor = TlsAcceptor::from(Arc::new(tls_config)); let state = state.clone();
                 tasks.spawn(async move {
                     let result: Result<()> = async {
@@ -800,6 +812,8 @@ async fn data_session(
     device: String,
     fingerprint: String,
 ) -> Result<()> {
+    let compression_supported =
+        stream.get_ref().1.alpn_protocol() == Some(nexo_tunnel::compression::ALPN);
     // 仅普通 Yamux 数据连接禁用 Nagle，避免小帧等待；控制及其他 ALPN 路径不受影响。
     stream
         .get_ref()
@@ -840,12 +854,14 @@ async fn data_session(
             let Some(quota_cancel) = quota.connection() else { continue; };
             let stream = tokio::time::timeout(Duration::from_secs(10), nexo_tunnel::new_outbound(&mut connection)).await.context("隧道开流超时")??;
             let meter = state.tunnel_runtime.traffic.meter(&command.service.tenant, &command.service.id);
-            let observed=matches!(command.service.protocol.as_str(),"tcp"|"tcp_udp").then(||Arc::new(std::sync::Mutex::new(state.tunnel_runtime.analytics.session(&command.service.id,"tcp"))));
+            let observed=matches!(command.service.protocol.as_str(),"tcp"|"tcp_udp").then(||Arc::new(std::sync::Mutex::new(state.tunnel_runtime.analytics.session(&command.service.id,"tcp",command.peer))));
             copies.spawn(state.tunnel_runtime.transfers.track_future(async move {
                 let mut stream = nexo_tunnel::into_tokio_io(stream);
                 let transfer = async {
-                    let header = LogicalStreamHeader::new(&command.service.id, uuid::Uuid::new_v4().to_string(), command.service.revision)?;
+                    let mut header = LogicalStreamHeader::new(&command.service.id, uuid::Uuid::new_v4().to_string(), command.service.revision)?;
+                    header.compressed = compression_supported && command.service.compression_enabled;
                     tokio::time::timeout(Duration::from_secs(10), nexo_tunnel::write_logical_header(&mut stream, &header)).await??;
+                    let stream = nexo_tunnel::compression::wrap(stream, header.compressed);
                     let mut stream = crate::traffic::Counted::new(stream, meter.clone(), true).with_quota(quota.clone(), quota_cancel.clone());
                     let mut socket = crate::traffic::Counted::new(&mut command.socket, meter, false).with_quota(quota, quota_cancel.clone());
                     let mut stream=nexo_tunnel::observation::Observed::new(&mut stream,observed.clone(),true);
@@ -1120,6 +1136,7 @@ mod tests {
             device: "device".into(),
             revision: 1,
             protocol: "http".into(),
+            compression_enabled: false,
             port: None,
         };
         let directory = state.config.runtime_dir.join("tunnel-sockets");
@@ -1918,6 +1935,7 @@ mod tests {
             https_port: None,
             ipv6_direct_enabled: None,
             http_redirect_enabled: None,
+            compression_enabled: None,
             access_mode: None,
             access_password: None,
             service_mode: None,

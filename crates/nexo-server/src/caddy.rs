@@ -26,7 +26,7 @@ use tokio::{
     sync::{Mutex, Notify},
 };
 
-pub const CADDY_VERSION: &str = "2.11.4";
+pub const CADDY_VERSION: &str = "2.11.9";
 pub const XCADDY_VERSION: &str = "0.4.7";
 pub const CLOUDFLARE_MODULE_VERSION: &str = "0.2.4";
 /// 内网重定向依赖本次进程内的已认证会话，不能把旧出口当作跨重启的可信配置。

@@ -23,8 +23,10 @@
 - p50/p95 使用延迟桶上界，不是精确逐请求分位数。
 - 访客按入口和北京时间自然日近似去重，长周期展示日去重数之和；共享出口可能低估，跨入口访问可能高估。
 - 请求与会话明细保留 7 天，小时聚合保留 90 天；历史未采集数据不能补回。
-- 来源只保存 IPv4 /24 或 IPv6 /48 网段；查询参数、原始 IP 和访客摘要不出现在请求明细接口中。统计队列不保存请求体、Cookie 或认证头。
-- 地域与运营商来自本地数据库，可分别设置 `NEXO_GEOIP_DATABASE` 和 `NEXO_GEOIP_ASN_DATABASE`。未配置时显示未知，不调用外部 IP 查询服务。
+- HTTP、HTTPS 和 WebSocket 采用 Caddy 访问日志里的连接对端。TCP 采用公网监听收到的连接对端。UDP 采用首个数据报的来源地址。同一请求经过上游代理时，地域对应入口看到的对端地址。
+- 明细保留 IPv4 /24 或 IPv6 /48 网段以及推断出的国家或地区。统计队列与上报仅使用脱敏字段。地域排行分别显示 HTTP 请求数和已结束的 TCP／UDP 会话数，历史记录缺失地域时显示「未知」。
+- 内置节点、独立节点和启用 IPv6 直连的 Agent 先读取持久缓存，随后在后台下载 DB-IP Country Lite。内置节点与独立节点的缓存位于数据目录的 `geoip/`，Agent 位于 `direct/geoip/`。采集端每 24 小时检查月度版本，更新失败时继续使用最近一次有效缓存。出站请求用于下载整库，访客地址在采集端内存中完成查询。 [DB-IP Country Lite](https://db-ip.com/db/download/ip-to-country-lite)
+- 定义 `NEXO_GEOIP_DATABASE` 后，采集端在启动时读取管理员提供的 MMDB。运营商库继续通过 `NEXO_GEOIP_ASN_DATABASE` 指定。容器部署可把文件挂载为只读并设置容器内路径。
 
 ## 本地验证
 
@@ -81,6 +83,12 @@ Remove-Item Env:NEXO_GEOIP_DATABASE, Env:NEXO_GEOIP_ASN_DATABASE
 ```
 
 此测试读取真实二进制库，覆盖 IPv4、IPv6、IPv4-mapped IPv6、中文国家名、ASN 组织和未命中地址，并通过隔离子进程验证未配置、文件缺失及文件损坏时显示未知。它验证本地解码与脱敏，不验证商业地域库的现实准确性或更新质量。
+
+将官方 DB-IP Country Lite 的 MMDB gzip 文件路径填入 `NEXO_TEST_DBIP_GZIP`，可通过本地下载夹具复现版本发布延迟、缓存损坏回退和离线重启。 [DB-IP Country Lite](https://db-ip.com/db/download/ip-to-country-lite)
+
+```powershell
+cargo test -p nexo-core updates_and_reopens_real_country_cache --locked -- --ignored
+```
 
 ### 2026-10-25 本机验收记录
 

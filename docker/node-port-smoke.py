@@ -83,7 +83,9 @@ class NodeHarness(smoke.Harness):
             self.configure_local_domain(domain)
             services = []
             for protocol, host in [("http", "web"), ("https", "secure")]:
-                services.append(self.api("tunnels", "POST", {"name":host, "protocol":protocol, "device_id":device, "local_address":"127.0.0.1", "local_port":origin.server_address[1], "hostname":host, "public_domain_id":domain["id"], "https_port":self.args.https_port}))
+                services.append(self.api("tunnels", "POST", {"name":host, "protocol":protocol, "device_id":device, "local_address":"127.0.0.1", "local_port":origin.server_address[1], "hostname":host, "public_domain_id":domain["id"], "https_port":self.args.https_port, "compression_enabled": protocol == "https"}))
+            tcp = self.api("tunnels", "POST", {"name":"tcp", "protocol":"tcp", "device_id":device,
+                "local_address":"127.0.0.1", "local_port":origin.server_address[1], "compression_enabled":True})
             assert services[0]["public_address"] == f"http://web.nexo-smoke.localhost:{self.args.http_port}"
             assert services[1]["public_address"] == f"https://secure.nexo-smoke.localhost:{self.args.https_port}"
             self.check("服务地址显示自定义 HTTP/HTTPS 公网端口")
@@ -109,7 +111,7 @@ class NodeHarness(smoke.Harness):
             with sqlite3.connect(self.root / "server/nexo.db") as db:
                 db.execute("UPDATE relay_nodes SET public_ipv4=? WHERE id=?", (self.args.node_ip, node_id))
                 db.execute("INSERT INTO relay_node_grants VALUES(?,?)", (node_id, services[0]["tenant_id"]))
-                for service in services:
+                for service in [*services, tcp]:
                     db.execute("DELETE FROM service_nodes WHERE service_id=?", (service["id"],))
                     db.execute("INSERT INTO service_nodes VALUES(?,?)", (service["id"], node_id))
                 # 覆盖节点跳转路由；隧道表单当前未开放强制 HTTPS，此处仅设置测试快照。
@@ -136,6 +138,21 @@ class NodeHarness(smoke.Harness):
                     return db.execute("SELECT COUNT(*) FROM relay_public_health WHERE node_id=? AND healthy=1", (node_id,)).fetchone()[0] == 2
             smoke.wait_for(healthy, "管理 Server 在自定义端口完成连续三次公网入口探测", timeout=90)
             self.check("管理 Server 在实际 HTTP/HTTPS 端口完成健康探测")
+            def tcp_response():
+                with socket.create_connection((self.args.node_ip, tcp["public_port"]), timeout=3) as client:
+                    client.sendall(b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+                    with client.makefile("rb") as response:
+                        if b"nexo-real-origin\n" in response.read():
+                            return client.getsockname()[0]
+            client_ip = smoke.wait_for(tcp_response, "独立节点压缩 TCP 双向转发")
+            def tcp_fact():
+                items = self.api(f"traffic/analytics/sessions?tunnel_id={tcp['id']}")["items"]
+                return next((e for e in items if e["node"] == node_id and e["to_public"] > 0), None)
+            tcp_session = smoke.wait_for(tcp_fact, "独立节点 TCP 会话回传")
+            assert tcp_session["source"] == ".".join(client_ip.split(".")[:3]) + ".0/24"
+            assert tcp_session["country"] == "未知"
+            assert any(row["label"] == "未知" for row in self.api(f"traffic/analytics/summary?tunnel_id={tcp['id']}")["breakdowns"]["session_country"])
+            self.check("独立节点 TCP 会话上报来源网段与地域，压缩转发完成")
             for service in services:
                 host = f"{service['name']}.nexo-smoke.localhost"
                 secure = service["protocol"] == "https"
