@@ -55,6 +55,51 @@ test("编辑保存与放弃草稿回到详情原滚动位置，保留原域名",
   await expect(detail.getByRole("status")).toHaveText("配置已保存");
 });
 
+test("连续保存会重新计时，切页后提示到期消失，操作错误仍保留", { tag: ["@mobile", "@webkit"] }, async ({ page }) => {
+  const state = await installApiMocks(page);
+  await page.emulateMedia({ reducedMotion: "reduce" });
+  await page.goto("/#/services");
+  const list = page.locator('[id="page-%23%2Fservices"]');
+  await list.getByRole("link", { name: "媒体中心", exact: true }).click();
+  const detail = page.locator(".application-modal");
+  const editor = page.getByRole("dialog", { name: "编辑服务" });
+
+  async function save(name: string) {
+    await detail.getByRole("button", { name: "编辑服务" }).click();
+    await editor.getByLabel("服务名称", { exact: true }).fill(name);
+    await editor.getByRole("button", { name: "保存服务" }).click();
+    await expect(detail.getByRole("heading", { name, exact: true })).toBeVisible();
+    await expect(detail.getByRole("status")).toHaveText("配置已保存");
+  }
+
+  await save("第一次保存");
+  const firstSavedAt = Date.now();
+  // 保留真实时钟，让详情弹窗的浏览器动画正常结束。
+  await page.waitForTimeout(2000);
+  await save("第二次保存");
+  await detail.getByRole("button", { name: "关闭", exact: true }).click();
+  await expect(detail).toHaveCount(0);
+  const listMessage = list.getByText("配置已保存", { exact: true });
+  // 第一条提示已经到期，第二条仍应可见。
+  await page.waitForTimeout(Math.max(0, firstSavedAt + 5100 - Date.now()));
+  await expect(listMessage).toBeVisible();
+  await page.getByRole("link", { name: "首页", exact: true }).click();
+  await expect(list).toHaveAttribute("hidden", "");
+  await expect(listMessage).toHaveCount(0);
+  await page.getByRole("link", { name: "服务", exact: true }).click();
+  const service = list.getByRole("link", { name: "第二次保存", exact: true });
+  await expect(service).toBeVisible();
+  await expect(listMessage).toHaveCount(0);
+
+  state.failures.set("POST /api/v1/tunnels/t-1/disable", "暂时无法关闭");
+  await service.click();
+  await detail.getByRole("button", { name: "关闭服务" }).click();
+  const error = detail.getByRole("alert");
+  await expect(error).toContainText("暂时无法关闭");
+  await page.waitForTimeout(5000);
+  await expect(error).toContainText("暂时无法关闭");
+});
+
 test("详情继续刷新，编辑暂停刷新，启停错误留在弹窗", async ({ page }) => {
   const state = await installApiMocks(page);
   await page.goto("/#/services");

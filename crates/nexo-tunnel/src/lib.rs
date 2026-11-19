@@ -28,6 +28,31 @@ pub const TCP_KEEPALIVE_IDLE: Duration = Duration::from_secs(30);
 pub const TCP_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
 pub const TCP_KEEPALIVE_RETRIES: u32 = 3;
 
+/// Yamux 在驱动循环中异步回收流。预留一批名额供上一批流收尾及对端探测使用。
+pub const FORWARDING_SLOTS: usize = DEFAULT_MAX_STREAMS / 2;
+
+/// 监听器串行接入，每个入口最多等待一个已接受的 socket。撤权或替换会话时立即退出。
+pub async fn reserve_forwarding_slot(
+    slots: std::sync::Arc<tokio::sync::Semaphore>,
+    service: &tokio_util::sync::CancellationToken,
+    session: &tokio_util::sync::CancellationToken,
+) -> Option<tokio::sync::OwnedSemaphorePermit> {
+    tokio::select! {
+        biased;
+        _ = service.cancelled() => None,
+        _ = session.cancelled() => None,
+        result = tokio::time::timeout(Duration::from_secs(10), slots.acquire_owned()) => {
+            match result {
+                Ok(permit) => permit.ok(),
+                Err(_) => {
+                    tracing::debug!("隧道并发已满，新连接等待转发名额超过 10 秒");
+                    None
+                }
+            }
+        }
+    }
+}
+
 /// 为长期空闲的 Tunnel 数据连接启用跨平台 TCP keepalive。
 ///
 /// Yamux 在没有逻辑流时不会主动产生网络流量；短周期内核探测既能防止常见
@@ -236,6 +261,31 @@ pub fn into_tokio_io(stream: yamux::Stream) -> Compat<yamux::Stream> {
 mod tests {
     use super::*;
     use tokio::io::duplex;
+
+    #[tokio::test]
+    async fn cancelling_service_or_session_wakes_waiting_listener() {
+        use std::sync::Arc;
+        use tokio::sync::Semaphore;
+        use tokio_util::sync::CancellationToken;
+        let slots = Arc::new(Semaphore::new(1));
+        let active = slots.clone().acquire_owned().await.unwrap();
+        for cancel_service in [true, false] {
+            let service = CancellationToken::new();
+            let session = CancellationToken::new();
+            let waiter = reserve_forwarding_slot(slots.clone(), &service, &session);
+            tokio::pin!(waiter);
+            assert!(futures_util::poll!(&mut waiter).is_pending());
+            if cancel_service {
+                service.cancel();
+            } else {
+                session.cancel();
+            }
+            assert!(futures_util::poll!(waiter).is_ready());
+            assert_eq!(slots.available_permits(), 0);
+        }
+        drop(active);
+        assert_eq!(slots.available_permits(), 1);
+    }
 
     #[tokio::test]
     async fn logical_header_round_trip_is_length_bounded() {

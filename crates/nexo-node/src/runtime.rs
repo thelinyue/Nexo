@@ -26,7 +26,7 @@ use std::{
 };
 use tokio::{
     net::{TcpListener, TcpStream},
-    sync::{mpsc, watch, Mutex as AsyncMutex},
+    sync::{mpsc, watch, Mutex as AsyncMutex, OwnedSemaphorePermit, Semaphore},
     task::JoinSet,
 };
 use tokio_rustls::{TlsAcceptor, TlsConnector};
@@ -51,12 +51,28 @@ struct Open {
     service: wire::Service,
     socket: TcpStream,
     cancel: CancellationToken,
+    permit: OwnedSemaphorePermit,
 }
 #[derive(Clone)]
 struct Session {
     public_ipv4: Option<Ipv4Addr>,
     sender: mpsc::Sender<Open>,
     cancel: CancellationToken,
+    permits: Arc<Semaphore>,
+}
+impl Session {
+    async fn open(&self, service: &wire::Service, socket: TcpStream, cancel: &CancellationToken) {
+        if let Some(permit) =
+            nexo_tunnel::reserve_forwarding_slot(self.permits.clone(), cancel, &self.cancel).await
+        {
+            let _ = self.sender.try_send(Open {
+                service: service.clone(),
+                socket,
+                cancel: cancel.clone(),
+                permit,
+            });
+        }
+    }
 }
 /// 所有监听和会话受同一个快照约束；更新配置会取消旧服务的已有连接。
 struct Runtime {
@@ -387,6 +403,7 @@ async fn data_session(
             public_ipv4,
             sender: sender.clone(),
             cancel: cancel.clone(),
+            permits: Arc::new(Semaphore::new(nexo_tunnel::FORWARDING_SLOTS)),
         },
     ) {
         old.cancel.cancel();
@@ -394,16 +411,26 @@ async fn data_session(
     let mut connection = nexo_tunnel::yamux_connection(stream, yamux::Mode::Server);
     let mut copies = JoinSet::new();
     let result:Result<()>=async{loop{tokio::select!{
+        biased;
         _=cancel.cancelled()=>break,
         changed=snapshot.changed()=>{changed?;anyhow::ensure!(agent_for(&snapshot.borrow(),&cert).as_deref()==Some(&device),"设备授权已撤销");},
+        inbound=nexo_tunnel::next_inbound(&mut connection)=>match inbound?{None=>break,Some(stream)=>{
+            copies.spawn(async move{
+                let mut stream=nexo_tunnel::into_tokio_io(stream);
+                if let Ok(Ok(header))=tokio::time::timeout(Duration::from_secs(3),nexo_tunnel::read_logical_header(&mut stream)).await{
+                    if header.tunnel_id=="node-probe"&&header.revision==1{let _=tokio::io::AsyncWriteExt::write_all(&mut stream,&[1]).await;}
+                }
+            });
+        }},
         Some(_)=copies.join_next(),if !copies.is_empty()=>{},
         request=receiver.recv()=>{
             let Some(mut request)=request else{break;};
-            if request.cancel.is_cancelled()||!snapshot.borrow().services.contains(&request.service){continue;}
+            if request.cancel.is_cancelled()||!snapshot.borrow().accepting||!snapshot.borrow().services.contains(&request.service){continue;}
             let stream=tokio::time::timeout(Duration::from_secs(10),nexo_tunnel::new_outbound(&mut connection)).await??;
             let count=runtime.connections.clone();count.fetch_add(1,Ordering::Relaxed);
             let metered_runtime=runtime.clone();
             copies.spawn(async move{
+                let _permit = request.permit;
                 struct Count(Arc<AtomicU64>);impl Drop for Count{fn drop(&mut self){self.0.fetch_sub(1,Ordering::Relaxed);}}
                 let _count=Count(count);let mut stream=nexo_tunnel::into_tokio_io(stream);
                 let transfer=async{
@@ -416,15 +443,8 @@ async fn data_session(
                 tokio::select!{_=request.cancel.cancelled()=>{},result=transfer=>if let Err(error)=result{tracing::debug!("节点转发结束：{error:#}");}}
             });
         },
-        inbound=nexo_tunnel::next_inbound(&mut connection)=>match inbound?{None=>break,Some(stream)=>{
-            copies.spawn(async move{
-                let mut stream=nexo_tunnel::into_tokio_io(stream);
-                if let Ok(Ok(header))=tokio::time::timeout(Duration::from_secs(3),nexo_tunnel::read_logical_header(&mut stream)).await{
-                    if header.tunnel_id=="node-probe"&&header.revision==1{let _=tokio::io::AsyncWriteExt::write_all(&mut stream,&[1]).await;}
-                }
-            });
-        }}
     }}Ok(())}.await;
+    cancel.cancel();
     copies.abort_all();
     while copies.join_next().await.is_some() {}
     let mut sessions = runtime.sessions.lock().await;
@@ -514,7 +534,8 @@ async fn listeners(runtime: Arc<Runtime>, directory: PathBuf, node_id: String) -
                                     incoming=listener.accept()=>{
                                         let Ok((socket,_))=incoming else{break;};
                                         if !rt.snapshot.borrow().accepting{continue;}
-                                        if let Some(session)=rt.sessions.lock().await.get(&served.device){let _=session.sender.try_send(Open{service:served.clone(),socket,cancel:stop.clone()});}
+                                        let session = rt.sessions.lock().await.get(&served.device).cloned();
+                                        if let Some(session) = session { session.open(&served, socket, &stop).await; }
                                     }
                                 }
                             }

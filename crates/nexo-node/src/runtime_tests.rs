@@ -208,10 +208,10 @@ async fn mtls_scenario(metered: bool) {
                 }
             }
         });
-        let sender = tokio::time::timeout(Duration::from_secs(3), async {
+        let session = tokio::time::timeout(Duration::from_secs(3), async {
             loop {
                 if let Some(session) = runtime.sessions.lock().await.get("agent") {
-                    break session.sender.clone();
+                    break session.clone();
                 }
                 tokio::task::yield_now().await;
             }
@@ -223,18 +223,13 @@ async fn mtls_scenario(metered: bool) {
             .await
             .unwrap();
         let (socket, _) = public.accept().await.unwrap();
-        sender
-            .send(Open {
-                service: service.clone(),
-                socket,
-                cancel: CancellationToken::new(),
-            })
-            .await
-            .unwrap();
+        session
+            .open(&service, socket, &CancellationToken::new())
+            .await;
         visitors.push(visitor);
         runtimes.push(runtime);
     }
-    for visitor in &mut visitors {
+    for (visitor, runtime) in visitors.iter_mut().zip(&runtimes) {
         visitor.write_all(b"ping").await.unwrap();
         let mut bytes = [0; 4];
         tokio::time::timeout(Duration::from_secs(3), visitor.read_exact(&mut bytes))
@@ -242,6 +237,13 @@ async fn mtls_scenario(metered: bool) {
             .unwrap()
             .unwrap();
         assert_eq!(&bytes, b"ping");
+        assert_eq!(
+            runtime.sessions.lock().await["agent"]
+                .permits
+                .available_permits(),
+            nexo_tunnel::FORWARDING_SLOTS - 1,
+            "已建立的节点转发仍应持有名额"
+        );
     }
     runtimes[0].snapshot.send_replace(Snapshot::default());
     let result = tokio::time::timeout(Duration::from_secs(3), visitors[0].read(&mut [0; 4]))

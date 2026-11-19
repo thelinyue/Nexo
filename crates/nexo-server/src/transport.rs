@@ -54,7 +54,7 @@ struct OpenStream {
     socket: BoxIo,
     peer: Option<IpAddr>,
     cancel: CancellationToken,
-    _permit: OwnedSemaphorePermit,
+    permit: OwnedSemaphorePermit,
 }
 #[derive(Clone)]
 struct DataSession {
@@ -506,11 +506,20 @@ async fn handoff(
             return;
         }
     }
-    let connections = state.tunnel_runtime.connections.lock().await;
-    let Some(session) = connections.data.get(&service.device) else {
+    let session = state
+        .tunnel_runtime
+        .connections
+        .lock()
+        .await
+        .data
+        .get(&service.device)
+        .cloned();
+    let Some(session) = session else {
         return;
     };
-    let Ok(permit) = session.permits.clone().try_acquire_owned() else {
+    let Some(permit) =
+        nexo_tunnel::reserve_forwarding_slot(session.permits, cancel, &session.cancel).await
+    else {
         return;
     };
     let _ = session.sender.try_send(OpenStream {
@@ -518,7 +527,7 @@ async fn handoff(
         socket,
         peer,
         cancel: cancel.child_token(),
-        _permit: permit,
+        permit,
     });
 }
 
@@ -835,7 +844,7 @@ async fn data_session(
             DataSession {
                 sender: sender.clone(),
                 cancel: cancel.clone(),
-                permits: Arc::new(Semaphore::new(nexo_tunnel::DEFAULT_MAX_STREAMS)),
+                permits: Arc::new(Semaphore::new(nexo_tunnel::FORWARDING_SLOTS)),
             },
         );
         if let Some(previous) = previous {
@@ -845,7 +854,13 @@ async fn data_session(
     let mut connection = nexo_tunnel::yamux_connection(stream, yamux::Mode::Server);
     let mut copies = JoinSet::new();
     let result: Result<()> = async { loop { tokio::select! {
+        biased;
         _ = cancel.cancelled() => break,
+        // 优先驱动 Yamux 收发与回收，再消费开流请求。
+        inbound = nexo_tunnel::next_inbound(&mut connection) => match inbound? {
+            Some(_) => anyhow::bail!("设备不允许主动打开服务端逻辑流"),
+            None => break,
+        },
         Some(_) = copies.join_next(), if !copies.is_empty() => {},
         command = receiver.recv() => {
             let Some(mut command) = command else { break; };
@@ -856,6 +871,7 @@ async fn data_session(
             let meter = state.tunnel_runtime.traffic.meter(&command.service.tenant, &command.service.id);
             let observed=matches!(command.service.protocol.as_str(),"tcp"|"tcp_udp").then(||Arc::new(std::sync::Mutex::new(state.tunnel_runtime.analytics.session(&command.service.id,"tcp",command.peer))));
             copies.spawn(state.tunnel_runtime.transfers.track_future(async move {
+                let _permit = command.permit;
                 let mut stream = nexo_tunnel::into_tokio_io(stream);
                 let transfer = async {
                     let mut header = LogicalStreamHeader::new(&command.service.id, uuid::Uuid::new_v4().to_string(), command.service.revision)?;
@@ -876,11 +892,8 @@ async fn data_session(
                 }
             }));
         }
-        inbound = nexo_tunnel::next_inbound(&mut connection) => match inbound? {
-            Some(_) => anyhow::bail!("设备不允许主动打开服务端逻辑流"),
-            None => break,
-        }
     } } Ok(()) }.await;
+    cancel.cancel();
     copies.abort_all();
     while copies.join_next().await.is_some() {}
     let mut connections = state.tunnel_runtime.connections.lock().await;
@@ -1184,6 +1197,85 @@ mod tests {
     use tokio::io::{AsyncBufReadExt, BufReader};
 
     type ClientStream = tokio_rustls::client::TlsStream<TcpStream>;
+
+    #[tokio::test]
+    async fn busy_data_session_keeps_the_live_stream_and_serves_the_waiter() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let (state, _) = crate::tests::domain_fixture();
+        populate(&state);
+        let config = test_client_config(&state, "mine");
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(serve(state.clone(), listener, true));
+        let tls = tokio_rustls::TlsConnector::from(config)
+            .connect(
+                nexo_tunnel::identity::SERVER_NAME.try_into().unwrap(),
+                TcpStream::connect(address).await.unwrap(),
+            )
+            .await
+            .unwrap();
+        let mut mux = nexo_tunnel::yamux_connection(tls, yamux::Mode::Client);
+        let (accepted, mut streams) = mpsc::channel(2);
+        let agent = tokio::spawn(async move {
+            while let Ok(Some(stream)) = nexo_tunnel::next_inbound(&mut mux).await {
+                accepted
+                    .send(nexo_tunnel::into_tokio_io(stream))
+                    .await
+                    .unwrap();
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Some(session) = state
+                    .tunnel_runtime
+                    .connections
+                    .lock()
+                    .await
+                    .data
+                    .get_mut("mine")
+                {
+                    session.permits = Arc::new(Semaphore::new(1));
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+            let service = Service {
+                id: "own".into(),
+                tenant: "default".into(),
+                device: "mine".into(),
+                revision: 2,
+                protocol: "tcp".into(),
+                compression_enabled: false,
+                port: None,
+            };
+            let cancel = CancellationToken::new();
+            let (mut first, socket) = tokio::io::duplex(128);
+            handoff(&state, &service, Box::new(socket), None, &cancel).await;
+            let mut live = streams.recv().await.unwrap();
+            nexo_tunnel::read_logical_header(&mut live).await.unwrap();
+            let (mut second, socket) = tokio::io::duplex(128);
+            let waiter = handoff(&state, &service, Box::new(socket), None, &cancel);
+            tokio::pin!(waiter);
+            assert!(
+                futures_util::poll!(&mut waiter).is_pending(),
+                "已有流仍占用唯一许可"
+            );
+            live.write_all(b"a").await.unwrap();
+            assert_eq!(first.read_u8().await.unwrap(), b'a');
+            drop(first);
+            drop(live);
+            waiter.await;
+            let mut next = streams.recv().await.unwrap();
+            nexo_tunnel::read_logical_header(&mut next).await.unwrap();
+            next.write_all(b"b").await.unwrap();
+            assert_eq!(second.read_u8().await.unwrap(), b'b');
+        })
+        .await
+        .unwrap();
+        state.tunnel_runtime.stop.cancel();
+        server.await.unwrap().unwrap();
+        agent.abort();
+    }
 
     fn test_client_config(state: &AppState, device: &str) -> Arc<rustls::ClientConfig> {
         let key = rcgen::KeyPair::generate().unwrap();

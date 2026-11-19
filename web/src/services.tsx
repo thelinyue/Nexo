@@ -461,7 +461,16 @@ export function ServicesPage({ route, active, admin, csrf }: { route: string; ac
   const [pressing, setPressing] = useState<string | null>(null);
   const press = useRef<{ timer: number; pointer: number; x: number; y: number } | null>(null);
   const longPressed = useRef(false);
-  const [editor, setEditor] = useState<Tunnel | "new" | "new-proxy" | null>(null); const [busy, setBusy] = useState(false); const [actionError, setActionError] = useState<string | null>(null); const [message, setMessage] = useState<string | null>(null); const [deleting, setDeleting] = useState<Tunnel[] | null>(null);
+  const [editor, setEditor] = useState<Tunnel | "new" | "new-proxy" | null>(null); const [busy, setBusy] = useState(false); const [actionError, setActionError] = useState<string | null>(null); const [deleting, setDeleting] = useState<Tunnel[] | null>(null);
+  const [message, setMessage] = useState<{ text: string } | null>(null);
+  // 每次成功都创建独立提示，相同文案也会重新计时。页面隐藏时继续计时。
+  useEffect(() => {
+    if (!message) return;
+    const timer = window.setTimeout(() => {
+      setMessage(current => current === message ? null : current);
+    }, 5000);
+    return () => window.clearTimeout(timer);
+  }, [message]);
   const [changingAgent, setChangingAgent] = useState<Tunnel[] | null>(null);
   const [changingDomain, setChangingDomain] = useState<Tunnel[] | null>(null);
   const [creationMenu, setCreationMenu] = useState(false);
@@ -556,7 +565,7 @@ export function ServicesPage({ route, active, admin, csrf }: { route: string; ac
       const updated = items.length === 1
         ? [await request<Tunnel>(`/api/v1/tunnels/${encodeURIComponent(items[0].id)}/${enabled ? "enable" : "disable"}`, { method: "POST" }, csrf)]
         : await request<Tunnel[]>(`/api/v1/tunnels/batch/${enabled ? "enable" : "disable"}`, { method: "POST", body: JSON.stringify({ tunnel_ids: items.map(item => item.id) }) }, csrf);
-      updated.forEach(merge); setMessage(enabled ? "已启用，等待应用配置" : "已关闭服务");
+      updated.forEach(merge); setMessage({ text: enabled ? "已启用，等待应用配置" : "已关闭服务" });
     } catch (e) { setActionError(errorText(e)); } finally { setBusy(false); }
   }
   async function remove(items: Tunnel[]) {
@@ -566,7 +575,7 @@ export function ServicesPage({ route, active, admin, csrf }: { route: string; ac
     resource.setData(current => current && ({ ...current, tunnels: current.tunnels.filter(item => !ids.has(item.id)) }));
     setSelected(current => current.filter(id => !ids.has(id)));
     navigation?.removePages(items.map(item => `#/services/${encodeURIComponent(item.id)}`), "#/services");
-    setMessage(`已删除 ${items.length} 个服务`);
+    setMessage({ text: `已删除 ${items.length} 个服务` });
   }
   const topSearch = Boolean(navigation && (navigation.standalone || !navigation.desktop) && !detailId && tunnels.length);
   const viewToggle = <div className="service-view-toggle" role="group" aria-label="服务视图">{([["list", "列表", List], ["icons", "图标", LayoutGrid]] as const).map(([value, label, Icon]) => <button type="button" key={value} aria-label={`${label}视图`} title={`${label}视图`} aria-pressed={view === value} onClick={() => { cancelPress(); longPressed.current = false; if (value !== view) layout.capture(); setView(value); }}>{!navigation?.desktop && <Icon size={20} />}<span>{label}</span></button>)}</div>;
@@ -575,7 +584,7 @@ export function ServicesPage({ route, active, admin, csrf }: { route: string; ac
     <PageHeader title={route.startsWith("#/services/") ? detail?.name ?? "服务详情" : "服务"} topContent={topSearch && searchRow} createAction={(navigation?.desktop || !detailId) && !selecting && Boolean(tunnels.length) && (!navigation?.desktop
       ? <button className="primary-button page-create" data-resource="服务" aria-label="添加" aria-haspopup="dialog" aria-expanded={creationMenu} onClick={event => { creationTrigger.current = event.currentTarget; setCreationMenu(true); }}><Plus size={24} aria-hidden="true" /></button>
       : <>{addProxyButton}<CreateButton label="服务" onClick={() => create("new")} /></>)} />
-    {!detailId && <><Notice updatedAt={resource.updatedAt} error={resource.error} onRetry={() => void resource.reload()} /><Notice error={actionError} />{message && <p className="action-status" role="status">{message}</p>}</>}
+    {!detailId && <><Notice updatedAt={resource.updatedAt} error={resource.error} onRetry={() => void resource.reload()} /><Notice error={actionError} />{message && <p className="action-status" role="status">{message.text}</p>}</>}
     {!data && resource.busy && <Loading />}
     {data && <>
       {tunnels.length > 0 && <div className="toolbar service-toolbar">
@@ -599,7 +608,7 @@ export function ServicesPage({ route, active, admin, csrf }: { route: string; ac
       {selecting && <div className="batch-actions"><div className="batch-selection"><span aria-live="polite">已选择 {selected.length} 项</span><button className="text-button" disabled={busy || !visible.length} onClick={() => setSelected(selected.length === visible.length ? [] : visible.map(item => item.id))}>{visible.length > 0 && selected.length === visible.length ? "取消全选" : "全选"}</button>{!navigation?.desktop && <button className="text-button" disabled={busy} onClick={() => { setSelecting(false); setSelected([]); }}>完成</button>}</div><div className="batch-commands"><button className="secondary-button" title={selectedProxy ? "反向代理不能修改设备，请仅选择内网穿透服务" : undefined} disabled={!selected.length || busy || !data.devices.length || selectedProxy} onClick={() => { setActionError(null); setMessage(null); setChangingAgent(tunnels.filter(item => selected.includes(item.id))); }}><Server size={20} aria-hidden="true" /><span>修改设备</span></button><button className="secondary-button" disabled={busy || !tunnels.some(item => selected.includes(item.id) && hasServiceDomain(item))} onClick={() => { setActionError(null); setMessage(null); setChangingDomain(tunnels.filter(item => selected.includes(item.id))); }}><Globe size={20} aria-hidden="true" /><span>修改域名</span></button><button className="secondary-button" disabled={!selected.length || busy} onClick={() => void toggle(tunnels.filter(item => selected.includes(item.id)), true)}><Power size={20} aria-hidden="true" /><span>启用</span></button><button className="secondary-button" disabled={!selected.length || busy} onClick={() => void toggle(tunnels.filter(item => selected.includes(item.id)), false)}><PowerOff size={20} aria-hidden="true" /><span>关闭</span></button><button className="danger-button" disabled={!selected.length || busy} onClick={() => setDeleting(tunnels.filter(item => selected.includes(item.id)))}><Trash2 size={20} aria-hidden="true" /><span>删除</span></button></div></div>}
     </>}
     {detailId && active && !editor && <ApplicationModal title={detail?.name ?? "服务详情"} header={detail ? <div className="application-summary"><ServiceIcon id={detail.icon_id} protocol={detail.protocol} /><div><h2>{detail.name}</h2><Status kind={detailProxy ? "reverse_proxy" : "service"} value={detail.enabled ? detail.apply_status : "disabled"} /></div></div> : undefined} origin={detailPresentation.current.origin} enterFromOrigin={detailPresentation.current.animate} returnFocus={detailFocus} busy={busy} dismissWhen={Boolean(data && !detail && seenDetail.current === detailId)} onClose={() => closeDetail()}>{leave => <div className="modal-body service-detail-body" ref={element => { if (element) element.scrollTop = detailPresentation.current.scroll; }} onScroll={event => { detailPresentation.current.scroll = event.currentTarget.scrollTop; }}>
-      <Notice updatedAt={resource.updatedAt} error={resource.error} onRetry={() => void resource.reload()} /><Notice error={actionError} />{message && <p className="action-status" role="status">{message}</p>}
+      <Notice updatedAt={resource.updatedAt} error={resource.error} onRetry={() => void resource.reload()} /><Notice error={actionError} />{message && <p className="action-status" role="status">{message.text}</p>}
       {!data ? <Loading /> : !detail ? <Empty title="服务不存在"><button className="secondary-button" onClick={() => leave()}>返回服务列表</button></Empty> : <>
         {detail.apply_error && detail.apply_status !== "partial" && <div className="notice error"><strong>{detail.apply_error === "暂无可用 IPv4 入口" ? detail.apply_error : "转发配置需处理"}</strong><p>{detail.apply_error === "暂无可用 IPv4 入口" ? "请检查下方节点状态。" : detailProxy ? "请检查目标地址与域名配置。" : "当前服务可能无法访问。请核对设备连接与内网地址；网页服务还需检查域名配置。"}</p>{detail.apply_error !== "暂无可用 IPv4 入口" && <details><summary>技术详情</summary><p>{detail.apply_error}</p></details>}</div>}
         {!detailProxy && detail.origin_protocol === "https" && detail.origin_tls_verification === "insecure_skip_verify" && <div className="notice error"><span>内网证书验证已关闭，无法确认内网服务身份，请注意中间人攻击风险。</span></div>}
@@ -636,9 +645,9 @@ export function ServicesPage({ route, active, admin, csrf }: { route: string; ac
       <button aria-label="创建服务" onClick={() => create("new")}><Server size={22} aria-hidden="true" /><span>创建服务<small>通过设备访问内网服务</small></span><ChevronRight size={18} aria-hidden="true" /></button>
       <button aria-label="添加反向代理" onClick={() => create("new-proxy")}><Globe size={22} aria-hidden="true" /><span>添加反向代理<small>直接转发到目标地址</small></span><ChevronRight size={18} aria-hidden="true" /></button>
     </div></Modal>}
-    {editor && data && <ServiceEditor key={typeof editor === "string" ? editor : editor.id} mode={editor === "new-proxy" ? "reverse_proxy" : "tunnel"} active={active} admin={admin} tunnel={typeof editor === "string" ? undefined : editor} data={data} csrf={csrf} onClose={() => setEditor(null)} onSaved={item => { merge(item); setMessage("配置已保存"); }} />}
-    {changingAgent && active && data && <BatchAgentEditor items={changingAgent} devices={data.devices} csrf={csrf} onSaved={item => { merge(item); setSelected(current => current.filter(id => id !== item.id)); }} onComplete={() => setMessage(`已完成 ${changingAgent.length} 个服务的设备配置`)} onClose={() => setChangingAgent(null)} />}
-    {changingDomain && active && data && <BatchDomainEditor items={changingDomain} domains={data.domains} csrf={csrf} onSaved={item => { merge(item); setSelected(current => current.filter(id => id !== item.id)); }} onComplete={(completed, skipped) => { setMessage(`已保存 ${completed} 个服务的域名配置${skipped ? `，跳过 ${skipped} 个无域名服务` : ""}`); setSelected(current => current.filter(id => !changingDomain.some(item => item.id === id))); }} onClose={() => setChangingDomain(null)} />}
+    {editor && data && <ServiceEditor key={typeof editor === "string" ? editor : editor.id} mode={editor === "new-proxy" ? "reverse_proxy" : "tunnel"} active={active} admin={admin} tunnel={typeof editor === "string" ? undefined : editor} data={data} csrf={csrf} onClose={() => setEditor(null)} onSaved={item => { merge(item); setMessage({ text: "配置已保存" }); }} />}
+    {changingAgent && active && data && <BatchAgentEditor items={changingAgent} devices={data.devices} csrf={csrf} onSaved={item => { merge(item); setSelected(current => current.filter(id => id !== item.id)); }} onComplete={() => setMessage({ text: `已完成 ${changingAgent.length} 个服务的设备配置` })} onClose={() => setChangingAgent(null)} />}
+    {changingDomain && active && data && <BatchDomainEditor items={changingDomain} domains={data.domains} csrf={csrf} onSaved={item => { merge(item); setSelected(current => current.filter(id => id !== item.id)); }} onComplete={(completed, skipped) => { setMessage({ text: `已保存 ${completed} 个服务的域名配置${skipped ? `，跳过 ${skipped} 个无域名服务` : ""}` }); setSelected(current => current.filter(id => !changingDomain.some(item => item.id === id))); }} onClose={() => setChangingDomain(null)} />}
     {deleting && active && <Confirm title={deleting.length === 1 ? `删除 ${deleting[0].name}？` : `删除 ${deleting.length} 个服务？`} description="删除后将立即停止新的连接，此操作无法撤销。" label="删除服务" onClose={() => setDeleting(null)} onConfirm={() => remove(deleting.filter(item => tunnels.some(current => current.id === item.id)))} />}
   </>;
 }
